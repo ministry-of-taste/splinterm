@@ -168,8 +168,9 @@ use crate::renderer::{
     paint_history_overlay, paint_lair_explorer, paint_search_overlay, paint_session_picker_overlay,
     paint_snapshot_overlays, paint_snapshot_presented, paint_snapshot_region_presented,
     paint_snapshot_rows_presented, paint_tab_context_menu, premultiplied_theme_rgba,
-    scroll_snapshot_pixels, session_picker_hit_test, session_picker_overlay_layout,
-    snapshot_row_rect, tab_context_menu_hit_test, tab_context_menu_layout, write_ppm,
+    scroll_snapshot_pixels, search_overlay_panel, session_picker_hit_test,
+    session_picker_overlay_layout, snapshot_row_rect, tab_context_menu_hit_test,
+    tab_context_menu_layout, write_ppm,
 };
 use crate::{
     keymap::{ActionId, KeymapPress, PrefixState, ResolvedKeymap},
@@ -204,8 +205,8 @@ use clipboard::{
     write_clipboard_with_deadline,
 };
 use damage::{
-    BackingDamage, pending_draw_waits_for_frame, sync_backing_damage, take_full_surface_damage,
-    terminal_draw_waits_for_frame,
+    BackingDamage, pending_draw_waits_for_frame, search_panel_damage, sync_backing_damage,
+    take_full_surface_damage, terminal_draw_waits_for_frame,
 };
 use file_drop::{
     FileDropTarget, URI_LIST_MIME, accepted_uri_list_mime, copy_action_supported,
@@ -1099,6 +1100,7 @@ fn assemble_app(
             explorer_layout: None,
             explorer_text_cache: SessionPickerTextCache::default(),
             search_text_cache: SessionPickerTextCache::default(),
+            painted_search_panel: None,
             explorer_visible_start: 0,
             explorer_pressed: None,
             full_redraw: true,
@@ -2230,6 +2232,9 @@ struct PresentationState {
     explorer_layout: Option<LairExplorerLayout>,
     explorer_text_cache: SessionPickerTextCache,
     search_text_cache: SessionPickerTextCache,
+    /// Where the last committed frame drew the terminal search field, in
+    /// buffer pixels; the next frame damages it if the field closes or moves.
+    painted_search_panel: Option<Rect>,
     explorer_visible_start: usize,
     explorer_pressed: Option<ExplorerPointerPress>,
     full_redraw: bool,
@@ -11919,15 +11924,18 @@ impl App {
             )?;
             self.surface.buffers[buffer_index].stale.mark_full();
         }
+        let mut search_panel = None;
         if let Some(input) = self.panes.pane.search.input.as_ref() {
             if let Some(terminal) = search_paint_rect(content_rect, explorer_layout.as_ref()) {
+                let terminal = Self::buffer_rect(terminal, self.surface.scale_120)?;
+                search_panel = search_overlay_panel(terminal, self.surface.scale_120);
                 paint_search_overlay(
                     &mut self.presentation.search_text_cache,
                     &self.presentation.render_context,
                     canvas,
                     width,
                     height,
-                    Self::buffer_rect(terminal, self.surface.scale_120)?,
+                    terminal,
                     self.surface.scale_120,
                     self.presentation.renderer_generation,
                     chrome_panel_palette(self.presentation.theme, ChromeSurface::Popup),
@@ -12196,6 +12204,20 @@ impl App {
             }
         }
         self.panes.pane.painted_history_status = history_status;
+        // The search field is chrome over the terminal: partial damage covers
+        // only changed rows, so damage where it is and where it was.
+        if !damage_full_surface {
+            for region in search_panel_damage(self.presentation.painted_search_panel, search_panel)
+            {
+                self.surface.window.wl_surface().damage_buffer(
+                    i32::try_from(region.x).unwrap_or(i32::MAX),
+                    i32::try_from(region.y).unwrap_or(i32::MAX),
+                    i32::try_from(region.width).unwrap_or(i32::MAX),
+                    i32::try_from(region.height).unwrap_or(i32::MAX),
+                );
+            }
+        }
+        self.presentation.painted_search_panel = search_panel;
         self.panes.pane.raster_dirty_rows.fill(false);
         self.panes.pane.surface_dirty_rows.fill(false);
         self.panes.pane.pending_scrolls.clear();
