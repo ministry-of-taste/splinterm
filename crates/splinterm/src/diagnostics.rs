@@ -5,6 +5,7 @@ use std::{
     fs::{self, File, Permissions},
     io::{self, Read, Write},
     os::unix::fs::{MetadataExt, PermissionsExt},
+    panic::Location,
     path::{Path, PathBuf},
     sync::{
         Mutex, OnceLock,
@@ -219,6 +220,10 @@ pub struct DiagnosticEvent {
     pub exit_class: Option<ExitClass>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_code: Option<DiagnosticErrorCode>,
+    /// The `file:line` in Splinterm's own source that reported a failure:
+    /// a compile-time constant naming the failing path, never runtime text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_location: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -292,6 +297,8 @@ impl LogWriter {
 struct DiagnosticState {
     writer: Option<LogWriter>,
     pending_exit: Option<ExitClass>,
+    /// The first failure's source location, repeated on the exit record.
+    failure_location: Option<String>,
 }
 
 #[derive(Debug)]
@@ -326,6 +333,7 @@ impl ClientDiagnostics {
             state: Mutex::new(DiagnosticState {
                 writer: None,
                 pending_exit: None,
+                failure_location: None,
             }),
             terminal_committed: AtomicBool::new(false),
             handed_off: AtomicBool::new(false),
@@ -424,6 +432,43 @@ impl ClientDiagnostics {
             return;
         }
         let record = self.event(level, event, None, error_code);
+        self.write_record(&record, level);
+    }
+
+    /// Emits a failure event that names where in Splinterm's source it was
+    /// reported, and keeps that location for the exit record.
+    pub fn emit_failure(
+        &self,
+        level: DiagnosticLevel,
+        event: DiagnosticEventCode,
+        error_code: Option<DiagnosticErrorCode>,
+        location: &'static Location<'static>,
+    ) {
+        let location = source_location(location);
+        self.remember_failure_location(&location);
+        if !self.filter.enabled(module_for_event(event), level) {
+            return;
+        }
+        let mut record = self.event(level, event, None, error_code);
+        record.failure_location = Some(location);
+        self.write_record(&record, level);
+    }
+
+    /// Keeps a failure's source location for the exit record without
+    /// emitting an event of its own.
+    pub fn record_failure_location(&self, location: &'static Location<'static>) {
+        self.remember_failure_location(&source_location(location));
+    }
+
+    fn remember_failure_location(&self, location: &str) {
+        if let Ok(mut state) = self.state.lock()
+            && state.failure_location.is_none()
+        {
+            state.failure_location = Some(location.to_owned());
+        }
+    }
+
+    fn write_record(&self, record: &DiagnosticEvent, level: DiagnosticLevel) {
         let Ok(mut state) = self.state.lock() else {
             return;
         };
@@ -433,7 +478,7 @@ impl ClientDiagnostics {
         let Some(writer) = state.writer.as_mut() else {
             return;
         };
-        let encoded = writer.write_event(&record, false).unwrap_or_default();
+        let encoded = writer.write_event(record, false).unwrap_or_default();
         if matches!(level, DiagnosticLevel::Warn | DiagnosticLevel::Error) && !encoded.is_empty() {
             submit_journal(&encoded, level);
         }
@@ -443,14 +488,17 @@ impl ClientDiagnostics {
         if self.terminal_committed.swap(true, Ordering::AcqRel) {
             return;
         }
-        let exit_class = self
+        let (pending_exit, failure_location) = self
             .state
             .lock()
-            .ok()
-            .and_then(|state| state.pending_exit)
-            .unwrap_or(fallback);
+            .map(|state| (state.pending_exit, state.failure_location.clone()))
+            .unwrap_or_default();
+        let exit_class = pending_exit.unwrap_or(fallback);
         let (level, event) = terminal_kind(exit_class);
-        let record = self.event(level, event, Some(exit_class), error_code);
+        let mut record = self.event(level, event, Some(exit_class), error_code);
+        if !exit_class.is_clean() {
+            record.failure_location = failure_location;
+        }
         if !(exit_class.is_clean() && self.handed_off.load(Ordering::Acquire)) {
             let _ = self.write_last_exit(&record);
         }
@@ -546,6 +594,7 @@ impl ClientDiagnostics {
             build_commit: splinterd::SOURCE_COMMIT.map(str::to_owned),
             exit_class,
             error_code,
+            failure_location: None,
         }
     }
 
@@ -620,6 +669,22 @@ pub fn initialize_graphical() -> io::Result<&'static ClientDiagnostics> {
     GLOBAL
         .get()
         .ok_or_else(|| io::Error::other("diagnostic initialization race"))
+}
+
+/// Names a source location as `crates/...:line` (or the bare file name when
+/// the path is outside the workspace), so no build machine path is recorded.
+fn source_location(location: &Location<'_>) -> String {
+    let file = location.file();
+    let file = file.find("crates/").map_or_else(
+        || {
+            Path::new(file)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("unknown")
+        },
+        |start| &file[start..],
+    );
+    format!("{file}:{}", location.line())
 }
 
 pub fn finish_global(exit_class: ExitClass, error_code: Option<DiagnosticErrorCode>) {
@@ -1488,5 +1553,75 @@ mod tests {
         for (code, name) in codes {
             assert_eq!(serde_json::to_string(&code).unwrap(), format!("\"{name}\""));
         }
+    }
+
+    #[test]
+    fn a_failure_names_its_source_location_on_the_event_and_the_exit_record() {
+        let root = test_directory("failure-location");
+        let diagnostics = ClientDiagnostics::new(root.clone()).unwrap();
+        let location = Location::caller();
+        diagnostics.emit_failure(
+            DiagnosticLevel::Error,
+            DiagnosticEventCode::WaylandFailure,
+            Some(DiagnosticErrorCode::WaylandDispatch),
+            location,
+        );
+        // A later failure does not replace the first one on the exit record.
+        diagnostics.record_failure_location(Location::caller());
+        diagnostics.finish(
+            ExitClass::ErrorWaylandDispatch,
+            Some(DiagnosticErrorCode::InternalError),
+        );
+        let expected = format!("crates/splinterm/src/diagnostics.rs:{}", location.line());
+
+        let logs = retained_logs(&root);
+        assert_eq!(logs.len(), 1);
+        let records: Vec<DiagnosticEvent> = fs::read_to_string(&logs[0])
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].event, DiagnosticEventCode::WaylandFailure);
+        assert_eq!(records[0].failure_location.as_deref(), Some(&*expected));
+        assert_eq!(records[1].exit_class, Some(ExitClass::ErrorWaylandDispatch));
+        assert_eq!(records[1].failure_location.as_deref(), Some(&*expected));
+        let summary = read_single_event(&root.join("splinterm/last-client-exit.json"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.failure_location.as_deref(), Some(&*expected));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_clean_exit_carries_no_failure_location() {
+        let root = test_directory("failure-location-clean");
+        let diagnostics = ClientDiagnostics::new(root.clone()).unwrap();
+        diagnostics.record_failure_location(Location::caller());
+        diagnostics.finish(ExitClass::CleanUserClose, None);
+        let summary = read_single_event(&root.join("splinterm/last-client-exit.json"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.exit_class, Some(ExitClass::CleanUserClose));
+        assert_eq!(summary.failure_location, None);
+        let value = serde_json::to_value(&summary).unwrap();
+        assert!(value.get("failure_location").is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn records_without_a_failure_location_still_parse() {
+        let line = r#"{"schema_version":1,"timestamp_unix_ms":1,"component":"splinterm","module":"wayland","event":"wayland_failure","level":"error","pid":1,"client_instance_id":"00000000-0000-0000-0000-000000000000","build_version":"0.2.0","error_code":"wayland_dispatch"}"#;
+        let event: DiagnosticEvent = serde_json::from_str(line).unwrap();
+        assert_eq!(event.failure_location, None);
+    }
+
+    #[test]
+    fn a_source_location_keeps_only_the_workspace_relative_path() {
+        let location = Location::caller();
+        assert_eq!(
+            source_location(location),
+            format!("crates/splinterm/src/diagnostics.rs:{}", location.line())
+        );
     }
 }

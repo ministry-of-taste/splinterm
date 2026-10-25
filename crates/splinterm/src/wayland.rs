@@ -991,6 +991,9 @@ impl WaylandSession {
         if (event_loop_result.is_err() || teardown_result.is_err())
             && let Some(diagnostics) = diagnostics()
         {
+            // This line names the event loop or its teardown, unless a
+            // handler already recorded where it failed.
+            diagnostics.record_failure_location(std::panic::Location::caller());
             diagnostics.request_exit(ExitClass::ErrorWaylandDispatch);
         }
         event_loop_result?;
@@ -2508,15 +2511,21 @@ impl SchedulingState {
         self.exit = true;
     }
 
+    /// Ends the Window over `error`. The diagnostic records the caller's
+    /// source location, so a failure the log cannot describe still names the
+    /// path that reported it.
+    #[track_caller]
     fn fail(&mut self, error: anyhow::Error) {
+        let location = std::panic::Location::caller();
         if let Some(diagnostics) = diagnostics() {
-            diagnostics.emit(
+            diagnostics.emit_failure(
                 DiagnosticLevel::Error,
                 DiagnosticEventCode::WaylandFailure,
                 Some(DiagnosticErrorCode::WaylandDispatch),
+                location,
             );
         }
-        eprintln!("splinterm Wayland client failed: {error:#}");
+        eprintln!("splinterm Wayland client failed at {location}: {error:#}");
         self.failure = Some(error);
         self.request_exit(ExitClass::ErrorWaylandDispatch);
     }
