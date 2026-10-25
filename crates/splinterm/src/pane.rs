@@ -852,6 +852,21 @@ pub fn apply_preview_ratio(
     ancestor: u16,
     ratio: SplitRatio,
 ) -> bool {
+    match split_ratio_mut(root, target, ancestor) {
+        Some(current) => {
+            *current = ratio;
+            true
+        }
+        None => false,
+    }
+}
+
+/// The ratio of the branch `ancestor` levels above `target`'s leaf.
+pub fn split_ratio_mut(
+    root: &mut LayoutNode,
+    target: SplintId,
+    ancestor: u16,
+) -> Option<&mut SplitRatio> {
     fn path_to_target(node: &LayoutNode, target: SplintId, path: &mut Vec<bool>) -> bool {
         match node {
             LayoutNode::Leaf(splint) => splint.id == target,
@@ -873,7 +888,7 @@ pub fn apply_preview_ratio(
 
     let mut path = Vec::new();
     if !path_to_target(root, target, &mut path) || usize::from(ancestor) >= path.len() {
-        return false;
+        return None;
     }
     let branch_depth = path.len() - 1 - usize::from(ancestor);
     let mut node = root;
@@ -884,15 +899,14 @@ pub fn apply_preview_ratio(
             ..
         } = node
         else {
-            return false;
+            return None;
         };
         node = if second { second_node } else { first };
     }
-    let LayoutNode::Branch { ratio: current, .. } = node else {
-        return false;
+    let LayoutNode::Branch { ratio, .. } = node else {
+        return None;
     };
-    *current = ratio;
-    true
+    Some(ratio)
 }
 
 fn ancestor_distance(node: &LayoutNode, target: SplintId) -> Option<u16> {

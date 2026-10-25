@@ -196,8 +196,13 @@ fn print_client_event(label: &str, event: Option<&DiagnosticEvent>) {
         .and_then(|exit| serde_json::to_value(exit).ok())
         .and_then(|value| value.as_str().map(str::to_owned))
         .unwrap_or_else(|| "unavailable".to_owned());
+    let failed_at = event
+        .failure_location
+        .as_deref()
+        .map(|location| format!("; failed at {location}"))
+        .unwrap_or_default();
     println!(
-        "{label}: {exit}; client {}; window {}; topology revision {}",
+        "{label}: {exit}{failed_at}; client {}; window {}; topology revision {}",
         event.client_instance_id,
         event
             .window_id
@@ -445,6 +450,7 @@ mod tests {
             build_commit: None,
             exit_class: Some(ExitClass::Panic),
             error_code: None,
+            failure_location: None,
         };
         let external = CrashEvidence {
             timestamp_unix_ms: 10,
