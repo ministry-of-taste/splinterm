@@ -201,6 +201,27 @@ pub(super) fn tab_strip_layout(
     })
 }
 
+/// Moves a tab strip laid out from the Window's left edge right by `left`
+/// logical px, so it begins beside a full-height Explorer. Every hit target
+/// moves with it.
+pub(super) fn offset_tab_strip_layout(mut layout: TabStripLayout, left: u32) -> TabStripLayout {
+    if left == 0 {
+        return layout;
+    }
+    let shift = |rect: &mut Rect| rect.x = rect.x.saturating_add(left);
+    shift(&mut layout.rect);
+    shift(&mut layout.new_rect);
+    if let Some(host) = layout.host_rect.as_mut() {
+        shift(host);
+    }
+    for tab in &mut layout.tabs {
+        shift(&mut tab.rect);
+        shift(&mut tab.label_rect);
+        shift(&mut tab.close_rect);
+    }
+    layout
+}
+
 /// The remote tag owns its entire region, including in hidden-tab/observer windows.
 /// Reducing the tab layout's input width keeps every existing action out of the tag.
 fn remote_header_layout(
@@ -805,8 +826,20 @@ impl App {
             ids.iter()
                 .position(|dojo_id| *dojo_id == self.tab_state.active_dojo_id())?
         };
-        let width = self.surface.logical_width;
+        let left = self.tab_strip_left().min(self.surface.logical_width);
+        let width = self.surface.logical_width.saturating_sub(left);
         let height = self.tab_strip_logical_height();
+        let layout = self.tab_strip_layout_at_origin(width, height, &ids, active)?;
+        Some(offset_tab_strip_layout(layout, left))
+    }
+
+    fn tab_strip_layout_at_origin(
+        &self,
+        width: u32,
+        height: u32,
+        ids: &[DojoId],
+        active: usize,
+    ) -> Option<TabStripLayout> {
         if let Some((_, text)) = &self.tab_state.remote_host_text {
             let cell = text.pixel_width() / text.cells().max(1);
             let logical = |pixels| {
@@ -820,12 +853,12 @@ impl App {
             return remote_header_layout(
                 width,
                 height,
-                &ids,
+                ids,
                 active,
                 desired.min((width / 3).max(minimum)),
             );
         }
-        tab_strip_layout(width, height, &ids, active)
+        tab_strip_layout(width, height, ids, active)
     }
 
     fn prepare_clipped_remote_host_text(&mut self, layout: &TabStripLayout) -> Result<()> {
@@ -1378,6 +1411,36 @@ mod tests {
             &canvas[strip_offset..strip_offset + 4],
             &[0x10, 0x20, 0x40, 0x7f]
         );
+    }
+
+    /// Beside a full-height Explorer the strip is laid out at its own width
+    /// and moved right; every hit target moves with it, and nothing is left
+    /// over the Explorer.
+    #[test]
+    fn offset_tab_strip_moves_every_hit_target() {
+        use super::{TabHitTarget, offset_tab_strip_layout, tab_strip_hit_test};
+        let ids = [DojoId::new(), DojoId::new()];
+        let layout = tab_strip_layout(400, DEFAULT_TAB_STRIP_LOGICAL_HEIGHT, &ids, 0).unwrap();
+        assert_eq!(offset_tab_strip_layout(layout.clone(), 0), layout);
+        let left = 280;
+        let moved = offset_tab_strip_layout(layout.clone(), left);
+        assert_eq!(moved.rect.x, left);
+        assert_eq!(moved.rect.width, layout.rect.width);
+        assert_eq!(moved.new_rect.x, layout.new_rect.x + left);
+        for (moved_tab, tab) in moved.tabs.iter().zip(&layout.tabs) {
+            assert_eq!(moved_tab.rect.x, tab.rect.x + left);
+            assert_eq!(moved_tab.label_rect.x, tab.label_rect.x + left);
+            assert_eq!(moved_tab.close_rect.x, tab.close_rect.x + left);
+            assert_eq!(moved_tab.rect.width, tab.rect.width);
+        }
+        let first = moved.tabs[0].label_rect;
+        let inside = (f64::from(first.x + 1), f64::from(first.y + 1));
+        assert_eq!(
+            tab_strip_hit_test(&moved, inside),
+            Some(TabHitTarget::Activate(ids[0]))
+        );
+        // Where the first tab used to be is now the Explorer's.
+        assert_eq!(tab_strip_hit_test(&moved, (1.0, 1.0)), None);
     }
 
     #[test]

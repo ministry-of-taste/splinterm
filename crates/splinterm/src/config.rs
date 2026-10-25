@@ -119,6 +119,10 @@ pub struct AppConfig {
     /// light `line` Splint divider stroke and colour, under the active tab's
     /// thicker underline (`[multiplexer] tab-strip-border`, default on).
     pub tab_strip_border: bool,
+    /// Whether a docked Lair Explorer runs the Window's full height, with the
+    /// tab strip beginning at its right edge, instead of sitting below a
+    /// full-width tab strip (`[explorer] full-height`, default on).
+    pub explorer_full_height: bool,
     /// Whether a graphical client under Omarchy may show the one-time hint
     /// that recommends `splinterm integration omarchy enable`
     /// (`[main] omarchy-integration-hint`).
@@ -251,6 +255,7 @@ impl Default for AppConfig {
             allow_unrestricted_commands: false,
             explorer_agent_status: true,
             tab_strip_border: true,
+            explorer_full_height: true,
             omarchy_integration_hint: true,
             dialog_shortcut: Some(DialogShortcut::default()),
         }
@@ -1252,6 +1257,10 @@ fn parse_with_base(text: &str, config_dir: &Path) -> Result<ConfigLoad> {
             }
             "multiplexer.tab-strip-border" => {
                 config.tab_strip_border = parse_bool(value, index)?;
+                false
+            }
+            "explorer.full-height" => {
+                config.explorer_full_height = parse_bool(value, index)?;
                 false
             }
             "main.omarchy-integration-hint" | "omarchy-integration-hint" => {
@@ -2603,6 +2612,22 @@ mod tests {
         let shipped = parse(include_str!("../../../config/splinterm/config.ini")).unwrap();
         assert!(shipped.diagnostics.is_empty(), "{:?}", shipped.diagnostics);
         assert!(shipped.config.explorer_agent_status);
+    }
+
+    #[test]
+    fn explorer_full_height_defaults_on_and_can_be_turned_off() {
+        assert!(AppConfig::default().explorer_full_height);
+        assert!(parse("[explorer]\n").unwrap().config.explorer_full_height);
+        assert!(
+            !parse("[explorer]\nfull-height=no\n")
+                .unwrap()
+                .config
+                .explorer_full_height
+        );
+        let error = parse("[explorer]\nfull-height=maybe\n")
+            .unwrap_err()
+            .to_string();
+        assert!(error.starts_with("line 2:"), "{error}");
     }
 
     #[test]
