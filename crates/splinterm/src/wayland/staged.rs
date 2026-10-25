@@ -654,6 +654,10 @@ mod tests {
         assert!(busy.busy_notice);
         assert!(!busy.exit && busy.failure.is_none() && busy.parked.is_none());
 
+        let mut noted = scheduling(false);
+        noted.note_busy(&anyhow::Error::new(crate::wayland::TopologyQueueFull));
+        assert!(noted.busy_notice && !noted.exit && noted.failure.is_none());
+
         let mut broken = scheduling(false);
         broken.fail(anyhow::anyhow!("topology command queue is closed"));
         assert!(broken.exit && broken.failure.is_some() && !broken.busy_notice);

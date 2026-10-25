@@ -674,17 +674,25 @@ pub fn initialize_graphical() -> io::Result<&'static ClientDiagnostics> {
 /// Names a source location as `crates/...:line` (or the bare file name when
 /// the path is outside the workspace), so no build machine path is recorded.
 fn source_location(location: &Location<'_>) -> String {
-    let file = location.file();
-    let file = file.find("crates/").map_or_else(
+    format!("{}:{}", source_path(location.file()), location.line())
+}
+
+/// Keeps a path from the last `crates/splinter*` component on. Anything
+/// else, including an absolute path whose only `crates/` is a build
+/// directory, is cut to its file name.
+fn source_path(file: &str) -> &str {
+    if file.starts_with("crates/splinter") {
+        return file;
+    }
+    file.rfind("/crates/splinter").map_or_else(
         || {
             Path::new(file)
                 .file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or("unknown")
         },
-        |start| &file[start..],
-    );
-    format!("{file}:{}", location.line())
+        |start| &file[start + 1..],
+    )
 }
 
 pub fn finish_global(exit_class: ExitClass, error_code: Option<DiagnosticErrorCode>) {
@@ -1622,6 +1630,26 @@ mod tests {
         assert_eq!(
             source_location(location),
             format!("crates/splinterm/src/diagnostics.rs:{}", location.line())
+        );
+    }
+
+    #[test]
+    fn a_source_path_drops_every_build_directory() {
+        assert_eq!(
+            source_path("/build/crates/private-user/project/crates/splinterm/src/wayland.rs"),
+            "crates/splinterm/src/wayland.rs"
+        );
+        assert_eq!(
+            source_path("/home/someone/src/crates/splinterd/src/live.rs"),
+            "crates/splinterd/src/live.rs"
+        );
+        assert_eq!(
+            source_path("/build/crates/private-user/vendor/lib.rs"),
+            "lib.rs"
+        );
+        assert_eq!(
+            source_path("crates/splinterm/src/pane.rs"),
+            "crates/splinterm/src/pane.rs"
         );
     }
 }

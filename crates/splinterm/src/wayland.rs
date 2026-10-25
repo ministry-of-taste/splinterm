@@ -150,7 +150,7 @@ use crate::navigation_projection::{NavigationAction, NavigationNodeId};
 use crate::pane::PaneDivider;
 use crate::pane::{
     FocusDirection, LayoutFit, PaneChrome, PaneLayout, PaneResizeMetrics, PaneSplit,
-    apply_preview_ratio, directional_resize_ratio, split_fits, split_ratio_at,
+    directional_resize_ratio, split_fits, split_ratio_at, split_ratio_mut,
 };
 #[cfg(test)]
 use crate::renderer::paint_box_drawing_cell;
@@ -2259,6 +2259,24 @@ struct PresentationState {
 struct DividerDrag {
     split: PaneSplit,
     ratio: Option<SplitRatio>,
+    /// The split's ratio before the drag's first preview, put back when the
+    /// final ratio cannot be sent.
+    original: Option<SplitRatio>,
+}
+
+/// Puts a dragged split back to its ratio from before the drag. Returns
+/// whether the layout changed.
+fn restore_divider_ratio(layout: Option<&mut LayoutNode>, drag: &DividerDrag) -> bool {
+    let (Some(layout), Some(original)) = (layout, drag.original) else {
+        return false;
+    };
+    match split_ratio_mut(layout, drag.split.target, drag.split.ancestor) {
+        Some(current) if *current != original => {
+            *current = original;
+            true
+        }
+        _ => false,
+    }
 }
 
 #[allow(
@@ -2534,6 +2552,20 @@ impl SchedulingState {
         self.exit = true;
     }
 
+    /// Records an action dropped because the topology command queue was full,
+    /// and asks for the title notice on the next update turn.
+    fn note_busy(&mut self, error: &anyhow::Error) {
+        if let Some(diagnostics) = diagnostics() {
+            diagnostics.emit(
+                DiagnosticLevel::Warn,
+                DiagnosticEventCode::TopologyFailure,
+                Some(DiagnosticErrorCode::TopologyManager),
+            );
+        }
+        eprintln!("splinterm: an action was not sent: {error:#}");
+        self.busy_notice = true;
+    }
+
     /// Ends the Window over `error`. The diagnostic records the caller's
     /// source location, so a failure the log cannot describe still names the
     /// path that reported it.
@@ -2542,15 +2574,8 @@ impl SchedulingState {
         let location = std::panic::Location::caller();
         if error.downcast_ref::<TopologyQueueFull>().is_some() {
             // A busy topology manager is not a broken Window: the action is
-            // dropped and the title says so.
-            if let Some(diagnostics) = diagnostics() {
-                diagnostics.emit(
-                    DiagnosticLevel::Warn,
-                    DiagnosticEventCode::TopologyFailure,
-                    Some(DiagnosticErrorCode::TopologyManager),
-                );
-            }
-            eprintln!("splinterm: an action was not sent at {location}: {error:#}");
+            // dropped and the title says so. `note_busy` already logged it
+            // where the send failed.
             self.busy_notice = true;
             return;
         }
@@ -7173,9 +7198,18 @@ impl App {
             self.modal.session_picker_retry_command = Some(request);
         }
         let commands = self.tab_state.topology_commands.clone();
-        try_topology_command_with_rollback(commands.as_ref(), command, |target, pending| {
-            self.rollback_pending_remote_split(target, pending)
-        })
+        let sent =
+            try_topology_command_with_rollback(commands.as_ref(), command, |target, pending| {
+                self.rollback_pending_remote_split(target, pending)
+            });
+        // Every caller sees the error and cleans up as before; the notice is
+        // given here so a caller that does not end in `fail` still shows it.
+        if let Err(error) = &sent
+            && error.downcast_ref::<TopologyQueueFull>().is_some()
+        {
+            self.scheduling.note_busy(error);
+        }
+        sent
     }
 
     fn send_command(&mut self, command: WindowCommand) {
@@ -7787,15 +7821,13 @@ impl App {
                         self.input.divider_drag = None;
                         return Ok(false);
                     };
-                    if !apply_preview_ratio(
-                        &mut candidate,
-                        drag.split.target,
-                        drag.split.ancestor,
-                        ratio,
-                    ) {
+                    let Some(current) =
+                        split_ratio_mut(&mut candidate, drag.split.target, drag.split.ancestor)
+                    else {
                         self.input.divider_drag = None;
                         return Ok(false);
-                    }
+                    };
+                    let before = std::mem::replace(current, ratio);
                     let previous = self.panes.layout.replace(candidate);
                     // A drag stops where a pane would reach its minimum; it never
                     // pushes the layout into showing only the focused Splint.
@@ -7804,6 +7836,7 @@ impl App {
                         return Ok(true);
                     }
                     drag.ratio = Some(ratio);
+                    drag.original.get_or_insert(before);
                     self.input.divider_drag = Some(drag);
                     self.panes.pane.pointer_cell = None;
                     self.panes.pane.hovered_url = None;
@@ -7813,12 +7846,25 @@ impl App {
                 PointerEventKind::Release { button, .. } if button == BTN_LEFT => {
                     self.input.divider_drag = None;
                     if let Some(ratio) = drag.ratio {
-                        self.send_topology_command(WindowTopologyCommand::SetRatio {
+                        let sent = self.send_topology_command(WindowTopologyCommand::SetRatio {
                             dojo_id: self.tab_state.active_identity.dojo_id,
                             target: drag.split.target,
                             ancestor: drag.split.ancestor,
                             ratio,
-                        })?;
+                        });
+                        if let Err(error) = sent {
+                            // The manager kept its ratio, so the Window shows
+                            // it again rather than the unsent preview.
+                            if error.downcast_ref::<TopologyQueueFull>().is_some()
+                                && restore_divider_ratio(self.panes.layout.as_mut(), &drag)
+                            {
+                                self.presentation.full_redraw = true;
+                                if self.surface.configured {
+                                    self.scheduling.redraw_pending = true;
+                                }
+                            }
+                            return Err(error);
+                        }
                     }
                     Ok(true)
                 }
@@ -7841,7 +7887,11 @@ impl App {
                 // A layout change waits out a daemon handoff: the press is
                 // consumed without starting a drag.
                 if !self.handoff_paused() {
-                    self.input.divider_drag = Some(DividerDrag { split, ratio: None });
+                    self.input.divider_drag = Some(DividerDrag {
+                        split,
+                        ratio: None,
+                        original: None,
+                    });
                 }
                 self.panes.pane.pointer_cell = None;
                 self.panes.pane.hovered_url = None;
@@ -13143,6 +13193,51 @@ mod tests {
         drop(receiver);
         let closed = try_topology_command(&sender, WindowTopologyCommand::CloseWindow).unwrap_err();
         assert!(closed.downcast_ref::<TopologyQueueFull>().is_none());
+    }
+
+    #[test]
+    fn an_unsent_divider_drag_puts_the_split_back_to_its_starting_ratio() {
+        let first = Splint::shell(PathBuf::from("/tmp"));
+        let first_id = first.id;
+        let mut layout = LayoutNode::Branch {
+            axis: Axis::Horizontal,
+            ratio: SplitRatio::new(700).unwrap(),
+            first: Box::new(LayoutNode::Leaf(first)),
+            second: Box::new(LayoutNode::Leaf(Splint::shell(PathBuf::from("/")))),
+        };
+        let split = PaneSplit {
+            axis: Axis::Horizontal,
+            area: Rect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 10,
+            },
+            boundary: 70,
+            separator: 1,
+            target: first_id,
+            ancestor: 0,
+        };
+        let drag = DividerDrag {
+            split,
+            ratio: SplitRatio::new(700).ok(),
+            original: SplitRatio::new(500).ok(),
+        };
+        assert!(restore_divider_ratio(Some(&mut layout), &drag));
+        let LayoutNode::Branch { ratio, .. } = &layout else {
+            panic!("expected a branch");
+        };
+        assert_eq!(ratio.get(), 500);
+        assert!(
+            !restore_divider_ratio(Some(&mut layout), &drag),
+            "already restored"
+        );
+        let untouched = DividerDrag {
+            original: None,
+            ..drag
+        };
+        assert!(!restore_divider_ratio(Some(&mut layout), &untouched));
+        assert!(!restore_divider_ratio(None, &drag));
     }
 
     #[test]
