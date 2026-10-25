@@ -333,7 +333,13 @@ const fn opaque_rgba(color: u32) -> [u8; 4] {
 }
 
 fn tab_strip_background_rgba(theme: ResolvedTheme) -> [u8; 4] {
-    premultiplied_theme_rgba(theme.background, theme.background_alpha)
+    premultiplied_theme_rgba(theme.background, theme.tab_strip_alpha())
+}
+
+/// The selected Dojo tab's body: opaque by default, so it stands apart from
+/// a translucent strip, or at `[colors] active-tab-alpha`.
+fn active_tab_background_rgba(theme: ResolvedTheme) -> [u8; 4] {
+    premultiplied_theme_rgba(theme.active_tab_background, theme.chrome.active_tab_alpha)
 }
 
 fn paint_inactive_tab_divider(
@@ -984,7 +990,7 @@ impl App {
                     width,
                     height,
                     (position(rect.x), position(rect.y), rect.width, rect.height),
-                    premultiplied_theme_rgba(theme.active_tab_background, theme.background_alpha),
+                    active_tab_background_rgba(theme),
                 );
             } else {
                 paint_inactive_tab_divider(canvas, width, height, rect, scale_120, theme)?;
@@ -1314,7 +1320,9 @@ mod tests {
     }
 
     #[test]
-    fn tab_strip_and_active_tab_respect_background_alpha_with_exact_theme_roles() {
+    fn tab_strip_follows_background_alpha_and_the_active_tab_stays_opaque() {
+        use crate::config::ChromeColorOverrides;
+
         let theme = ResolvedTheme {
             background: 0x80_40_20,
             background_alpha: u16::MAX / 2,
@@ -1354,9 +1362,10 @@ mod tests {
         let active_x = usize::try_from(layout.tabs[0].rect.x + 1).unwrap();
         let sample_y = usize::try_from(layout.tabs[0].rect.y + 1).unwrap();
         let active_offset = (sample_y * 420 + active_x) * 4;
+        // Under glass the selected tab stays opaque, apart from the strip.
         assert_eq!(
             &canvas[active_offset..active_offset + 4],
-            &[0x33, 0x2a, 0x22, 0x7f]
+            &[0x66, 0x55, 0x44, 0xff]
         );
 
         let underline_y = usize::try_from(
@@ -1377,6 +1386,39 @@ mod tests {
         assert_eq!(
             &canvas[strip_offset..strip_offset + 4],
             &[0x10, 0x20, 0x40, 0x7f]
+        );
+
+        // `[colors] active-tab-alpha`, `tab-strip-alpha` and
+        // `active-tab-background` replace those defaults.
+        let overridden = theme.with_chrome_overrides(ChromeColorOverrides {
+            active_tab_background: Some(0x20_40_60),
+            active_tab_alpha: Some(u16::MAX / 2),
+            tab_strip_alpha: Some(u16::MAX),
+            ..ChromeColorOverrides::NONE
+        });
+        canvas.fill(0);
+        App::paint_tab_strip(
+            &mut canvas,
+            420,
+            DEFAULT_TAB_STRIP_LOGICAL_HEIGHT,
+            &layout,
+            120,
+            overridden,
+            active_dojo,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            &canvas[active_offset..active_offset + 4],
+            &[0x30, 0x20, 0x10, 0x7f]
+        );
+        assert_eq!(
+            &canvas[strip_offset..strip_offset + 4],
+            &[0x20, 0x40, 0x80, 0xff]
         );
     }
 

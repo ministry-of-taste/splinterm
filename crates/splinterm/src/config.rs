@@ -84,6 +84,9 @@ pub struct AppConfig {
     /// Optional native background-blur override (`[colors] blur`).
     /// When absent, the active theme owns the requested blur state.
     pub background_blur: Option<bool>,
+    /// Optional chrome background overrides (`[colors] active-tab-*`,
+    /// `tab-strip-alpha`, `explorer-*`). Absent keys keep the theme's value.
+    pub chrome_colors: ChromeColorOverrides,
     /// Explicit project JSON override. When absent, Splinterm follows the
     /// active Omarchy theme directly.
     pub theme_path: Option<PathBuf>,
@@ -234,6 +237,7 @@ impl Default for AppConfig {
             resize_delay_ms: 100,
             background_alpha: None,
             background_blur: None,
+            chrome_colors: ChromeColorOverrides::default(),
             theme_path: None,
             clipboard_image_directory: None,
             pane_divider_style: PaneDividerStyle::Line,
@@ -1226,6 +1230,28 @@ fn parse_with_base(text: &str, config_dir: &Path) -> Result<ConfigLoad> {
                 config.background_blur = Some(parse_bool(value, index)?);
                 false
             }
+            "colors.active-tab-background" => {
+                config.chrome_colors.active_tab_background =
+                    Some(parse_config_color(value, index)?);
+                false
+            }
+            "colors.active-tab-alpha" => {
+                config.chrome_colors.active_tab_alpha =
+                    Some(foot_alpha(parse_alpha(value, index)?));
+                false
+            }
+            "colors.tab-strip-alpha" => {
+                config.chrome_colors.tab_strip_alpha = Some(foot_alpha(parse_alpha(value, index)?));
+                false
+            }
+            "colors.explorer-background" => {
+                config.chrome_colors.explorer_background = Some(parse_config_color(value, index)?);
+                false
+            }
+            "colors.explorer-alpha" => {
+                config.chrome_colors.explorer_alpha = Some(foot_alpha(parse_alpha(value, index)?));
+                false
+            }
             "scrollback.lines" => {
                 config.scrollback_lines = parse_range(value, 0, 1_000_000, index)?;
                 false
@@ -1403,6 +1429,10 @@ where
     Ok(parsed)
 }
 
+fn parse_config_color(value: &str, line: usize) -> Result<u32> {
+    parse_color(value).map_err(|error| anyhow::anyhow!("line {}: {error}", line + 1))
+}
+
 fn parse_alpha(value: &str, line: usize) -> Result<f32> {
     let alpha = value
         .parse::<f32>()
@@ -1499,6 +1529,9 @@ pub struct ResolvedTheme {
     pub pane_border_active: u32,
     pub background_alpha: u16,
     pub background_blur: bool,
+    /// Coverage of Splinterm's own chrome backgrounds, and the Explorer's
+    /// panel colour. Splinterm owns these; themes do not set them.
+    pub chrome: ChromeBackgrounds,
     pub ansi: [u32; 16],
     /// Omarchy shell settings layered from `shell.toml`; Omarchy's defaults
     /// for other theme sources.
@@ -1523,6 +1556,7 @@ impl Default for ResolvedTheme {
             pane_border_active: 0x78d2ff,
             background_alpha: u16::MAX,
             background_blur: false,
+            chrome: ChromeBackgrounds::default(),
             ansi: [
                 0x1d2021, 0xcc241d, 0x98971a, 0xd79921, 0x458588, 0xb16286, 0x689d6a, 0xa89984,
                 0x928374, 0xfb4934, 0xb8bb26, 0xfabd2f, 0x83a598, 0xd3869b, 0x8ec07c, 0xebdbb2,
@@ -1603,7 +1637,113 @@ fn inactive_tab_foreground_fallback(background: u32, foreground: u32, muted: u32
         .unwrap_or(foreground)
 }
 
+/// How Splinterm draws its own chrome backgrounds over the Window's glass.
+///
+/// The tab strip and the docked Lair Explorer follow the terminal background
+/// alpha unless `config.ini` sets their own. The selected Dojo tab is opaque
+/// by default, so under Glassy Windows it stays clearly apart from the
+/// translucent strip and the inactive tabs on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChromeBackgrounds {
+    /// Selected Dojo tab body coverage (`[colors] active-tab-alpha`).
+    pub active_tab_alpha: u16,
+    /// Tab strip coverage (`[colors] tab-strip-alpha`); `None` follows the
+    /// terminal background alpha.
+    pub tab_strip_alpha: Option<u16>,
+    /// Lair Explorer panel colour (`[colors] explorer-background`); `None`
+    /// uses the terminal background.
+    pub explorer_background: Option<u32>,
+    /// Lair Explorer coverage (`[colors] explorer-alpha`); `None` follows the
+    /// terminal background alpha.
+    pub explorer_alpha: Option<u16>,
+}
+
+impl Default for ChromeBackgrounds {
+    fn default() -> Self {
+        Self {
+            active_tab_alpha: u16::MAX,
+            tab_strip_alpha: None,
+            explorer_background: None,
+            explorer_alpha: None,
+        }
+    }
+}
+
+/// The `[colors]` chrome keys `config.ini` sets. Each absent key keeps the
+/// theme's or Splinterm's default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ChromeColorOverrides {
+    pub active_tab_background: Option<u32>,
+    pub active_tab_alpha: Option<u16>,
+    pub tab_strip_alpha: Option<u16>,
+    pub explorer_background: Option<u32>,
+    pub explorer_alpha: Option<u16>,
+}
+
+impl ChromeColorOverrides {
+    /// No chrome key set.
+    pub const NONE: Self = Self {
+        active_tab_background: None,
+        active_tab_alpha: None,
+        tab_strip_alpha: None,
+        explorer_background: None,
+        explorer_alpha: None,
+    };
+}
+
 impl ResolvedTheme {
+    /// Applies the `config.ini` chrome keys. A replaced selected-tab colour
+    /// gets its label colour chosen again for contrast, as a theme without an
+    /// explicit `active_tab_foreground` does.
+    #[must_use]
+    pub fn with_chrome_overrides(mut self, overrides: ChromeColorOverrides) -> Self {
+        if let Some(color) = overrides.active_tab_background {
+            self.active_tab_background = color;
+            self.active_tab_foreground =
+                active_tab_foreground_fallback(self.background, self.foreground, color);
+        }
+        if let Some(alpha) = overrides.active_tab_alpha {
+            self.chrome.active_tab_alpha = alpha;
+        }
+        if overrides.tab_strip_alpha.is_some() {
+            self.chrome.tab_strip_alpha = overrides.tab_strip_alpha;
+        }
+        if overrides.explorer_background.is_some() {
+            self.chrome.explorer_background = overrides.explorer_background;
+        }
+        if overrides.explorer_alpha.is_some() {
+            self.chrome.explorer_alpha = overrides.explorer_alpha;
+        }
+        self
+    }
+
+    /// The tab strip's coverage.
+    #[must_use]
+    pub const fn tab_strip_alpha(&self) -> u16 {
+        match self.chrome.tab_strip_alpha {
+            Some(alpha) => alpha,
+            None => self.background_alpha,
+        }
+    }
+
+    /// The docked Lair Explorer's panel colour.
+    #[must_use]
+    pub const fn explorer_background(&self) -> u32 {
+        match self.chrome.explorer_background {
+            Some(color) => color,
+            None => self.background,
+        }
+    }
+
+    /// The docked Lair Explorer's coverage.
+    #[must_use]
+    pub const fn explorer_alpha(&self) -> u16 {
+        match self.chrome.explorer_alpha {
+            Some(alpha) => alpha,
+            None => self.background_alpha,
+        }
+    }
+
     #[must_use]
     pub fn with_color_overrides(mut self, alpha: Option<u16>, blur: Option<bool>) -> Self {
         if let Some(alpha) = alpha {
@@ -1683,6 +1823,7 @@ impl ThemePalette {
                 .unwrap_or(ui_accent),
             background_alpha: foot_alpha(self.alpha),
             background_blur: self.blur,
+            chrome: ChromeBackgrounds::default(),
             ansi,
             shell: OmarchyShellSettings::default(),
         })
@@ -1867,6 +2008,7 @@ fn resolve_omarchy_theme(colors_raw: &str, foot_raw: &str) -> Result<ResolvedThe
         pane_border_active: ui_accent,
         background_alpha: foot_alpha(alpha),
         background_blur: blur,
+        chrome: ChromeBackgrounds::default(),
         ansi,
         shell: OmarchyShellSettings::default(),
     })
@@ -2449,6 +2591,74 @@ mod tests {
                 .to_string()
                 .contains("face/style")
         );
+    }
+
+    #[test]
+    fn chrome_color_keys_parse_strictly_and_default_to_the_theme() {
+        let loaded = parse(
+            "[colors]\nactive-tab-background=#102030\nactive-tab-alpha=0.5\n\
+             tab-strip-alpha=0.9\nexplorer-background=0x405060\nexplorer-alpha=1.0\n",
+        )
+        .unwrap()
+        .config;
+        assert_eq!(
+            loaded.chrome_colors,
+            ChromeColorOverrides {
+                active_tab_background: Some(0x10_20_30),
+                active_tab_alpha: Some(foot_alpha(0.5)),
+                tab_strip_alpha: Some(foot_alpha(0.9)),
+                explorer_background: Some(0x40_50_60),
+                explorer_alpha: Some(u16::MAX),
+            }
+        );
+        assert_eq!(
+            parse("").unwrap().config.chrome_colors,
+            ChromeColorOverrides::NONE
+        );
+        for bad in [
+            "active-tab-background=red",
+            "explorer-background=#12345",
+            "active-tab-alpha=1.5",
+            "tab-strip-alpha=-0.1",
+            "explorer-alpha=nan",
+        ] {
+            let error = parse(&format!("[colors]\n{bad}\n"))
+                .unwrap_err()
+                .to_string();
+            assert!(error.starts_with("line 2:"), "{bad}: {error}");
+        }
+    }
+
+    #[test]
+    fn chrome_overrides_keep_the_selected_tab_opaque_and_follow_the_theme_otherwise() {
+        let glassy = ResolvedTheme {
+            background_alpha: foot_alpha(0.65),
+            ..ResolvedTheme::default()
+        };
+        let theme = glassy.with_chrome_overrides(ChromeColorOverrides::NONE);
+        assert_eq!(theme, glassy);
+        assert_eq!(theme.chrome.active_tab_alpha, u16::MAX);
+        assert_eq!(theme.tab_strip_alpha(), foot_alpha(0.65));
+        assert_eq!(theme.explorer_alpha(), foot_alpha(0.65));
+        assert_eq!(theme.explorer_background(), theme.background);
+
+        let light_tab = glassy.with_chrome_overrides(ChromeColorOverrides {
+            active_tab_background: Some(0xf0_f0_f0),
+            active_tab_alpha: Some(foot_alpha(0.8)),
+            tab_strip_alpha: Some(u16::MAX),
+            explorer_background: Some(0x20_20_20),
+            explorer_alpha: Some(foot_alpha(0.4)),
+        });
+        assert_eq!(light_tab.active_tab_background, 0xf0_f0_f0);
+        // The label is chosen again: the dark background reads on a light tab.
+        assert_eq!(light_tab.active_tab_foreground, glassy.background);
+        assert!(contrast_ratio(light_tab.active_tab_foreground, 0xf0_f0_f0) >= 4.5);
+        assert_eq!(light_tab.chrome.active_tab_alpha, foot_alpha(0.8));
+        assert_eq!(light_tab.tab_strip_alpha(), u16::MAX);
+        assert_eq!(light_tab.explorer_background(), 0x20_20_20);
+        assert_eq!(light_tab.explorer_alpha(), foot_alpha(0.4));
+        // The terminal's own glass is untouched.
+        assert_eq!(light_tab.background_alpha, foot_alpha(0.65));
     }
 
     #[test]

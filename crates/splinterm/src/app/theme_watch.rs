@@ -8,9 +8,10 @@ use anyhow::Result;
 use splinterm::{
     ThemeUpdate, WindowTopologyUpdate, WindowUpdate,
     config::{
-        AppConfig, OmarchyShellConcern, OmarchyShellSettings, OmarchyTextSizeFallback,
-        OmarchyThemeRoots, OmarchyThemeSelection, ResolvedTheme, ThemeSource, ThemeSourceLoad,
-        load_live_omarchy_theme, load_omarchy_shell, load_theme, load_theme_source_for_startup,
+        AppConfig, ChromeColorOverrides, OmarchyShellConcern, OmarchyShellSettings,
+        OmarchyTextSizeFallback, OmarchyThemeRoots, OmarchyThemeSelection, ResolvedTheme,
+        ThemeSource, ThemeSourceLoad, load_live_omarchy_theme, load_omarchy_shell, load_theme,
+        load_theme_source_for_startup,
     },
 };
 use tokio::sync::mpsc;
@@ -35,6 +36,8 @@ pub(in crate::app) struct ThemeOverrides {
     /// (`ui_text_size_px`) is always published, so a Window whose
     /// configuration reload drops the key can fall back to it live.
     pub(in crate::app) follow_ui_text_size: bool,
+    /// The `[colors]` chrome background keys.
+    pub(in crate::app) chrome: ChromeColorOverrides,
 }
 
 impl ThemeOverrides {
@@ -44,6 +47,7 @@ impl ThemeOverrides {
             blur: config.background_blur,
             follow_text_size: config.follows_omarchy_text_size(),
             follow_ui_text_size: config.ui_font_size.is_none(),
+            chrome: config.chrome_colors,
         }
     }
 
@@ -65,7 +69,9 @@ impl ThemeOverrides {
             theme.shell.text_size_px = None;
             theme.shell.text_size_held = false;
         }
-        theme.with_color_overrides(self.alpha, self.blur)
+        theme
+            .with_color_overrides(self.alpha, self.blur)
+            .with_chrome_overrides(self.chrome)
     }
 }
 
@@ -626,6 +632,7 @@ mod tests {
         blur: None,
         follow_text_size: true,
         follow_ui_text_size: true,
+        chrome: ChromeColorOverrides::NONE,
     };
 
     #[tokio::test(start_paused = true)]
@@ -738,6 +745,28 @@ mod tests {
         };
         assert_eq!(update.theme.background, 0x65_43_21);
         watcher.abort();
+    }
+
+    #[test]
+    fn config_chrome_keys_reach_every_theme_the_window_applies() {
+        let overrides = ThemeOverrides::from_config(
+            &splinterm::config::parse(
+                "[colors]\nactive-tab-alpha=0.5\ntab-strip-alpha=1.0\nexplorer-alpha=0.8\n",
+            )
+            .unwrap()
+            .config,
+        );
+        // Startup and every live theme update pass through `apply`.
+        let glassy = ResolvedTheme {
+            background_alpha: u16::MAX / 2,
+            ..ResolvedTheme::default()
+        };
+        let applied = overrides.apply(glassy);
+        assert_eq!(applied.chrome.active_tab_alpha, u16::MAX / 2);
+        assert_eq!(applied.tab_strip_alpha(), u16::MAX);
+        assert_eq!(applied.explorer_alpha(), 52_428);
+        assert_eq!(applied.background_alpha, u16::MAX / 2);
+        assert_eq!(NO_OVERRIDES.apply(glassy).chrome.active_tab_alpha, u16::MAX);
     }
 
     #[test]
@@ -927,6 +956,7 @@ mod tests {
                 blur: blur_override,
                 follow_text_size: true,
                 follow_ui_text_size: true,
+                chrome: ChromeColorOverrides::NONE,
             },
             current,
             &mut Vec::new(),

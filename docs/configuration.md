@@ -118,6 +118,11 @@ substitution, but do not sandbox hostile processes running as your own user.
 | `main.omarchy-integration-hint` | under Omarchy without the `terminal` tag, show one desktop notification recommending `splinterm integration omarchy enable` ([why](integrations.md#why-the-terminal-tag-matters)) | strict boolean; yes |
 | `colors.alpha` | optional Foot-compatible override for theme background translucency | 0.0–1.0; unset (theme-owned) |
 | `colors.blur` | optional native background-blur request | strict boolean; unset (theme-owned, otherwise `no`) |
+| `colors.active-tab-background` | selected Dojo tab body colour, `#RRGGBB` or `0xRRGGBB`; its label colour is chosen again for contrast ([Chrome backgrounds](#chrome-backgrounds)) | unset (theme-owned) |
+| `colors.active-tab-alpha` | selected Dojo tab body coverage over the Window's backdrop | 0.0–1.0; 1.0 |
+| `colors.tab-strip-alpha` | tab strip coverage, behind the inactive tabs | 0.0–1.0; unset (terminal background alpha) |
+| `colors.explorer-background` | docked Lair Explorer panel colour, `#RRGGBB` or `0xRRGGBB`; its text colours are chosen against it | unset (terminal background) |
+| `colors.explorer-alpha` | docked Lair Explorer panel coverage | 0.0–1.0; unset (terminal background alpha) |
 | `scrollback.lines` | daemon terminal history budget | 0–1,000,000; 1000 |
 | `clipboard.image-directory` | explicit absolute private directory for user-requested local clipboard PNG saves | unset; no temporary fallback |
 | `cursor.style` | `block`, `beam`, or `underline` | block |
@@ -794,9 +799,11 @@ with 25, 50, and 75 % foreground and takes the first that qualifies, falling
 back to the plain foreground. Contrast ignores alpha. Native Omarchy themes do
 not need Splinterm-specific palette roles.
 
-The tab-strip and selected-tab backgrounds both inherit the terminal alpha
-while preserving their resolved colors. The selected-tab underline remains the
-opaque UI accent. Terminal selections continue to use Foot's independent
+The tab-strip background inherits the terminal alpha while preserving its
+resolved color. The selected-tab body stays opaque, so it remains clearly apart
+from the strip and the inactive tabs when the terminal is translucent. The
+selected-tab underline remains the opaque UI accent. `config.ini` can change
+both; see [Chrome backgrounds](#chrome-backgrounds). Terminal selections continue to use Foot's independent
 `selection-foreground`, falling back to the terminal foreground when that Foot
 role is absent. Foot's `[main] initial-color-theme=light` selects the light
 palette, `[colors-light]` together with the deprecated `[colors2]`. A missing or
@@ -842,7 +849,8 @@ Splinterm sees each edit within one 500 ms poll. It applies the change through
   which updates the compositor effect without repainting.
 
 The default terminal background, the padding, and the tab strip become
-translucent; Splinterm premultiplies them by the alpha. Panels follow the shell
+translucent; Splinterm premultiplies them by the alpha. The selected Dojo tab
+stays opaque. Panels follow the shell
 alpha described under "Omarchy shell settings" below. Text, explicit cell
 backgrounds, and the cursor stay opaque, so text remains crisp over the blur. An
 explicit `[colors] alpha` or `blur` in Splinterm's own `config.ini` overrides
@@ -926,6 +934,8 @@ The docked Lair Explorer is not a floating panel but part of the Window, like
 the tab strip: its background, selected row and active filter are drawn at the
 terminal's own background alpha (foot.ini `alpha`, which Glassy Windows sets),
 so the backdrop shows through it exactly as through the terminal beside it.
+`[colors] explorer-alpha` and `explorer-background` change that; see
+[Chrome backgrounds](#chrome-backgrounds).
 Its text, icons, divider, rules and selection rail stay opaque. Like terminal
 text, its text is not given the contrast floor below.
 
@@ -942,7 +952,39 @@ many light themes do, keeps its panels opaque. As in the
 shell, a number outside 0.0–1.0 is clamped into that range, and a value that is
 not a number is treated as Omarchy's opaque default; both are reported once. An
 explicit `main.theme` JSON keeps all panels opaque and ignores these values.
-Splinterm has no separate panel alpha key.
+Splinterm has no separate alpha key for these floating panels.
+
+#### Chrome backgrounds
+
+Splinterm draws its own chrome over the Window's glass. These `[colors]` keys
+in `config.ini` override how. Every key is optional, and an absent key keeps
+the default:
+
+| Key | Default |
+| --- | --- |
+| `active-tab-background` | the theme's selected-tab colour (see the role table above) |
+| `active-tab-alpha` | 1.0, opaque |
+| `tab-strip-alpha` | the terminal background alpha |
+| `explorer-background` | the terminal background |
+| `explorer-alpha` | the terminal background alpha |
+
+```ini
+[colors]
+active-tab-alpha=0.9
+tab-strip-alpha=0.5
+explorer-alpha=0.8
+```
+
+Alphas take 0.0–1.0 and colours take `#RRGGBB` or `0xRRGGBB`; anything else
+fails startup with the line number. The keys apply to every theme source,
+including an explicit `main.theme` JSON palette, and survive theme switches and
+Glassy Windows toggles. A changed `active-tab-background` gets its label and
+close glyph colour chosen again, whichever of the terminal background or
+foreground has the higher contrast against it. A changed `explorer-background`
+gets its text colours corrected to 4.5:1 against it, as the theme background
+does. Alphas give no contrast guarantee against the backdrop, as for the
+terminal itself. Like `alpha` and `blur`, the keys are read when a Window
+opens; **Reload configuration** does not apply them.
 
 #### Text size
 
