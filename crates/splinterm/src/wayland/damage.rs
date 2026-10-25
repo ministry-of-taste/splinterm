@@ -5,6 +5,20 @@ use crate::{
     renderer::snapshot_row_rect,
 };
 
+/// The surface damage a frame owes the terminal search field: where it is
+/// drawn now, since its text changes as it is typed and searched, and where
+/// it was last drawn when that differs. Without the second, a field closed
+/// with Escape, hidden by a tab or focus change, or moved by a resize stays
+/// on screen: the buffer is repainted, but the compositor is only told about
+/// changed terminal rows and keeps showing the old pixels elsewhere.
+pub(super) fn search_panel_damage(previous: Option<Rect>, current: Option<Rect>) -> Vec<Rect> {
+    let mut rects: Vec<Rect> = current.into_iter().collect();
+    if previous != current {
+        rects.extend(previous);
+    }
+    rects
+}
+
 pub(super) fn terminal_draw_waits_for_frame(frame_pending: bool, _buffer_available: bool) -> bool {
     frame_pending
 }
@@ -200,6 +214,28 @@ pub(super) fn sync_backing_damage(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_panel_damage_covers_the_field_and_where_it_was() {
+        let at = |x| Rect {
+            x,
+            y: 500,
+            width: 440,
+            height: 48,
+        };
+        // Closed with nothing drawn: no damage.
+        assert!(search_panel_damage(None, None).is_empty());
+        // Opened, or open and typed into: the field itself.
+        assert_eq!(search_panel_damage(None, Some(at(8))), vec![at(8)]);
+        assert_eq!(search_panel_damage(Some(at(8)), Some(at(8))), vec![at(8)]);
+        // Closed: where it was, so the compositor drops the old pixels.
+        assert_eq!(search_panel_damage(Some(at(8)), None), vec![at(8)]);
+        // Moved, as by a resize or a docked Explorer: both places.
+        assert_eq!(
+            search_panel_damage(Some(at(8)), Some(at(300))),
+            vec![at(300), at(8)]
+        );
+    }
 
     #[test]
     fn terminal_draws_obey_the_compositor_frame_boundary() {
