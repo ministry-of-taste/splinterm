@@ -133,13 +133,13 @@ use crate::frontend::{
     BuiltInCommandDispatch, BuiltInCommandId, CommandControlAction, CommandHistoryAction,
     CommandPaletteContext, CommandPaletteUi, CommandTabMoveAvailability, CommandZoomAction,
     DojoPromptUi, FontUpdate, LairDirection, LairExplorerDecision, LairExplorerFilter,
-    LairExplorerUi, LairPromptKind, PerfTraceCorrelation, SelectorKind, SessionPickerCatalog,
-    SessionPickerCreationTarget, SessionPickerDecision, SessionPickerTarget, SessionPickerUi,
-    TabContextMenuUi, TabMenuActionId, TabMenuContext, TabMenuDispatch, TabMenuRightPress,
-    TerminalGridLimits, TerminationDecision, ThemeUpdate, TrustedConsentUi, TrustedDialogKey,
-    TrustedInput, WindowCommand, WindowDojoIdentity, WindowOptions, WindowPaneOptions,
-    WindowTopologyCommand, WindowTopologyUpdate, WindowUpdate, close_other_tabs_command,
-    lair_lifecycle_command, tab_menu_right_press,
+    LairExplorerRow, LairExplorerUi, LairPromptKind, PerfTraceCorrelation, SelectorKind,
+    SessionPickerCatalog, SessionPickerCreationTarget, SessionPickerDecision, SessionPickerTarget,
+    SessionPickerUi, TabContextMenuUi, TabMenuActionId, TabMenuContext, TabMenuDispatch,
+    TabMenuRightPress, TerminalGridLimits, TerminationDecision, ThemeUpdate, TrustedConsentUi,
+    TrustedDialogKey, TrustedInput, WindowCommand, WindowDojoIdentity, WindowOptions,
+    WindowPaneOptions, WindowTopologyCommand, WindowTopologyUpdate, WindowUpdate,
+    close_other_tabs_command, lair_lifecycle_command, tab_menu_right_press,
 };
 use crate::geometry::{
     FontSize, OutputDpiObservation, Rect, SurfaceGeometry, WindowGeometry, buffer_to_logical_ceil,
@@ -164,13 +164,13 @@ use crate::renderer::{
     command_palette_hit_test, command_palette_layout, dojo_prompt_hit_test, dojo_prompt_layout,
     explorer_minimum_docked_terminal_width, fill_rect, history_overlay_layout,
     lair_explorer_disclosure_hit_test, lair_explorer_filter_hit_test, lair_explorer_hit_test,
-    lair_explorer_layout, paint, paint_command_palette, paint_dojo_prompt, paint_handoff_banner,
-    paint_history_overlay, paint_lair_explorer, paint_search_overlay, paint_session_picker_overlay,
-    paint_snapshot_overlays, paint_snapshot_presented, paint_snapshot_region_presented,
-    paint_snapshot_rows_presented, paint_tab_context_menu, premultiplied_theme_rgba,
-    scroll_snapshot_pixels, search_overlay_panel, session_picker_hit_test,
-    session_picker_overlay_layout, snapshot_row_rect, tab_context_menu_hit_test,
-    tab_context_menu_layout, write_ppm,
+    lair_explorer_layout, lair_explorer_layout_with_header, paint, paint_command_palette,
+    paint_dojo_prompt, paint_handoff_banner, paint_history_overlay, paint_lair_explorer,
+    paint_search_overlay, paint_session_picker_overlay, paint_snapshot_overlays,
+    paint_snapshot_presented, paint_snapshot_region_presented, paint_snapshot_rows_presented,
+    paint_tab_context_menu, premultiplied_theme_rgba, scroll_snapshot_pixels, search_overlay_panel,
+    session_picker_hit_test, session_picker_overlay_layout, snapshot_row_rect,
+    tab_context_menu_hit_test, tab_context_menu_layout, write_ppm,
 };
 use crate::{
     keymap::{ActionId, KeymapPress, PrefixState, ResolvedKeymap},
@@ -238,7 +238,7 @@ use staged::{key_repeat_reaches_phase, phase_end_parks};
 use tabs::DEFAULT_TAB_STRIP_LOGICAL_HEIGHT;
 use tabs::{
     DojoTabView, TabHitTarget, TabsState, tab_context_target, tab_strip_hit_test,
-    tab_strip_logical_height,
+    tab_strip_logical_height, tab_text_maximum_cell_height,
 };
 #[cfg(test)]
 use terminal_state::snapshot_is_newer;
@@ -3992,6 +3992,46 @@ fn explorer_beside_tabs(
     Some(layout)
 }
 
+/// A docked Explorer over the Window's whole height `full`, beside a tab
+/// strip `strip` logical px tall. Beside a shown strip its header takes the
+/// strip's height and sizes its text as the tab labels are at `scale_120`,
+/// so the header and the labels share one baseline; with no strip it keeps
+/// the row-high header. `None` when the Explorer would be a drawer.
+fn full_height_explorer_layout(
+    full: Rect,
+    strip: u32,
+    scale_120: u32,
+    minimum_terminal_width: u32,
+    rows: &[LairExplorerRow],
+    selected: Option<NavigationNodeId>,
+    requested_start: usize,
+) -> Option<LairExplorerLayout> {
+    let layout = if strip == 0 {
+        lair_explorer_layout(
+            full,
+            minimum_terminal_width,
+            rows,
+            selected,
+            requested_start,
+        )
+    } else {
+        lair_explorer_layout_with_header(
+            full,
+            strip,
+            minimum_terminal_width,
+            rows,
+            selected,
+            requested_start,
+        )
+        .map(|mut layout| {
+            layout.header_text_cell_cap =
+                tab_text_maximum_cell_height(strip, scale_120).unwrap_or(u32::MAX);
+            layout
+        })
+    };
+    layout.and_then(|layout| explorer_beside_tabs(layout, strip))
+}
+
 /// Where a tab strip beside a full-height Explorer begins: the docked
 /// panel's right edge. A drawer or a hidden Explorer leaves it at 0.
 fn tab_strip_left_of(explorer: Option<&LairExplorerLayout>) -> u32 {
@@ -4043,15 +4083,15 @@ impl App {
                 width: self.surface.logical_width,
                 height: self.surface.logical_height,
             };
-            if let Some(layout) = lair_explorer_layout(
+            if let Some(layout) = full_height_explorer_layout(
                 full,
+                below_tabs.y,
+                self.surface.scale_120,
                 minimum_terminal_width,
                 &rows,
                 self.explorer.selected(),
                 self.presentation.explorer_visible_start,
-            )
-            .and_then(|layout| explorer_beside_tabs(layout, below_tabs.y))
-            {
+            ) {
                 return Some(layout);
             }
         }
@@ -17701,6 +17741,55 @@ mod tests {
         assert!(explorer_beside_tabs(drawer.clone(), strip).is_none());
         assert_eq!(tab_strip_left_of(Some(&drawer)), 0);
         assert_eq!(tab_strip_left_of(None), 0);
+    }
+
+    /// Beside the tab strip, the Explorer's header line is exactly the
+    /// strip's height with no gap below the strip's top, its filters span
+    /// that line, and its text is capped as the tab labels' is, so header
+    /// and labels share a baseline at every strip height and scale.
+    #[test]
+    fn full_height_explorer_header_matches_the_tab_strip() {
+        let window = Rect {
+            x: 0,
+            y: 0,
+            width: 900,
+            height: 400,
+        };
+        for strip in [20, 26, 34, 48] {
+            for scale in [120, 150, 180, 240] {
+                let case = format!("strip={strip} scale={scale}");
+                let layout =
+                    full_height_explorer_layout(window, strip, scale, 160, &[], None, 0).unwrap();
+                assert_eq!(
+                    (layout.header.y, layout.header.height),
+                    (0, strip),
+                    "{case}"
+                );
+                assert_eq!(
+                    layout.header_text_cell_cap,
+                    tab_text_maximum_cell_height(strip, scale).unwrap(),
+                    "{case}"
+                );
+                assert_eq!(layout.filters.len(), 3, "{case}");
+                for (_, rect) in &layout.filters {
+                    assert_eq!((rect.y, rect.height), (0, strip), "{case}");
+                }
+                assert_eq!(layout.terminal.y, strip, "{case}");
+                assert_eq!(layout.panel.height, window.height, "{case}");
+            }
+        }
+        // With the strip hidden the header keeps the row-high line and the
+        // chrome text cap.
+        let hidden = full_height_explorer_layout(window, 0, 120, 160, &[], None, 0).unwrap();
+        let default = lair_explorer_layout(window, 160, &[], None, 0).unwrap();
+        assert_eq!(hidden.header, default.header);
+        assert_eq!(hidden.header_text_cell_cap, u32::MAX);
+        // A drawer is never laid out beside the strip.
+        let narrow = Rect {
+            width: 400,
+            ..window
+        };
+        assert!(full_height_explorer_layout(narrow, 26, 120, 160, &[], None, 0).is_none());
     }
 
     #[test]

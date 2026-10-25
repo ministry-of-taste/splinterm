@@ -405,6 +405,10 @@ a hostile program running as your account.
 - A docked Explorer runs the Window's full height, and the tab strip sits
   beside it over the terminal. `[explorer] full-height=no` restores the
   full-width tab strip above the Explorer.
+- The Explorer's header is a plain line of text rather than a bar: a muted
+  `lairs` title and the filters as `live · saved · all`, the chosen one in
+  bold, with no rule or highlight. Beside the tab strip it is exactly the
+  strip's height and its text sits on the tab labels' baseline.
 - `multiplexer.pane-gap` (0–64 logical px, default 0) leaves empty space
   between neighbouring Splints and around them at the Window's edges: between
   and around whole frames with `divider-style=frame`, around the centred line

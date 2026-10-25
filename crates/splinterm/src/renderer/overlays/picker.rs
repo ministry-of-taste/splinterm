@@ -857,6 +857,8 @@ pub(crate) struct SessionPickerTextItem<'a> {
 pub(super) struct SessionPickerTextKey {
     source: ChromeSource,
     constrained_width: u32,
+    /// The tallest text cell in buffer px; `u32::MAX` for the chrome line cap.
+    maximum_cell_height: u32,
     style: ChromeTextStyle,
     scale_120: u32,
     renderer_generation: u64,
@@ -1086,25 +1088,75 @@ pub(super) fn paint_picker_source(
     alignment: PickerTextAlignment,
     color: u32,
 ) -> Result<()> {
+    paint_picker_source_within(
+        cache,
+        context,
+        used,
+        canvas,
+        canvas_width,
+        canvas_height,
+        source,
+        style,
+        scale_120,
+        renderer_generation,
+        clip,
+        alignment,
+        color,
+        u32::MAX,
+    )
+}
+
+/// Paints chrome text whose cells are at most `maximum_cell_height` buffer px
+/// tall, as the tab strip sizes its labels; `u32::MAX` keeps the chrome line
+/// cap that [`paint_picker_source`] uses.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn paint_picker_source_within(
+    cache: &mut SessionPickerTextCache,
+    context: &RenderContext,
+    used: &mut HashSet<SessionPickerTextKey>,
+    canvas: &mut [u8],
+    canvas_width: u32,
+    canvas_height: u32,
+    source: &ChromeSource,
+    style: ChromeTextStyle,
+    scale_120: u32,
+    renderer_generation: u64,
+    clip: Rect,
+    alignment: PickerTextAlignment,
+    color: u32,
+    maximum_cell_height: u32,
+) -> Result<()> {
     if source.is_empty() || clip.width == 0 || clip.height == 0 {
         return Ok(());
     }
     let key = SessionPickerTextKey {
         source: source.clone(),
         constrained_width: clip.width,
+        maximum_cell_height,
         style,
         scale_120,
         renderer_generation,
     };
+    let load = |source: &ChromeSource| {
+        if maximum_cell_height == u32::MAX {
+            ChromeText::load_source_styled_with_context(source, scale_120, style, context)
+        } else {
+            ChromeText::load_source_styled_within(
+                source,
+                scale_120,
+                style,
+                context,
+                maximum_cell_height,
+            )
+        }
+    };
     if !cache.entries.contains_key(&key) {
-        let mut text =
-            ChromeText::load_source_styled_with_context(source, scale_120, style, context)?;
+        let mut text = load(source)?;
         if text.pixel_width() > clip.width {
             let maximum_cells =
                 usize::try_from(clip.width / text.frame.cell_width.max(1)).unwrap_or(usize::MAX);
             let truncated = truncate_picker_source(source, maximum_cells);
-            text =
-                ChromeText::load_source_styled_with_context(&truncated, scale_120, style, context)?;
+            text = load(&truncated)?;
         }
         cache.entries.insert(key.clone(), text);
     }
@@ -1139,6 +1191,7 @@ pub(super) fn picker_cell_width(
     let key = SessionPickerTextKey {
         source: ChromeSource::from(" "),
         constrained_width: u32::MAX,
+        maximum_cell_height: u32::MAX,
         style,
         scale_120,
         renderer_generation,

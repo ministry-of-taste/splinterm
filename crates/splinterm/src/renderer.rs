@@ -96,7 +96,8 @@ pub(crate) use overlays::actions::{
 pub(crate) use overlays::explorer::{
     LairExplorerLayout, LairExplorerPresentationMode, explorer_minimum_docked_terminal_width,
     lair_explorer_disclosure_hit_test, lair_explorer_filter_hit_test, lair_explorer_hit_test,
-    lair_explorer_layout, lair_explorer_palette, lair_explorer_shows_working, paint_lair_explorer,
+    lair_explorer_layout, lair_explorer_layout_with_header, lair_explorer_palette,
+    lair_explorer_shows_working, paint_lair_explorer,
 };
 pub(crate) use overlays::handoff::paint_handoff_banner;
 pub(crate) use overlays::history::{
