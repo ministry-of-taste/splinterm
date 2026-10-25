@@ -6062,6 +6062,7 @@ impl App {
                 if self.presentation.explorer_full_height != loaded.config.explorer_full_height {
                     // The terminal area moves when a docked Explorer is shown.
                     self.presentation.explorer_full_height = loaded.config.explorer_full_height;
+                    self.relayout_tab_strip();
                     self.relayout_panes();
                 }
                 self.presentation.ui_font_size = loaded.config.ui_font_size;
@@ -6430,6 +6431,8 @@ impl App {
                 }
                 self.presentation.explorer_layout = None;
                 self.presentation.full_redraw = true;
+                // Beside a full-height Explorer the tab strip moves with it.
+                self.relayout_tab_strip();
                 if self.surface.configured {
                     self.emit_resize()?;
                 }
@@ -6438,6 +6441,9 @@ impl App {
             BuiltInCommandDispatch::FocusLairExplorer => (|| -> Result<()> {
                 let was_visible = self.explorer.visible();
                 self.set_explorer_focus(true, queue_handle);
+                if !was_visible {
+                    self.relayout_tab_strip();
+                }
                 if !was_visible && self.surface.configured {
                     self.emit_resize()?;
                 }
