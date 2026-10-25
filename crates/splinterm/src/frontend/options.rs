@@ -535,6 +535,9 @@ pub struct WindowOptions {
     /// `[multiplexer] tab-strip-border`: draw the light `line` divider stroke
     /// along the bottom of the tab strip.
     pub tab_strip_border: bool,
+    /// `[explorer] full-height`: a docked Explorer runs the Window's full
+    /// height and the tab strip begins at its right edge.
+    pub explorer_full_height: bool,
     /// Whether the Window binds the text-input (IME) protocol. The remote
     /// connection status Window turns it off so an input method never sees or
     /// draws a typed password as composing text.
@@ -607,6 +610,7 @@ impl Default for WindowOptions {
             remote_display_identity: None,
             agent_status_presentation: true,
             tab_strip_border: true,
+            explorer_full_height: true,
             input_method: true,
             mapped: None,
             handoff_status: None,

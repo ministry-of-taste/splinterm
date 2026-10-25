@@ -402,6 +402,9 @@ a hostile program running as your account.
 - Copy mode gains `w`/`b`/`e` word motions and `0`/`$`.
 - The Explorer docks beside a half-width terminal instead of covering it, and
   tabs, the Explorer, menus, and dialogs stay readable at maximum zoom.
+- A docked Explorer runs the Window's full height, and the tab strip sits
+  beside it over the terminal. `[explorer] full-height=no` restores the
+  full-width tab strip above the Explorer.
 - `multiplexer.pane-gap` (0–64 logical px, default 0) leaves empty space
   between neighbouring Splints and around them at the Window's edges: between
   and around whole frames with `divider-style=frame`, around the centred line
