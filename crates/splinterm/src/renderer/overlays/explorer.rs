@@ -633,10 +633,16 @@ fn footer_lines(footer: Rect, scale_120: u32, inset: u32) -> Vec<Rect> {
 /// `alpha`, which Omarchy's glassy mode sets), as the terminal and the tab
 /// strip are. The docked sidebar is part of the Window, not a floating menu,
 /// so it does not take the shell's menu alpha. Text and icons stay opaque.
+/// `[colors] explorer-background` and `explorer-alpha` replace the panel's
+/// colour and coverage; its text colours are then chosen against that colour.
 #[must_use]
 pub(crate) fn lair_explorer_palette(theme: ResolvedTheme) -> SessionPickerPalette {
-    let mut palette = chrome_panel_palette(theme, ChromeSurface::Menu);
-    palette.panel_fill = premultiplied_theme_rgba(palette.panel, theme.background_alpha);
+    let panel_theme = ResolvedTheme {
+        background: theme.explorer_background(),
+        ..theme
+    };
+    let mut palette = chrome_panel_palette(panel_theme, ChromeSurface::Menu);
+    palette.panel_fill = premultiplied_theme_rgba(palette.panel, theme.explorer_alpha());
     palette
 }
 
@@ -2385,6 +2391,45 @@ mod tests {
     /// (foot.ini `alpha`, Omarchy glassy mode) as the terminal and the tab
     /// strip do. Its panel and fills keep the theme alpha; text, icons, the
     /// divider, the rules, and the selection rail stay opaque.
+    /// `[colors] explorer-background` and `explorer-alpha` replace the
+    /// panel's colour and coverage, and its text is chosen against the new
+    /// colour. Without them the panel is the Window's glass, as above.
+    #[test]
+    fn explorer_background_and_alpha_overrides_replace_the_panel() {
+        use crate::config::ChromeColorOverrides;
+        let theme = ResolvedTheme {
+            background: 0x80_40_20,
+            background_alpha: u16::MAX / 2,
+            foreground: 0xee_ee_ee,
+            ..ResolvedTheme::default()
+        };
+        let light = theme.with_chrome_overrides(ChromeColorOverrides {
+            explorer_background: Some(0xf0_f0_f0),
+            explorer_alpha: Some(u16::MAX),
+            ..ChromeColorOverrides::NONE
+        });
+        let palette = lair_explorer_palette(light);
+        assert_eq!(palette.panel_fill, [0xf0, 0xf0, 0xf0, 0xff]);
+        let expected = chrome_panel_palette(
+            ResolvedTheme {
+                background: 0xf0_f0_f0,
+                ..light
+            },
+            ChromeSurface::Menu,
+        );
+        assert_eq!(palette.primary, expected.primary);
+        assert_ne!(palette.primary, lair_explorer_palette(theme).primary);
+
+        let alpha_only = theme.with_chrome_overrides(ChromeColorOverrides {
+            explorer_alpha: Some(u16::MAX),
+            ..ChromeColorOverrides::NONE
+        });
+        assert_eq!(
+            lair_explorer_palette(alpha_only).panel_fill,
+            [0x80, 0x40, 0x20, 0xff]
+        );
+    }
+
     #[test]
     fn explorer_respects_background_alpha_with_opaque_text_and_lines() {
         let theme = ResolvedTheme {
