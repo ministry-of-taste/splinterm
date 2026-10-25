@@ -137,6 +137,12 @@ and choose **Toggle Lair explorer** to show or hide it, or **Focus Lair explorer
 to show it and move keyboard focus there. These Explorer actions have no default
 shortcut. **Return focus to terminal** moves focus back without hiding Explorer.
 
+When the Window is wide enough to dock it, the Explorer runs the Window's full
+height on the left, and the tab strip starts at its right edge, above the
+terminal panes only. `[explorer] full-height=no` in `config.ini` puts it below a
+full-width tab strip instead. In a Window too narrow to dock it, the Explorer
+opens over the terminal, below the tab strip.
+
 Right-click a row for actions on that exact item, without selecting or opening it.
 With Explorer focused, Menu or Shift+F10 opens the selected row's menu; use
 Up/Down, Enter, and Escape to choose, run, or cancel an action:

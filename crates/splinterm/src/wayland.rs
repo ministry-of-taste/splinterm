@@ -1101,6 +1101,7 @@ fn assemble_app(
             cursor_style: options.cursor_style,
             cursor_blink: options.cursor_blink,
             tab_strip_border: options.tab_strip_border,
+            explorer_full_height: options.explorer_full_height,
             title: TitleSettings {
                 text: options.title,
                 controller_label: options.controller_title,
@@ -2230,6 +2231,8 @@ struct PresentationState {
     cursor_blink: bool,
     /// `[multiplexer] tab-strip-border`, which configuration reload replaces.
     tab_strip_border: bool,
+    /// `[explorer] full-height`, which configuration reload replaces.
+    explorer_full_height: bool,
     title: TitleSettings,
     theme: ResolvedTheme,
     pane_divider_style: PaneDividerStyle,
@@ -3745,6 +3748,33 @@ fn session_picker_new_command(
     }
 }
 
+/// A docked Explorer laid out over the Window's full height keeps that
+/// height; the terminal beside it starts below the tab strip, `strip_height`
+/// logical px tall. A drawer, which overlays the terminal, is not used here:
+/// it keeps the layout below the tab strip.
+fn explorer_beside_tabs(
+    mut layout: LairExplorerLayout,
+    strip_height: u32,
+) -> Option<LairExplorerLayout> {
+    if layout.mode != LairExplorerPresentationMode::Docked {
+        return None;
+    }
+    let strip_height = strip_height.min(layout.terminal.height);
+    layout.terminal.y = layout.terminal.y.saturating_add(strip_height);
+    layout.terminal.height = layout.terminal.height.saturating_sub(strip_height);
+    Some(layout)
+}
+
+/// Where a tab strip beside a full-height Explorer begins: the docked
+/// panel's right edge. A drawer or a hidden Explorer leaves it at 0.
+fn tab_strip_left_of(explorer: Option<&LairExplorerLayout>) -> u32 {
+    explorer
+        .filter(|layout| layout.mode == LairExplorerPresentationMode::Docked)
+        .map_or(0, |layout| {
+            layout.panel.x.saturating_add(layout.panel.width)
+        })
+}
+
 impl App {
     fn base_content_rect(&self) -> Rect {
         let y = tab_strip_height(
@@ -3778,13 +3808,42 @@ impl App {
         let minimum_terminal_width =
             explorer_minimum_docked_terminal_width(cell_width, self.presentation.initial_columns);
         let rows = self.explorer.rows();
+        let below_tabs = self.base_content_rect();
+        if self.presentation.explorer_full_height {
+            let full = Rect {
+                x: 0,
+                y: 0,
+                width: self.surface.logical_width,
+                height: self.surface.logical_height,
+            };
+            if let Some(layout) = lair_explorer_layout(
+                full,
+                minimum_terminal_width,
+                &rows,
+                self.explorer.selected(),
+                self.presentation.explorer_visible_start,
+            )
+            .and_then(|layout| explorer_beside_tabs(layout, below_tabs.y))
+            {
+                return Some(layout);
+            }
+        }
         lair_explorer_layout(
-            self.base_content_rect(),
+            below_tabs,
             minimum_terminal_width,
             &rows,
             self.explorer.selected(),
             self.presentation.explorer_visible_start,
         )
+    }
+
+    /// Where the tab strip begins: at a full-height docked Explorer's right
+    /// edge, otherwise at the Window's left edge.
+    fn tab_strip_left(&self) -> u32 {
+        if !self.presentation.explorer_full_height {
+            return 0;
+        }
+        tab_strip_left_of(self.current_explorer_layout().as_ref())
     }
 
     fn content_rect(&self) -> Rect {
@@ -6134,6 +6193,12 @@ impl App {
                     self.presentation.tab_strip_border = loaded.config.tab_strip_border;
                     self.presentation.full_redraw = true;
                 }
+                if self.presentation.explorer_full_height != loaded.config.explorer_full_height {
+                    // The terminal area moves when a docked Explorer is shown.
+                    self.presentation.explorer_full_height = loaded.config.explorer_full_height;
+                    self.relayout_tab_strip();
+                    self.relayout_panes();
+                }
                 self.presentation.ui_font_size = loaded.config.ui_font_size;
                 self.reconcile_chrome_font_size();
                 self.apply_pane_chrome(
@@ -6500,6 +6565,8 @@ impl App {
                 }
                 self.presentation.explorer_layout = None;
                 self.presentation.full_redraw = true;
+                // Beside a full-height Explorer the tab strip moves with it.
+                self.relayout_tab_strip();
                 if self.surface.configured {
                     self.emit_resize()?;
                 }
@@ -6508,6 +6575,9 @@ impl App {
             BuiltInCommandDispatch::FocusLairExplorer => (|| -> Result<()> {
                 let was_visible = self.explorer.visible();
                 self.set_explorer_focus(true, queue_handle);
+                if !was_visible {
+                    self.relayout_tab_strip();
+                }
                 if !was_visible && self.surface.configured {
                     self.emit_resize()?;
                 }
@@ -17131,6 +17201,59 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `[explorer] full-height`: a docked Explorer laid out over the whole
+    /// Window keeps that height, the terminal beside it starts below the tab
+    /// strip, and the strip begins at the panel's right edge. A drawer keeps
+    /// the layout below the strip.
+    #[test]
+    fn full_height_explorer_docks_beside_the_tab_strip() {
+        let window = Rect {
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 320,
+        };
+        let strip = 26;
+        let docked = lair_explorer_layout(window, 160, &[], None, 0).unwrap();
+        assert_eq!(docked.mode, LairExplorerPresentationMode::Docked);
+        let beside = explorer_beside_tabs(docked.clone(), strip).unwrap();
+        assert_eq!(beside.panel, docked.panel);
+        assert_eq!((beside.panel.y, beside.panel.height), (0, 320));
+        assert_eq!(beside.header, docked.header);
+        assert_eq!(beside.rows, docked.rows);
+        assert_eq!(
+            beside.terminal,
+            Rect {
+                x: docked.panel.width,
+                y: strip,
+                width: 800 - docked.panel.width,
+                height: 320 - strip,
+            }
+        );
+        assert_eq!(tab_strip_left_of(Some(&beside)), docked.panel.width);
+
+        // No tab strip: the terminal keeps the full height.
+        assert_eq!(
+            explorer_beside_tabs(docked.clone(), 0).unwrap().terminal,
+            docked.terminal
+        );
+        // A strip taller than the Window leaves no terminal, never wraps.
+        assert_eq!(
+            explorer_beside_tabs(docked, 1_000).unwrap().terminal.height,
+            0
+        );
+
+        let narrow = Rect {
+            width: 400,
+            ..window
+        };
+        let drawer = lair_explorer_layout(narrow, 160, &[], None, 0).unwrap();
+        assert_eq!(drawer.mode, LairExplorerPresentationMode::Drawer);
+        assert!(explorer_beside_tabs(drawer.clone(), strip).is_none());
+        assert_eq!(tab_strip_left_of(Some(&drawer)), 0);
+        assert_eq!(tab_strip_left_of(None), 0);
     }
 
     #[test]

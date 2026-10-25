@@ -136,6 +136,7 @@ substitution, but do not sandbox hostile processes running as your own user.
 | `multiplexer.divider-style` | `line`, `frame`, or `none` pane chrome | line |
 | `multiplexer.pane-gap` | empty space between adjacent Splint panes and around the pane area at the Window's edges, in logical px scaled by the output scale (see below); shrinks, down to none, where the Splints cannot fit it; configuration reload applies it | 0–64; 0 |
 | `multiplexer.frame-title` | top-frame title source: `splint` or `none`; inert outside frame style | splint |
+| `explorer.full-height` | a docked Lair Explorer runs the Window's full height and the tab strip begins at its right edge, above the terminal only; `no` puts the Explorer below a full-width tab strip. An Explorer too wide to dock opens over the terminal below the tab strip either way; configuration reload applies it | strict boolean; yes |
 | `explorer.agent-status` | show explicitly reported agent status in the Explorer, on Dojo tabs, and in navigation accessibility; `no` hides it all; configuration reload applies it | yes |
 | `integration.dialog-shortcut` | the chord that engages a waiting trusted dialog's keyboard, as a click inside does, without answering it: `ctrl+alt+` and one letter or digit (modifiers in any order; no `shift`, and no Super chords), or `none` to turn it off. When Hyprland maps dialogs without focus (the Omarchy integration), Splinterm also binds it while a dialog waits, so it reaches the dialog from any Window ([Trusted dialogs](usage.md#trusted-dialogs)); read when a dialog starts | ctrl+alt+g |
 
@@ -175,11 +176,12 @@ applies exactly these settings: the `[key-bindings]` keymap (profile, overlay
 file, and `prefix-timeout-ms`), `clipboard.image-directory` (an in-flight save
 is cancelled), `main.ui-font-pixelsize` and `multiplexer.tab-strip-border`
 (chrome is drawn again at once),
-`explorer.agent-status`, `multiplexer.divider-style`, `multiplexer.frame-title`,
-`multiplexer.pane-gap`, `multiplexer.close-unused`,
+`explorer.agent-status`, `explorer.full-height`, `multiplexer.divider-style`,
+`multiplexer.frame-title`, `multiplexer.pane-gap`, `multiplexer.close-unused`,
 `multiplexer.persist-on-tab-organization`, `multiplexer.new-dojo-directory`,
-and `multiplexer.new-splint-directory`. A changed `multiplexer.divider-style`,
-`multiplexer.frame-title`, or `multiplexer.pane-gap` lays the Splints out again
+and `multiplexer.new-splint-directory`. A changed `explorer.full-height`,
+`multiplexer.divider-style`, `multiplexer.frame-title`, or
+`multiplexer.pane-gap` lays the Splints out again
 at once and resizes each one's PTY; a gap they
 cannot fit shrinks for that layout, as described above, rather than being
 refused. The other four multiplexer settings take effect at the Window's next
