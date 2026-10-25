@@ -108,7 +108,8 @@ pub(crate) use overlays::picker::session_picker_palette;
 pub(crate) use overlays::picker::{
     ChromeSurface, SessionPickerOverlayLayout, SessionPickerPurpose, SessionPickerTextCache,
     SessionPickerTextItem, chrome_panel_fill, chrome_panel_palette, paint_search_overlay,
-    paint_session_picker_overlay, session_picker_hit_test, session_picker_overlay_layout,
+    paint_session_picker_overlay, search_overlay_panel, session_picker_hit_test,
+    session_picker_overlay_layout,
 };
 #[cfg(test)]
 use raster::pixel_index;

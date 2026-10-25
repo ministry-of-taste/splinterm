@@ -1153,6 +1153,41 @@ pub(super) fn picker_cell_width(
     Ok(width)
 }
 
+/// The terminal search field's panel, in buffer pixels, at the bottom left
+/// of `terminal`; `None` when the terminal is too small to show it. The
+/// painter and the Window's surface damage both use it, so a frame that
+/// removes or moves the field damages exactly where it was drawn.
+#[must_use]
+pub(crate) fn search_overlay_panel(terminal: Rect, scale_120: u32) -> Option<Rect> {
+    if scale_120 == 0 {
+        return None;
+    }
+    let scaled = |logical: u32| logical.saturating_mul(scale_120).div_ceil(120).max(1);
+    let margin = scaled(8);
+    let width = terminal
+        .width
+        .saturating_sub(margin.saturating_mul(2))
+        .min(scaled(440));
+    let height = terminal
+        .height
+        .saturating_sub(margin.saturating_mul(2))
+        .min(scaled(48));
+    if width < scaled(96) || height < scaled(28) {
+        return None;
+    }
+    Some(Rect {
+        x: terminal.x.saturating_add(margin),
+        y: terminal.y.saturating_add(
+            terminal
+                .height
+                .saturating_sub(margin)
+                .saturating_sub(height),
+        ),
+        width,
+        height,
+    })
+}
+
 /// Paint a bounded terminal search field inside the terminal side of any Explorer split.
 /// The compositor title alone is not a visible search surface on every desktop.
 #[allow(
@@ -1175,33 +1210,11 @@ pub(crate) fn paint_search_overlay(
     matches: usize,
     selected: usize,
 ) -> Result<bool> {
-    if scale_120 == 0 {
+    let Some(panel) = search_overlay_panel(terminal, scale_120) else {
         return Ok(false);
-    }
-    let scaled = |logical: u32| logical.saturating_mul(scale_120).div_ceil(120).max(1);
-    let margin = scaled(8);
-    let width = terminal
-        .width
-        .saturating_sub(margin.saturating_mul(2))
-        .min(scaled(440));
-    let height = terminal
-        .height
-        .saturating_sub(margin.saturating_mul(2))
-        .min(scaled(48));
-    if width < scaled(96) || height < scaled(28) {
-        return Ok(false);
-    }
-    let panel = Rect {
-        x: terminal.x.saturating_add(margin),
-        y: terminal.y.saturating_add(
-            terminal
-                .height
-                .saturating_sub(margin)
-                .saturating_sub(height),
-        ),
-        width,
-        height,
     };
+    let scaled = |logical: u32| logical.saturating_mul(scale_120).div_ceil(120).max(1);
+    let height = panel.height;
     fill_rect(
         canvas,
         canvas_width,
@@ -1851,15 +1864,15 @@ mod tests {
             render(&format!("{long}y")),
             "editing the clipped query tail must change painted pixels"
         );
+        // Every painted pixel lies inside `search_overlay_panel`, the rect
+        // the Window damages when the field closes or moves, and that rect
+        // sits at the bottom left of the terminal.
+        let panel = search_overlay_panel(content, 120).unwrap();
+        assert_eq!(panel.x, content.x + 8);
+        assert_eq!(panel.y + panel.height, content.y + content.height - 8);
+        let mut painted_inside = false;
         for y in 0..480 {
             for x in 0..900 {
-                if x >= content.x
-                    && x < content.x + content.width
-                    && y >= content.y
-                    && y < content.y + content.height
-                {
-                    continue;
-                }
                 let pixel = pixel_index(
                     900,
                     480,
@@ -1867,13 +1880,22 @@ mod tests {
                     i32::try_from(y).unwrap(),
                 )
                 .unwrap();
+                if x >= panel.x
+                    && x < panel.x + panel.width
+                    && y >= panel.y
+                    && y < panel.y + panel.height
+                {
+                    painted_inside |= alpha[pixel..pixel + 4] != [0; 4];
+                    continue;
+                }
                 assert_eq!(
                     &alpha[pixel..pixel + 4],
                     &[0; 4],
-                    "paint escaped terminal area"
+                    "paint escaped the damaged search panel at {x},{y}"
                 );
             }
         }
+        assert!(painted_inside);
     }
 
     #[test]
@@ -1907,6 +1929,8 @@ mod tests {
             .unwrap()
         );
         assert!(canvas.iter().all(|byte| *byte == 0));
+        assert_eq!(search_overlay_panel(tiny, 120), None);
+        assert_eq!(search_overlay_panel(tiny, 0), None);
         let terminal = Rect {
             x: 260,
             y: 40,
