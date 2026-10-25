@@ -416,7 +416,12 @@ a hostile program running as your account.
   palette quietly.
 - Glassy Windows: the terminal background, padding, tab strip, and docked Lair
   Explorer turn translucent with blur when glass is on, while text and icons
-  stay opaque and crisp. Toggling applies live.
+  stay opaque and crisp. The selected Dojo tab stays opaque, so it stands
+  clearly apart from the inactive tabs. Toggling applies live.
+- New `[colors]` keys in `config.ini` let you choose these yourself:
+  `active-tab-background` and `active-tab-alpha` for the selected tab,
+  `tab-strip-alpha` for the strip, and `explorer-background` and
+  `explorer-alpha` for the docked Explorer.
 - Splinterm follows three settings from the Omarchy shell's `shell.toml`: panel
   alpha for menus and popups (raised as needed to keep text readable), the text
   size set by `omarchy-display-text-size`, and the top bar's height. Open
