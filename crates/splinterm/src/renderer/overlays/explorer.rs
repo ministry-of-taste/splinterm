@@ -685,6 +685,71 @@ pub(crate) fn lair_explorer_palette(theme: ResolvedTheme) -> SessionPickerPalett
     palette
 }
 
+/// Where one header filter's text goes, in buffer px.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FilterTextClip {
+    token: Rect,
+    /// The `·` on the boundary before this filter; never before the first,
+    /// and left out when either neighbouring share is narrower than a cell.
+    separator: Option<Rect>,
+}
+
+/// Disjoint clips for the header filters' tokens and separators. `shares`
+/// are the filters' buffer rects, left to right; `right` is where the
+/// divider begins. A separator takes the `cell` px around its boundary,
+/// `cell / 2` left of it and the rest right of it, and each token is inset by
+/// the same amounts, so neither an odd cell nor a fractional scale makes two
+/// clips overlap.
+fn filter_text_clips(shares: &[Rect], cell: u32, right: u32) -> Vec<FilterTextClip> {
+    let left_half = cell / 2;
+    let right_half = cell - left_half;
+    // Each share runs to the next one's start, which also absorbs any
+    // overlap from rounding at fractional scales, and never past `right`.
+    let spans: Vec<(u32, u32)> = shares
+        .iter()
+        .enumerate()
+        .map(|(index, share)| {
+            let start = share.x.min(right);
+            let end = shares
+                .get(index + 1)
+                .map_or(share.x.saturating_add(share.width), |next| next.x)
+                .min(right)
+                .max(start);
+            (start, end)
+        })
+        .collect();
+    spans
+        .iter()
+        .enumerate()
+        .map(|(index, &(start, end))| {
+            let token_left = start.saturating_add(right_half).min(end);
+            let token_right = end.saturating_sub(left_half).max(token_left);
+            let separator = index
+                .checked_sub(1)
+                .map(|previous| spans[previous])
+                .filter(|&(previous_start, previous_end)| {
+                    previous_end.saturating_sub(previous_start) >= cell
+                        && end.saturating_sub(start) >= cell
+                })
+                .map(|_| Rect {
+                    x: start.saturating_sub(left_half),
+                    y: shares[index].y,
+                    width: cell,
+                    height: shares[index].height,
+                });
+            FilterTextClip {
+                token: Rect {
+                    x: token_left,
+                    y: shares[index].y,
+                    width: token_right - token_left,
+                    height: shares[index].height,
+                },
+                separator,
+            }
+        })
+        .collect()
+}
+
 /// A fill on the panel, such as the selected row or the active filter, at
 /// the panel's own glass alpha, as the tab strip draws its active tab.
 fn glass_rgba(color: u32, panel_fill: [u8; 4]) -> [u8; 4] {
@@ -815,17 +880,16 @@ pub(crate) fn paint_lair_explorer(
     }
 
     // Each token is centred in its share of the line, and a `·` sits on the
-    // boundary between neighbours, inside half a cell of each share. Nothing
-    // reaches the divider, however narrow the panel.
-    let half_cell = cell_width / 2;
-    for (index, (choice, rect)) in layout.filters.iter().enumerate() {
-        let rect = buffer_rect(*rect, scale_120);
-        let rect = Rect {
-            width: rect.width.min(right.saturating_sub(rect.x)),
-            ..rect
-        };
-        if index > 0 {
-            let separator_x = rect.x.saturating_sub(half_cell).max(panel.x);
+    // boundary between neighbours. No clip overlaps another or reaches the
+    // divider, however narrow the panel.
+    let shares: Vec<Rect> = layout
+        .filters
+        .iter()
+        .map(|(_, rect)| buffer_rect(*rect, scale_120))
+        .collect();
+    let clips = filter_text_clips(&shares, cell_width, right);
+    for ((choice, _), clip) in layout.filters.iter().zip(&clips) {
+        if let Some(separator) = clip.separator {
             paint_picker_source_within(
                 cache,
                 context,
@@ -837,11 +901,7 @@ pub(crate) fn paint_lair_explorer(
                 ChromeTextStyle::Regular,
                 scale_120,
                 renderer_generation,
-                Rect {
-                    x: separator_x,
-                    width: cell_width.min(right.saturating_sub(separator_x)),
-                    ..rect
-                },
+                separator,
                 PickerTextAlignment::Center,
                 palette.secondary,
                 header_text_cap,
@@ -863,11 +923,7 @@ pub(crate) fn paint_lair_explorer(
             },
             scale_120,
             renderer_generation,
-            Rect {
-                x: rect.x.saturating_add(half_cell),
-                width: rect.width.saturating_sub(half_cell.saturating_mul(2)),
-                ..rect
-            },
+            clip.token,
             PickerTextAlignment::Center,
             if active {
                 palette.primary
@@ -1104,6 +1160,82 @@ mod tests {
             false,
         )
         .unwrap();
+    }
+
+    /// The header filters' token and separator clips never overlap one
+    /// another or reach the divider: odd and even cells, fractional scales,
+    /// and shares narrower than a cell.
+    #[test]
+    fn filter_text_clips_are_disjoint_and_stay_left_of_the_divider() {
+        for width in [1, 2, 20, 40, 60, 100, 200, 288] {
+            for scale in [120, 150, 175, 180, 240] {
+                for cell in [1, 6, 7, 8, 9, 15] {
+                    let case = format!("width={width} scale={scale} cell={cell}");
+                    let content = Rect {
+                        x: 3,
+                        y: 0,
+                        width,
+                        height: 400,
+                    };
+                    let layout = lair_explorer_layout(content, 0, &[], None, 0).unwrap();
+                    let panel = buffer_rect(layout.panel, scale);
+                    let border = scale.div_ceil(120).max(1);
+                    let right = panel.x + panel.width.saturating_sub(border);
+                    let shares: Vec<Rect> = layout
+                        .filters
+                        .iter()
+                        .map(|(_, rect)| buffer_rect(*rect, scale))
+                        .collect();
+                    let clips = filter_text_clips(&shares, cell, right);
+                    assert_eq!(clips.len(), shares.len(), "{case}");
+                    assert!(clips.first().is_none_or(|clip| clip.separator.is_none()));
+                    let mut spans: Vec<(u32, u32)> = clips
+                        .iter()
+                        .flat_map(|clip| clip.separator.into_iter().chain([clip.token]))
+                        .filter(|rect| rect.width > 0)
+                        .map(|rect| (rect.x, rect.x + rect.width))
+                        .collect();
+                    for &(left, end) in &spans {
+                        assert!(left >= panel.x && end <= right, "{case}: {left}..{end}");
+                    }
+                    spans.sort_unstable();
+                    for pair in spans.windows(2) {
+                        assert!(pair[0].1 <= pair[1].0, "{case}: {pair:?}");
+                    }
+                    for (index, clip) in clips.iter().enumerate().skip(1) {
+                        if clip.separator.is_some() {
+                            assert_eq!(clip.separator.unwrap().width, cell, "{case}");
+                            assert!(shares[index].width >= cell, "{case}");
+                        }
+                    }
+                }
+            }
+        }
+        // A wide panel at 1x with an 8 px cell keeps both separators.
+        let shares = [
+            Rect {
+                x: 84,
+                y: 0,
+                width: 65,
+                height: 26,
+            },
+            Rect {
+                x: 149,
+                y: 0,
+                width: 66,
+                height: 26,
+            },
+            Rect {
+                x: 215,
+                y: 0,
+                width: 65,
+                height: 26,
+            },
+        ];
+        let clips = filter_text_clips(&shares, 8, 287);
+        assert_eq!(clips[1].separator.unwrap().x, 145);
+        assert_eq!(clips[2].separator.unwrap().x, 211);
+        assert_eq!((clips[0].token.x, clips[0].token.width), (88, 57));
     }
 
     #[test]
