@@ -318,6 +318,25 @@ const fn final_tab_removal_action(
     }
 }
 
+/// Picks the tab to show once `closing` closes: the set's usual neighbour when
+/// `ready` holds for it, or else the first other tab for which it holds. When
+/// no other tab is ready the usual neighbour is returned, so activating it
+/// reports the problem.
+fn tab_after_close<T>(
+    tabs: &WindowTabSet<T>,
+    closing: DojoId,
+    ready: impl Fn(&DojoTab<T>) -> bool,
+) -> Option<DojoId> {
+    let usual = tabs.selection_after_close(closing)?;
+    if tabs.get(usual).is_some_and(&ready) {
+        return Some(usual);
+    }
+    tabs.iter()
+        .find(|tab| tab.dojo_id != closing && ready(tab))
+        .map(|tab| tab.dojo_id)
+        .or(Some(usual))
+}
+
 fn session_picker_handoff_command(executable: &Path) -> Command {
     let mut command = Command::new(executable);
     command.arg("dojos");
@@ -1275,6 +1294,7 @@ fn assemble_app(
             pending_frame_trace: None,
             keep_surface: options.keep_surface,
             parked: None,
+            busy_notice: false,
         },
     };
     app.explorer
@@ -2415,6 +2435,9 @@ struct SchedulingState {
     keep_surface: bool,
     /// The exit that parked a staged Window; its input is discarded.
     parked: Option<ExitClass>,
+    /// An action was dropped because the topology manager was busy; the
+    /// Window says so in its title on its next update.
+    busy_notice: bool,
 }
 
 struct App {
@@ -2517,6 +2540,20 @@ impl SchedulingState {
     #[track_caller]
     fn fail(&mut self, error: anyhow::Error) {
         let location = std::panic::Location::caller();
+        if error.downcast_ref::<TopologyQueueFull>().is_some() {
+            // A busy topology manager is not a broken Window: the action is
+            // dropped and the title says so.
+            if let Some(diagnostics) = diagnostics() {
+                diagnostics.emit(
+                    DiagnosticLevel::Warn,
+                    DiagnosticEventCode::TopologyFailure,
+                    Some(DiagnosticErrorCode::TopologyManager),
+                );
+            }
+            eprintln!("splinterm: an action was not sent at {location}: {error:#}");
+            self.busy_notice = true;
+            return;
+        }
         if let Some(diagnostics) = diagnostics() {
             diagnostics.emit_failure(
                 DiagnosticLevel::Error,
@@ -2715,12 +2752,26 @@ fn request_return_live_resync(
     Ok(true)
 }
 
+/// The topology manager is still busy with earlier commands, for example
+/// while "Terminate Dojo…" waits for a Splint to exit after SIGHUP. The
+/// Window is fine; only this one action was not sent.
+#[derive(Debug)]
+struct TopologyQueueFull;
+
+impl std::fmt::Display for TopologyQueueFull {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("topology command queue is full")
+    }
+}
+
+impl std::error::Error for TopologyQueueFull {}
+
 fn try_topology_command(
     commands: &Sender<WindowTopologyCommand>,
     command: WindowTopologyCommand,
 ) -> Result<()> {
     commands.try_send(command).map_err(|error| match error {
-        TrySendError::Full(_) => anyhow::anyhow!("topology command queue is full"),
+        TrySendError::Full(_) => anyhow::Error::new(TopologyQueueFull),
         TrySendError::Closed(_) => anyhow::anyhow!("topology command queue is closed"),
     })
 }
@@ -3816,6 +3867,55 @@ impl App {
             );
             Self::request_pane_control_release(pane, input_pending);
         }
+    }
+
+    /// Removes a tab the topology manager closed, switching first to the tab
+    /// that follows it when it was the active one. Returns whether the Window
+    /// changed.
+    fn remove_tab_locally(&mut self, dojo_id: DojoId) -> Result<bool> {
+        let mut changed = false;
+        if self.tab_state.active_dojo_id() == dojo_id {
+            if let Some(selected) = self.tab_after_close(dojo_id) {
+                changed |= self.activate_tab(selected)?;
+            } else {
+                self.release_visible_pane_controllers();
+            }
+        }
+        let mut removed = self.tab_state.tabs.close(dojo_id);
+        let removal_action = final_tab_removal_action(
+            removed.is_some(),
+            self.tab_state.tabs.len(),
+            self.modal.session_picker_requested,
+        );
+        if let Some(removed) = removed.as_mut() {
+            if let Some(view) = removed.value.as_mut() {
+                Self::release_tab_controllers(view, &self.input.pending_terminal_input);
+            }
+            self.tab_state.tab_label_cache.clear();
+            self.presentation.full_redraw = true;
+            changed = true;
+        }
+        match removal_action {
+            FinalTabRemovalAction::Continue => {}
+            FinalTabRemovalAction::Exit => self
+                .scheduling
+                .request_exit(ExitClass::CleanFinalTabRemoved),
+            FinalTabRemovalAction::ExitAndHandoffPicker => {
+                self.modal.session_picker_requested = false;
+                if spawn_session_picker_handoff().is_err() {
+                    eprintln!("splinterm Dojo picker handoff failed");
+                }
+                self.scheduling
+                    .request_exit(ExitClass::CleanFinalTabRemoved);
+            }
+        }
+        Ok(changed)
+    }
+
+    /// The tab to show once `dojo_id` closes: the usual neighbour when its
+    /// panes are ready to show, or else the first other tab whose panes are.
+    fn tab_after_close(&self, dojo_id: DojoId) -> Option<DojoId> {
+        tab_after_close(&self.tab_state.tabs, dojo_id, |tab| tab.value.is_some())
     }
 
     fn activate_tab(&mut self, dojo_id: DojoId) -> Result<bool> {
@@ -9740,43 +9840,12 @@ impl App {
                     dojo_id,
                     acknowledged,
                 } => {
-                    let was_active = self.tab_state.active_dojo_id() == dojo_id;
-                    if was_active {
-                        if let Some(selected) = self.tab_state.tabs.selection_after_close(dojo_id) {
-                            changed |= self.activate_tab(selected)?;
-                        } else {
-                            self.release_visible_pane_controllers();
-                        }
-                    }
-                    let mut removed = self.tab_state.tabs.close(dojo_id);
-                    let removal_action = final_tab_removal_action(
-                        removed.is_some(),
-                        self.tab_state.tabs.len(),
-                        self.modal.session_picker_requested,
-                    );
-                    if let Some(removed) = removed.as_mut() {
-                        if let Some(view) = removed.value.as_mut() {
-                            Self::release_tab_controllers(view, &self.input.pending_terminal_input);
-                        }
-                        self.tab_state.tab_label_cache.clear();
-                        self.presentation.full_redraw = true;
-                        changed = true;
-                    }
-                    match removal_action {
-                        FinalTabRemovalAction::Continue => {}
-                        FinalTabRemovalAction::Exit => self
-                            .scheduling
-                            .request_exit(ExitClass::CleanFinalTabRemoved),
-                        FinalTabRemovalAction::ExitAndHandoffPicker => {
-                            self.modal.session_picker_requested = false;
-                            if spawn_session_picker_handoff().is_err() {
-                                eprintln!("splinterm Dojo picker handoff failed");
-                            }
-                            self.scheduling
-                                .request_exit(ExitClass::CleanFinalTabRemoved);
-                        }
-                    }
+                    // The topology manager waits for this acknowledgement and
+                    // stops without it, so it is sent even when removing the
+                    // tab here fails.
+                    let removed = self.remove_tab_locally(dojo_id);
                     let _ = acknowledged.send(());
+                    changed |= removed?;
                 }
                 WindowTopologyUpdate::UpdateIdentity(identity) => {
                     if let Some(diagnostics) = diagnostics() {
@@ -10124,6 +10193,9 @@ impl App {
         reason = "bounded update draining and semantic damage coalescing stay adjacent"
     )]
     fn apply_updates(&mut self, queue_handle: &QueueHandle<Self>) -> Result<()> {
+        if std::mem::take(&mut self.scheduling.busy_notice) {
+            self.window_notice("Busy: that action was not sent, try again");
+        }
         // First, so every gate below sees this turn's handoff pause.
         self.apply_handoff_status(Instant::now());
         let (topology_changed, topology_theme) = self.apply_topology_updates(queue_handle)?;
@@ -13031,6 +13103,46 @@ mod tests {
         let command = session_picker_handoff_command(Path::new("/opt/splinterm"));
         assert_eq!(command.get_program(), "/opt/splinterm");
         assert_eq!(command.get_args().collect::<Vec<_>>(), ["dojos"]);
+    }
+
+    #[test]
+    fn a_closed_active_tab_hands_over_to_a_tab_whose_panes_are_ready() {
+        let lair = splinterm_core::LairId::new();
+        let (first, second, third) = (DojoId::new(), DojoId::new(), DojoId::new());
+        let ready = |tab: &DojoTab<bool>| tab.value;
+
+        let mut tabs = WindowTabSet::new(DojoTab::new(lair, first, true));
+        tabs.open_or_activate(DojoTab::new(lair, second, false))
+            .unwrap();
+        tabs.open_or_activate(DojoTab::new(lair, third, true))
+            .unwrap();
+        assert!(tabs.activate(first));
+        // The usual neighbour has no panes ready, so the next ready tab shows.
+        assert_eq!(tab_after_close(&tabs, first, ready), Some(third));
+        assert!(tabs.activate(third));
+        assert_eq!(tab_after_close(&tabs, third, ready), Some(first));
+
+        // With no other ready tab the usual neighbour stands, and activating
+        // it reports the problem as before.
+        let mut lone = WindowTabSet::new(DojoTab::new(lair, first, true));
+        lone.open_or_activate(DojoTab::new(lair, second, false))
+            .unwrap();
+        assert!(lone.activate(first));
+        assert_eq!(tab_after_close(&lone, first, ready), Some(second));
+
+        let single = WindowTabSet::new(DojoTab::new(lair, first, true));
+        assert_eq!(tab_after_close(&single, first, ready), None);
+    }
+
+    #[test]
+    fn only_a_full_topology_queue_is_the_typed_busy_error() {
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        try_topology_command(&sender, WindowTopologyCommand::CloseWindow).unwrap();
+        let full = try_topology_command(&sender, WindowTopologyCommand::CloseWindow).unwrap_err();
+        assert!(full.downcast_ref::<TopologyQueueFull>().is_some());
+        drop(receiver);
+        let closed = try_topology_command(&sender, WindowTopologyCommand::CloseWindow).unwrap_err();
+        assert!(closed.downcast_ref::<TopologyQueueFull>().is_none());
     }
 
     #[test]

@@ -610,6 +610,7 @@ mod tests {
             pending_frame_trace: None,
             keep_surface,
             parked: None,
+            busy_notice: false,
         }
     }
 
@@ -644,6 +645,18 @@ mod tests {
         let mut failed = scheduling(true);
         failed.fail(anyhow::anyhow!("dispatch failed"));
         assert!(failed.exit && failed.parked.is_none() && failed.failure.is_some());
+    }
+
+    #[test]
+    fn a_busy_topology_queue_drops_the_action_and_keeps_the_window() {
+        let mut busy = scheduling(false);
+        busy.fail(anyhow::Error::new(crate::wayland::TopologyQueueFull).context("activate a tab"));
+        assert!(busy.busy_notice);
+        assert!(!busy.exit && busy.failure.is_none() && busy.parked.is_none());
+
+        let mut broken = scheduling(false);
+        broken.fail(anyhow::anyhow!("topology command queue is closed"));
+        assert!(broken.exit && broken.failure.is_some() && !broken.busy_notice);
     }
 
     fn identity() -> WindowDojoIdentity {
