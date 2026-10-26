@@ -1186,6 +1186,7 @@ fn assemble_app(
                 scrollback_viewport: ScrollbackViewport::default(),
                 painted_history_status: None,
                 history_page_pending: false,
+                resync_pending: false,
                 history_page_top: None,
                 history_selection_pin_blocked: false,
                 scroll_started_at: None,
@@ -1485,6 +1486,9 @@ struct PaneView {
     image_sources: ImageContentLeaseSet,
     scrollback_viewport: ScrollbackViewport,
     painted_history_status: Option<HistoryOverlayStatus>,
+    /// A return-to-live resynchronization was sent and its authoritative
+    /// snapshot has not arrived; another would only queue behind it.
+    resync_pending: bool,
     history_page_pending: bool,
     /// The oldest cached history row when older history was last requested.
     /// Pages join the cache only while that row is still its first.
@@ -1747,6 +1751,7 @@ impl PaneView {
             scrollback_viewport: ScrollbackViewport::default(),
             painted_history_status: None,
             history_page_pending: false,
+            resync_pending: false,
             history_page_top: None,
             history_selection_pin_blocked: false,
             scroll_started_at: None,
@@ -1783,6 +1788,17 @@ impl PaneView {
         self.selecting = false;
         self.hovered_url = None;
         self.history_selection_pin_blocked = false;
+    }
+
+    /// The screen selections resolve against below the history cache: the
+    /// one this pane shows, which is the held screen while a viewport holds.
+    fn selection_screen(&self) -> Option<&[TerminalRow]> {
+        let snapshot = self.snapshot.as_ref()?;
+        Some(
+            self.scrollback_viewport
+                .held_screen()
+                .unwrap_or(&snapshot.visible_rows),
+        )
     }
 
     fn display_snapshot(&self) -> Option<TerminalSnapshot> {
@@ -1921,6 +1937,7 @@ impl PaneView {
                 image_sources,
                 authoritative,
             } => {
+                self.resync_pending &= !authoritative;
                 snapshot
                     .validate()
                     .map_err(|error| anyhow::anyhow!(error.message))?;
@@ -2890,19 +2907,37 @@ fn propagate_raster_damage_through_scroll(
     }
 }
 
+/// Sends a command the Window can do without: a resynchronization, a
+/// history page or a search. When the queue is full the bridge is behind,
+/// for example while it delivers a flood of output, and the command is
+/// dropped instead of ending the Window. Returns whether it was sent.
+fn try_advisory_command(commands: &Sender<WindowCommand>, command: WindowCommand) -> Result<bool> {
+    match commands.try_send(command) {
+        Ok(()) => Ok(true),
+        Err(TrySendError::Full(_)) => Ok(false),
+        Err(TrySendError::Closed(_)) => {
+            Err(anyhow::anyhow!("Wayland command receiver disconnected"))
+        }
+    }
+}
+
+/// Asks for an authoritative snapshot when a viewport reaches live, unless
+/// one is already on its way. A dropped request is harmless: a live view
+/// already drops history that lags, and the next return to live asks again.
 fn request_return_live_resync(
     commands: Option<&Sender<WindowCommand>>,
+    pending: &mut bool,
     previous_offset: usize,
     current_offset: usize,
 ) -> Result<bool> {
-    if previous_offset == 0 || current_offset != 0 {
+    if previous_offset == 0 || current_offset != 0 || *pending {
         return Ok(false);
     }
     let Some(commands) = commands else {
         return Ok(false);
     };
-    try_window_command(commands, WindowCommand::Resynchronize)?;
-    Ok(true)
+    *pending = try_advisory_command(commands, WindowCommand::Resynchronize)?;
+    Ok(*pending)
 }
 
 /// The topology manager is still busy with earlier commands, for example
@@ -4811,7 +4846,7 @@ impl App {
         let Some(commands) = self.panes.pane.commands.as_ref() else {
             return Ok(());
         };
-        try_window_command(
+        if !try_advisory_command(
             commands,
             WindowCommand::FetchScrollback {
                 splint_id: snapshot.splint_id,
@@ -4820,7 +4855,9 @@ impl App {
                 history_generation: snapshot.history_generation,
                 before_row_id,
             },
-        )?;
+        )? {
+            return Ok(());
+        }
         self.panes.pane.history_page_pending = true;
         self.panes.pane.history_page_top = Some(before_row_id);
         Ok(())
@@ -4853,6 +4890,7 @@ impl App {
         let moved = current_offset != previous_offset;
         request_return_live_resync(
             self.panes.pane.commands.as_ref(),
+            &mut self.panes.pane.resync_pending,
             previous_offset,
             current_offset,
         )?;
@@ -5021,7 +5059,7 @@ impl App {
                         .selection
                         .context("selection survived output")?;
                     anyhow::ensure!(
-                        selection_is_retained(snapshot, selection),
+                        selection_is_retained(snapshot, &snapshot.visible_rows, selection),
                         "selection endpoints were not retained during output"
                     );
                     probe.evidence.push(serde_json::json!({
@@ -5474,12 +5512,7 @@ impl App {
 
     fn finish_selection(&mut self) -> Option<&[u8]> {
         self.panes.pane.selecting = false;
-        self.panes.pane.selected_text =
-            self.panes.pane.selection.and_then(|selection| {
-                self.panes.pane.snapshot.as_ref().and_then(|snapshot| {
-                    selection_text(snapshot, selection).map(String::into_bytes)
-                })
-            });
+        self.panes.pane.selected_text = self.current_selection_text();
         self.panes.pane.selected_text.as_deref()
     }
 
@@ -5530,11 +5563,20 @@ impl App {
         }
     }
 
+    /// The text the selection covers in the rows this pane shows.
+    fn current_selection_text(&self) -> Option<Vec<u8>> {
+        let selection = self.panes.pane.selection?;
+        let snapshot = self.panes.pane.snapshot.as_ref()?;
+        let screen = self.panes.pane.selection_screen()?;
+        selection_text(snapshot, screen, selection).map(String::into_bytes)
+    }
+
     fn dirty_selection(&mut self, selection: Option<Selection>) {
         let bounds = selection.and_then(|selection| {
             let snapshot = self.panes.pane.snapshot.as_ref()?;
+            let screen = self.panes.pane.selection_screen()?;
             let display = self.panes.display_snapshot_cow()?;
-            selection_display_bounds(snapshot, &display, selection)
+            selection_display_bounds(snapshot, screen, &display, selection)
         });
         if let Some((start, end)) = bounds {
             let rows = self
@@ -5578,7 +5620,10 @@ impl App {
                 .pane
                 .snapshot
                 .as_ref()
-                .is_some_and(|snapshot| selection_is_retained(snapshot, selection))
+                .zip(self.panes.pane.selection_screen())
+                .is_some_and(|(snapshot, screen)| {
+                    selection_is_retained(snapshot, screen, selection)
+                })
         });
         let copy_mode_retained = self.modal.copy_mode.is_none_or(|state| {
             self.panes
@@ -5593,7 +5638,14 @@ impl App {
             self.panes.pane.selecting = false;
             self.panes.pane.history_selection_pin_blocked = false;
         }
+        let previous_text = self.panes.pane.selected_text.take();
         self.invalidate_viewport_local_state();
+        // A finished selection that survives new output still copies. Its
+        // rows keep their text, but read them again in case one changed in
+        // place; a row that left the cache keeps the earlier text.
+        if !self.panes.pane.selecting && self.panes.pane.selection.is_some() {
+            self.panes.pane.selected_text = self.current_selection_text().or(previous_text);
+        }
     }
 
     fn recompute_hovered_url(&mut self) {
@@ -8879,17 +8931,24 @@ impl App {
                         .newest_available_scrollback_row_id
                         .and_then(|id| id.checked_add(1))
                 });
-            if let Some(before_row_id) = before_row_id {
-                self.panes.pane.history_page_pending = true;
-                self.panes.pane.history_page_top =
-                    snapshot.scrollback_rows.first().and_then(|row| row.row_id);
-                self.send_command(WindowCommand::FetchScrollback {
-                    splint_id: snapshot.splint_id,
-                    incarnation: snapshot.incarnation,
-                    terminal_revision: snapshot.revision,
-                    history_generation: snapshot.history_generation,
-                    before_row_id,
-                });
+            let command = before_row_id.map(|before_row_id| WindowCommand::FetchScrollback {
+                splint_id: snapshot.splint_id,
+                incarnation: snapshot.incarnation,
+                terminal_revision: snapshot.revision,
+                history_generation: snapshot.history_generation,
+                before_row_id,
+            });
+            let top = snapshot.scrollback_rows.first().and_then(|row| row.row_id);
+            if let (Some(command), Some(commands)) = (command, self.panes.pane.commands.as_ref()) {
+                // Retried with the next update while the match is unrevealed.
+                match try_advisory_command(commands, command) {
+                    Ok(true) => {
+                        self.panes.pane.history_page_pending = true;
+                        self.panes.pane.history_page_top = top;
+                    }
+                    Ok(false) => {}
+                    Err(error) => self.scheduling.fail(error),
+                }
             }
         }
     }
@@ -8899,21 +8958,35 @@ impl App {
             return;
         };
         let query = self.panes.pane.search.query.clone();
-        // Without a controller nothing is sent, so nothing is in flight.
-        if query.is_empty() || self.panes.pane.commands.is_none() {
+        let Some(commands) = self.panes.pane.commands.as_ref() else {
+            return;
+        };
+        if query.is_empty() {
             return;
         }
+        let continuing = cursor.is_some();
+        let sent = try_advisory_command(
+            commands,
+            WindowCommand::Search {
+                terminal_revision: snapshot.revision,
+                history_generation: snapshot.history_generation,
+                query: query.clone(),
+                case_sensitive: false,
+                cursor,
+            },
+        );
         let search = &mut self.panes.pane.search;
-        search.in_flight = search.in_flight.saturating_add(1);
-        search.submitted_query.clone_from(&query);
-        search.searching = cursor.is_some() && search.matches.is_empty();
-        self.send_command(WindowCommand::Search {
-            terminal_revision: snapshot.revision,
-            history_generation: snapshot.history_generation,
-            query,
-            case_sensitive: false,
-            cursor,
-        });
+        match sent {
+            // Counted only when sent: nothing else answers it.
+            Ok(true) => {
+                search.in_flight = search.in_flight.saturating_add(1);
+                search.submitted_query = query;
+                search.searching = continuing && search.matches.is_empty();
+            }
+            // Busy: Enter or Ctrl+N asks again.
+            Ok(false) => search.searching = false,
+            Err(error) => self.scheduling.fail(error),
+        }
     }
 
     #[allow(
@@ -10612,6 +10685,7 @@ impl App {
                     authoritative,
                 } => {
                     self.panes.pane.history_page_pending = false;
+                    self.panes.pane.resync_pending &= !authoritative;
                     snapshot
                         .validate()
                         .map_err(|error| anyhow::anyhow!(error.message))?;
@@ -11703,8 +11777,9 @@ impl App {
         let height_i32 = i32::try_from(height).context("buffer height fits i32")?;
         let resolved_selection = self.panes.pane.selection.and_then(|selection| {
             let snapshot = self.panes.pane.snapshot.as_ref()?;
+            let screen = self.panes.pane.selection_screen()?;
             let display = self.panes.display_snapshot_cow()?;
-            selection_display_bounds(snapshot, &display, selection)
+            selection_display_bounds(snapshot, screen, &display, selection)
                 .map(|(start, end)| ((start.row, start.column), (end.row, end.column)))
         });
         let inline_picker_open = self.modal.inline_picker_open();
@@ -17569,7 +17644,10 @@ mod tests {
                 column: 0,
             },
         };
-        assert_eq!(selection_text(&view, selection).as_deref(), Some("A界\nBC"));
+        assert_eq!(
+            selection_text(&view, &view.visible_rows, selection).as_deref(),
+            Some("A界\nBC")
+        );
         let stale = Selection {
             anchor: SelectionEndpoint {
                 history_generation: 2,
@@ -17577,7 +17655,7 @@ mod tests {
             },
             ..selection
         };
-        assert_eq!(selection_text(&view, stale), None);
+        assert_eq!(selection_text(&view, &view.visible_rows, stale), None);
     }
 
     #[test]
@@ -17602,19 +17680,74 @@ mod tests {
                 column: 0,
             },
         };
-        assert!(selection_is_retained(&state, selection));
+        assert!(selection_is_retained(
+            &state,
+            &state.visible_rows,
+            selection
+        ));
 
         let moved = state.visible_rows.remove(0);
         state.scrollback_rows.push(moved);
         state.rows = 1;
-        assert!(selection_is_retained(&state, selection));
+        assert!(selection_is_retained(
+            &state,
+            &state.visible_rows,
+            selection
+        ));
         state.history_generation = 2;
-        assert!(!selection_is_retained(&state, selection));
+        assert!(!selection_is_retained(
+            &state,
+            &state.visible_rows,
+            selection
+        ));
         state.history_generation = 1;
         state.scrollback_rows.clear();
-        assert!(!selection_is_retained(&state, selection));
+        assert!(!selection_is_retained(
+            &state,
+            &state.visible_rows,
+            selection
+        ));
         state.active_screen = ActiveScreen::Alternate;
-        assert!(!selection_is_retained(&state, selection));
+        assert!(!selection_is_retained(
+            &state,
+            &state.visible_rows,
+            selection
+        ));
+    }
+
+    #[test]
+    fn a_selection_on_a_held_screen_copies_its_rows() {
+        let row = |row_id, text: &str| {
+            let mut row = blank_row(2);
+            row.row_id = Some(row_id);
+            for (cell, character) in row.cells.iter_mut().zip(text.chars()) {
+                cell.content = character.to_string();
+            }
+            row
+        };
+        let mut state = snapshot(SplintId::new(), 1, 1);
+        state.columns = 2;
+        state.rows = 2;
+        state.scrollback_rows = vec![row(1, "h1")];
+        // The live screen moved on; the held one still shows rows 5 and 6.
+        state.visible_rows = vec![row(20, "n1"), row(21, "n2")];
+        let held = vec![row(5, "s1"), row(6, "s2")];
+        let endpoint = |row_id, column| SelectionEndpoint {
+            active_screen: ActiveScreen::Normal,
+            history_generation: 1,
+            row_id,
+            column,
+        };
+        let selection = Selection {
+            anchor: endpoint(1, 0),
+            end: endpoint(6, 1),
+        };
+        assert_eq!(
+            selection_text(&state, &held, selection).as_deref(),
+            Some("h1\ns1\ns2")
+        );
+        assert!(selection_is_retained(&state, &held, selection));
+        assert_eq!(selection_text(&state, &state.visible_rows, selection), None);
     }
 
     #[test]
@@ -17646,14 +17779,15 @@ mod tests {
                 column: 0,
             },
         };
-        let copied = selection_text(&state, selection).expect("loaded endpoints resolve");
+        let copied = selection_text(&state, &state.visible_rows, selection)
+            .expect("loaded endpoints resolve");
         assert_eq!(copied.lines().count(), 48);
 
         let mut display = state.clone();
         display.scrollback_rows.clear();
         display.visible_rows = rows[19..27].to_vec();
         assert_eq!(
-            selection_display_bounds(&state, &display, selection),
+            selection_display_bounds(&state, &state.visible_rows, &display, selection),
             Some((
                 CellPosition { row: 0, column: 0 },
                 CellPosition { row: 7, column: 0 },
@@ -18099,10 +18233,28 @@ mod tests {
     fn return_to_live_queues_one_authoritative_resynchronization() {
         let (commands, mut receiver) = tokio::sync::mpsc::channel(1);
 
-        assert!(!request_return_live_resync(Some(&commands), 0, 0).unwrap());
-        assert!(!request_return_live_resync(Some(&commands), 4, 2).unwrap());
-        assert!(request_return_live_resync(Some(&commands), 2, 0).unwrap());
+        let mut pending = false;
+        assert!(!request_return_live_resync(Some(&commands), &mut pending, 0, 0).unwrap());
+        assert!(!request_return_live_resync(Some(&commands), &mut pending, 4, 2).unwrap());
+        assert!(request_return_live_resync(Some(&commands), &mut pending, 2, 0).unwrap());
+        assert!(pending);
+        // One on its way: another return to live does not queue a second.
+        assert!(!request_return_live_resync(Some(&commands), &mut pending, 2, 0).unwrap());
         assert_eq!(receiver.try_recv().unwrap(), WindowCommand::Resynchronize);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_full_command_queue_drops_advisory_commands_without_failing() {
+        let (commands, mut receiver) = tokio::sync::mpsc::channel(1);
+        commands.try_send(WindowCommand::ReleaseControl).unwrap();
+        let mut pending = false;
+        assert!(!request_return_live_resync(Some(&commands), &mut pending, 2, 0).unwrap());
+        assert!(!pending, "a dropped request is asked for again");
+        assert!(!try_advisory_command(&commands, WindowCommand::Resynchronize).unwrap());
+        assert_eq!(receiver.try_recv().unwrap(), WindowCommand::ReleaseControl);
+        drop(receiver);
+        assert!(try_advisory_command(&commands, WindowCommand::Resynchronize).is_err());
     }
 
     #[test]

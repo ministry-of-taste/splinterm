@@ -48,6 +48,12 @@ impl ScrollbackViewport {
         self.held_screen.is_some()
     }
 
+    /// The screen a holding viewport shows in place of the live one.
+    #[must_use]
+    pub fn held_screen(&self) -> Option<&[TerminalRow]> {
+        self.held_screen.as_deref()
+    }
+
     /// Holds the history cache and `screen`, the screen this viewport was
     /// composed with, until the viewport returns to live. A live viewport
     /// never holds.
