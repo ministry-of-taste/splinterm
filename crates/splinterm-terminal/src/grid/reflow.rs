@@ -259,11 +259,11 @@ impl Grid {
         for (index, row) in builder.rows.into_iter().enumerate() {
             dimensions.rows[index] = Some(row);
         }
-        dimensions.offset = if output_rows >= new_screen_rows {
-            output_rows - new_screen_rows
-        } else {
-            new_row_capacity - (new_screen_rows - output_rows)
-        };
+        // As in Foot, the last reflowed row ends at the bottom of the screen
+        // when there is enough content; otherwise the screen starts at the
+        // first row, so a short screen keeps its text at the top and empty
+        // rows below it, and none of it moves into history.
+        dimensions.offset = output_rows.saturating_sub(new_screen_rows);
         for relative in 0..new_screen_rows {
             let index = dimensions.absolute_index(Grid::signed_row(relative));
             if dimensions.rows[index].is_none() {
@@ -312,15 +312,16 @@ impl Grid {
             .checked_add(1)
             .expect("history generation exhausted");
         dimensions.reidentify_allocated_rows_chronologically();
-        let leading_padding = new_screen_rows.saturating_sub(output_rows);
         let row_mappings = builder
             .row_mappings
             .into_iter()
             .filter_map(|(old_id, row)| {
                 let mapped = if row < output_rows {
                     Some(row)
-                } else if leading_padding > 0 {
-                    Some(dimensions.absolute_index(Grid::signed_row(leading_padding - 1)))
+                } else if output_rows < new_screen_rows {
+                    // A dropped trailing empty row maps to the first empty
+                    // row below the content.
+                    Some(dimensions.absolute_index(Grid::signed_row(output_rows)))
                 } else {
                     None
                 }?;
@@ -464,9 +465,9 @@ mod tests {
         assert!(grid.row(1).unwrap().has_linebreak());
 
         grid.resize_with_reflow(8, 6, 2, |_| 1);
-        assert_eq!(row_text(grid.row(0).unwrap()), "");
-        assert_eq!(row_text(grid.row(1).unwrap()), "abcdef");
-        assert!(grid.row(1).unwrap().has_linebreak());
+        assert_eq!(row_text(grid.row(0).unwrap()), "abcdef");
+        assert!(grid.row(0).unwrap().has_linebreak());
+        assert_eq!(row_text(grid.row(1).unwrap()), "");
     }
 
     #[test]
@@ -490,8 +491,8 @@ mod tests {
 
         grid.resize_with_reflow(4, 2, 2, |_| 1);
 
-        assert_eq!(row_text(grid.row(1).unwrap()), "ab");
-        assert!(!grid.row(1).unwrap().has_linebreak());
+        assert_eq!(row_text(grid.row(0).unwrap()), "ab");
+        assert!(!grid.row(0).unwrap().has_linebreak());
     }
 
     #[test]
@@ -506,22 +507,22 @@ mod tests {
 
         grid.resize_with_reflow(8, 3, 2, |_| 1);
 
-        let bottom = grid.row(1).unwrap();
-        assert_eq!(bottom[0].content(), CellContent::Scalar('a'));
-        assert_eq!(bottom[1].content(), CellContent::Empty);
-        assert_eq!(bottom[2].content(), CellContent::Scalar('b'));
-        assert!(bottom.has_linebreak());
+        let joined = grid.row(0).unwrap();
+        assert_eq!(joined[0].content(), CellContent::Scalar('a'));
+        assert_eq!(joined[1].content(), CellContent::Empty);
+        assert_eq!(joined[2].content(), CellContent::Scalar('b'));
+        assert!(joined.has_linebreak());
     }
 
     #[test]
-    fn trailing_empty_hard_rows_do_not_push_content_out_of_view() {
+    fn trailing_empty_hard_rows_leave_short_content_at_the_top() {
         let mut grid = Grid::with_screen_size(4, 2, 2);
         put_text(grid.row_mut(0).unwrap(), "ok", true);
 
         grid.resize_with_reflow(4, 2, 2, |_| 1);
 
-        assert_eq!(row_text(grid.row(0).unwrap()), "");
-        assert_eq!(row_text(grid.row(1).unwrap()), "ok");
+        assert_eq!(row_text(grid.row(0).unwrap()), "ok");
+        assert_eq!(row_text(grid.row(1).unwrap()), "");
     }
 
     #[test]

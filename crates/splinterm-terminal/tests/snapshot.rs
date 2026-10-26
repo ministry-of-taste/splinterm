@@ -423,3 +423,33 @@ fn reset_preserves_monotonic_revision_and_chunking_updates_match() {
     );
     assert!(whole.revision().value() > 1);
 }
+
+fn dump(terminal: &Terminal) -> (Vec<String>, Vec<String>, (i32, i32)) {
+    let snapshot = terminal.snapshot(SnapshotRequest {
+        max_scrollback_rows: 1000,
+    });
+    let trim = |row| row_text(row).trim_end().to_owned();
+    let screen = snapshot.visible_rows().map(trim).collect::<Vec<_>>();
+    let history = snapshot.scrollback_rows().map(trim).collect::<Vec<_>>();
+    let cursor = snapshot.cursor().cursor.position();
+    (screen, history, (cursor.row, cursor.column))
+}
+
+#[test]
+fn shrinking_a_short_screen_keeps_its_text_at_the_top_and_out_of_history() {
+    let mut terminal = terminal(40, 30);
+    for line in 0..50 {
+        terminal.advance(format!("old {line}\r\n").as_bytes());
+    }
+    // `clear`, then three lines and a program waiting for input below them.
+    terminal.advance(b"\x1b[H\x1b[2J\x1b[3JL1 top\r\nL2\r\nL3\r\n");
+    terminal.resize(40, 10);
+    let shrunk = dump(&terminal);
+    terminal.resize(40, 30);
+    let grown = dump(&terminal);
+    for (screen, history, cursor) in [&shrunk, &grown] {
+        assert_eq!(&screen[..4], ["L1 top", "L2", "L3", ""]);
+        assert!(history.is_empty(), "history {history:?}");
+        assert_eq!(*cursor, (3, 0));
+    }
+}
