@@ -8959,6 +8959,15 @@ impl App {
                 .and_then(|row| row.row_id)
                 .is_none_or(|top| item.row_id < top)
         {
+            // A selection pins its rows in the bounded history cache, which
+            // then refuses older pages and the walk would never arrive. The
+            // match replaces the selection once revealed, so drop it now.
+            if self.panes.pane.selection.is_some() {
+                self.clear_selection();
+            }
+            let Some(snapshot) = self.panes.pane.snapshot.as_ref() else {
+                return;
+            };
             // Walk back from the oldest loaded row with the view there,
             // detached: a live view drops history that lags new output, so
             // each new line would restart the walk and it would never arrive.
