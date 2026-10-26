@@ -1003,8 +1003,16 @@ pub(in crate::app) async fn drive_controller(
                     continue;
                 }
                 WindowCommand::Resynchronize => {
-                    if outputs.resyncs.send(()).await.is_err() {
-                        bail!("pane subscription stopped before resynchronization");
+                    // A resynchronization already waiting covers this one: it
+                    // starts after this request, so its snapshot is at least as
+                    // new. Waiting for room instead would stall this loop
+                    // behind a slow snapshot while the Window's commands pile
+                    // up, and a full Window queue ends the Window.
+                    match outputs.resyncs.try_send(()) {
+                        Ok(()) | Err(mpsc::error::TrySendError::Full(())) => {}
+                        Err(mpsc::error::TrySendError::Closed(())) => {
+                            bail!("pane subscription stopped before resynchronization");
+                        }
                     }
                     continue;
                 }

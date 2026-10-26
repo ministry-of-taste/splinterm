@@ -171,7 +171,9 @@ async fn run_case_in_window(
         }
         drop(sender);
         let (updates, mut update_receiver) = mpsc::channel(32);
-        let (resyncs, mut resync_receiver) = mpsc::channel(32);
+        // One slot, as in a Window: a second request while one waits is
+        // coalesced.
+        let (resyncs, mut resync_receiver) = mpsc::channel(1);
         let result = run_controller(
             connection,
             receiver,
@@ -202,6 +204,28 @@ async fn run_case_in_window(
     })
     .await
     .expect("controller protocol case must finish without hanging")
+}
+
+#[tokio::test]
+async fn resynchronizations_coalesce_while_one_waits() {
+    let id = SplintId::new();
+    let (result, _updates, resyncs) = run_case(
+        id,
+        true,
+        vec![
+            WindowCommand::Resynchronize,
+            WindowCommand::Resynchronize,
+            WindowCommand::Resynchronize,
+            WindowCommand::ReleaseControl,
+        ],
+        vec![(
+            Request::ReleaseControl { controller_id: 1 },
+            Ok(Response::Acknowledged),
+        )],
+    )
+    .await;
+    result.unwrap();
+    assert_eq!(resyncs, 1);
 }
 
 #[tokio::test]

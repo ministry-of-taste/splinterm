@@ -2652,6 +2652,29 @@ fn pages_join_history(
     same_history && (same_top || same_revision)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HistoryKey {
+    Navigate(HistoryNavigation),
+    /// Handled with nothing to do; the terminal never receives it.
+    Consume,
+    Forward,
+}
+
+/// What a history shortcut does. Return to live while already live on the
+/// normal screen is consumed, so a shell never receives Shift+End and inserts
+/// a stray character; a full-screen application still receives it.
+fn history_key(action: Option<ActionId>, live: bool, screen: Option<ActiveScreen>) -> HistoryKey {
+    match action {
+        Some(ActionId::PageUp) => HistoryKey::Navigate(HistoryNavigation::PageUp),
+        Some(ActionId::PageDown) => HistoryKey::Navigate(HistoryNavigation::PageDown),
+        Some(ActionId::ReturnToLive) if !live => {
+            HistoryKey::Navigate(HistoryNavigation::ReturnToLive)
+        }
+        Some(ActionId::ReturnToLive) if screen == Some(ActiveScreen::Normal) => HistoryKey::Consume,
+        _ => HistoryKey::Forward,
+    }
+}
+
 fn try_window_command(commands: &Sender<WindowCommand>, command: WindowCommand) -> Result<()> {
     commands.try_send(command).map_err(|error| match error {
         TrySendError::Full(_) => anyhow::anyhow!("Wayland command queue overflow"),
@@ -5100,17 +5123,25 @@ impl App {
         event: &KeyEvent,
         queue_handle: &QueueHandle<Self>,
     ) -> Result<bool> {
-        let navigation = match shortcut_action_for(&self.input.keymap, event, self.input.modifiers)
-        {
-            Some(ActionId::PageUp) => HistoryNavigation::PageUp,
-            Some(ActionId::PageDown) => HistoryNavigation::PageDown,
-            Some(ActionId::ReturnToLive) if !self.panes.pane.scrollback_viewport.is_live() => {
-                HistoryNavigation::ReturnToLive
+        let action = shortcut_action_for(&self.input.keymap, event, self.input.modifiers);
+        let screen = self
+            .panes
+            .pane
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.active_screen);
+        match history_key(
+            action,
+            self.panes.pane.scrollback_viewport.is_live(),
+            screen,
+        ) {
+            HistoryKey::Navigate(navigation) => {
+                self.apply_history_navigation(navigation, queue_handle)?;
+                Ok(true)
             }
-            _ => return Ok(false),
-        };
-        self.apply_history_navigation(navigation, queue_handle)?;
-        Ok(true)
+            HistoryKey::Consume => Ok(true),
+            HistoryKey::Forward => Ok(false),
+        }
     }
 
     fn send_input(&mut self, bytes: Vec<u8>) -> Result<()> {
@@ -17912,6 +17943,32 @@ mod tests {
             },
         );
         assert_eq!(pending.map(|update| update.generation), Some(13));
+    }
+
+    #[test]
+    fn return_to_live_at_live_is_consumed_only_on_the_normal_screen() {
+        let normal = Some(ActiveScreen::Normal);
+        assert_eq!(
+            history_key(Some(ActionId::ReturnToLive), false, normal),
+            HistoryKey::Navigate(HistoryNavigation::ReturnToLive)
+        );
+        assert_eq!(
+            history_key(Some(ActionId::ReturnToLive), true, normal),
+            HistoryKey::Consume
+        );
+        assert_eq!(
+            history_key(
+                Some(ActionId::ReturnToLive),
+                true,
+                Some(ActiveScreen::Alternate)
+            ),
+            HistoryKey::Forward
+        );
+        assert_eq!(
+            history_key(Some(ActionId::PageUp), true, normal),
+            HistoryKey::Navigate(HistoryNavigation::PageUp)
+        );
+        assert_eq!(history_key(None, true, normal), HistoryKey::Forward);
     }
 
     #[test]
