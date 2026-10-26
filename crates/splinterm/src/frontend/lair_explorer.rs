@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use splinterm_core::{LairRetention, SplintId};
 
 use super::{
-    agent_access::{AccessMarks, AccessReach, mark_text},
+    agent_access::{AccessMarks, AccessReach, mark_text, waiting_text},
     agent_status::{self, AgentAggregate, AgentGlyphs, AgentSpinner},
     text_edit::BoundedTextEditor,
     topology::LairExplorerActivationTarget,
@@ -111,9 +111,16 @@ pub(crate) struct LairExplorerRow {
     pub(crate) retention: Option<LairRetention>,
     /// The agent access mark, drawn as an icon.
     pub(crate) access: Option<LairExplorerAccess>,
+    /// The footer's short status line for the selected row: only what the
+    /// row does not already show, most urgent first, e.g. "1 needs input ·
+    /// 2 working · saved". It leaves out the name, a running row's lifecycle,
+    /// a disposable Lair's retention, and a current Dojo's attachment, and is
+    /// empty when nothing else is worth saying.
     pub(crate) status: String,
-    /// The status in words for assistive technology. Icons are visual only, so
-    /// this matches `status`, which already counts states in words.
+    /// The full status in words for assistive technology and automation, e.g.
+    /// "Running · Saved · 1 needs input, 2 working". Icons are visual only, so
+    /// this spells out every state, including the ordinary ones `status`
+    /// leaves out.
     pub(crate) accessible_status: String,
     pub(crate) level: usize,
     pub(crate) expanded: Option<bool>,
@@ -456,6 +463,27 @@ impl LairExplorerUi {
             }
             Some(_) => format!(" · {}", agent_status::UNAVAILABLE_TEXT),
         }
+    }
+
+    /// A parent row's agent counts for the footer's short status line.
+    fn aggregate_brief(&self, aggregate: &AgentAggregate) -> Option<String> {
+        if !self.agent_status_enabled || aggregate.is_empty() {
+            None
+        } else if self.agent_status_available() {
+            Some(aggregate.counts_brief())
+        } else {
+            Some(lower_first(agent_status::UNAVAILABLE_TEXT))
+        }
+    }
+
+    /// A Splint row's agent status for the footer's short status line.
+    fn splint_brief(&self, status: Option<&NavigationAgentStatus>) -> Option<String> {
+        let status = status.filter(|_| self.agent_status_enabled)?;
+        Some(if self.agent_status_available() {
+            agent_status::splint_brief(status)
+        } else {
+            lower_first(agent_status::UNAVAILABLE_TEXT)
+        })
     }
 
     fn agent_column_visible(&self) -> bool {
@@ -865,7 +893,7 @@ impl LairExplorerUi {
                     .filter_map(|splint| splint.agent_status.as_ref()),
             );
             let (whole, part, waiting) = self.lair_reach(lair);
-            let status = with_access_mark(
+            let accessible_status = with_access_mark(
                 mark_text(whole, part, waiting),
                 format!(
                     "{} · {}{}",
@@ -874,6 +902,13 @@ impl LairExplorerUi {
                     self.aggregate_suffix(&aggregate)
                 ),
             );
+            let status = brief_status([
+                waiting_text(waiting).map(|text| lower_first(&text)),
+                self.aggregate_brief(&aggregate),
+                lifecycle_brief(lair.lifecycle()),
+                retention_brief(lair.retention),
+                mark_text(whole, part, 0).map(|text| lower_first(&text)),
+            ]);
             rows.push(LairExplorerRow {
                 id: lair.id,
                 kind: LairExplorerRowKind::Lair,
@@ -887,7 +922,7 @@ impl LairExplorerUi {
                     .any(|splint| is_live(splint.lifecycle)),
                 retention: lair.retention.is_protected().then_some(lair.retention),
                 access: LairExplorerAccess::of(whole, part, waiting),
-                accessible_status: status.clone(),
+                accessible_status,
                 status,
                 level: 1,
                 expanded: Some(lair_expanded),
@@ -938,7 +973,7 @@ impl LairExplorerUi {
         );
         let base = format!("{} · {attachment}", lifecycle_label(dojo.lifecycle()));
         let (whole, part) = self.dojo_reach(dojo);
-        let status = with_access_mark(
+        let accessible_status = with_access_mark(
             mark_text(whole, part, 0),
             row_status(
                 pending,
@@ -946,6 +981,18 @@ impl LairExplorerUi {
                 blocker,
             ),
         );
+        // The current-row dot already marks the current Dojo, and most Dojos
+        // in the list are not open here; only a background tab is worth words.
+        let attachment_brief = (dojo.attachment == WindowAttachment::Here && !dojo.active_here)
+            .then(|| "open here".to_owned());
+        let status = brief_status([
+            pending.then(|| "pending".to_owned()),
+            self.aggregate_brief(&aggregate),
+            lifecycle_brief(dojo.lifecycle()),
+            attachment_brief,
+            blocker.map(lower_first),
+            mark_text(whole, part, 0).map(|text| lower_first(&text)),
+        ]);
         rows.push(LairExplorerRow {
             id: dojo.id,
             kind: LairExplorerRowKind::Dojo,
@@ -955,7 +1002,7 @@ impl LairExplorerUi {
             live: dojo.splints.iter().any(|splint| is_live(splint.lifecycle)),
             retention: None,
             access: LairExplorerAccess::of(whole, part, 0),
-            accessible_status: status.clone(),
+            accessible_status,
             status,
             level: 2,
             expanded: Some(dojo_expanded),
@@ -973,39 +1020,50 @@ impl LairExplorerUi {
             if searching && !lair_matches && !dojo_matches && !self.splint_matches(splint, query) {
                 continue;
             }
-            let (enabled, blocker) = availability(splint.target.capability.availability);
-            let state = format!(
-                "{}{}",
-                lifecycle_label(splint.lifecycle),
-                self.splint_suffix(splint.agent_status.as_ref())
-            );
-            let pending = self
-                .pending
-                .is_some_and(|pending| pending.id() == splint.id);
-            let reach = self.splint_reach(splint);
-            let status = with_access_mark(
-                mark_text(reach, AccessReach::None, 0),
-                row_status(pending, &state, blocker),
-            );
-            rows.push(LairExplorerRow {
-                id: splint.id,
-                kind: LairExplorerRowKind::Splint,
-                label: splint.label.clone(),
-                agent_column: self.splint_column(splint),
-                agent_working: self.agent_column_visible()
-                    && self.agent_status_available()
-                    && agent_status::shows_working(splint.agent_status.as_ref()),
-                live: is_live(splint.lifecycle),
-                retention: None,
-                access: LairExplorerAccess::of(reach, AccessReach::None, 0),
-                accessible_status: status.clone(),
-                status,
-                level: 3,
-                expanded: None,
-                current: splint.focused_here,
-                enabled: enabled && !pending,
-                pending,
-            });
+            rows.push(self.splint_row(splint));
+        }
+    }
+
+    fn splint_row(&self, splint: &NavigationExplorerSplint) -> LairExplorerRow {
+        let (enabled, blocker) = availability(splint.target.capability.availability);
+        let state = format!(
+            "{}{}",
+            lifecycle_label(splint.lifecycle),
+            self.splint_suffix(splint.agent_status.as_ref())
+        );
+        let pending = self
+            .pending
+            .is_some_and(|pending| pending.id() == splint.id);
+        let reach = self.splint_reach(splint);
+        let accessible_status = with_access_mark(
+            mark_text(reach, AccessReach::None, 0),
+            row_status(pending, &state, blocker),
+        );
+        let status = brief_status([
+            pending.then(|| "pending".to_owned()),
+            self.splint_brief(splint.agent_status.as_ref()),
+            lifecycle_brief(splint.lifecycle),
+            blocker.map(lower_first),
+            mark_text(reach, AccessReach::None, 0).map(|text| lower_first(&text)),
+        ]);
+        LairExplorerRow {
+            id: splint.id,
+            kind: LairExplorerRowKind::Splint,
+            label: splint.label.clone(),
+            agent_column: self.splint_column(splint),
+            agent_working: self.agent_column_visible()
+                && self.agent_status_available()
+                && agent_status::shows_working(splint.agent_status.as_ref()),
+            live: is_live(splint.lifecycle),
+            retention: None,
+            access: LairExplorerAccess::of(reach, AccessReach::None, 0),
+            accessible_status,
+            status,
+            level: 3,
+            expanded: None,
+            current: splint.focused_here,
+            enabled: enabled && !pending,
+            pending,
         }
     }
 
@@ -1288,6 +1346,50 @@ fn retention_label(retention: LairRetention) -> &'static str {
         LairRetention::Saved => "Saved",
         LairRetention::Pinned => "Pinned",
     }
+}
+
+/// The lifecycle on the footer's short status line: nothing for a running
+/// row, the ordinary case the live dot already shows.
+fn lifecycle_brief(lifecycle: NavigationLifecycle) -> Option<String> {
+    let text = match lifecycle {
+        NavigationLifecycle::Running => return None,
+        NavigationLifecycle::Starting => "starting",
+        NavigationLifecycle::Mixed => "mixed state",
+        NavigationLifecycle::Exited => "stopped",
+        NavigationLifecycle::Restorable => "restorable",
+        NavigationLifecycle::Unavailable => "unavailable",
+    };
+    Some(text.to_owned())
+}
+
+/// The retention on the footer's short status line: nothing for a
+/// disposable Lair, the default every new Lair starts with.
+fn retention_brief(retention: LairRetention) -> Option<String> {
+    let text = match retention {
+        LairRetention::Disposable => return None,
+        LairRetention::Saved => "saved",
+        LairRetention::Pinned => "pinned",
+    };
+    Some(text.to_owned())
+}
+
+/// The footer's short status line: the parts there are, in the order given,
+/// joined by ` · `; empty when there are none.
+fn brief_status(parts: impl IntoIterator<Item = Option<String>>) -> String {
+    parts
+        .into_iter()
+        .flatten()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+/// Splinterm's own sentence-case words in the footer's lowercase style.
+fn lower_first(text: &str) -> String {
+    let mut characters = text.chars();
+    characters.next().map_or_else(String::new, |first| {
+        first.to_lowercase().chain(characters).collect()
+    })
 }
 
 fn normalized_query(query: &str) -> Vec<String> {
@@ -1880,7 +1982,8 @@ pub(super) mod tests {
         let pending = rows.iter().find(|row| row.id == selected).unwrap();
         assert!(pending.pending);
         assert!(!pending.enabled);
-        assert_eq!(pending.status, "Pending · Running");
+        assert_eq!(pending.accessible_status, "Pending · Running");
+        assert_eq!(pending.status, "pending");
         assert_eq!(rows.iter().filter(|row| row.pending).count(), 1);
         assert_eq!(explorer.decision(), None);
         let LairExplorerDecision::FocusSplint(target) = decision else {
@@ -2047,8 +2150,8 @@ pub(super) mod tests {
             .into_iter()
             .find(|row| row.kind == LairExplorerRowKind::Splint)
             .unwrap();
-        assert!(splint.status.contains("Restorable"));
-        assert!(splint.status.contains("Refreshing topology"));
+        assert!(splint.accessible_status.contains("Restorable"));
+        assert!(splint.accessible_status.contains("Refreshing topology"));
         assert!(!splint.enabled);
     }
 
@@ -2088,11 +2191,17 @@ pub(super) mod tests {
         explorer.reveal_current();
         let rows = explorer.rows();
         assert_eq!(
-            rows.iter().find(|row| row.id == lair).unwrap().status,
+            rows.iter()
+                .find(|row| row.id == lair)
+                .unwrap()
+                .accessible_status,
             "Running · Saved"
         );
         assert_eq!(
-            rows.iter().find(|row| row.id == dojo).unwrap().status,
+            rows.iter()
+                .find(|row| row.id == dojo)
+                .unwrap()
+                .accessible_status,
             "Running · Current"
         );
         view.lairs[0].dojos[0].active_here = false;
@@ -2101,11 +2210,17 @@ pub(super) mod tests {
         explorer.set_view(view);
         let rows = explorer.rows();
         assert_eq!(
-            rows.iter().find(|row| row.id == lair).unwrap().status,
+            rows.iter()
+                .find(|row| row.id == lair)
+                .unwrap()
+                .accessible_status,
             "Stopped · Restorable · Saved"
         );
         assert_eq!(
-            rows.iter().find(|row| row.id == dojo).unwrap().status,
+            rows.iter()
+                .find(|row| row.id == dojo)
+                .unwrap()
+                .accessible_status,
             "Stopped · Restorable · Not open here"
         );
     }
@@ -2242,19 +2357,37 @@ pub(super) mod tests {
                 Some("    ".to_owned())
             ]
         );
-        // Parent rows count states in words, visually and for accessibility.
-        assert_eq!(rows[0].status, "Running · Saved · 1 needs input, 1 working");
-        assert_eq!(rows[0].accessible_status, rows[0].status);
+        // Parent rows count states in words for accessibility, every state
+        // spelled out.
         assert_eq!(
-            rows[1].status,
+            rows[0].accessible_status,
+            "Running · Saved · 1 needs input, 1 working"
+        );
+        assert_eq!(
+            rows[1].accessible_status,
             "Running · Current · 1 needs input, 1 working"
         );
         assert_eq!(
-            rows[3].status,
+            rows[3].accessible_status,
             "Running · Needs input · waiting for approval"
         );
-        assert_eq!(rows[3].accessible_status, rows[3].status);
-        assert_eq!(rows[4].status, "Unavailable · Pinned");
+        assert_eq!(rows[4].accessible_status, "Unavailable · Pinned");
+        // The footer's short line leads with the agents, needs input first,
+        // and drops what is ordinary: running, the current Dojo.
+        let statuses = rows
+            .iter()
+            .map(|row| row.status.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            statuses,
+            [
+                "1 needs input · 1 working · saved",
+                "1 needs input · 1 working",
+                "working · waiting for approval",
+                "needs input · waiting for approval",
+                "unavailable · pinned",
+            ]
+        );
 
         // Without the icon face the column falls back to ASCII text.
         assert!(explorer.set_agent_glyphs(AgentGlyphs::Ascii));
@@ -2262,6 +2395,83 @@ pub(super) mod tests {
         assert_eq!(column(&rows[2]).as_deref(), Some("⠋ "));
         assert!(rows[2].agent_column.as_ref().unwrap().icons().is_empty());
         assert_eq!(column(&rows[4]).as_deref(), Some("  "));
+    }
+
+    /// The footer's short line never repeats the row's name and leaves out
+    /// what is ordinary: a running lifecycle, a disposable Lair, the current
+    /// Dojo. The accessible text still spells all of it out.
+    #[test]
+    fn footer_status_says_only_what_the_row_does_not_show() {
+        use splinterm_protocol::AgentState;
+        let mut live = agent_view([
+            Some(agent(AgentState::Done, false)),
+            Some(agent(AgentState::Working, false)),
+        ]);
+        live.lairs[0].retention = LairRetention::Disposable;
+        live.lairs[0].label = "Lair 7".into();
+        let mut explorer = LairExplorerUi::default();
+        explorer.set_view(live);
+        let rows = expanded_rows(&mut explorer);
+        assert_eq!(
+            rows[0].accessible_status,
+            "Running · Disposable · 1 working, 1 done"
+        );
+        // Working outranks done, and states no Splint is in are left out.
+        assert_eq!(rows[0].status, "1 working · 1 done");
+        assert_eq!(rows[1].status, "1 working · 1 done");
+        assert!(
+            rows.iter()
+                .all(|row| !row.status.contains(row.label.as_str())),
+            "{rows:?}"
+        );
+        // Without agents a live disposable Lair and its current Dojo and
+        // running Splint have nothing more to say.
+        let mut plain = view();
+        plain.lairs[0].retention = LairRetention::Disposable;
+        explorer.set_view(plain);
+        let rows = expanded_rows(&mut explorer);
+        assert_eq!(
+            rows.iter()
+                .take(3)
+                .map(|row| row.status.as_str())
+                .collect::<Vec<_>>(),
+            ["", "", ""]
+        );
+        assert_eq!(rows[0].accessible_status, "Running · Disposable");
+        assert_eq!(rows[1].accessible_status, "Running · Current");
+        assert_eq!(rows[2].accessible_status, "Running");
+
+        // A stopped, restorable, or starting saved Lair keeps both words.
+        explorer.set_filter(LairExplorerFilter::All);
+        for (lifecycle, words) in [
+            (NavigationLifecycle::Exited, "stopped · saved"),
+            (NavigationLifecycle::Restorable, "restorable · saved"),
+            (NavigationLifecycle::Starting, "starting · saved"),
+        ] {
+            let mut stopped = view();
+            stopped.lairs[0].dojos[0].splints[0].lifecycle = lifecycle;
+            explorer.set_view(stopped);
+            let rows = explorer.rows();
+            let work = rows.iter().find(|row| row.label == "work").unwrap();
+            assert_eq!(work.status, words);
+            assert!(work.accessible_status.contains("Saved"));
+        }
+
+        // A Dojo open here in a background tab says so; most Dojos in the
+        // list are not open here and say nothing about it.
+        let mut background = view();
+        background.lairs[0].dojos[0].active_here = false;
+        let notes = background.lairs[1].id;
+        explorer.set_view(background);
+        expanded_rows(&mut explorer);
+        assert!(explorer.select(notes) && explorer.toggle_selected());
+        let rows = explorer.rows();
+        let editor = rows.iter().find(|row| row.label == "editor").unwrap();
+        assert_eq!(editor.status, "open here");
+        assert_eq!(editor.accessible_status, "Running · Open here");
+        let draft = rows.iter().find(|row| row.label == "draft").unwrap();
+        assert!(!draft.status.contains("open here"), "{}", draft.status);
+        assert!(draft.accessible_status.contains("Not open here"));
     }
 
     #[test]
@@ -2272,13 +2482,23 @@ pub(super) mod tests {
         let rows = expanded_rows(&mut explorer);
         assert_eq!(column(&rows[2]).as_deref(), Some("⠋ [clock]"));
         assert_eq!(
-            rows[2].status,
+            rows[2].accessible_status,
             "Running · Working · stale (no report for 2 min) · waiting for approval"
         );
         assert_eq!(column(&rows[3]).as_deref(), Some("    "));
-        assert_eq!(rows[3].status, "Running");
-        assert_eq!(rows[1].status, "Running · Current · 1 working (stale)");
-        assert_eq!(rows[1].accessible_status, rows[1].status);
+        assert_eq!(rows[3].accessible_status, "Running");
+        assert_eq!(
+            rows[1].accessible_status,
+            "Running · Current · 1 working (stale)"
+        );
+        // The short line keeps the stale marker and its age.
+        assert_eq!(
+            rows[2].status,
+            "working · stale 2 min · waiting for approval"
+        );
+        assert_eq!(rows[1].status, "1 working (stale)");
+        // A plain running Splint has nothing more to say.
+        assert_eq!(rows[3].status, "");
     }
 
     #[test]
@@ -2290,26 +2510,41 @@ pub(super) mod tests {
         explorer.reveal_current();
         explorer.begin_refresh();
         assert_eq!(
-            explorer.rows()[2].status,
+            explorer.rows()[2].accessible_status,
             "Running · Error · waiting for approval · Refreshing topology"
+        );
+        assert_eq!(
+            explorer.rows()[2].status,
+            "error · waiting for approval · refreshing topology"
         );
         explorer.mark_disconnected();
         let rows = explorer.rows();
         assert_eq!(
-            rows[2].status,
+            rows[2].accessible_status,
             "Running · Agent status unavailable · Endpoint is disconnected"
+        );
+        assert_eq!(
+            rows[2].status,
+            "agent status unavailable · endpoint is disconnected"
         );
         assert_eq!(column(&rows[2]).as_deref(), Some("    "));
         assert_eq!(column(&rows[1]).as_deref(), Some("    "));
-        assert!(rows[1].status.contains("Agent status unavailable"));
-        assert!(rows.iter().all(|row| !row.status.contains("Error")));
+        assert!(
+            rows[1]
+                .accessible_status
+                .contains("Agent status unavailable")
+        );
+        assert!(
+            rows.iter()
+                .all(|row| !row.accessible_status.contains("Error"))
+        );
 
         let mut stale = base;
         stale.freshness = EndpointFreshness::Stale;
         explorer.set_view(stale);
         assert!(
             explorer.rows()[2]
-                .status
+                .accessible_status
                 .contains("Agent status unavailable")
         );
     }
@@ -2354,8 +2589,9 @@ pub(super) mod tests {
         assert!(!explorer.set_agent_status_enabled(false));
         let rows = expanded_rows(&mut explorer);
         assert!(rows.iter().all(|row| row.agent_column.is_none()));
-        assert_eq!(rows[2].status, "Running");
-        assert_eq!(rows[1].status, "Running · Current");
+        assert_eq!(rows[2].accessible_status, "Running");
+        assert_eq!(rows[1].accessible_status, "Running · Current");
+        assert!(rows[1..4].iter().all(|row| row.status.is_empty()));
         explorer.begin_search();
         explorer.set_search("done".into());
         assert!(explorer.rows().is_empty());
@@ -2402,7 +2638,11 @@ pub(super) mod tests {
         let mut explorer = LairExplorerUi::default();
         explorer.set_view(view);
         let before = expanded_rows(&mut explorer);
-        assert!(before.iter().all(|row| !row.status.contains("Agent")));
+        assert!(
+            before
+                .iter()
+                .all(|row| !row.accessible_status.contains("Agent"))
+        );
 
         // A Splint once grant, connected; a while-open grant for "notes",
         // not connected; and a request waiting about "notes".
@@ -2429,12 +2669,10 @@ pub(super) mod tests {
         assert!(explorer.set_access_marks(AccessMarks::from_snapshot(&snapshot)));
         assert!(!explorer.set_access_marks(AccessMarks::from_snapshot(&snapshot)));
         let rows = expanded_rows(&mut explorer);
-        let status = |label: &str| {
-            let row = rows.iter().find(|row| row.label == label).unwrap();
-            assert_eq!(row.status, row.accessible_status, "{label}");
-            row.status.clone()
-        };
-        let access = |label: &str| rows.iter().find(|row| row.label == label).unwrap().access;
+        let row = |label: &str| rows.iter().find(|row| row.label == label).unwrap();
+        let status = |label: &str| row(label).accessible_status.clone();
+        let brief = |label: &str| row(label).status.as_str();
+        let access = |label: &str| row(label).access;
         assert_eq!(access("work"), Some(LairExplorerAccess::Connected));
         assert_eq!(access("editor"), Some(LairExplorerAccess::Connected));
         assert_eq!(access("shell"), Some(LairExplorerAccess::Connected));
@@ -2450,6 +2688,15 @@ pub(super) mod tests {
             "{}",
             status("notes")
         );
+        // The short line keeps every mark in words: a waiting request first,
+        // reach last, after the row's other state.
+        assert_eq!(brief("work"), "saved · agent connected to part");
+        assert_eq!(brief("editor"), "agent connected to part");
+        assert_eq!(brief("shell"), "agent connected");
+        assert_eq!(
+            brief("notes"),
+            "agent asking for access · unavailable · pinned · agent can reach"
+        );
 
         // A remembered grant for the whole workspace marks it, not its rows.
         let mut remembered = entry(remembered_key(), AccessEntryKind::Remembered, work);
@@ -2457,9 +2704,13 @@ pub(super) mod tests {
         snapshot.entries = vec![remembered];
         assert!(explorer.set_access_marks(AccessMarks::from_snapshot(&snapshot)));
         let rows = expanded_rows(&mut explorer);
-        assert!(rows[0].status.starts_with("Agent can reach · "));
+        assert!(rows[0].accessible_status.starts_with("Agent can reach · "));
         assert_eq!(rows[0].access, Some(LairExplorerAccess::Reachable));
-        assert!(rows[1..].iter().all(|row| !row.status.contains("Agent")));
+        assert!(
+            rows[1..]
+                .iter()
+                .all(|row| !row.accessible_status.contains("Agent"))
+        );
         assert!(rows[1..].iter().all(|row| row.access.is_none()));
 
         // The marks end with the access.
@@ -2467,7 +2718,7 @@ pub(super) mod tests {
         assert!(
             expanded_rows(&mut explorer)
                 .iter()
-                .all(|row| !row.status.contains("Agent"))
+                .all(|row| !row.accessible_status.contains("Agent"))
         );
     }
 
@@ -2500,9 +2751,14 @@ pub(super) mod tests {
                 .all(|row| row.retention.is_none())
         );
         // The marks are visual only; the words say the same.
-        assert!(row("work").status.contains("Saved"));
-        assert!(row("notes").status.contains("Pinned"));
-        assert!(row("scratch").status.contains("Disposable"));
+        assert!(row("work").accessible_status.contains("Saved"));
+        assert!(row("notes").accessible_status.contains("Pinned"));
+        assert!(row("scratch").accessible_status.contains("Disposable"));
+        // The short line keeps only the retention that is not the default:
+        // every new Lair starts disposable.
+        assert!(row("work").status.contains("saved"));
+        assert!(row("notes").status.contains("pinned"));
+        assert!(!row("scratch").status.contains("disposable"));
         assert!(rows.iter().all(|row| row.access.is_none()));
         assert_eq!(
             LairExplorerAccess::of(AccessReach::Reachable, AccessReach::Connected, 0),
@@ -2554,8 +2810,11 @@ pub(super) mod tests {
             assert_eq!(column(&rows[index]).as_deref(), Some("⠙   "));
         }
         // The words never move: status and accessible text stay the same.
-        assert_eq!(rows[2].status, "Running · Working · waiting for approval");
-        assert_eq!(rows[2].accessible_status, rows[2].status);
+        assert_eq!(
+            rows[2].accessible_status,
+            "Running · Working · waiting for approval"
+        );
+        assert_eq!(rows[2].status, "working · waiting for approval");
 
         // A stale working status and one outranked by needs input rest.
         explorer.set_view(agent_view([

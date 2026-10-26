@@ -2,9 +2,10 @@
 //!
 //! One line per row: the current-row dot, the disclosure chevron, and the
 //! name on the left, and fixed, right-aligned icon columns for agent access,
-//! agent status, live state, and retention. The selected row's status is
-//! spelled out in words in the footer, which also carries the search field,
-//! navigation notices, and who owns keyboard input.
+//! agent status, live state, and retention. The footer gives the selected
+//! row one short status line, only what the row does not already show, then
+//! a line for the search field, navigation notices, and who owns keyboard
+//! input.
 
 use std::collections::HashSet;
 
@@ -42,10 +43,10 @@ const HEADER_SPACER: u32 = 4;
 const HEADER_TITLE_WIDTH: u32 = 84;
 /// One chrome text line: tall enough for the chrome line cap.
 const FOOTER_LINE_HEIGHT: u32 = 24;
-/// Two lines of the selected row's status words and one context line.
-const FOOTER_STATUS_LINES: usize = 2;
+/// One short status line for the selected row, then one context line.
+const FOOTER_STATUS_LINES: usize = 1;
 const FOOTER_PADDING: u32 = 4;
-const FOOTER_HEIGHT: u32 = FOOTER_LINE_HEIGHT * 3 + FOOTER_PADDING;
+const FOOTER_HEIGHT: u32 = FOOTER_LINE_HEIGHT * 2 + FOOTER_PADDING;
 const ROW_HEIGHT: u32 = 26;
 /// Logical pixels each tree level indents a row's name.
 const LEVEL_INDENT: u32 = 12;
@@ -113,92 +114,35 @@ fn explorer_context_text(
     }
 }
 
-/// The selected row's status in words: its name, then its status.
-fn explorer_status_words(row: &LairExplorerRow) -> String {
-    if row.status.is_empty() {
-        row.label.clone()
-    } else {
-        format!("{} · {}", row.label, row.status)
-    }
-}
-
 fn text_cells(text: &str) -> usize {
     text.chars()
         .map(|character| character.width().unwrap_or(0).min(2))
         .sum()
 }
 
-/// Lays `text` out in at most `lines` lines of at most `cells` cells,
-/// breaking only between words. A ` · ` separator never starts a line. Text
-/// that does not fit ends in `…` after the last whole word that fits; only a
-/// word wider than a whole line is cut, at a character boundary.
-fn wrap_status_words(text: &str, cells: usize, lines: usize) -> Vec<String> {
-    let mut wrapped = Vec::new();
-    if cells == 0 || lines == 0 {
-        return wrapped;
+/// Fits the selected row's short status into one line of `cells` cells; it
+/// never wraps. Text that does not fit ends in `…` after the last whole part
+/// between ` · ` separators that fits, or, when not even the first part
+/// fits, after its last whole word; only a first word wider than the line is
+/// cut, at a character boundary.
+fn fit_status_line(text: &str, cells: usize) -> String {
+    if text_cells(text) <= cells {
+        return text.to_owned();
     }
-    // Each word with the separator before it: " · " after a "·" token,
-    // otherwise one space. A line drops the separator of its first word.
-    let mut words = Vec::new();
-    let mut separated = false;
-    for word in text.split(' ').filter(|word| !word.is_empty()) {
-        if word == "·" {
-            separated = true;
-        } else {
-            words.push((if separated { " · " } else { " " }, word));
-            separated = false;
-        }
-    }
-    let joined = |line: &[(&str, &str)]| {
-        let mut text = String::new();
-        for (index, (separator, word)) in line.iter().enumerate() {
-            if index > 0 {
-                text.push_str(separator);
-            }
-            text.push_str(word);
-        }
-        text
+    // The longest prefix that ends before `boundary` and leaves a cell for
+    // the ellipsis. Prefix widths only grow, so the scan stops at the first
+    // one too wide.
+    let fitting = |boundary: &str| {
+        text.match_indices(boundary)
+            .map(|(end, _)| text[..end].trim_end())
+            .filter(|shown| !shown.is_empty())
+            .take_while(|shown| text_cells(shown) < cells)
+            .last()
     };
-    let mut line: Vec<(&str, &str)> = Vec::new();
-    for (separator, word) in words {
-        if !line.is_empty() {
-            let mut candidate = line.clone();
-            candidate.push((separator, word));
-            if text_cells(&joined(&candidate)) <= cells {
-                line = candidate;
-                continue;
-            }
-            if wrapped.len() + 1 == lines {
-                // The last line: end on a whole word and an ellipsis. A
-                // single word that fills the line stays whole instead.
-                while line.len() > 1 && text_cells(&joined(&line)) >= cells {
-                    line.pop();
-                }
-                let shown = joined(&line);
-                wrapped.push(if text_cells(&shown) < cells {
-                    format!("{shown}…")
-                } else {
-                    shown
-                });
-                return wrapped;
-            }
-            wrapped.push(joined(&line));
-            line.clear();
-        }
-        if text_cells(word) <= cells {
-            line.push((separator, word));
-            continue;
-        }
-        // A word wider than a whole line: the only cut inside a word.
-        wrapped.push(truncate_picker_text(word, cells));
-        if wrapped.len() == lines {
-            return wrapped;
-        }
-    }
-    if !line.is_empty() {
-        wrapped.push(joined(&line));
-    }
-    wrapped
+    fitting(" · ").or_else(|| fitting(" ")).map_or_else(
+        || truncate_picker_text(text, cells),
+        |shown| format!("{shown}…"),
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -646,7 +590,7 @@ fn buffer_rect(rect: Rect, scale_120: u32) -> Rect {
     }
 }
 
-/// The footer's text lines in buffer pixels: the status lines, then the
+/// The footer's text lines in buffer pixels: the status line, then the
 /// context line, below the footer's padding and its top rule.
 fn footer_lines(footer: Rect, scale_120: u32, inset: u32) -> Vec<Rect> {
     let line = FOOTER_LINE_HEIGHT.saturating_mul(scale_120).div_ceil(120);
@@ -1059,26 +1003,28 @@ pub(crate) fn paint_lair_explorer(
     } else {
         status_message
     };
-    if let Some(row) = selected.and_then(|id| rows.iter().find(|row| row.id == id)) {
-        let words = explorer_status_words(row);
-        let wrapped = wrap_status_words(&words, line_cells(&lines[0]), FOOTER_STATUS_LINES);
-        for (line, text) in lines.iter().zip(&wrapped) {
-            paint_picker_text(
-                cache,
-                context,
-                &mut used,
-                canvas,
-                canvas_width,
-                canvas_height,
-                text,
-                ChromeTextStyle::Regular,
-                scale_120,
-                renderer_generation,
-                *line,
-                PickerTextAlignment::Left,
-                palette.primary,
-            )?;
-        }
+    // The selected row is highlighted just above, so its line never repeats
+    // the name; a row with nothing more to say leaves the line blank.
+    if let Some(row) = selected
+        .and_then(|id| rows.iter().find(|row| row.id == id))
+        .filter(|row| !row.status.is_empty())
+    {
+        let status_line = lines[0];
+        paint_picker_text(
+            cache,
+            context,
+            &mut used,
+            canvas,
+            canvas_width,
+            canvas_height,
+            &fit_status_line(&row.status, line_cells(&status_line)),
+            ChromeTextStyle::Regular,
+            scale_120,
+            renderer_generation,
+            status_line,
+            PickerTextAlignment::Left,
+            palette.primary,
+        )?;
     }
     let context_line = lines[FOOTER_STATUS_LINES];
     paint_picker_text(
@@ -1117,8 +1063,8 @@ mod tests {
             live: false,
             retention: None,
             access: None,
-            status: "Saved".into(),
-            accessible_status: "Saved".into(),
+            status: "stopped · saved".into(),
+            accessible_status: "Stopped · Saved".into(),
             level: 1,
             expanded: Some(false),
             current: false,
@@ -1459,9 +1405,10 @@ mod tests {
             0,
         )
         .unwrap();
-        // One line per row: eleven rows fit where two-line rows fitted five.
-        assert_eq!(layout.visible_capacity, 11);
-        assert_eq!(layout.visible_start, 19);
+        // One line per row and a two-line footer: twelve rows fit where
+        // two-line rows over a three-line footer fitted five.
+        assert_eq!(layout.visible_capacity, 12);
+        assert_eq!(layout.visible_start, 18);
         let last = layout.rows.last().unwrap();
         assert_eq!(last.id, selected);
         assert!(last.rect.y + last.rect.height <= layout.footer.y);
@@ -1678,73 +1625,50 @@ mod tests {
     }
 
     #[test]
-    fn status_words_wrap_and_truncate_only_between_words() {
-        let words =
-            "splinterm · Agent connected to part · Running · Saved · 1 needs input, 2 working";
-        for cells in 1..=90 {
-            for lines in 1..=3 {
-                let wrapped = wrap_status_words(words, cells, lines);
-                assert!(wrapped.len() <= lines, "{cells}/{lines}: {wrapped:?}");
-                assert!(!wrapped.is_empty());
-                for line in &wrapped {
-                    assert!(text_cells(line) <= cells, "{cells}/{lines}: {line:?}");
-                    assert!(!line.starts_with('·') && !line.starts_with(' '), "{line:?}");
-                    assert!(!line.ends_with(" ·") && !line.ends_with(' '), "{line:?}");
-                    // Every word is whole unless one word is wider than
-                    // the whole line.
-                    for word in line.trim_end_matches('…').split(' ') {
-                        let whole = words.split(' ').any(|original| original == word);
-                        assert!(
-                            whole || text_cells(word) >= cells.saturating_sub(1),
-                            "{cells}/{lines}: cut {word:?} in {line:?}"
-                        );
-                    }
-                }
-                let shown = wrapped.join(" ");
-                if wrapped.len() == lines && !shown.trim_end_matches('…').ends_with("working") {
-                    assert!(
-                        wrapped.last().unwrap().ends_with('…')
-                            || text_cells(wrapped.last().unwrap()) == cells,
-                        "{cells}/{lines}: {wrapped:?}"
-                    );
-                }
+    fn status_line_never_wraps_and_ends_in_an_ellipsis_between_parts() {
+        let status = "agent asking for access · 1 needs input · 2 working · saved";
+        let first_word = text_cells("agent");
+        for cells in 0..=90 {
+            let fitted = fit_status_line(status, cells);
+            assert!(text_cells(&fitted) <= cells, "{cells}: {fitted:?}");
+            assert!(!fitted.contains('\n'), "{cells}: {fitted:?}");
+            if text_cells(status) <= cells {
+                assert_eq!(fitted, status);
+                continue;
+            }
+            if cells == 0 {
+                assert!(fitted.is_empty());
+                continue;
+            }
+            assert!(fitted.ends_with('…'), "{cells}: {fitted:?}");
+            let shown = fitted.trim_end_matches('…');
+            assert!(
+                !shown.ends_with(" ·") && !shown.ends_with(' '),
+                "{fitted:?}"
+            );
+            // Whole words, unless the first word alone is wider than the line.
+            if first_word < cells {
+                assert!(
+                    status.starts_with(shown) && status[shown.len()..].starts_with(' '),
+                    "{cells}: cut a word in {fitted:?}"
+                );
+            }
+            // Once the first part fits, the cut falls between parts.
+            if text_cells("agent asking for access") < cells {
+                assert!(status[shown.len()..].starts_with(" · "), "{fitted:?}");
             }
         }
+        // A narrow panel: the attention parts first, then the ellipsis.
         assert_eq!(
-            wrap_status_words(words, 40, 2),
-            [
-                "splinterm · Agent connected to part",
-                "Running · Saved · 1 needs input, 2…"
-            ]
+            fit_status_line("1 needs input · 2 working · 1 done · saved", 26),
+            "1 needs input · 2 working…"
         );
-        assert_eq!(
-            wrap_status_words("work · Running · Saved", 40, 2),
-            ["work · Running · Saved"]
-        );
-        assert_eq!(
-            wrap_status_words("work · Running · Saved", 15, 2),
-            ["work · Running", "Saved"]
-        );
-        assert_eq!(
-            wrap_status_words("work · Running · Saved", 15, 1),
-            ["work · Running…"]
-        );
-        assert!(wrap_status_words(words, 0, 2).is_empty());
-        assert!(wrap_status_words(words, 20, 0).is_empty());
-    }
-
-    #[test]
-    fn footer_words_name_the_selected_row_and_its_full_status() {
-        let mut entry = row(NavigationNodeId::Lair(LairId::new()));
-        entry.label = "splinterm".into();
-        entry.status = "Agent connected · Running · Saved · 1 working".into();
-        entry.accessible_status = entry.status.clone();
-        assert_eq!(
-            explorer_status_words(&entry),
-            "splinterm · Agent connected · Running · Saved · 1 working"
-        );
-        // The words come from the same status as the accessible text.
-        assert!(explorer_status_words(&entry).ends_with(&entry.accessible_status));
+        assert_eq!(fit_status_line(status, 30), "agent asking for access…");
+        assert_eq!(fit_status_line(status, 16), "agent asking…");
+        assert_eq!(fit_status_line(status, 4), "age…");
+        // Wide characters count two cells.
+        assert_eq!(fit_status_line("作業中 · saved", 8), "作業中…");
+        assert_eq!(fit_status_line("2 working", 9), "2 working");
     }
 
     #[test]
@@ -2346,75 +2270,85 @@ mod tests {
         }
     }
 
-    /// The selected row's status is spelled out in the footer, and with no
-    /// row selected the footer's status lines stay empty.
+    /// The selected row's short status fills the footer's one status line,
+    /// and a row with nothing more to say leaves that line blank rather than
+    /// repeating its name, as does having no row selected.
     #[test]
-    fn footer_paints_the_selected_rows_words_inside_its_status_lines() {
+    fn footer_paints_the_selected_rows_short_status_on_one_line() {
         use super::super::picker::session_picker_palette;
         use crate::config::ResolvedTheme;
 
         let context = RenderContext::new(u16::MAX);
         let id = NavigationNodeId::Lair(LairId::new());
         let mut entry = row(id);
-        entry.status = "Agent connected · Running · Saved · 1 needs input, 2 working".into();
-        let rows = [entry];
+        entry.status = "1 needs input · 2 working · saved · agent connected".into();
+        let mut plain = entry.clone();
+        plain.status = String::new();
         let surface = Rect {
             x: 0,
             y: 0,
             width: 1000,
             height: HEADER_HEIGHT + HEADER_SPACER + FOOTER_HEIGHT + ROW_HEIGHT,
         };
-        let layout = lair_explorer_layout(surface, 640, &rows, None, 0).unwrap();
         let palette = session_picker_palette(ResolvedTheme::default());
-        for scale in [120, 240] {
-            let canvas_width = surface.width * scale / 120 + 1;
-            let canvas_height = surface.height * scale / 120 + 1;
-            let draw = |selected| {
-                let mut canvas = vec![0; (canvas_width * canvas_height * 4) as usize];
-                paint(
-                    &context,
-                    &mut canvas,
-                    canvas_width,
-                    canvas_height,
-                    scale,
-                    &layout,
-                    palette,
-                    &rows,
-                    selected,
-                    true,
-                    LairExplorerFilter::All,
-                );
-                canvas
-            };
-            let unselected = draw(None);
-            let selected = draw(Some(id));
-            let inset = LEVEL_INDENT.saturating_mul(scale).div_ceil(120);
-            let lines = footer_lines(buffer_rect(layout.footer, scale), scale, inset);
-            let row_rect = buffer_rect(layout.rows[0].rect, scale);
-            let mut in_lines = [0_usize; FOOTER_STATUS_LINES];
-            for (index, (a, b)) in selected
-                .chunks_exact(4)
-                .zip(unselected.chunks_exact(4))
-                .enumerate()
-            {
-                if a == b {
-                    continue;
-                }
-                let x = u32::try_from(index).unwrap() % canvas_width;
-                let y = u32::try_from(index).unwrap() / canvas_width;
-                if (row_rect.y..row_rect.y + row_rect.height).contains(&y) {
-                    continue;
-                }
-                let line = lines[..FOOTER_STATUS_LINES]
-                    .iter()
-                    .position(|line| {
+        for (rows, says_something) in [([entry], true), ([plain], false)] {
+            let layout = lair_explorer_layout(surface, 640, &rows, None, 0).unwrap();
+            for scale in [120, 240] {
+                let canvas_width = surface.width * scale / 120 + 1;
+                let canvas_height = surface.height * scale / 120 + 1;
+                let draw = |selected| {
+                    let mut canvas = vec![0; (canvas_width * canvas_height * 4) as usize];
+                    paint(
+                        &context,
+                        &mut canvas,
+                        canvas_width,
+                        canvas_height,
+                        scale,
+                        &layout,
+                        palette,
+                        &rows,
+                        selected,
+                        true,
+                        LairExplorerFilter::All,
+                    );
+                    canvas
+                };
+                let unselected = draw(None);
+                let selected = draw(Some(id));
+                let inset = LEVEL_INDENT.saturating_mul(scale).div_ceil(120);
+                let lines = footer_lines(buffer_rect(layout.footer, scale), scale, inset);
+                // One status line, then the context line.
+                assert_eq!(lines.len(), 2);
+                let row_rect = buffer_rect(layout.rows[0].rect, scale);
+                let mut on_status_line = 0_usize;
+                for (index, (a, b)) in selected
+                    .chunks_exact(4)
+                    .zip(unselected.chunks_exact(4))
+                    .enumerate()
+                {
+                    if a == b {
+                        continue;
+                    }
+                    let x = u32::try_from(index).unwrap() % canvas_width;
+                    let y = u32::try_from(index).unwrap() / canvas_width;
+                    if (row_rect.y..row_rect.y + row_rect.height).contains(&y) {
+                        continue;
+                    }
+                    let line = lines[0];
+                    assert!(
                         (line.y..line.y + line.height).contains(&y)
-                            && (line.x..line.x + line.width).contains(&x)
-                    })
-                    .unwrap_or_else(|| panic!("footer words outside their lines at {x},{y}"));
-                in_lines[line] += 1;
+                            && (line.x..line.x + line.width).contains(&x),
+                        "footer status outside its line at {x},{y}"
+                    );
+                    on_status_line += 1;
+                }
+                assert_eq!(
+                    on_status_line > 0,
+                    says_something,
+                    "scale {scale}: {:?}",
+                    rows[0].status
+                );
             }
-            assert!(in_lines[0] > 0, "scale {scale}");
         }
     }
 
