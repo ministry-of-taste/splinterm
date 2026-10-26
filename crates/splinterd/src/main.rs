@@ -86,7 +86,8 @@ use splinterm_protocol::{
 use splinterm_pty::{LinuxPtyBackend, PtyCommand, PtySize, default_shell};
 use splinterm_terminal::{
     ActiveScreen, ColorSource as TerminalColorSource, DEFAULT_KITTY_UPLOAD_BYTES_PER_DAEMON,
-    ScrollDirection, SharedImageBudget, SharedKittyUploadBudget, TerminalDamage, TerminalUpdate,
+    ScrollDirection, SearchFrom, SharedImageBudget, SharedKittyUploadBudget, TerminalDamage,
+    TerminalUpdate,
 };
 use tokio::{
     fs,
@@ -6908,6 +6909,7 @@ async fn search_response(
         search.title,
     )
     .await?;
+    let next_cursor = encode_search_cursor(&search.page);
     let page = WireSearchPage {
         splint_id,
         incarnation,
@@ -6924,7 +6926,7 @@ async fn search_response(
                 preview: item.preview,
             })
             .collect(),
-        next_cursor: search.page.next_offset.map(encode_search_cursor),
+        next_cursor,
         timed_out: search.page.timed_out,
     };
     page.validate()?;
@@ -10795,7 +10797,13 @@ async fn handle_authorized_request(
             }
             let search = current_handle(state, splint_id, incarnation)
                 .await?
-                .search(query, case_sensitive, 0, max_results, SEARCH_DEADLINE)
+                .search(
+                    query,
+                    case_sensitive,
+                    SearchFrom::Offset(0),
+                    max_results,
+                    SEARCH_DEADLINE,
+                )
                 .await
                 .map_err(|_| internal())?;
             search_response(state, splint_id, incarnation, search).await?
@@ -10817,7 +10825,7 @@ async fn handle_authorized_request(
             {
                 return Err(invalid("search request exceeds protocol bounds"));
             }
-            let skip_rows = decode_search_cursor(cursor.as_deref())?;
+            let from = decode_search_cursor(cursor.as_deref())?;
             if !authorization.policy_authorized() {
                 let _ = authorize_scope(
                     state,
@@ -10832,17 +10840,16 @@ async fn handle_authorized_request(
             }
             let search = current_handle(state, splint_id, incarnation)
                 .await?
-                .search(
-                    query,
-                    case_sensitive,
-                    skip_rows,
-                    max_results,
-                    SEARCH_DEADLINE,
-                )
+                .search(query, case_sensitive, from, max_results, SEARCH_DEADLINE)
                 .await
                 .map_err(|_| internal())?;
-            if search.terminal_revision.value() != terminal_revision
-                || search.history_generation != history_generation
+            // History rows keep their ids within a history generation, so new
+            // output does not stale a page of history matches with a row
+            // cursor. A screen row's match or an offset holds only at the
+            // exact revision.
+            if search.history_generation != history_generation
+                || (search.page.revision_bound
+                    && search.terminal_revision.value() != terminal_revision)
             {
                 return Ok(Handled {
                     response: search_resync_response(state, splint_id, incarnation, search).await?,
@@ -15304,16 +15311,30 @@ fn invalid(message: &str) -> ProtocolError {
     ProtocolError::new(ErrorCode::InvalidArgument, message)
 }
 
-fn decode_search_cursor(cursor: Option<&str>) -> Result<usize, ProtocolError> {
-    let Some(cursor) = cursor else { return Ok(0) };
+/// A search cursor is `r` and a hex row id to continue before, or, from a
+/// daemon before row cursors, a hex count of the newest rows to skip.
+fn decode_search_cursor(cursor: Option<&str>) -> Result<SearchFrom, ProtocolError> {
+    let Some(cursor) = cursor else {
+        return Ok(SearchFrom::Offset(0));
+    };
     if cursor.is_empty() || cursor.len() > MAX_SEARCH_CURSOR_BYTES {
         return Err(invalid("search cursor exceeds limit"));
     }
-    usize::from_str_radix(cursor, 16).map_err(|_| invalid("search cursor is invalid"))
+    let invalid_cursor = |_| invalid("search cursor is invalid");
+    match cursor.strip_prefix('r') {
+        Some(row_id) => u64::from_str_radix(row_id, 16)
+            .map(SearchFrom::BeforeRow)
+            .map_err(invalid_cursor),
+        None => usize::from_str_radix(cursor, 16)
+            .map(SearchFrom::Offset)
+            .map_err(invalid_cursor),
+    }
 }
 
-fn encode_search_cursor(offset: usize) -> String {
-    format!("{offset:016x}")
+fn encode_search_cursor(page: &splinterm_terminal::SearchPage) -> Option<String> {
+    page.next_before_row_id
+        .map(|row_id| format!("r{row_id:016x}"))
+        .or_else(|| page.next_offset.map(|offset| format!("{offset:016x}")))
 }
 fn internal() -> ProtocolError {
     ProtocolError::new(ErrorCode::Internal, "operation failed")

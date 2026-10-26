@@ -93,7 +93,7 @@ use splinterm_core::{
     Axis, DojoId, LairId, LairRetention, LayoutNode, Splint, SplintId, SplitRatio, TopologyRevision,
 };
 use splinterm_protocol::{
-    ActiveScreen, ControlTransferDecision, MouseTracking, SearchMatch, TerminalCell,
+    ActiveScreen, ControlTransferDecision, MouseTracking, SearchMatch, SearchPage, TerminalCell,
     TerminalInputModes, TerminalRow, TerminalSnapshot,
     perf_trace::{
         PerfTraceEvent, emit_perf_trace, emit_perf_trace_at, monotonic_raw_ns, perf_trace_enabled,
@@ -1407,6 +1407,55 @@ struct SearchUiState {
     selected: usize,
     next_cursor: Option<String>,
     pending_reveal: Option<SearchMatch>,
+    /// Searches sent and not yet answered, and the query of the latest.
+    in_flight: usize,
+    submitted_query: String,
+    /// Older history is still being searched for the latest query.
+    searching: bool,
+}
+
+impl SearchUiState {
+    /// Takes one search page. A page that ran out of time before finding
+    /// anything returns the cursor to read the next one with, while the
+    /// page answers the latest search and the query is unchanged. Daemon
+    /// search reads about 10 ms of rows per request, so without this a match
+    /// further back looks missing.
+    fn take_page(&mut self, page: SearchPage) -> Option<String> {
+        self.in_flight = self.in_flight.saturating_sub(1);
+        let latest = self.in_flight == 0;
+        let keep_going = latest
+            && page.matches.is_empty()
+            && page.timed_out
+            && self.input.is_some()
+            && self.submitted_query == self.query;
+        self.matches = page.matches;
+        self.selected = 0;
+        self.next_cursor = page.next_cursor;
+        self.pending_reveal = self.matches.first().cloned();
+        self.searching = keep_going && self.next_cursor.is_some();
+        if self.searching {
+            self.next_cursor.clone()
+        } else {
+            None
+        }
+    }
+
+    /// Closes the search field. Searches already sent are still counted, so
+    /// their late pages never pass for a newer search's.
+    fn close(&mut self) {
+        *self = Self {
+            in_flight: self.in_flight,
+            ..Self::default()
+        };
+    }
+
+    fn resync_required(&mut self) {
+        self.in_flight = self.in_flight.saturating_sub(1);
+        self.matches.clear();
+        self.next_cursor = None;
+        self.pending_reveal = None;
+        self.searching = false;
+    }
 }
 
 fn new_search_editor() -> BoundedTextEditor {
@@ -2028,16 +2077,13 @@ impl PaneView {
                 Ok(BackgroundUpdateImpact::VISUAL)
             }
             WindowUpdate::SearchResults(page) => {
-                self.search.matches = page.matches;
-                self.search.selected = 0;
-                self.search.next_cursor = page.next_cursor;
-                self.search.pending_reveal = self.search.matches.first().cloned();
+                // Ctrl+N continues once the pane has focus again.
+                let _ = self.search.take_page(page);
+                self.search.searching = false;
                 Ok(BackgroundUpdateImpact::VISUAL)
             }
             WindowUpdate::SearchResyncRequired => {
-                self.search.matches.clear();
-                self.search.next_cursor = None;
-                self.search.pending_reveal = None;
+                self.search.resync_required();
                 Ok(BackgroundUpdateImpact::VISUAL)
             }
             WindowUpdate::ScrollbackResyncRequired => {
@@ -8815,7 +8861,15 @@ impl App {
             self.panes.pane.search.pending_reveal = None;
             self.panes.pane.viewport_dirty = true;
             self.presentation.full_redraw = true;
-        } else if !self.panes.pane.history_page_pending {
+        } else if !self.panes.pane.history_page_pending
+            // A match newer than the cache was found after this Window's
+            // latest update; it arrives with the next ones, which retry this.
+            && snapshot
+                .scrollback_rows
+                .first()
+                .and_then(|row| row.row_id)
+                .is_none_or(|top| item.row_id < top)
+        {
             let before_row_id = snapshot
                 .scrollback_rows
                 .first()
@@ -8845,9 +8899,14 @@ impl App {
             return;
         };
         let query = self.panes.pane.search.query.clone();
-        if query.is_empty() {
+        // Without a controller nothing is sent, so nothing is in flight.
+        if query.is_empty() || self.panes.pane.commands.is_none() {
             return;
         }
+        let search = &mut self.panes.pane.search;
+        search.in_flight = search.in_flight.saturating_add(1);
+        search.submitted_query.clone_from(&query);
+        search.searching = cursor.is_some() && search.matches.is_empty();
         self.send_command(WindowCommand::Search {
             terminal_revision: snapshot.revision,
             history_generation: snapshot.history_generation,
@@ -9329,7 +9388,7 @@ impl App {
             match event.keysym {
                 Keysym::Escape => {
                     self.input.input_generation = self.input.input_generation.saturating_add(1);
-                    self.panes.pane.search = SearchUiState::default();
+                    self.panes.pane.search.close();
                     self.panes.pane.selection = None;
                 }
                 Keysym::Return | Keysym::KP_Enter => {
@@ -10894,20 +10953,16 @@ impl App {
                     title_changed = true;
                 }
                 WindowUpdate::SearchResults(page) => {
-                    self.panes.pane.search.matches = page.matches;
-                    self.panes.pane.search.selected = 0;
-                    self.panes.pane.search.next_cursor = page.next_cursor;
-                    self.panes.pane.search.pending_reveal =
-                        self.panes.pane.search.matches.first().cloned();
+                    if let Some(cursor) = self.panes.pane.search.take_page(page) {
+                        self.submit_search(Some(cursor));
+                    }
                     title_changed = true;
                     visual_changed = true;
                     focused_visual_changed = true;
                     self.presentation.full_redraw = true;
                 }
                 WindowUpdate::SearchResyncRequired => {
-                    self.panes.pane.search.matches.clear();
-                    self.panes.pane.search.next_cursor = None;
-                    self.panes.pane.search.pending_reveal = None;
+                    self.panes.pane.search.resync_required();
                     title_changed = true;
                     visual_changed = true;
                     focused_visual_changed = true;
@@ -12171,6 +12226,7 @@ impl App {
                     &self.panes.pane.search.query,
                     self.panes.pane.search.matches.len(),
                     self.panes.pane.search.selected,
+                    self.panes.pane.search.searching,
                 )?;
             }
             self.surface.buffers[buffer_index].stale.mark_full();
@@ -17943,6 +17999,74 @@ mod tests {
             },
         );
         assert_eq!(pending.map(|update| update.generation), Some(13));
+    }
+
+    fn search_page(matches: usize, timed_out: bool, cursor: Option<&str>) -> SearchPage {
+        SearchPage {
+            splint_id: SplintId::new(),
+            incarnation: 1,
+            terminal_revision: 1,
+            history_generation: 1,
+            matches: (0..matches)
+                .map(|index| SearchMatch {
+                    row_id: u64::try_from(index).unwrap(),
+                    start_column: 0,
+                    end_column: 1,
+                    preview: "x".to_owned(),
+                })
+                .collect(),
+            next_cursor: cursor.map(str::to_owned),
+            timed_out,
+        }
+    }
+
+    #[test]
+    fn a_timed_out_empty_search_page_continues_only_for_the_latest_query() {
+        let open = |query: &str, in_flight: usize| SearchUiState {
+            input: Some(new_search_editor()),
+            query: query.to_owned(),
+            submitted_query: "needle".to_owned(),
+            in_flight,
+            ..SearchUiState::default()
+        };
+
+        let mut search = open("needle", 1);
+        assert_eq!(
+            search.take_page(search_page(0, true, Some("c1"))),
+            Some("c1".to_owned())
+        );
+        assert!(search.searching);
+
+        // A match, the end of history, or an untimed empty page stops it.
+        for page in [
+            search_page(1, true, Some("c2")),
+            search_page(0, true, None),
+            search_page(0, false, Some("c2")),
+        ] {
+            let mut search = open("needle", 1);
+            assert_eq!(search.take_page(page), None);
+            assert!(!search.searching);
+        }
+
+        // An older page while a newer search is in flight, an edited query,
+        // or a closed search field never continues.
+        assert_eq!(
+            open("needle", 2).take_page(search_page(0, true, Some("c"))),
+            None
+        );
+        assert_eq!(
+            open("other", 1).take_page(search_page(0, true, Some("c"))),
+            None
+        );
+        let mut closed = open("needle", 1);
+        closed.input = None;
+        assert_eq!(closed.take_page(search_page(0, true, Some("c"))), None);
+
+        let mut resynced = open("needle", 1);
+        resynced.searching = true;
+        resynced.resync_required();
+        assert!(!resynced.searching);
+        assert_eq!(resynced.in_flight, 0);
     }
 
     #[test]

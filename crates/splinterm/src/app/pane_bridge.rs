@@ -1200,7 +1200,8 @@ pub(in crate::app) async fn drive_controller(
                                 .updates
                                 .send(WindowUpdate::SearchResyncRequired)
                                 .await;
-                            let _ = outputs.resyncs.send(()).await;
+                            // As for Resynchronize: one already waiting covers it.
+                            let _ = outputs.resyncs.try_send(());
                         }
                         _ => bail!("splinterd did not return search results"),
                     }

@@ -1209,6 +1209,7 @@ pub(crate) fn paint_search_overlay(
     searched_query: &str,
     matches: usize,
     selected: usize,
+    searching: bool,
 ) -> Result<bool> {
     let Some(panel) = search_overlay_panel(terminal, scale_120) else {
         return Ok(false);
@@ -1285,7 +1286,9 @@ pub(crate) fn paint_search_overlay(
         palette.primary,
     )?;
     if !single_line {
-        let status = if input == searched_query {
+        let status = if input == searched_query && searching && matches == 0 {
+            "Searching older history… · Esc close".to_owned()
+        } else if input == searched_query {
             format!(
                 "{}/{} matches · Ctrl+N/P next/prev · Esc close",
                 selected.saturating_add(1).min(matches),
@@ -1846,6 +1849,7 @@ mod tests {
                     query,
                     3,
                     0,
+                    false,
                 )
                 .unwrap()
             );
@@ -1925,6 +1929,7 @@ mod tests {
                 "needle",
                 0,
                 0,
+                false,
             )
             .unwrap()
         );
@@ -1952,6 +1957,7 @@ mod tests {
                 "",
                 0,
                 0,
+                false,
             )
             .unwrap()
         );

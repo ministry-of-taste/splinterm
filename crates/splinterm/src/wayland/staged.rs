@@ -50,9 +50,9 @@ use wayland_client::protocol::{wl_keyboard, wl_pointer, wl_seat};
 use wayland_protocols::wp::text_input::zv3::client::zwp_text_input_v3::ZwpTextInputV3;
 
 use super::{
-    App, ExitClass, PendingTerminalInput, PlatformState, SCALE_DENOMINATOR, SearchUiState,
-    SurfaceState, WaylandSession, WindowOptions, assemble_app, bind_text_input_manager,
-    diagnostics, initial_window_title, note_window_diagnostics, prepare_window, window_app_id,
+    App, ExitClass, PendingTerminalInput, PlatformState, SCALE_DENOMINATOR, SurfaceState,
+    WaylandSession, WindowOptions, assemble_app, bind_text_input_manager, diagnostics,
+    initial_window_title, note_window_diagnostics, prepare_window, window_app_id,
 };
 
 /// How one phase of a staged Window ended.
@@ -338,7 +338,7 @@ impl App {
         self.panes.pane.selection = None;
         self.panes.pane.selected_text = None;
         self.panes.pane.selecting = false;
-        self.panes.pane.search = SearchUiState::default();
+        self.panes.pane.search.close();
     }
 
     fn into_kept(mut self) -> KeptWindow {

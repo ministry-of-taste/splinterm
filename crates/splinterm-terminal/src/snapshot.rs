@@ -48,8 +48,32 @@ pub struct SearchPage {
     pub terminal_revision: TerminalRevision,
     pub matches: Vec<SearchMatch>,
     pub has_older: bool,
+    /// Rows to skip from the newest to continue; it moves when rows append.
     pub next_offset: Option<usize>,
+    /// Continue with the history rows older than this one. History row ids
+    /// are stable within a history generation, so this stays right while
+    /// output appends.
+    pub next_before_row_id: Option<u64>,
+    /// The page holds a screen row's match or continues by offset. Both
+    /// are right only at `terminal_revision`: a screen row takes a new id
+    /// when it scrolls into history, and an offset moves when rows append.
+    pub revision_bound: bool,
     pub timed_out: bool,
+}
+
+/// Where a search page starts, newest-first.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SearchFrom {
+    /// After skipping this many of the newest rows.
+    Offset(usize),
+    /// At the newest history row older than this history row id.
+    BeforeRow(u64),
+}
+
+impl From<usize> for SearchFrom {
+    fn from(offset: usize) -> Self {
+        Self::Offset(offset)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

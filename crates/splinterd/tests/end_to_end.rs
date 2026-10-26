@@ -4618,7 +4618,7 @@ async fn termination_waiting_on_a_resistant_process_does_not_block_topology_chan
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn bounded_scrollback_search_pages_and_invalidates_stale_cursors() {
+async fn bounded_scrollback_search_pages_and_cursors_outlive_new_output() {
     time::timeout(TEST_TIMEOUT, async {
         let daemon = Daemon::start().await;
         let mut client = daemon.connect().await;
@@ -4648,22 +4648,26 @@ async fn bounded_scrollback_search_pages_and_invalidates_stale_cursors() {
             .input(
                 splint_id,
                 incarnation,
-                "printf 'Needle one\\nnoise\\nneedle two 界\\n'\n".as_bytes(),
+                // The matches scroll into history, where a row cursor
+                // outlives new output.
+                "printf 'Needle one\\nnoise\\nneedle two 界\\n'; seq 1 80; echo scrolled-$((1+1))\n"
+                    .as_bytes(),
             )
             .await;
-        snapshot_until(&mut client, splint_id, incarnation, "needle two").await;
+        snapshot_until(&mut client, splint_id, incarnation, "scrolled-2").await;
         time::sleep(Duration::from_millis(50)).await;
         let (_, snapshot) = client.attach(splint_id, incarnation).await;
-        let search = |cursor| Request::SearchScrollback {
+        let search_in = |history_generation, cursor| Request::SearchScrollback {
             splint_id,
             incarnation,
             terminal_revision: snapshot.revision,
-            history_generation: snapshot.history_generation,
+            history_generation,
             query: "NEEDLE".into(),
             case_sensitive: false,
             cursor,
             max_results: 1,
         };
+        let search = |cursor| search_in(snapshot.history_generation, cursor);
         let Response::SearchResults { page: first, .. } = client.request(search(None)).await else {
             panic!("daemon did not return first search page");
         };
@@ -4678,12 +4682,27 @@ async fn bounded_scrollback_search_pages_and_invalidates_stale_cursors() {
         assert_eq!(second.matches.len(), 1);
         assert_ne!(first.matches[0].row_id, second.matches[0].row_id);
 
+        // New output keeps the cursor: it names a row, not an offset.
         client
             .input(splint_id, incarnation, b"printf 'revision-change\\n'\n")
             .await;
         snapshot_until(&mut client, splint_id, incarnation, "revision-change").await;
+        let Response::SearchResults {
+            page: after_output, ..
+        } = client.request(search(first.next_cursor.clone())).await
+        else {
+            panic!("new output staled a row cursor");
+        };
+        assert_eq!(after_output.matches, second.matches);
+
+        // Another history generation does stale it.
         assert!(matches!(
-            client.request(search(first.next_cursor)).await,
+            client
+                .request(search_in(
+                    snapshot.history_generation + 1,
+                    first.next_cursor
+                ))
+                .await,
             Response::SearchResyncRequired { .. }
         ));
         daemon.shutdown();

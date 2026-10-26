@@ -737,10 +737,15 @@ impl Terminal {
         &self,
         query: &str,
         case_sensitive: bool,
-        skip_rows: usize,
+        from: impl Into<crate::SearchFrom>,
         maximum_results: usize,
         deadline: Duration,
     ) -> SearchPage {
+        let from = from.into();
+        let (skip_rows, before_row_id) = match from {
+            crate::SearchFrom::Offset(skip_rows) => (skip_rows, None),
+            crate::SearchFrom::BeforeRow(row_id) => (0, Some(row_id)),
+        };
         let needle = if case_sensitive {
             query.to_owned()
         } else {
@@ -751,75 +756,54 @@ impl Terminal {
         let mut scanned_rows = 0_usize;
         let mut timed_out = false;
         let mut has_older = false;
-        let mut rows = self.normal.rows_reverse().skip(skip_rows).peekable();
-        while let Some((row_id, row)) = rows.next() {
-            scanned_rows = scanned_rows.saturating_add(1);
-            if started.elapsed() >= deadline {
+        let mut row_search = RowSearch::new(needle, case_sensitive);
+        let mut next_before_row_id = None;
+        let mut revision_bound = skip_rows > 0;
+        let mut rows = self
+            .normal
+            .rows_reverse_placed()
+            .skip(skip_rows)
+            .skip_while(|(row_id, _, in_history)| {
+                before_row_id.is_some_and(|before| !in_history || *row_id >= before)
+            })
+            .peekable();
+        while let Some((row_id, row, in_history)) = rows.next() {
+            // Every page reads at least one row, so a continuation always
+            // moves on, and the row the deadline stops at is read next time.
+            if scanned_rows > 0 && started.elapsed() >= deadline {
                 timed_out = true;
                 has_older = true;
+                next_before_row_id = row_id.checked_add(1).filter(|_| in_history);
                 break;
             }
-            let cells = row.cells();
-            let mut original = String::new();
-            let mut searchable = String::new();
-            let mut byte_columns = Vec::<(usize, usize)>::new();
-            for (column, cell) in cells.iter().enumerate() {
-                let content = match cell.content() {
-                    CellContent::Empty => " ".to_owned(),
-                    CellContent::Scalar(character) => character.to_string(),
-                    CellContent::Composed(key) => self
-                        .composed
-                        .chars(key)
-                        .map_or_else(String::new, |chars| chars.iter().collect()),
-                    CellContent::Spacer(_) => continue,
-                };
-                let end_column = cells
-                    .get(column + 1)
-                    .and_then(|next| match next.content() {
-                        CellContent::Spacer(remaining) => usize::try_from(remaining)
-                            .ok()
-                            .map(|remaining| column + remaining + 1),
-                        _ => None,
-                    })
-                    .unwrap_or(column + 1);
-                original.push_str(&content);
-                let normalized = if case_sensitive {
-                    content
-                } else {
-                    content.to_lowercase()
-                };
-                byte_columns.extend(std::iter::repeat_n((column, end_column), normalized.len()));
-                searchable.push_str(&normalized);
-            }
-            if let Some(start) = searchable.find(&needle) {
-                let end = start + needle.len();
-                if let (Some((start_column, _)), Some((_, end_column))) = (
-                    byte_columns.get(start).copied(),
-                    byte_columns.get(end.saturating_sub(1)).copied(),
-                ) {
-                    let mut preview = original.trim_end().to_owned();
-                    while preview.len() > 256 {
-                        preview.pop();
-                    }
-                    matches.push(SearchMatch {
-                        row_id,
-                        start_column,
-                        end_column,
-                        preview,
-                    });
-                }
+            scanned_rows = scanned_rows.saturating_add(1);
+            if let Some((start_column, end_column, preview)) =
+                row_search.find(row.cells(), &self.composed)
+            {
+                revision_bound |= !in_history;
+                matches.push(SearchMatch {
+                    row_id,
+                    start_column,
+                    end_column,
+                    preview,
+                });
             }
             if matches.len() == maximum_results {
                 has_older = rows.peek().is_some();
+                next_before_row_id = Some(row_id).filter(|_| in_history);
                 break;
             }
         }
+        let next_before_row_id = next_before_row_id.filter(|_| has_older);
+        revision_bound |= has_older && next_before_row_id.is_none();
         SearchPage {
             history_generation: self.normal.history_generation(),
             terminal_revision: self.revision,
             matches,
             has_older,
             next_offset: has_older.then_some(skip_rows.saturating_add(scanned_rows)),
+            next_before_row_id,
+            revision_bound,
             timed_out,
         }
     }
@@ -3179,6 +3163,95 @@ impl Terminal {
     }
 }
 
+/// One search query matched against rows, with buffers reused across them.
+struct RowSearch {
+    needle: String,
+    case_sensitive: bool,
+    /// A match can reach past a row's last written cell only through blanks
+    /// the query itself ends with, so a row is read that far past it. Search
+    /// time then follows the row's content, not its width.
+    trailing_blanks: usize,
+    original: String,
+    searchable: String,
+    byte_columns: Vec<(usize, usize)>,
+}
+
+impl RowSearch {
+    fn new(needle: String, case_sensitive: bool) -> Self {
+        let trailing_blanks = needle.chars().rev().take_while(|&c| c == ' ').count();
+        Self {
+            needle,
+            case_sensitive,
+            trailing_blanks,
+            original: String::new(),
+            searchable: String::new(),
+            byte_columns: Vec::new(),
+        }
+    }
+
+    /// The first match in `cells`: its start and end columns and the row's
+    /// text as a preview.
+    fn find(
+        &mut self,
+        cells: &[crate::Cell],
+        composed: &ComposedTable,
+    ) -> Option<(usize, usize, String)> {
+        let written = cells
+            .iter()
+            .rposition(|cell| !matches!(cell.content(), CellContent::Empty))
+            .map_or(0, |last| last + 1);
+        let cells = &cells[..written
+            .saturating_add(self.trailing_blanks)
+            .min(cells.len())];
+        self.original.clear();
+        self.searchable.clear();
+        self.byte_columns.clear();
+        for (column, cell) in cells.iter().enumerate() {
+            let end_column = cells
+                .get(column + 1)
+                .and_then(|next| match next.content() {
+                    CellContent::Spacer(remaining) => usize::try_from(remaining)
+                        .ok()
+                        .map(|remaining| column + remaining + 1),
+                    _ => None,
+                })
+                .unwrap_or(column + 1);
+            let mut push = |character: char| {
+                self.original.push(character);
+                let before = self.searchable.len();
+                if self.case_sensitive {
+                    self.searchable.push(character);
+                } else {
+                    self.searchable.extend(character.to_lowercase());
+                }
+                self.byte_columns.extend(std::iter::repeat_n(
+                    (column, end_column),
+                    self.searchable.len() - before,
+                ));
+            };
+            match cell.content() {
+                CellContent::Empty => push(' '),
+                CellContent::Scalar(character) => push(character),
+                CellContent::Composed(key) => {
+                    for &character in composed.chars(key).unwrap_or_default() {
+                        push(character);
+                    }
+                }
+                CellContent::Spacer(_) => {}
+            }
+        }
+        let start = self.searchable.find(&self.needle)?;
+        let end = start + self.needle.len();
+        let (start_column, _) = self.byte_columns.get(start).copied()?;
+        let (_, end_column) = self.byte_columns.get(end.saturating_sub(1)).copied()?;
+        let mut preview = self.original.trim_end().to_owned();
+        while preview.len() > 256 {
+            preview.pop();
+        }
+        Some((start_column, end_column, preview))
+    }
+}
+
 fn rows_semantically_equal(left: &crate::Row, right: &crate::Row) -> bool {
     left.has_linebreak() == right.has_linebreak()
         && left.len() == right.len()
@@ -3958,6 +4031,100 @@ mod tests {
         assert_eq!(wide.matches.len(), 1);
         assert!(wide.matches[0].end_column > wide.matches[0].start_column);
         assert_eq!(first.history_generation, second.history_generation);
+    }
+
+    #[test]
+    fn a_row_cursor_continues_across_appends_and_timeouts_lose_no_row() {
+        let mut terminal = Terminal::new(
+            20,
+            2,
+            TerminalConfig {
+                scrollback_lines: 16,
+                ..TerminalConfig::default()
+            },
+        );
+        // All four in history, below two blank screen rows.
+        terminal.advance(b"hit 1\r\nhit 2\r\nhit 3\r\nhit 4\r\n\r\n");
+        let first = terminal.search_normal("hit", false, 0, 1, Duration::from_secs(1));
+        assert_eq!(first.matches[0].preview, "hit 4");
+        assert!(!first.revision_bound);
+        let cursor = first.next_before_row_id.expect("older rows remain");
+
+        terminal.advance(b"hit 5\r\nhit 6\r\n");
+        let next = terminal.search_normal(
+            "hit",
+            false,
+            crate::SearchFrom::BeforeRow(cursor),
+            8,
+            Duration::from_secs(1),
+        );
+        let previews: Vec<_> = next
+            .matches
+            .iter()
+            .map(|item| item.preview.as_str())
+            .collect();
+        assert_eq!(previews, ["hit 3", "hit 2", "hit 1"]);
+        assert!(!next.has_older);
+        assert_eq!(next.next_before_row_id, None);
+        assert!(!next.revision_bound);
+
+        // "hit 6" is on the screen now: that match holds only at this revision.
+        let newest = terminal.search_normal("hit", false, 0, 1, Duration::from_secs(1));
+        assert_eq!(newest.matches[0].preview, "hit 6");
+        assert!(newest.revision_bound);
+
+        // A zero deadline still reads one row per page and resumes at the
+        // row it stopped on.
+        let mut found = Vec::new();
+        let mut from = crate::SearchFrom::Offset(0);
+        for _ in 0..32 {
+            let page = terminal.search_normal("hit", false, from, 8, Duration::ZERO);
+            found.extend(page.matches.into_iter().map(|item| item.preview));
+            from = match (page.next_before_row_id, page.next_offset) {
+                (Some(before), _) => crate::SearchFrom::BeforeRow(before),
+                (None, Some(offset)) => crate::SearchFrom::Offset(offset),
+                (None, None) => break,
+            };
+        }
+        assert_eq!(
+            found,
+            ["hit 6", "hit 5", "hit 4", "hit 3", "hit 2", "hit 1"]
+        );
+    }
+
+    #[test]
+    fn search_stops_at_written_cells_but_keeps_blanks_a_query_ends_with() {
+        let mut terminal = Terminal::new(
+            263,
+            2,
+            TerminalConfig {
+                scrollback_lines: 8,
+                ..TerminalConfig::default()
+            },
+        );
+        terminal.advance("tail\r\n\r\nMiDdLe é\r\nend".as_bytes());
+        let search =
+            |query: &str| terminal.search_normal(query, false, 0, 8, Duration::from_secs(1));
+
+        let spaced = search("tail  ");
+        assert_eq!(spaced.matches.len(), 1);
+        assert_eq!(
+            (spaced.matches[0].start_column, spaced.matches[0].end_column),
+            (0, 6)
+        );
+        assert_eq!(spaced.matches[0].preview, "tail");
+
+        let mixed = search("middle É");
+        assert_eq!(mixed.matches.len(), 1);
+        assert_eq!(
+            (mixed.matches[0].start_column, mixed.matches[0].end_column),
+            (0, 8)
+        );
+        assert_eq!(mixed.matches[0].preview, "MiDdLe é");
+
+        // Every row, the blank one included, holds a single blank.
+        assert_eq!(search(" ").matches.len(), 4);
+        assert!(search("tail   x").matches.is_empty());
     }
 
     #[test]

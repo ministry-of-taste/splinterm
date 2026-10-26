@@ -24,8 +24,8 @@ use splinterm_pty::{
 use splinterm_terminal::{
     ActiveScreen, CellAttributesSnapshot, CellSnapshotContent, CursorSnapshot, Dimensions,
     ImageContent, ImageContentId, ImageContentMetadata, ImagePlacement, ScrollDirection,
-    ScrollRegion, ScrollbackSnapshot, SearchPage, SnapshotRequest, Terminal, TerminalConfig,
-    TerminalDamage, TerminalEvent, TerminalModes, TerminalRevision, TerminalUpdate,
+    ScrollRegion, ScrollbackSnapshot, SearchFrom, SearchPage, SnapshotRequest, Terminal,
+    TerminalConfig, TerminalDamage, TerminalEvent, TerminalModes, TerminalRevision, TerminalUpdate,
 };
 use thiserror::Error;
 use tokio::{
@@ -2889,7 +2889,14 @@ enum Command {
     Snapshot(usize, Reply<LiveSnapshot>),
     ImageContent(ImageContentId, u64, [u8; 32], Reply<ImageContent>),
     ScrollbackPage(Option<u64>, usize, Reply<LiveScrollbackPage>),
-    Search(String, bool, usize, usize, Duration, Reply<LiveSearchPage>),
+    Search(
+        String,
+        bool,
+        SearchFrom,
+        usize,
+        Duration,
+        Reply<LiveSearchPage>,
+    ),
     Subscribe(usize, usize, Reply<Subscription>),
     Attach(usize, usize, Reply<(LiveSnapshot, Subscription)>),
     SubscribeCompact(usize, usize, Reply<CompactSubscription>),
@@ -3632,19 +3639,12 @@ impl LiveSplintHandle {
         &self,
         query: String,
         case_sensitive: bool,
-        skip_rows: usize,
+        from: SearchFrom,
         max_results: usize,
         deadline: Duration,
     ) -> Result<LiveSearchPage, LiveError> {
         self.request(|reply| {
-            Command::Search(
-                query,
-                case_sensitive,
-                skip_rows,
-                max_results,
-                deadline,
-                reply,
-            )
+            Command::Search(query, case_sensitive, from, max_results, deadline, reply)
         })
         .await
     }
@@ -5342,18 +5342,13 @@ fn handle_command(
                 has_older: page.has_older,
             }));
         }
-        Command::Search(query, case_sensitive, skip_rows, maximum_results, deadline, reply) => {
+        Command::Search(query, case_sensitive, from, maximum_results, deadline, reply) => {
             let snapshot = terminal.snapshot(SnapshotRequest {
                 max_scrollback_rows: 0,
             });
             let title = snapshot.title().to_owned();
-            let page = terminal.search_normal(
-                &query,
-                case_sensitive,
-                skip_rows,
-                maximum_results,
-                deadline,
-            );
+            let page =
+                terminal.search_normal(&query, case_sensitive, from, maximum_results, deadline);
             let _ = reply.send(Ok(LiveSearchPage {
                 terminal_revision: page.terminal_revision,
                 history_generation: page.history_generation,

@@ -770,14 +770,20 @@ impl Grid {
         (rows.into(), has_older)
     }
 
-    pub(crate) fn rows_reverse(&self) -> impl Iterator<Item = (u64, &Row)> {
+    /// Retained rows newest-first, each with its id and whether it is in
+    /// history rather than on the screen.
+    ///
+    /// A row gets a new, larger id as it scrolls into history, so history
+    /// ids grow with position; screen rows keep older ids until then.
+    pub(crate) fn rows_reverse_placed(&self) -> impl Iterator<Item = (u64, &Row, bool)> {
         let start = self.scrollback_start(self.screen_rows);
+        let history_capacity = self.rows.len() - self.screen_rows;
         (0..self.rows.len()).rev().filter_map(move |distance| {
             let index = start.wrapping_add(distance) & (self.rows.len() - 1);
             let row = self.rows[index].as_ref()?;
             let id = self.row_ids[index];
             assert_ne!(id, 0, "allocated row has stable identity");
-            Some((id, row))
+            Some((id, row, distance < history_capacity))
         })
     }
 
