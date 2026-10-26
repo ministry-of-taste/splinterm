@@ -167,6 +167,8 @@ impl Grid {
         let mut saw_row = false;
         let mut last_linebreak = true;
         let mut pending_empty_linebreaks = 0;
+        // The saved cursor's empty line among the pending ones, and its column.
+        let mut saved_cursor_pending: Option<(usize, usize)> = None;
 
         for distance in 0..self.rows.len() {
             let physical_row = chronological_start.wrapping_add(distance) & mask;
@@ -180,14 +182,22 @@ impl Grid {
 
             let tracker_column = [
                 (physical_row == builder.origins.cursor.0).then_some(builder.origins.cursor.1),
-                (physical_row == builder.origins.saved_cursor.0)
-                    .then_some(builder.origins.saved_cursor.1),
                 (physical_row == builder.origins.view.0).then_some(builder.origins.view.1),
             ]
             .into_iter()
             .flatten()
             .max()
             .map_or(0, |column| column + 1);
+            // Unlike Foot, the saved cursor does not make an empty row count
+            // as content. It moves with its line, so after a resize it can
+            // sit far below a screen cleared since, which would then keep
+            // blank rows down to it and lose its text into history when the
+            // pane shrinks. On an empty line it follows that line instead.
+            let saved_cursor_column = if physical_row == builder.origins.saved_cursor.0 {
+                builder.origins.saved_cursor.1 + 1
+            } else {
+                0
+            };
 
             let meaningful = row
                 .cells()
@@ -204,16 +214,26 @@ impl Grid {
                     content_count += 1;
                 }
             }
-            let count = content_count.max(tracker_column).min(row.len());
+            let mut count = content_count.max(tracker_column);
+            if count > 0 {
+                count = count.max(saved_cursor_column);
+            }
+            let count = count.min(row.len());
             if count > 0 {
                 last_linebreak = row.has_linebreak();
             }
 
             if count > 0 && pending_empty_linebreaks > 0 {
-                for _ in 0..pending_empty_linebreaks {
+                for line in 0..pending_empty_linebreaks {
+                    if let Some((pending, column)) = saved_cursor_pending
+                        && pending == line
+                    {
+                        builder.mappings.saved_cursor = Some((builder.rows.len(), column));
+                    }
                     builder.finish_hard_line();
                 }
                 pending_empty_linebreaks = 0;
+                saved_cursor_pending = None;
             }
 
             let mut column = 0;
@@ -228,6 +248,10 @@ impl Grid {
                 if count > 0 {
                     builder.finish_hard_line();
                 } else {
+                    if physical_row == builder.origins.saved_cursor.0 {
+                        saved_cursor_pending =
+                            Some((pending_empty_linebreaks, builder.origins.saved_cursor.1));
+                    }
                     pending_empty_linebreaks += 1;
                 }
             }
@@ -259,11 +283,11 @@ impl Grid {
         for (index, row) in builder.rows.into_iter().enumerate() {
             dimensions.rows[index] = Some(row);
         }
-        dimensions.offset = if output_rows >= new_screen_rows {
-            output_rows - new_screen_rows
-        } else {
-            new_row_capacity - (new_screen_rows - output_rows)
-        };
+        // As in Foot, the last reflowed row ends at the bottom of the screen
+        // when there is enough content; otherwise the screen starts at the
+        // first row, so a short screen keeps its text at the top and empty
+        // rows below it, and none of it moves into history.
+        dimensions.offset = output_rows.saturating_sub(new_screen_rows);
         for relative in 0..new_screen_rows {
             let index = dimensions.absolute_index(Grid::signed_row(relative));
             if dimensions.rows[index].is_none() {
@@ -294,9 +318,26 @@ impl Grid {
             new_columns,
             new_screen_rows,
         );
+        // A saved cursor on a trailing empty line stays as far below the
+        // content as it was; any other unmapped one keeps its screen row.
+        let saved_cursor_mapping = builder.mappings.saved_cursor.or_else(|| {
+            let (row, column) = saved_cursor_pending.map_or_else(
+                || {
+                    (
+                        usize::try_from(saved_position.row)
+                            .expect("saved cursor row is non-negative"),
+                        usize::try_from(saved_position.column)
+                            .expect("saved cursor column is non-negative"),
+                    )
+                },
+                |(pending, column)| ((output_rows - dimensions.offset) + pending, column),
+            );
+            let row = row.min(new_screen_rows - 1);
+            Some((dimensions.absolute_index(Grid::signed_row(row)), column))
+        });
         dimensions.saved_cursor = remap_cursor(
             self.saved_cursor,
-            builder.mappings.saved_cursor,
+            saved_cursor_mapping,
             dimensions.offset,
             new_row_capacity,
             new_columns,
@@ -312,15 +353,16 @@ impl Grid {
             .checked_add(1)
             .expect("history generation exhausted");
         dimensions.reidentify_allocated_rows_chronologically();
-        let leading_padding = new_screen_rows.saturating_sub(output_rows);
         let row_mappings = builder
             .row_mappings
             .into_iter()
             .filter_map(|(old_id, row)| {
                 let mapped = if row < output_rows {
                     Some(row)
-                } else if leading_padding > 0 {
-                    Some(dimensions.absolute_index(Grid::signed_row(leading_padding - 1)))
+                } else if output_rows < new_screen_rows {
+                    // A dropped trailing empty row maps to the first empty
+                    // row below the content.
+                    Some(dimensions.absolute_index(Grid::signed_row(output_rows)))
                 } else {
                     None
                 }?;
@@ -464,9 +506,9 @@ mod tests {
         assert!(grid.row(1).unwrap().has_linebreak());
 
         grid.resize_with_reflow(8, 6, 2, |_| 1);
-        assert_eq!(row_text(grid.row(0).unwrap()), "");
-        assert_eq!(row_text(grid.row(1).unwrap()), "abcdef");
-        assert!(grid.row(1).unwrap().has_linebreak());
+        assert_eq!(row_text(grid.row(0).unwrap()), "abcdef");
+        assert!(grid.row(0).unwrap().has_linebreak());
+        assert_eq!(row_text(grid.row(1).unwrap()), "");
     }
 
     #[test]
@@ -490,8 +532,8 @@ mod tests {
 
         grid.resize_with_reflow(4, 2, 2, |_| 1);
 
-        assert_eq!(row_text(grid.row(1).unwrap()), "ab");
-        assert!(!grid.row(1).unwrap().has_linebreak());
+        assert_eq!(row_text(grid.row(0).unwrap()), "ab");
+        assert!(!grid.row(0).unwrap().has_linebreak());
     }
 
     #[test]
@@ -506,22 +548,22 @@ mod tests {
 
         grid.resize_with_reflow(8, 3, 2, |_| 1);
 
-        let bottom = grid.row(1).unwrap();
-        assert_eq!(bottom[0].content(), CellContent::Scalar('a'));
-        assert_eq!(bottom[1].content(), CellContent::Empty);
-        assert_eq!(bottom[2].content(), CellContent::Scalar('b'));
-        assert!(bottom.has_linebreak());
+        let joined = grid.row(0).unwrap();
+        assert_eq!(joined[0].content(), CellContent::Scalar('a'));
+        assert_eq!(joined[1].content(), CellContent::Empty);
+        assert_eq!(joined[2].content(), CellContent::Scalar('b'));
+        assert!(joined.has_linebreak());
     }
 
     #[test]
-    fn trailing_empty_hard_rows_do_not_push_content_out_of_view() {
+    fn trailing_empty_hard_rows_leave_short_content_at_the_top() {
         let mut grid = Grid::with_screen_size(4, 2, 2);
         put_text(grid.row_mut(0).unwrap(), "ok", true);
 
         grid.resize_with_reflow(4, 2, 2, |_| 1);
 
-        assert_eq!(row_text(grid.row(0).unwrap()), "");
-        assert_eq!(row_text(grid.row(1).unwrap()), "ok");
+        assert_eq!(row_text(grid.row(0).unwrap()), "ok");
+        assert_eq!(row_text(grid.row(1).unwrap()), "");
     }
 
     #[test]

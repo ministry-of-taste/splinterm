@@ -423,3 +423,82 @@ fn reset_preserves_monotonic_revision_and_chunking_updates_match() {
     );
     assert!(whole.revision().value() > 1);
 }
+
+fn dump(terminal: &Terminal) -> (Vec<String>, Vec<String>, (i32, i32)) {
+    let snapshot = terminal.snapshot(SnapshotRequest {
+        max_scrollback_rows: 1000,
+    });
+    let trim = |row| row_text(row).trim_end().to_owned();
+    let screen = snapshot.visible_rows().map(trim).collect::<Vec<_>>();
+    let history = snapshot.scrollback_rows().map(trim).collect::<Vec<_>>();
+    let cursor = snapshot.cursor().cursor.position();
+    (screen, history, (cursor.row, cursor.column))
+}
+
+#[test]
+fn shrinking_a_short_screen_keeps_its_text_at_the_top_and_out_of_history() {
+    let mut terminal = terminal(40, 30);
+    for line in 0..50 {
+        terminal.advance(format!("old {line}\r\n").as_bytes());
+    }
+    // `clear`, then three lines and a program waiting for input below them.
+    terminal.advance(b"\x1b[H\x1b[2J\x1b[3JL1 top\r\nL2\r\nL3\r\n");
+    terminal.resize(40, 10);
+    let shrunk = dump(&terminal);
+    terminal.resize(40, 30);
+    let grown = dump(&terminal);
+    for (screen, history, cursor) in [&shrunk, &grown] {
+        assert_eq!(&screen[..4], ["L1 top", "L2", "L3", ""]);
+        assert!(history.is_empty(), "history {history:?}");
+        assert_eq!(*cursor, (3, 0));
+    }
+}
+
+#[test]
+fn a_short_screen_stays_at_the_top_after_an_earlier_resize_pushed_rows_into_history() {
+    let mut terminal = terminal(40, 30);
+    terminal.advance(b"\x1b[H\x1b[2J\x1b[3J");
+    for line in 1..=30 {
+        terminal.advance(format!("{line}\r\n").as_bytes());
+    }
+    // A smaller pane pushes rows into history, then the pane grows back.
+    terminal.resize(40, 10);
+    terminal.resize(40, 30);
+    terminal.advance(b"\x1b[H\x1b[2J\x1b[3JL1 top\r\nL2\r\nL3\r\n");
+    terminal.resize(40, 10);
+    let shrunk = dump(&terminal);
+    terminal.resize(40, 30);
+    let grown = dump(&terminal);
+    for (screen, history, cursor) in [&shrunk, &grown] {
+        assert_eq!(&screen[..4], ["L1 top", "L2", "L3", ""]);
+        assert!(history.is_empty(), "history {history:?}");
+        assert_eq!(*cursor, (3, 0));
+    }
+    // The saved cursor sat on a blank row below the text; it still does.
+    terminal.advance(b"\x1b8");
+    assert_eq!(dump(&terminal).2, (9, 0));
+}
+
+#[test]
+fn a_saved_cursor_on_an_empty_line_follows_it_through_a_reflow() {
+    let mut terminal = terminal(10, 6);
+    // A full line, an empty line holding the saved cursor, then "x".
+    terminal.advance(b"abcdefghij\r\n\r\nx\x1b[2;1H\x1b7\x1b[4;1H");
+    terminal.resize(5, 6);
+    terminal.advance(b"\x1b8Z");
+    let (screen, _, _) = dump(&terminal);
+    assert_eq!(&screen[..4], ["abcde", "fghij", "Z", "x"]);
+}
+
+#[test]
+fn a_saved_cursor_on_an_empty_line_follows_it_when_history_comes_back() {
+    let mut terminal = terminal(10, 10);
+    for line in 0..25 {
+        terminal.advance(format!("n{line}\r\n").as_bytes());
+    }
+    terminal.advance(b"top\r\n\r\nbottom\r\n\x1b[8;1H\x1b7\x1b[10;1H");
+    terminal.resize(10, 30);
+    terminal.advance(b"\x1b8Z");
+    let (screen, _, _) = dump(&terminal);
+    assert_eq!(&screen[24..28], ["n24", "top", "Z", "bottom"]);
+}

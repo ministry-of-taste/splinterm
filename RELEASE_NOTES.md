@@ -498,6 +498,10 @@ a hostile program running as your account.
   thousand lines and then showed no matches. Paging through matches in
   history also keeps working while the terminal prints.
 - `Shift+End` at the bottom of a shell no longer types `F`.
+- Resizing a pane whose text does not fill it, for example by splitting it,
+  keeps the text at the top, as in Foot. Before, the text and the cursor
+  moved to the bottom with blank rows above them, and growing the pane again
+  left them there.
 
 ## Known limitations
 
