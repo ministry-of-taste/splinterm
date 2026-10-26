@@ -158,6 +158,10 @@ fn close_action(root: &LayoutNode, target: SplintId) -> Result<CloseAction> {
     })
 }
 
+fn close_target_already_closed(root: &LayoutNode, target: SplintId) -> bool {
+    root.find_splint(target).is_none()
+}
+
 fn validate_exited_close_target(
     root: &LayoutNode,
     target: SplintId,
@@ -311,6 +315,14 @@ async fn close_focused_splint(
     expected_topology_revision: TopologyRevision,
     target: SplintId,
 ) -> Result<TopologyCommandOutcome> {
+    // Closing a live pane ends its process, and the Window then asks to
+    // close the exited pane as well; that second request finds the pane
+    // already closed, which is what it asked for.
+    if close_target_already_closed(root, target) {
+        return Ok(TopologyCommandOutcome::Updated {
+            pending_focus: None,
+        });
+    }
     let (mut close_revision, mut close_root, expected_incarnation) =
         match close_action(root, target)? {
             CloseAction::CloseExited => (expected_topology_revision, root.clone(), None),
@@ -4074,10 +4086,11 @@ mod tests {
         SessionEntry, SessionPickerTarget, SplintId, SplintState, SplitRatio,
         TopologyCommandOutcome, TopologyManagerWake, TopologyRevision, WindowTabSet,
         WindowTopologyCommand, WindowTopologyUpdate, build_lair_prompt_target, cancel_pane_tasks,
-        captured_dojo_kill_targets, close_action, close_other_tab_targets, collect_lair_targets,
-        command_has_pending_split, explorer_prompt_from_catalog, explorer_splint_from_snapshot,
-        lair_navigation_target, materialized_dojo_targets, next_topology_manager_wake,
-        parent_ratio, pending_focus_for_observation, picker_catalog, refreshed_close_state,
+        captured_dojo_kill_targets, close_action, close_other_tab_targets,
+        close_target_already_closed, collect_lair_targets, command_has_pending_split,
+        explorer_prompt_from_catalog, explorer_splint_from_snapshot, lair_navigation_target,
+        materialized_dojo_targets, next_topology_manager_wake, parent_ratio,
+        pending_focus_for_observation, picker_catalog, refreshed_close_state,
         select_live_dojo_from, send_existing_tab_activation, tab_organization_promotes,
         topology_command_outcome, topology_edit_target, topology_identity_diff,
         validate_exited_close_target, validate_lair_retention_target, window_has_tab_capacity,
@@ -4524,6 +4537,8 @@ mod tests {
             close_action(&exited_root, exited_id).unwrap(),
             CloseAction::CloseExited
         );
+        assert!(!close_target_already_closed(&exited_root, exited_id));
+        assert!(close_target_already_closed(&exited_root, SplintId::new()));
         assert!(validate_exited_close_target(&exited_root, exited_id, Some(7)).unwrap());
         assert!(validate_exited_close_target(&exited_root, exited_id, Some(8)).is_err());
 
