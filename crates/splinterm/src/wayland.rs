@@ -11288,7 +11288,22 @@ impl App {
                 .iter()
                 .filter(|dirty| **dirty)
                 .count();
+            // A view that moved since its last frame, by scrolling or by a
+            // history page joining, shows other rows in most places. The
+            // rows marked dirty above cover only what output changed, so
+            // repaint the whole pane; the draw step that would have done it
+            // for the scroll is skipped once this frame is current.
+            let shown_rows_changed = if live_viewport {
+                self.panes.pane.viewport_dirty
+            } else {
+                self.panes.pane.viewport_dirty
+                    || self.panes.pane.rendered_row_ids != row_ids(display)
+            };
+            if shown_rows_changed {
+                self.presentation.full_redraw = true;
+            }
             if full_frame_reload
+                || shown_rows_changed
                 || self.panes.pane.snapshot_frame.is_none()
                 || (!live_viewport && !cursor_only_history)
             {
