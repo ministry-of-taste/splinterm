@@ -26,15 +26,18 @@ use super::{
     },
     picker::{
         ChromeSurface, PickerTextAlignment, SessionPickerPalette, SessionPickerTextCache,
-        chrome_panel_palette, editable_text, paint_picker_source, paint_picker_text,
-        picker_cell_width, truncate_picker_text,
+        chrome_panel_palette, editable_text, paint_picker_source, paint_picker_source_within,
+        paint_picker_text, picker_cell_width, truncate_picker_text,
     },
 };
 
 const PREFERRED_WIDTH: u32 = 288;
-/// The title and the Live / Saved / All filters share one header line.
-const HEADER_HEIGHT: u32 = 30;
-const FILTER_HEIGHT: u32 = 24;
+/// The title and the live / saved / all filters share one header line, a
+/// row tall unless the header sits beside the tab strip and takes its height.
+const HEADER_HEIGHT: u32 = ROW_HEIGHT;
+/// The gap between the header line and the first row. The header draws no
+/// rule or fill of its own, so this space is what sets it apart.
+const HEADER_SPACER: u32 = 4;
 /// The header title's share of the panel before the filters begin.
 const HEADER_TITLE_WIDTH: u32 = 84;
 /// One chrome text line: tall enough for the chrome line cap.
@@ -74,7 +77,9 @@ pub(crate) fn explorer_minimum_docked_terminal_width(cell_width: u32, initial_co
         .min(MAXIMUM_DOCKED_TERMINAL_FLOOR)
 }
 
-const HEADER_TEXT: &str = "LAIRS";
+const HEADER_TEXT: &str = "lairs";
+/// Painted between neighbouring header filters.
+const FILTER_SEPARATOR: &str = "·";
 
 /// The footer's context line when no search or notice takes it: who owns
 /// keyboard input and how to move.
@@ -213,6 +218,10 @@ pub(crate) struct LairExplorerLayout {
     pub(crate) panel: Rect,
     pub(crate) terminal: Rect,
     pub(crate) header: Rect,
+    /// The tallest header text cell in buffer px, or `u32::MAX` for the
+    /// chrome line cap. A header beside the tab strip sizes its text as the
+    /// tab labels are, so both share one baseline.
+    pub(crate) header_text_cell_cap: u32,
     pub(crate) footer: Rect,
     pub(crate) filters: Vec<(LairExplorerFilter, Rect)>,
     pub(crate) rows: Vec<LairExplorerRowLayout>,
@@ -229,7 +238,28 @@ pub(crate) fn lair_explorer_layout(
     selected: Option<NavigationNodeId>,
     requested_start: usize,
 ) -> Option<LairExplorerLayout> {
-    if content.width == 0 || content.height == 0 {
+    lair_explorer_layout_with_header(
+        content,
+        HEADER_HEIGHT,
+        minimum_terminal_width,
+        rows,
+        selected,
+        requested_start,
+    )
+}
+
+/// The Explorer's layout with a header line `header` logical px tall, such
+/// as the tab strip's height for a docked Explorer that runs beside it.
+#[must_use]
+pub(crate) fn lair_explorer_layout_with_header(
+    content: Rect,
+    header: u32,
+    minimum_terminal_width: u32,
+    rows: &[LairExplorerRow],
+    selected: Option<NavigationNodeId>,
+    requested_start: usize,
+) -> Option<LairExplorerLayout> {
+    if content.width == 0 || content.height == 0 || header == 0 {
         return None;
     }
     let width = PREFERRED_WIDTH.min(content.width);
@@ -248,11 +278,14 @@ pub(crate) fn lair_explorer_layout(
         },
         LairExplorerPresentationMode::Drawer => content,
     };
-    let header_height = HEADER_HEIGHT.min(panel.height);
+    let header_height = header.min(panel.height);
     let footer_height = FOOTER_HEIGHT.min(panel.height.saturating_sub(header_height));
+    let list_top = header_height
+        .saturating_add(HEADER_SPACER)
+        .min(panel.height.saturating_sub(footer_height));
     let list_height = panel
         .height
-        .saturating_sub(header_height)
+        .saturating_sub(list_top)
         .saturating_sub(footer_height);
     let capacity = usize::try_from(list_height / ROW_HEIGHT).unwrap_or(0);
     let selected_index = selected.and_then(|id| rows.iter().position(|row| row.id == id));
@@ -274,7 +307,7 @@ pub(crate) fn lair_explorer_layout(
             id: row.id,
             rect: Rect {
                 x: panel.x,
-                y: panel.y.saturating_add(header_height).saturating_add(
+                y: panel.y.saturating_add(list_top).saturating_add(
                     ROW_HEIGHT.saturating_mul(u32::try_from(slot).unwrap_or(u32::MAX)),
                 ),
                 width: panel.width,
@@ -291,6 +324,7 @@ pub(crate) fn lair_explorer_layout(
             width: panel.width,
             height: header_height,
         },
+        header_text_cell_cap: u32::MAX,
         footer: Rect {
             x: panel.x,
             y: panel
@@ -299,30 +333,8 @@ pub(crate) fn lair_explorer_layout(
             width: panel.width,
             height: footer_height,
         },
-        filters: if header_height == HEADER_HEIGHT {
-            // The filters take the header line right of the title, with the
-            // panel's inset on their right.
-            let title = HEADER_TITLE_WIDTH.min(panel.width.saturating_mul(3) / 10);
-            let inset = 8.min(panel.width / 2);
-            let available = panel.width.saturating_sub(title).saturating_sub(inset);
-            LairExplorerFilter::ALL
-                .into_iter()
-                .enumerate()
-                .map(|(index, filter)| {
-                    let index = u32::try_from(index).unwrap_or(0);
-                    let left = available * index / 3;
-                    let right = available * (index + 1) / 3;
-                    (
-                        filter,
-                        Rect {
-                            x: panel.x.saturating_add(title).saturating_add(left),
-                            y: panel.y.saturating_add((HEADER_HEIGHT - FILTER_HEIGHT) / 2),
-                            width: right - left,
-                            height: FILTER_HEIGHT,
-                        },
-                    )
-                })
-                .collect()
+        filters: if header_height == header {
+            header_filter_rects(panel, header_height)
         } else {
             Vec::new()
         },
@@ -331,6 +343,33 @@ pub(crate) fn lair_explorer_layout(
         visible_capacity: capacity,
         mode,
     })
+}
+
+/// The filters take the header line right of the title, with the panel's
+/// inset on their right. Each one's target is its whole share of the line,
+/// `height` logical px tall.
+fn header_filter_rects(panel: Rect, height: u32) -> Vec<(LairExplorerFilter, Rect)> {
+    let title = HEADER_TITLE_WIDTH.min(panel.width.saturating_mul(3) / 10);
+    let inset = 8.min(panel.width / 2);
+    let available = panel.width.saturating_sub(title).saturating_sub(inset);
+    LairExplorerFilter::ALL
+        .into_iter()
+        .enumerate()
+        .map(|(index, filter)| {
+            let index = u32::try_from(index).unwrap_or(0);
+            let left = available * index / 3;
+            let right = available * (index + 1) / 3;
+            (
+                filter,
+                Rect {
+                    x: panel.x.saturating_add(title).saturating_add(left),
+                    y: panel.y,
+                    width: right - left,
+                    height,
+                },
+            )
+        })
+        .collect()
 }
 
 #[must_use]
@@ -646,6 +685,71 @@ pub(crate) fn lair_explorer_palette(theme: ResolvedTheme) -> SessionPickerPalett
     palette
 }
 
+/// Where one header filter's text goes, in buffer px.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FilterTextClip {
+    token: Rect,
+    /// The `·` on the boundary before this filter; never before the first,
+    /// and left out when either neighbouring share is narrower than a cell.
+    separator: Option<Rect>,
+}
+
+/// Disjoint clips for the header filters' tokens and separators. `shares`
+/// are the filters' buffer rects, left to right; `right` is where the
+/// divider begins. A separator takes the `cell` px around its boundary,
+/// `cell / 2` left of it and the rest right of it, and each token is inset by
+/// the same amounts, so neither an odd cell nor a fractional scale makes two
+/// clips overlap.
+fn filter_text_clips(shares: &[Rect], cell: u32, right: u32) -> Vec<FilterTextClip> {
+    let left_half = cell / 2;
+    let right_half = cell - left_half;
+    // Each share runs to the next one's start, which also absorbs any
+    // overlap from rounding at fractional scales, and never past `right`.
+    let spans: Vec<(u32, u32)> = shares
+        .iter()
+        .enumerate()
+        .map(|(index, share)| {
+            let start = share.x.min(right);
+            let end = shares
+                .get(index + 1)
+                .map_or(share.x.saturating_add(share.width), |next| next.x)
+                .min(right)
+                .max(start);
+            (start, end)
+        })
+        .collect();
+    spans
+        .iter()
+        .enumerate()
+        .map(|(index, &(start, end))| {
+            let token_left = start.saturating_add(right_half).min(end);
+            let token_right = end.saturating_sub(left_half).max(token_left);
+            let separator = index
+                .checked_sub(1)
+                .map(|previous| spans[previous])
+                .filter(|&(previous_start, previous_end)| {
+                    previous_end.saturating_sub(previous_start) >= cell
+                        && end.saturating_sub(start) >= cell
+                })
+                .map(|_| Rect {
+                    x: start.saturating_sub(left_half),
+                    y: shares[index].y,
+                    width: cell,
+                    height: shares[index].height,
+                });
+            FilterTextClip {
+                token: Rect {
+                    x: token_left,
+                    y: shares[index].y,
+                    width: token_right - token_left,
+                    height: shares[index].height,
+                },
+                separator,
+            }
+        })
+        .collect()
+}
+
 /// A fill on the panel, such as the selected row or the active filter, at
 /// the panel's own glass alpha, as the tab strip draws its active tab.
 fn glass_rgba(color: u32, panel_fill: [u8; 4]) -> [u8; 4] {
@@ -734,14 +838,18 @@ pub(crate) fn paint_lair_explorer(
         .map_or(header.x + header.width, |(_, rect)| {
             buffer_rect(*rect, scale_120).x
         });
-    paint_picker_text(
+    // The header is a line of text, not a bar: no fill and no rule, so it
+    // does not read as a second tab strip. The title is muted; the filters
+    // are plain tokens with the active one in bold.
+    let header_text_cap = layout.header_text_cell_cap;
+    paint_picker_source_within(
         cache,
         context,
         &mut used,
         canvas,
         canvas_width,
         canvas_height,
-        HEADER_TEXT,
+        &ChromeSource::from(HEADER_TEXT),
         ChromeTextStyle::Bold,
         scale_120,
         renderer_generation,
@@ -752,25 +860,18 @@ pub(crate) fn paint_lair_explorer(
             height: header.height,
         },
         PickerTextAlignment::Left,
-        palette.primary,
+        palette.secondary,
+        header_text_cap,
     )?;
-    // Rules under the header and over the footer, inside the divider.
-    for y in [
-        header
-            .y
-            .saturating_add(header.height.saturating_sub(border)),
-        buffer_rect(layout.footer, scale_120).y,
-    ] {
-        if header.height == 0 {
-            break;
-        }
+    // The rule over the footer, inside the divider.
+    if header.height != 0 {
         fill_rect(
             canvas,
             canvas_width,
             canvas_height,
             (
                 i32::try_from(panel.x).unwrap_or(i32::MAX),
-                i32::try_from(y).unwrap_or(i32::MAX),
+                i32::try_from(buffer_rect(layout.footer, scale_120).y).unwrap_or(i32::MAX),
                 right.saturating_sub(panel.x),
                 border,
             ),
@@ -778,30 +879,43 @@ pub(crate) fn paint_lair_explorer(
         );
     }
 
-    for (choice, rect) in &layout.filters {
-        let rect = buffer_rect(*rect, scale_120);
-        let rect = Rect {
-            width: rect.width.min(right.saturating_sub(rect.x)),
-            ..rect
-        };
-        let active = *choice == filter;
-        if active {
-            fill_rect(
+    // Each token is centred in its share of the line, and a `·` sits on the
+    // boundary between neighbours. No clip overlaps another or reaches the
+    // divider, however narrow the panel.
+    let shares: Vec<Rect> = layout
+        .filters
+        .iter()
+        .map(|(_, rect)| buffer_rect(*rect, scale_120))
+        .collect();
+    let clips = filter_text_clips(&shares, cell_width, right);
+    for ((choice, _), clip) in layout.filters.iter().zip(&clips) {
+        if let Some(separator) = clip.separator {
+            paint_picker_source_within(
+                cache,
+                context,
+                &mut used,
                 canvas,
                 canvas_width,
                 canvas_height,
-                tuple(rect),
-                glass_rgba(palette.selected_fill, palette.panel_fill),
-            );
+                &ChromeSource::from(FILTER_SEPARATOR),
+                ChromeTextStyle::Regular,
+                scale_120,
+                renderer_generation,
+                separator,
+                PickerTextAlignment::Center,
+                palette.secondary,
+                header_text_cap,
+            )?;
         }
-        paint_picker_text(
+        let active = *choice == filter;
+        paint_picker_source_within(
             cache,
             context,
             &mut used,
             canvas,
             canvas_width,
             canvas_height,
-            choice.label(),
+            &ChromeSource::from(choice.token()),
             if active {
                 ChromeTextStyle::Bold
             } else {
@@ -809,13 +923,14 @@ pub(crate) fn paint_lair_explorer(
             },
             scale_120,
             renderer_generation,
-            rect,
+            clip.token,
             PickerTextAlignment::Center,
             if active {
-                palette.selected_primary
+                palette.primary
             } else {
                 palette.secondary
             },
+            header_text_cap,
         )?;
     }
 
@@ -1047,6 +1162,82 @@ mod tests {
         .unwrap();
     }
 
+    /// The header filters' token and separator clips never overlap one
+    /// another or reach the divider: odd and even cells, fractional scales,
+    /// and shares narrower than a cell.
+    #[test]
+    fn filter_text_clips_are_disjoint_and_stay_left_of_the_divider() {
+        for width in [1, 2, 20, 40, 60, 100, 200, 288] {
+            for scale in [120, 150, 175, 180, 240] {
+                for cell in [1, 6, 7, 8, 9, 15] {
+                    let case = format!("width={width} scale={scale} cell={cell}");
+                    let content = Rect {
+                        x: 3,
+                        y: 0,
+                        width,
+                        height: 400,
+                    };
+                    let layout = lair_explorer_layout(content, 0, &[], None, 0).unwrap();
+                    let panel = buffer_rect(layout.panel, scale);
+                    let border = scale.div_ceil(120).max(1);
+                    let right = panel.x + panel.width.saturating_sub(border);
+                    let shares: Vec<Rect> = layout
+                        .filters
+                        .iter()
+                        .map(|(_, rect)| buffer_rect(*rect, scale))
+                        .collect();
+                    let clips = filter_text_clips(&shares, cell, right);
+                    assert_eq!(clips.len(), shares.len(), "{case}");
+                    assert!(clips.first().is_none_or(|clip| clip.separator.is_none()));
+                    let mut spans: Vec<(u32, u32)> = clips
+                        .iter()
+                        .flat_map(|clip| clip.separator.into_iter().chain([clip.token]))
+                        .filter(|rect| rect.width > 0)
+                        .map(|rect| (rect.x, rect.x + rect.width))
+                        .collect();
+                    for &(left, end) in &spans {
+                        assert!(left >= panel.x && end <= right, "{case}: {left}..{end}");
+                    }
+                    spans.sort_unstable();
+                    for pair in spans.windows(2) {
+                        assert!(pair[0].1 <= pair[1].0, "{case}: {pair:?}");
+                    }
+                    for (index, clip) in clips.iter().enumerate().skip(1) {
+                        if clip.separator.is_some() {
+                            assert_eq!(clip.separator.unwrap().width, cell, "{case}");
+                            assert!(shares[index].width >= cell, "{case}");
+                        }
+                    }
+                }
+            }
+        }
+        // A wide panel at 1x with an 8 px cell keeps both separators.
+        let shares = [
+            Rect {
+                x: 84,
+                y: 0,
+                width: 65,
+                height: 26,
+            },
+            Rect {
+                x: 149,
+                y: 0,
+                width: 66,
+                height: 26,
+            },
+            Rect {
+                x: 215,
+                y: 0,
+                width: 65,
+                height: 26,
+            },
+        ];
+        let clips = filter_text_clips(&shares, 8, 287);
+        assert_eq!(clips[1].separator.unwrap().x, 145);
+        assert_eq!(clips[2].separator.unwrap().x, 211);
+        assert_eq!((clips[0].token.x, clips[0].token.width), (88, 57));
+    }
+
     #[test]
     fn selected_row_preserves_divider_pixels_at_all_scales_and_widths() {
         use super::super::picker::session_picker_palette;
@@ -1075,7 +1266,7 @@ mod tests {
                         x: 7,
                         y: 20,
                         width,
-                        height: HEADER_HEIGHT + FOOTER_HEIGHT + ROW_HEIGHT,
+                        height: HEADER_HEIGHT + HEADER_SPACER + FOOTER_HEIGHT + ROW_HEIGHT,
                     };
                     let layout = lair_explorer_layout(content, 640, &rows, Some(id), 0).unwrap();
                     let canvas_width = (content.x + content.width) * scale / 120 + 1;
@@ -1306,7 +1497,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(layout.rows.len(), rows.len());
-        assert_eq!(layout.rows[0].rect.y, layout.header.y + HEADER_HEIGHT);
+        assert_eq!(
+            layout.rows[0].rect.y,
+            layout.header.y + HEADER_HEIGHT + HEADER_SPACER
+        );
         for (index, (laid, entry)) in layout.rows.iter().zip(&rows).enumerate() {
             assert_eq!(laid.rect.height, ROW_HEIGHT);
             if let Some(next) = layout.rows.get(index + 1) {
@@ -1460,7 +1654,7 @@ mod tests {
                 notice
             );
         }
-        assert_eq!(HEADER_TEXT, "LAIRS");
+        assert_eq!(HEADER_TEXT, "lairs");
     }
 
     #[test]
@@ -1816,7 +2010,7 @@ mod tests {
             x: 0,
             y: 0,
             width: 1000,
-            height: HEADER_HEIGHT + FOOTER_HEIGHT + ROW_HEIGHT,
+            height: HEADER_HEIGHT + HEADER_SPACER + FOOTER_HEIGHT + ROW_HEIGHT,
         };
         let layout = lair_explorer_layout(surface, 640, &rows, None, 0).unwrap();
         let canvas_width = surface.width * scale / 120 + 1;
@@ -2168,7 +2362,7 @@ mod tests {
             x: 0,
             y: 0,
             width: 1000,
-            height: HEADER_HEIGHT + FOOTER_HEIGHT + ROW_HEIGHT,
+            height: HEADER_HEIGHT + HEADER_SPACER + FOOTER_HEIGHT + ROW_HEIGHT,
         };
         let layout = lair_explorer_layout(surface, 640, &rows, None, 0).unwrap();
         let palette = session_picker_palette(ResolvedTheme::default());
@@ -2244,7 +2438,7 @@ mod tests {
         let bottom = lair_explorer_layout(content(400), 640, &rows, Some(rows[29].id), 0).unwrap();
         assert!(lair_explorer_shows_working(&bottom, &rows));
         let no_room = lair_explorer_layout(
-            content(HEADER_HEIGHT + FOOTER_HEIGHT),
+            content(HEADER_HEIGHT + HEADER_SPACER + FOOTER_HEIGHT),
             640,
             &rows,
             Some(rows[29].id),
@@ -2267,9 +2461,12 @@ mod tests {
         let palette = session_picker_palette(ResolvedTheme::default());
         let some = [row(NavigationNodeId::Lair(LairId::new()))];
         for (rows, height) in [
-            (&[][..], HEADER_HEIGHT + FOOTER_HEIGHT),
-            (&some[..], HEADER_HEIGHT + FOOTER_HEIGHT),
-            (&[][..], HEADER_HEIGHT + FOOTER_HEIGHT + ROW_HEIGHT),
+            (&[][..], HEADER_HEIGHT + HEADER_SPACER + FOOTER_HEIGHT),
+            (&some[..], HEADER_HEIGHT + HEADER_SPACER + FOOTER_HEIGHT),
+            (
+                &[][..],
+                HEADER_HEIGHT + HEADER_SPACER + FOOTER_HEIGHT + ROW_HEIGHT,
+            ),
         ] {
             let surface = Rect {
                 x: 0,
@@ -2457,7 +2654,7 @@ mod tests {
             x: 0,
             y: 0,
             width: 1000,
-            height: HEADER_HEIGHT + FOOTER_HEIGHT + ROW_HEIGHT * 3,
+            height: HEADER_HEIGHT + HEADER_SPACER + FOOTER_HEIGHT + ROW_HEIGHT * 3,
         };
         let layout = lair_explorer_layout(surface, 640, &rows, Some(id), 0).unwrap();
         let (width, height) = (surface.width, surface.height);
@@ -2493,16 +2690,16 @@ mod tests {
             glass_rgba(palette.selected_fill, palette.panel_fill)[3],
             0x7f
         );
-        // The active filter tab too.
+        // The header is text on the glass: the active filter has no pill,
+        // and no rule runs under the header line or through its spacer.
         let (_, live) = layout.filters[0];
-        assert_eq!(
-            pixel(live.x + 1, live.y + 1),
-            bgra(glass_rgba(palette.selected_fill, palette.panel_fill))
-        );
-        // The rail, divider, and header rule are opaque.
+        assert_eq!(pixel(live.x + 1, live.y + 1), bgra(palette.panel_fill));
+        for y in layout.header.y + HEADER_HEIGHT - 1..layout.rows[0].rect.y {
+            assert_eq!(pixel(150, y), bgra(palette.panel_fill), "y={y}");
+        }
+        // The rail and divider are opaque.
         assert_eq!(pixel(0, selected_y)[3], 0xff);
         assert_eq!(pixel(layout.panel.width - 1, empty_y)[3], 0xff);
-        assert_eq!(pixel(150, layout.header.y + HEADER_HEIGHT - 1)[3], 0xff);
         // Nothing in the panel is more transparent than the glass, and the
         // text's full-coverage pixels are opaque.
         let mut opaque_ink = 0;

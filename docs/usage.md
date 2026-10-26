@@ -203,8 +203,9 @@ restorable Dojo opens a restore confirmation rather than reporting a permission
 failure. Detached starting or mixed-state Dojos still cannot be attached;
 Explorer explains this lifecycle restriction instead of calling it a denial.
 
-The header shows the title and the **Live / Saved / All** filters on one
-line, initially **Live**. **Live** keeps
+The header shows the `lairs` title and the `live · saved · all` filters on
+one line, with the chosen filter in bold, initially **Live**. Beside the tab
+strip, the header is the strip's height. **Live** keeps
 running or starting Splints and their parent context; a mixed parent containing
 only stopped or unavailable Splints is not live. **Saved** keeps saved and pinned Lairs,
 including any live work inside them. These filters preserve the authoritative

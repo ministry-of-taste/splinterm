@@ -38,6 +38,15 @@ impl LairExplorerFilter {
         }
     }
 
+    /// The filter's lowercase token in the Explorer header.
+    pub(crate) const fn token(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Live => "live",
+            Self::Saved => "saved",
+        }
+    }
+
     pub(crate) const fn next(self) -> Self {
         match self {
             Self::Live => Self::Saved,
