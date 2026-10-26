@@ -1853,17 +1853,17 @@ mod tests {
     }
 
     #[test]
-    fn resize_is_retained_until_control_is_available_and_uses_existing_control() {
+    fn resize_is_retained_for_reacquisition_and_uses_existing_control() {
         let splint_id = SplintId::new();
         let resize = (80, 40, 800, 800);
-        let mut prepared = None;
+        let mut requested = None;
 
-        assert!(resolved_resize_request(None, &mut prepared, (splint_id, 3), resize).is_none());
-        assert_eq!(prepared, Some(resize));
+        assert!(resolved_resize_request(None, &mut requested, (splint_id, 3), resize).is_none());
+        assert_eq!(requested, Some(resize));
 
         let request = resolved_resize_request(
             Some(9),
-            &mut prepared,
+            &mut requested,
             (splint_id, 3),
             (100, 50, 1_000, 1_000),
         )
@@ -1880,7 +1880,8 @@ mod tests {
                 pixel_height: 1_000,
             } if requested_splint == splint_id
         ));
-        assert_eq!(prepared, None);
+        // The latest size is kept so a later control acquisition reapplies it.
+        assert_eq!(requested, Some((100, 50, 1_000, 1_000)));
     }
 
     #[test]
@@ -1949,7 +1950,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn granted_control_event_exposes_controller_for_prepared_resize() {
+    async fn granted_control_event_exposes_controller_for_requested_resize() {
         let (updates, mut receiver) = mpsc::channel(1);
         let mut active_controller = None;
         let acquired = handle_control_event(
@@ -1977,11 +1978,11 @@ mod tests {
                 ControlTransferOutcome::Granted
             ))
         ));
-        let mut prepared = Some((100, 40, 1_000, 800));
+        let mut requested = Some((100, 40, 1_000, 800));
         assert!(matches!(
             resolved_resize_request(
                 active_controller,
-                &mut prepared,
+                &mut requested,
                 (SplintId::new(), 3),
                 (100, 40, 1_000, 800),
             ),
@@ -1992,7 +1993,7 @@ mod tests {
                 ..
             })
         ));
-        assert!(prepared.is_none());
+        assert_eq!(requested, Some((100, 40, 1_000, 800)));
     }
 
     #[test]

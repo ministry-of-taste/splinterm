@@ -244,7 +244,7 @@ async fn release_then_request_reacquires_and_keeps_controller_loop_alive() {
 }
 
 #[tokio::test]
-async fn reacquire_applies_prepared_resize_before_input_and_releases_new_lease() {
+async fn reacquire_applies_requested_resize_before_input_and_releases_new_lease() {
     let id = SplintId::new();
     let ack = || {
         Ok(Response::TerminalActionAcknowledged {
@@ -301,6 +301,81 @@ async fn reacquire_applies_prepared_resize_before_input_and_releases_new_lease()
     )
     .await;
     result.unwrap();
+}
+
+/// Another client resized the Splint while this pane had lost control. The
+/// frontend never resends a size it already sent, so reacquiring control for
+/// input must reapply the pane's own size before the input, or the shell keeps
+/// the other client's rows and the bottom of the pane is drawn off-screen.
+#[tokio::test]
+async fn reacquire_after_control_loss_reapplies_the_latest_size_before_input() {
+    let id = SplintId::new();
+    let lost = ServerFrame::Event {
+        subscription_id: 9,
+        sequence: 1,
+        event: SubscriptionEvent::ControlStatusChanged {
+            status: ControlStatus {
+                splint_id: id,
+                incarnation: 7,
+                controlled: true,
+                locally_owned: false,
+            },
+        },
+    };
+    let resize = |controller_id| Request::Resize {
+        controller_id,
+        splint_id: id,
+        incarnation: 7,
+        columns: 222,
+        rows: 51,
+        pixel_width: 1_554,
+        pixel_height: 867,
+    };
+    let (result, updates, _) = run_case_with(
+        id,
+        true,
+        ServerLimits::default(),
+        vec![
+            WindowCommand::Resize {
+                columns: 222,
+                rows: 51,
+                pixel_width: 1_554,
+                pixel_height: 867,
+            },
+            WindowCommand::Input(b"a".to_vec()),
+        ],
+        vec![
+            (resize(1), Ok(input_acknowledged(id)), vec![lost]),
+            (acquire(id), Ok(granted()), Vec::new()),
+            (resize(2), Ok(input_acknowledged(id)), Vec::new()),
+            (
+                Request::Input {
+                    controller_id: 2,
+                    splint_id: id,
+                    incarnation: 7,
+                    bytes: b"a".to_vec(),
+                    focus_report: false,
+                },
+                Ok(input_acknowledged(id)),
+                Vec::new(),
+            ),
+            (
+                Request::ReleaseControl { controller_id: 2 },
+                Ok(Response::Acknowledged),
+                Vec::new(),
+            ),
+        ],
+    )
+    .await;
+    result.unwrap();
+    let control: Vec<_> = updates
+        .into_iter()
+        .filter_map(|update| match update {
+            WindowUpdate::Control(active) => Some(active),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(control, vec![true, false, true]);
 }
 
 #[tokio::test]
