@@ -1918,6 +1918,7 @@ impl PaneView {
             snapshot.oldest_available_scrollback_row_id = oldest;
             snapshot.newest_available_scrollback_row_id = newest;
         }
+        self.scrollback_viewport.reanchor(snapshot);
         Ok(true)
     }
 
@@ -10999,6 +11000,14 @@ impl App {
                             if let Some((oldest, newest)) = metadata {
                                 snapshot.oldest_available_scrollback_row_id = oldest;
                                 snapshot.newest_available_scrollback_row_id = newest;
+                            }
+                            // A full cache drops its newest rows, below the
+                            // view: keep the view on its rows, and rebuild the
+                            // frame, whose rows and drawn offset are now stale.
+                            if !self.panes.pane.scrollback_viewport.is_live() {
+                                self.panes.pane.scrollback_viewport.reanchor(snapshot);
+                                visual_changed = true;
+                                focused_visual_changed = true;
                             }
                         } else {
                             self.panes.pane.history_selection_pin_blocked = true;

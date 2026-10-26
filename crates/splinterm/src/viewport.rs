@@ -175,6 +175,32 @@ impl ScrollbackViewport {
         self.unseen_rows = self.unseen_rows.saturating_add(appended);
     }
 
+    /// Keeps a detached viewport on the same rows after its history cache
+    /// gained older rows above it or dropped newer ones below it, as when an
+    /// older page joins a full cache. Without this the same offset from the
+    /// bottom would show other rows.
+    pub fn reanchor(&mut self, snapshot: &TerminalSnapshot) {
+        if self.is_live() {
+            return;
+        }
+        let anchor_index = self.anchor_row_id.and_then(|anchor_row_id| {
+            snapshot
+                .scrollback_rows
+                .iter()
+                .position(|row| row.row_id == Some(anchor_row_id))
+        });
+        let total_rows = self.total_rows(snapshot);
+        let viewport_height = snapshot.rows.min(total_rows);
+        self.offset_from_bottom = anchor_index
+            .map_or(self.offset_from_bottom, |anchor_index| {
+                total_rows.saturating_sub(anchor_index.saturating_add(viewport_height))
+            })
+            .min(snapshot.scrollback_rows.len());
+        if anchor_index.is_none() {
+            self.update_anchor(snapshot);
+        }
+    }
+
     fn update_anchor(&mut self, snapshot: &TerminalSnapshot) {
         if self.is_live() {
             self.anchor_row_id = None;
@@ -276,6 +302,28 @@ mod tests {
                 .any(|row| row.row_id == Some(2))
         );
         assert!(!viewport.reveal_row(99, &state));
+    }
+
+    #[test]
+    fn reanchoring_keeps_the_top_row_when_a_page_joins_a_full_cache() {
+        let initial = snapshot(&["h1", "h2", "h3", "h4", "h5", "h6"], &["v1", "v2"]);
+        let mut viewport = ScrollbackViewport::default();
+        viewport.scroll_up(4, &initial);
+        let top = |viewport: &ScrollbackViewport, state: &TerminalSnapshot| {
+            viewport.visible_rows(state)[0].row_id
+        };
+        assert_eq!(top(&viewport, &initial), Some(3));
+
+        // An older page joins above and the bounded cache drops the two
+        // newest rows below the view.
+        let mut joined = initial.clone();
+        let mut older = initial.scrollback_rows[..1].to_vec();
+        older[0].row_id = Some(0);
+        joined.scrollback_rows = [older, initial.scrollback_rows[..4].to_vec()].concat();
+        viewport.reanchor(&joined);
+        assert_eq!(top(&viewport, &joined), Some(3));
+        assert_eq!(viewport.offset_from_bottom(), 2);
+        assert_eq!(viewport.unseen_rows(), 0);
     }
 
     #[test]
