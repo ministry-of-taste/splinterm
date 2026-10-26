@@ -180,14 +180,22 @@ impl Grid {
 
             let tracker_column = [
                 (physical_row == builder.origins.cursor.0).then_some(builder.origins.cursor.1),
-                (physical_row == builder.origins.saved_cursor.0)
-                    .then_some(builder.origins.saved_cursor.1),
                 (physical_row == builder.origins.view.0).then_some(builder.origins.view.1),
             ]
             .into_iter()
             .flatten()
             .max()
             .map_or(0, |column| column + 1);
+            // Unlike Foot, the saved cursor does not make an empty row count
+            // as content. Restoring it is rare, but it stays wherever its row
+            // went, so after a resize it can sit far below a screen cleared
+            // since, which would then keep blank rows down to it and lose its
+            // text into history when the pane shrinks.
+            let saved_cursor_column = if physical_row == builder.origins.saved_cursor.0 {
+                builder.origins.saved_cursor.1 + 1
+            } else {
+                0
+            };
 
             let meaningful = row
                 .cells()
@@ -204,7 +212,11 @@ impl Grid {
                     content_count += 1;
                 }
             }
-            let count = content_count.max(tracker_column).min(row.len());
+            let mut count = content_count.max(tracker_column);
+            if count > 0 {
+                count = count.max(saved_cursor_column);
+            }
+            let count = count.min(row.len());
             if count > 0 {
                 last_linebreak = row.has_linebreak();
             }
@@ -294,9 +306,18 @@ impl Grid {
             new_columns,
             new_screen_rows,
         );
+        // A saved cursor on a row that was not content keeps its screen row.
+        let saved_cursor_mapping = builder.mappings.saved_cursor.or_else(|| {
+            let row = usize::try_from(saved_position.row)
+                .expect("saved cursor row is non-negative")
+                .min(new_screen_rows - 1);
+            let column = usize::try_from(saved_position.column)
+                .expect("saved cursor column is non-negative");
+            Some((dimensions.absolute_index(Grid::signed_row(row)), column))
+        });
         dimensions.saved_cursor = remap_cursor(
             self.saved_cursor,
-            builder.mappings.saved_cursor,
+            saved_cursor_mapping,
             dimensions.offset,
             new_row_capacity,
             new_columns,

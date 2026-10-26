@@ -453,3 +453,25 @@ fn shrinking_a_short_screen_keeps_its_text_at_the_top_and_out_of_history() {
         assert_eq!(*cursor, (3, 0));
     }
 }
+
+#[test]
+fn a_short_screen_stays_at_the_top_after_an_earlier_resize_pushed_rows_into_history() {
+    let mut terminal = terminal(40, 30);
+    terminal.advance(b"\x1b[H\x1b[2J\x1b[3J");
+    for line in 1..=30 {
+        terminal.advance(format!("{line}\r\n").as_bytes());
+    }
+    // A smaller pane pushes rows into history, then the pane grows back.
+    terminal.resize(40, 10);
+    terminal.resize(40, 30);
+    terminal.advance(b"\x1b[H\x1b[2J\x1b[3JL1 top\r\nL2\r\nL3\r\n");
+    terminal.resize(40, 10);
+    let shrunk = dump(&terminal);
+    terminal.resize(40, 30);
+    let grown = dump(&terminal);
+    for (screen, history, cursor) in [&shrunk, &grown] {
+        assert_eq!(&screen[..4], ["L1 top", "L2", "L3", ""]);
+        assert!(history.is_empty(), "history {history:?}");
+        assert_eq!(*cursor, (3, 0));
+    }
+}
