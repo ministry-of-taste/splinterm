@@ -244,9 +244,16 @@ pub(in crate::app) async fn fetch_scrollback_pages(
     mut before_row_id: u64,
 ) -> Result<Option<Vec<splinterm_protocol::ScrollbackPage>>> {
     const PREFETCH_PAGE_COUNT: usize = 4;
+    // Output that keeps arriving moves the terminal revision between the
+    // frontend's request and each page. History rows never change within one
+    // generation, so a page is re-read at the newer revision a few times
+    // before the frontend resynchronizes and loses its place.
+    const REVISION_RETRIES: usize = 4;
     let started = std::time::Instant::now();
     let mut pages = Vec::with_capacity(PREFETCH_PAGE_COUNT);
-    for _ in 0..PREFETCH_PAGE_COUNT {
+    let mut retries = 0;
+    let mut terminal_revision = terminal_revision;
+    while pages.len() < PREFETCH_PAGE_COUNT {
         let response = connection
             .request(Request::ScrollbackPage {
                 splint_id,
@@ -259,6 +266,18 @@ pub(in crate::app) async fn fetch_scrollback_pages(
             .await?;
         let page = match response {
             Response::ScrollbackPage { page, .. } => page,
+            Response::ScrollbackResyncRequired {
+                current_revision,
+                history_generation: current_generation,
+                ..
+            } if current_generation == history_generation
+                && current_revision > terminal_revision
+                && retries < REVISION_RETRIES =>
+            {
+                retries += 1;
+                terminal_revision = current_revision;
+                continue;
+            }
             Response::ScrollbackResyncRequired { .. } => return Ok(None),
             _ => bail!("splinterd did not return a scrollback page"),
         };
@@ -621,7 +640,7 @@ pub(in crate::app) async fn handle_scrollback_fetch(
     history_generation: u64,
     before_row_id: u64,
 ) -> Result<bool> {
-    match fetch_scrollback_pages(
+    let pages = fetch_scrollback_pages(
         control,
         splint_id,
         incarnation,
@@ -629,22 +648,22 @@ pub(in crate::app) async fn handle_scrollback_fetch(
         history_generation,
         before_row_id,
     )
-    .await?
-    {
-        Some(pages) if !pages.is_empty() => Ok(outputs
+    .await?;
+    // An empty batch is still delivered: it ends the frontend's pending
+    // request, which otherwise blocks further history requests until the next
+    // terminal update.
+    if let Some(pages) = pages {
+        return Ok(outputs
             .updates
             .send(WindowUpdate::ScrollbackPages(pages))
             .await
-            .is_ok()),
-        Some(_) => Ok(true),
-        None => {
-            let _ = outputs
-                .updates
-                .send(WindowUpdate::ScrollbackResyncRequired)
-                .await;
-            Ok(outputs.resyncs.send(()).await.is_ok())
-        }
+            .is_ok());
     }
+    let _ = outputs
+        .updates
+        .send(WindowUpdate::ScrollbackResyncRequired)
+        .await;
+    Ok(outputs.resyncs.send(()).await.is_ok())
 }
 
 pub(in crate::app) fn resolved_resize_request(

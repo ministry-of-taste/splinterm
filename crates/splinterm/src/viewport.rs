@@ -7,6 +7,11 @@ pub struct ScrollbackViewport {
     offset_from_bottom: usize,
     unseen_rows: usize,
     anchor_row_id: Option<u64>,
+    /// The screen as it was when this detached viewport began holding its
+    /// history. While held, the viewport composes the cached history with this
+    /// screen instead of the live one, so new output that cannot be joined to
+    /// the cache never moves or clears what the user is reading.
+    held_screen: Option<Vec<TerminalRow>>,
 }
 
 impl ScrollbackViewport {
@@ -34,6 +39,43 @@ impl ScrollbackViewport {
         self.offset_from_bottom = 0;
         self.unseen_rows = 0;
         self.anchor_row_id = None;
+        self.held_screen = None;
+    }
+
+    /// Whether this detached viewport holds its history and screen.
+    #[must_use]
+    pub fn is_holding(&self) -> bool {
+        self.held_screen.is_some()
+    }
+
+    /// Holds the history cache and `screen`, the screen this viewport was
+    /// composed with, until the viewport returns to live. A live viewport
+    /// never holds.
+    pub fn hold(&mut self, screen: Vec<TerminalRow>) {
+        if !self.is_live() && self.held_screen.is_none() {
+            self.held_screen = Some(screen);
+        }
+    }
+
+    /// Counts rows of new output that a held viewport did not take in.
+    pub fn note_unseen(&mut self, rows: usize) {
+        if !self.is_live() {
+            self.unseen_rows = self.unseen_rows.saturating_add(rows);
+        }
+    }
+
+    /// The screen rows this viewport composes below the history cache.
+    fn screen<'a>(&'a self, snapshot: &'a TerminalSnapshot) -> &'a [TerminalRow] {
+        self.held_screen
+            .as_deref()
+            .unwrap_or(snapshot.visible_rows.as_slice())
+    }
+
+    fn total_rows(&self, snapshot: &TerminalSnapshot) -> usize {
+        snapshot
+            .scrollback_rows
+            .len()
+            .saturating_add(self.screen(snapshot).len())
     }
 
     pub fn scroll_up(&mut self, lines: usize, snapshot: &TerminalSnapshot) {
@@ -62,15 +104,12 @@ impl ScrollbackViewport {
             .iter()
             .position(|row| row.row_id == Some(row_id))
         else {
-            return snapshot
-                .visible_rows
+            return self
+                .screen(snapshot)
                 .iter()
                 .any(|row| row.row_id == Some(row_id));
         };
-        let total_rows = snapshot
-            .scrollback_rows
-            .len()
-            .saturating_add(snapshot.visible_rows.len());
+        let total_rows = self.total_rows(snapshot);
         let viewport_height = snapshot.rows.min(total_rows);
         self.offset_from_bottom = total_rows
             .saturating_sub(index.saturating_add(viewport_height))
@@ -122,10 +161,7 @@ impl ScrollbackViewport {
             .iter()
             .filter(|row| row.row_id.is_some_and(|id| !previous_ids.contains(&id)))
             .count();
-        let total_rows = snapshot
-            .scrollback_rows
-            .len()
-            .saturating_add(snapshot.visible_rows.len());
+        let total_rows = self.total_rows(snapshot);
         let viewport_height = snapshot.rows.min(total_rows);
         self.offset_from_bottom = total_rows
             .saturating_sub(anchor_index.saturating_add(viewport_height))
@@ -138,10 +174,7 @@ impl ScrollbackViewport {
             self.anchor_row_id = None;
             return;
         }
-        let total_rows = snapshot
-            .scrollback_rows
-            .len()
-            .saturating_add(snapshot.visible_rows.len());
+        let total_rows = self.total_rows(snapshot);
         let viewport_height = snapshot.rows.min(total_rows);
         let end = total_rows.saturating_sub(self.offset_from_bottom);
         let start = end.saturating_sub(viewport_height);
@@ -155,18 +188,13 @@ impl ScrollbackViewport {
     }
 
     #[must_use]
-    pub fn visible_rows<'a>(&self, snapshot: &'a TerminalSnapshot) -> Vec<&'a TerminalRow> {
+    pub fn visible_rows<'a>(&'a self, snapshot: &'a TerminalSnapshot) -> Vec<&'a TerminalRow> {
         if self.is_live() || snapshot.active_screen == ActiveScreen::Alternate {
             return snapshot.visible_rows.iter().collect();
         }
-        let mut rows = Vec::with_capacity(
-            snapshot
-                .scrollback_rows
-                .len()
-                .saturating_add(snapshot.visible_rows.len()),
-        );
+        let mut rows = Vec::with_capacity(self.total_rows(snapshot));
         rows.extend(snapshot.scrollback_rows.iter());
-        rows.extend(snapshot.visible_rows.iter());
+        rows.extend(self.screen(snapshot).iter());
         let viewport_height = snapshot.rows.min(rows.len());
         let end = rows.len().saturating_sub(self.offset_from_bottom);
         let start = end.saturating_sub(viewport_height);

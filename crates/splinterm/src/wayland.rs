@@ -243,14 +243,15 @@ use tabs::{
 #[cfg(test)]
 use terminal_state::snapshot_is_newer;
 use terminal_state::{
-    MAX_CACHED_HISTORY_BYTES, MAX_CACHED_HISTORY_ROWS, apply_terminal_update,
-    bound_history_page_with_pins, changed_terminal_patch_rows, history_cache_bytes,
-    omitted_rows_before_cache, snapshot_replaces, terminal_update_changes_visible_content,
-    terminal_update_full_frame_reasons,
+    MAX_CACHED_HISTORY_BYTES, MAX_CACHED_HISTORY_ROWS, apply_terminal_update_for_viewport,
+    bound_history_page_with_pins, changed_terminal_patch_rows, discard_lagging_history,
+    history_cache_bytes, omitted_rows_before_cache, retain_history_for_viewport, snapshot_replaces,
+    terminal_update_changes_visible_content, terminal_update_full_frame_reasons,
 };
 #[cfg(test)]
 use terminal_state::{
-    apply_scrollback_update, blank_row, coalesce_snapshots, terminal_update_requires_full_frame,
+    apply_scrollback_update, apply_terminal_update, blank_row, coalesce_snapshots,
+    terminal_update_requires_full_frame,
 };
 
 const INITIAL_WIDTH: u32 = 960;
@@ -1185,6 +1186,7 @@ fn assemble_app(
                 scrollback_viewport: ScrollbackViewport::default(),
                 painted_history_status: None,
                 history_page_pending: false,
+                history_page_top: None,
                 history_selection_pin_blocked: false,
                 scroll_started_at: None,
                 rendered_viewport_offset: 0,
@@ -1435,6 +1437,9 @@ struct PaneView {
     scrollback_viewport: ScrollbackViewport,
     painted_history_status: Option<HistoryOverlayStatus>,
     history_page_pending: bool,
+    /// The oldest cached history row when older history was last requested.
+    /// Pages join the cache only while that row is still its first.
+    history_page_top: Option<u64>,
     history_selection_pin_blocked: bool,
     scroll_started_at: Option<Instant>,
     rendered_viewport_offset: usize,
@@ -1608,6 +1613,12 @@ impl PaneView {
         self.trace_superseded_revisions = 0;
     }
 
+    fn discard_lagging_history(&mut self) {
+        if let Some(snapshot) = self.snapshot.as_mut() {
+            discard_lagging_history(snapshot, &self.scrollback_viewport);
+        }
+    }
+
     fn history_rows_needed_for_viewport_transition(&self) -> Vec<TerminalRow> {
         if self.scrollback_viewport.is_live() {
             Vec::new()
@@ -1687,6 +1698,7 @@ impl PaneView {
             scrollback_viewport: ScrollbackViewport::default(),
             painted_history_status: None,
             history_page_pending: false,
+            history_page_top: None,
             history_selection_pin_blocked: false,
             scroll_started_at: None,
             rendered_viewport_offset: 0,
@@ -1729,11 +1741,16 @@ impl PaneView {
         if self.scrollback_viewport.is_live() {
             return Some(snapshot.clone());
         }
-        let cursor_row = viewport_cursor_row(
-            snapshot.cursor_row,
-            self.scrollback_viewport.offset_from_bottom(),
-            snapshot.rows,
-        );
+        // A held viewport shows an older screen; the live cursor is not on it.
+        let cursor_row = (!self.scrollback_viewport.is_holding())
+            .then(|| {
+                viewport_cursor_row(
+                    snapshot.cursor_row,
+                    self.scrollback_viewport.offset_from_bottom(),
+                    snapshot.rows,
+                )
+            })
+            .flatten();
         let mut input_modes = snapshot.input_modes;
         if cursor_row.is_none() {
             input_modes.cursor_visible = false;
@@ -1790,12 +1807,7 @@ impl PaneView {
             .snapshot
             .as_mut()
             .context("scrollback pages arrived before initial pane snapshot")?;
-        if pages.iter().any(|page| {
-            page.splint_id != snapshot.splint_id
-                || page.incarnation != snapshot.incarnation
-                || page.terminal_revision != snapshot.revision
-                || page.history_generation != snapshot.history_generation
-        }) {
+        if !pages_join_history(&pages, snapshot, self.history_page_top) {
             return Ok(false);
         }
         let first_loaded = snapshot
@@ -1808,8 +1820,10 @@ impl PaneView {
             .iter()
             .filter_map(|row| row.row_id)
             .collect::<std::collections::BTreeSet<_>>();
+        // Only a page read at this revision describes this snapshot's bounds.
         let metadata = pages
             .first()
+            .filter(|page| page.terminal_revision == snapshot.revision)
             .map(|page| (page.oldest_available_row_id, page.newest_available_row_id));
         let mut older = pages
             .into_iter()
@@ -1874,11 +1888,19 @@ impl PaneView {
                         current.history_generation
                     });
                 let previous_rows = self.history_rows_needed_for_viewport_transition();
+                if let Some(current) = self.snapshot.as_ref() {
+                    retain_history_for_viewport(
+                        current,
+                        &mut snapshot,
+                        &mut self.scrollback_viewport,
+                    );
+                }
                 self.scrollback_viewport.observe_history_change(
                     previous_generation,
                     &previous_rows,
                     &snapshot,
                 );
+                discard_lagging_history(&mut snapshot, &self.scrollback_viewport);
                 self.clear_local_content_state();
                 self.snapshot = Some(snapshot);
                 self.image_sources = image_sources;
@@ -1919,13 +1941,18 @@ impl PaneView {
                         .snapshot
                         .as_mut()
                         .context("terminal update arrived before initial pane snapshot")?;
-                    apply_terminal_update(snapshot, update)?;
+                    apply_terminal_update_for_viewport(
+                        snapshot,
+                        update,
+                        &mut self.scrollback_viewport,
+                    )?;
                     apply_theme(snapshot, theme);
                     self.scrollback_viewport.observe_history_change(
                         previous_generation,
                         &previous_rows,
                         snapshot,
                     );
+                    discard_lagging_history(snapshot, &self.scrollback_viewport);
                 }
                 if let Some(image_sources) = image_sources {
                     self.image_sources = image_sources;
@@ -2599,6 +2626,30 @@ impl SchedulingState {
         self.failure = Some(error);
         self.request_exit(ExitClass::ErrorWaylandDispatch);
     }
+}
+
+/// Whether a batch of older history pages may be joined to `snapshot`'s cache.
+///
+/// History rows never change within one generation, so a page read at another
+/// terminal revision still holds the right rows, but it joins the cache only if
+/// the cache still starts at `requested_top`, the row the pages were read
+/// before. Without that, a cache replaced in the meantime would get a seam.
+fn pages_join_history(
+    pages: &[splinterm_protocol::ScrollbackPage],
+    snapshot: &TerminalSnapshot,
+    requested_top: Option<u64>,
+) -> bool {
+    let same_history = pages.iter().all(|page| {
+        page.splint_id == snapshot.splint_id
+            && page.incarnation == snapshot.incarnation
+            && page.history_generation == snapshot.history_generation
+    });
+    let cache_top = snapshot.scrollback_rows.first().and_then(|row| row.row_id);
+    let same_top = cache_top.is_some() && cache_top == requested_top;
+    let same_revision = pages
+        .iter()
+        .all(|page| page.terminal_revision == snapshot.revision);
+    same_history && (same_top || same_revision)
 }
 
 fn try_window_command(commands: &Sender<WindowCommand>, command: WindowCommand) -> Result<()> {
@@ -4702,11 +4753,13 @@ impl App {
             },
         )?;
         self.panes.pane.history_page_pending = true;
+        self.panes.pane.history_page_top = Some(before_row_id);
         Ok(())
     }
 
     fn scroll_history(&mut self, action: MouseAction, lines: usize) -> Result<bool> {
         self.cancel_clipboard_image();
+        self.panes.pane.discard_lagging_history();
         let snapshot = self
             .panes
             .pane
@@ -4743,6 +4796,8 @@ impl App {
                 self.request_older_history()?;
             }
         }
+        // Scrolling back to live ends a hold; its cache no longer joins the screen.
+        self.panes.pane.discard_lagging_history();
         if !moved {
             return Ok(false);
         }
@@ -8741,6 +8796,8 @@ impl App {
                 });
             if let Some(before_row_id) = before_row_id {
                 self.panes.pane.history_page_pending = true;
+                self.panes.pane.history_page_top =
+                    snapshot.scrollback_rows.first().and_then(|row| row.row_id);
                 self.send_command(WindowCommand::FetchScrollback {
                     splint_id: snapshot.splint_id,
                     incarnation: snapshot.incarnation,
@@ -10486,11 +10543,20 @@ impl App {
                             .panes
                             .pane
                             .history_rows_needed_for_viewport_transition();
-                        self.panes.pane.scrollback_viewport.observe_history_change(
+                        let pane = &mut self.panes.pane;
+                        if let Some(current) = pane.snapshot.as_ref() {
+                            retain_history_for_viewport(
+                                current,
+                                &mut snapshot,
+                                &mut pane.scrollback_viewport,
+                            );
+                        }
+                        pane.scrollback_viewport.observe_history_change(
                             previous_generation,
                             &previous_rows,
                             &snapshot,
                         );
+                        discard_lagging_history(&mut snapshot, &pane.scrollback_viewport);
                         self.invalidate_local_content_state();
                         self.panes.pane.snapshot = Some(snapshot);
                         self.panes.pane.image_sources = image_sources;
@@ -10547,19 +10613,23 @@ impl App {
                         .history_rows_needed_for_viewport_transition();
                     let trace_copied_history_bytes =
                         apply_started.map(|_| history_cache_bytes(&previous_rows));
-                    let snapshot = self
-                        .panes
-                        .pane
+                    let pane = &mut self.panes.pane;
+                    let snapshot = pane
                         .snapshot
                         .as_mut()
                         .context("terminal update arrived before initial snapshot")?;
-                    apply_terminal_update(snapshot, update)?;
+                    apply_terminal_update_for_viewport(
+                        snapshot,
+                        update,
+                        &mut pane.scrollback_viewport,
+                    )?;
                     apply_theme(snapshot, self.presentation.theme);
-                    self.panes.pane.scrollback_viewport.observe_history_change(
+                    pane.scrollback_viewport.observe_history_change(
                         previous_generation,
                         &previous_rows,
                         snapshot,
                     );
+                    discard_lagging_history(snapshot, &pane.scrollback_viewport);
                     if history_changed && !self.panes.pane.scrollback_viewport.is_live() {
                         full = true;
                     }
@@ -10711,12 +10781,7 @@ impl App {
                         .snapshot
                         .as_mut()
                         .context("scrollback pages arrived before initial snapshot")?;
-                    if pages.iter().any(|page| {
-                        page.splint_id != snapshot.splint_id
-                            || page.incarnation != snapshot.incarnation
-                            || page.terminal_revision != snapshot.revision
-                            || page.history_generation != snapshot.history_generation
-                    }) {
+                    if !pages_join_history(&pages, snapshot, self.panes.pane.history_page_top) {
                         continue;
                     }
                     let first_loaded = snapshot
@@ -10731,6 +10796,7 @@ impl App {
                         .collect::<std::collections::BTreeSet<_>>();
                     let metadata = pages
                         .first()
+                        .filter(|page| page.terminal_revision == snapshot.revision)
                         .map(|page| (page.oldest_available_row_id, page.newest_available_row_id));
                     let mut older = pages
                         .into_iter()
@@ -16664,6 +16730,36 @@ mod tests {
         )
         .unwrap();
         current
+    }
+
+    #[test]
+    fn older_pages_join_only_an_unchanged_cache_top_or_the_same_revision() {
+        let mut current = snapshot(SplintId::new(), 1, 10);
+        current.scrollback_rows = (50..=60).map(|id| history_row(id, 0)).collect();
+        let page = |terminal_revision| splinterm_protocol::ScrollbackPage {
+            splint_id: current.splint_id,
+            incarnation: current.incarnation,
+            terminal_revision,
+            history_generation: current.history_generation,
+            oldest_available_row_id: Some(1),
+            newest_available_row_id: Some(60),
+            rows: (40..=49).map(|id| history_row(id, 0)).collect(),
+            has_older: true,
+        };
+        let later = current.revision + 3;
+        assert!(pages_join_history(&[page(later)], &current, Some(50)));
+        assert!(pages_join_history(
+            &[page(current.revision)],
+            &current,
+            Some(7)
+        ));
+        assert!(!pages_join_history(&[page(later)], &current, Some(7)));
+        assert!(!pages_join_history(&[page(later)], &current, None));
+        let mut other_generation = page(later);
+        other_generation.history_generation += 1;
+        assert!(!pages_join_history(&[other_generation], &current, Some(50)));
+        current.scrollback_rows.clear();
+        assert!(!pages_join_history(&[page(later)], &current, None));
     }
 
     #[test]
