@@ -474,4 +474,31 @@ fn a_short_screen_stays_at_the_top_after_an_earlier_resize_pushed_rows_into_hist
         assert!(history.is_empty(), "history {history:?}");
         assert_eq!(*cursor, (3, 0));
     }
+    // The saved cursor sat on a blank row below the text; it still does.
+    terminal.advance(b"\x1b8");
+    assert_eq!(dump(&terminal).2, (9, 0));
+}
+
+#[test]
+fn a_saved_cursor_on_an_empty_line_follows_it_through_a_reflow() {
+    let mut terminal = terminal(10, 6);
+    // A full line, an empty line holding the saved cursor, then "x".
+    terminal.advance(b"abcdefghij\r\n\r\nx\x1b[2;1H\x1b7\x1b[4;1H");
+    terminal.resize(5, 6);
+    terminal.advance(b"\x1b8Z");
+    let (screen, _, _) = dump(&terminal);
+    assert_eq!(&screen[..4], ["abcde", "fghij", "Z", "x"]);
+}
+
+#[test]
+fn a_saved_cursor_on_an_empty_line_follows_it_when_history_comes_back() {
+    let mut terminal = terminal(10, 10);
+    for line in 0..25 {
+        terminal.advance(format!("n{line}\r\n").as_bytes());
+    }
+    terminal.advance(b"top\r\n\r\nbottom\r\n\x1b[8;1H\x1b7\x1b[10;1H");
+    terminal.resize(10, 30);
+    terminal.advance(b"\x1b8Z");
+    let (screen, _, _) = dump(&terminal);
+    assert_eq!(&screen[24..28], ["n24", "top", "Z", "bottom"]);
 }

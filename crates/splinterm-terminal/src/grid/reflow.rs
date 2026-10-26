@@ -167,6 +167,8 @@ impl Grid {
         let mut saw_row = false;
         let mut last_linebreak = true;
         let mut pending_empty_linebreaks = 0;
+        // The saved cursor's empty line among the pending ones, and its column.
+        let mut saved_cursor_pending: Option<(usize, usize)> = None;
 
         for distance in 0..self.rows.len() {
             let physical_row = chronological_start.wrapping_add(distance) & mask;
@@ -187,10 +189,10 @@ impl Grid {
             .max()
             .map_or(0, |column| column + 1);
             // Unlike Foot, the saved cursor does not make an empty row count
-            // as content. Restoring it is rare, but it stays wherever its row
-            // went, so after a resize it can sit far below a screen cleared
-            // since, which would then keep blank rows down to it and lose its
-            // text into history when the pane shrinks.
+            // as content. It moves with its line, so after a resize it can
+            // sit far below a screen cleared since, which would then keep
+            // blank rows down to it and lose its text into history when the
+            // pane shrinks. On an empty line it follows that line instead.
             let saved_cursor_column = if physical_row == builder.origins.saved_cursor.0 {
                 builder.origins.saved_cursor.1 + 1
             } else {
@@ -222,10 +224,16 @@ impl Grid {
             }
 
             if count > 0 && pending_empty_linebreaks > 0 {
-                for _ in 0..pending_empty_linebreaks {
+                for line in 0..pending_empty_linebreaks {
+                    if let Some((pending, column)) = saved_cursor_pending
+                        && pending == line
+                    {
+                        builder.mappings.saved_cursor = Some((builder.rows.len(), column));
+                    }
                     builder.finish_hard_line();
                 }
                 pending_empty_linebreaks = 0;
+                saved_cursor_pending = None;
             }
 
             let mut column = 0;
@@ -240,6 +248,10 @@ impl Grid {
                 if count > 0 {
                     builder.finish_hard_line();
                 } else {
+                    if physical_row == builder.origins.saved_cursor.0 {
+                        saved_cursor_pending =
+                            Some((pending_empty_linebreaks, builder.origins.saved_cursor.1));
+                    }
                     pending_empty_linebreaks += 1;
                 }
             }
@@ -306,13 +318,21 @@ impl Grid {
             new_columns,
             new_screen_rows,
         );
-        // A saved cursor on a row that was not content keeps its screen row.
+        // A saved cursor on a trailing empty line stays as far below the
+        // content as it was; any other unmapped one keeps its screen row.
         let saved_cursor_mapping = builder.mappings.saved_cursor.or_else(|| {
-            let row = usize::try_from(saved_position.row)
-                .expect("saved cursor row is non-negative")
-                .min(new_screen_rows - 1);
-            let column = usize::try_from(saved_position.column)
-                .expect("saved cursor column is non-negative");
+            let (row, column) = saved_cursor_pending.map_or_else(
+                || {
+                    (
+                        usize::try_from(saved_position.row)
+                            .expect("saved cursor row is non-negative"),
+                        usize::try_from(saved_position.column)
+                            .expect("saved cursor column is non-negative"),
+                    )
+                },
+                |(pending, column)| ((output_rows - dimensions.offset) + pending, column),
+            );
+            let row = row.min(new_screen_rows - 1);
             Some((dimensions.absolute_index(Grid::signed_row(row)), column))
         });
         dimensions.saved_cursor = remap_cursor(
