@@ -2,9 +2,49 @@
 
 use anyhow::Result;
 use splinterm_protocol::{
-    CellAttributes, ColorSource, HistoryTransition, ScrollDirection, TerminalCell, TerminalRow,
-    TerminalScroll, TerminalSnapshot, TerminalUpdate, UnderlineStyle,
+    ActiveScreen, CellAttributes, ColorSource, HistoryTransition, ScrollDirection, TerminalCell,
+    TerminalRow, TerminalScroll, TerminalSnapshot, TerminalUpdate, UnderlineStyle,
 };
+
+use crate::viewport::ScrollbackViewport;
+
+/// How an update treats a history cache that a detached viewport is reading.
+///
+/// A bounded update carries at most a few newest rows, so a burst of output
+/// cannot always be joined to the cache. A live viewport then replaces the
+/// cache with the newest rows; a detached one keeps its rows instead, or the
+/// user's place in history would be lost and the viewport sent back to live.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum HistoryHold {
+    /// A live viewport: an unjoinable cache is replaced.
+    Off,
+    /// A detached viewport: an unjoinable cache is kept as it is.
+    IfUnjoinable,
+    /// A viewport already holding its history: the cached rows never change.
+    Always,
+}
+
+impl HistoryHold {
+    pub(super) fn for_viewport(viewport: &ScrollbackViewport) -> Self {
+        if viewport.is_live() {
+            Self::Off
+        } else if viewport.is_holding() {
+            Self::Always
+        } else {
+            Self::IfUnjoinable
+        }
+    }
+}
+
+/// Whether an update's history rows were taken into the cache.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum HistoryApplied {
+    Taken,
+    /// The cache was kept; `appended_rows` rows of new history were not added.
+    Held {
+        appended_rows: usize,
+    },
+}
 
 pub(super) const MAX_CACHED_HISTORY_ROWS: usize = 4096;
 pub(super) const MAX_CACHED_HISTORY_BYTES: usize = 16 * 1024 * 1024;
@@ -99,14 +139,16 @@ pub(super) fn omitted_rows_before_cache(
     rows: &[TerminalRow],
     available_rows: usize,
 ) -> usize {
-    oldest_available_row_id
-        .zip(rows.first().and_then(|row| row.row_id))
-        .and_then(|(oldest, first)| first.checked_sub(oldest))
-        .and_then(|omitted| usize::try_from(omitted).ok())
-        .map_or_else(
-            || available_rows.saturating_sub(rows.len()),
-            |omitted| omitted.min(available_rows),
-        )
+    match (
+        oldest_available_row_id,
+        rows.first().and_then(|row| row.row_id),
+    ) {
+        // A cache that starts at or before the daemon's oldest row, as a held
+        // cache can after the daemon trims, has nothing older to fetch.
+        (Some(oldest), Some(first)) => usize::try_from(first.saturating_sub(oldest))
+            .map_or(available_rows, |omitted| omitted.min(available_rows)),
+        _ => available_rows.saturating_sub(rows.len()),
+    }
 }
 
 fn bound_history_cache(rows: &mut Vec<TerminalRow>, keep_oldest: bool) {
@@ -253,10 +295,19 @@ pub(super) fn terminal_update_requires_full_frame(
     terminal_update_full_frame_reasons(update, current) != 0
 }
 
+#[cfg(test)]
 pub(super) fn apply_scrollback_update(
     snapshot: &mut TerminalSnapshot,
     scrollback: splinterm_protocol::TerminalScrollbackUpdate,
 ) -> Result<()> {
+    apply_scrollback_update_holding(snapshot, scrollback, HistoryHold::Off).map(|_| ())
+}
+
+fn apply_scrollback_update_holding(
+    snapshot: &mut TerminalSnapshot,
+    scrollback: splinterm_protocol::TerminalScrollbackUpdate,
+    hold: HistoryHold,
+) -> Result<HistoryApplied> {
     match scrollback.transition {
         HistoryTransition::Append { .. }
             if scrollback.history_generation != snapshot.history_generation =>
@@ -306,12 +357,35 @@ pub(super) fn apply_scrollback_update(
                     .zip(&scrollback.rows)
                     .all(|(cached, returned)| cached.row_id == returned.row_id)
         });
-    let preserve_cached = scrollback.history_generation == snapshot.history_generation
+    let same_history = scrollback.history_generation == snapshot.history_generation
         && matches!(
             scrollback.transition,
             HistoryTransition::Append { .. } | HistoryTransition::Replace
-        )
-        && (complete_append || overlapping_tail);
+        );
+    let preserve_cached = same_history && (complete_append || overlapping_tail);
+    let keep_cache = same_history
+        && match hold {
+            HistoryHold::Off => false,
+            HistoryHold::IfUnjoinable => !preserve_cached,
+            HistoryHold::Always => true,
+        };
+    if keep_cache {
+        // Rows are immutable within one history generation, so the kept rows
+        // stay correct even after the daemon trims them.
+        snapshot.oldest_available_scrollback_row_id = scrollback.oldest_available_row_id;
+        snapshot.newest_available_scrollback_row_id = scrollback.newest_available_row_id;
+        snapshot.available_scrollback_rows = scrollback.available_rows;
+        snapshot.omitted_oldest_scrollback_rows = omitted_rows_before_cache(
+            snapshot.oldest_available_scrollback_row_id,
+            &snapshot.scrollback_rows,
+            snapshot.available_scrollback_rows,
+        );
+        let appended_rows = match scrollback.transition {
+            HistoryTransition::Append { appended_rows, .. } => appended_rows,
+            _ => 0,
+        };
+        return Ok(HistoryApplied::Held { appended_rows });
+    }
     let oldest_available = scrollback.oldest_available_row_id;
     let mut rows = std::mem::take(&mut snapshot.scrollback_rows);
     if preserve_cached {
@@ -337,7 +411,101 @@ pub(super) fn apply_scrollback_update(
     snapshot.omitted_oldest_scrollback_rows = snapshot
         .available_scrollback_rows
         .saturating_sub(snapshot.scrollback_rows.len());
+    Ok(HistoryApplied::Taken)
+}
+
+/// Applies `update` to a pane's snapshot on behalf of its viewport.
+///
+/// A detached viewport that cannot take the update's history into its cache
+/// starts holding its history and the screen it was composed with, and counts
+/// the rows it did not take as unseen. Call `observe_history_change` after.
+pub(super) fn apply_terminal_update_for_viewport(
+    snapshot: &mut TerminalSnapshot,
+    update: TerminalUpdate,
+    viewport: &mut ScrollbackViewport,
+) -> Result<()> {
+    let hold = HistoryHold::for_viewport(viewport);
+    let screen = (hold == HistoryHold::IfUnjoinable && update.scrollback.is_some())
+        .then(|| snapshot.visible_rows.clone());
+    let applied = apply_terminal_update_holding(snapshot, update, hold)?;
+    if let HistoryApplied::Held { appended_rows } = applied {
+        if let Some(screen) = screen {
+            viewport.hold(screen);
+        }
+        viewport.note_unseen(appended_rows);
+    }
     Ok(())
+}
+
+/// Keeps a detached viewport's history across an authoritative snapshot, which
+/// carries only the newest few history rows. The cache is joined to `next`
+/// when its rows overlap; otherwise the viewport holds the cache and the screen
+/// it was composed with. Call before `observe_history_change`.
+pub(super) fn retain_history_for_viewport(
+    current: &TerminalSnapshot,
+    next: &mut TerminalSnapshot,
+    viewport: &mut ScrollbackViewport,
+) {
+    if viewport.is_live()
+        || next.history_generation != current.history_generation
+        || next.active_screen == ActiveScreen::Alternate
+        || next.available_scrollback_rows == 0
+        || current.scrollback_rows.is_empty()
+    {
+        return;
+    }
+    let joined_at = (!viewport.is_holding())
+        .then(|| next.scrollback_rows.first().and_then(|row| row.row_id))
+        .flatten()
+        .and_then(|first| {
+            current
+                .scrollback_rows
+                .iter()
+                .position(|row| row.row_id == Some(first))
+        })
+        .filter(|&start| {
+            let suffix = &current.scrollback_rows[start..];
+            suffix.len() <= next.scrollback_rows.len()
+                && suffix
+                    .iter()
+                    .zip(&next.scrollback_rows)
+                    .all(|(cached, returned)| cached.row_id == returned.row_id)
+        });
+    let mut rows = if let Some(start) = joined_at {
+        let mut rows = current.scrollback_rows[..start].to_vec();
+        rows.append(&mut next.scrollback_rows);
+        bound_history_cache(&mut rows, false);
+        rows
+    } else {
+        viewport.hold(current.visible_rows.clone());
+        current.scrollback_rows.clone()
+    };
+    std::mem::swap(&mut next.scrollback_rows, &mut rows);
+    next.omitted_oldest_scrollback_rows = omitted_rows_before_cache(
+        next.oldest_available_scrollback_row_id,
+        &next.scrollback_rows,
+        next.available_scrollback_rows,
+    );
+}
+
+/// Drops a history cache that no longer ends at the newest history row.
+///
+/// Only a held viewport keeps such a cache. Once the viewport is live again,
+/// joining that cache to the current screen would show a seam, so it is
+/// dropped and refilled from older pages on demand.
+pub(super) fn discard_lagging_history(
+    snapshot: &mut TerminalSnapshot,
+    viewport: &ScrollbackViewport,
+) {
+    if !viewport.is_live() || snapshot.scrollback_rows.is_empty() {
+        return;
+    }
+    let tail = snapshot.scrollback_rows.last().and_then(|row| row.row_id);
+    if tail.is_some() && tail == snapshot.newest_available_scrollback_row_id {
+        return;
+    }
+    snapshot.scrollback_rows.clear();
+    snapshot.omitted_oldest_scrollback_rows = snapshot.available_scrollback_rows;
 }
 
 fn apply_terminal_scroll(visible_rows: &mut [TerminalRow], columns: usize, scroll: TerminalScroll) {
@@ -359,10 +527,25 @@ fn apply_terminal_scroll(visible_rows: &mut [TerminalRow], columns: usize, scrol
     }
 }
 
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "tests and the history benchmark apply updates without a viewport"
+    )
+)]
 pub(super) fn apply_terminal_update(
     snapshot: &mut TerminalSnapshot,
     update: TerminalUpdate,
 ) -> Result<()> {
+    apply_terminal_update_holding(snapshot, update, HistoryHold::Off).map(|_| ())
+}
+
+fn apply_terminal_update_holding(
+    snapshot: &mut TerminalSnapshot,
+    update: TerminalUpdate,
+    hold: HistoryHold,
+) -> Result<HistoryApplied> {
     update
         .validate_against(
             snapshot.revision,
@@ -419,14 +602,15 @@ pub(super) fn apply_terminal_update(
     if let Some(colors) = update.default_colors {
         snapshot.default_colors = colors;
     }
-    if let Some(scrollback) = update.scrollback {
-        apply_scrollback_update(snapshot, scrollback)?;
-    }
+    let applied = match update.scrollback {
+        Some(scrollback) => apply_scrollback_update_holding(snapshot, scrollback, hold)?,
+        None => HistoryApplied::Taken,
+    };
     if let Some(images) = update.images {
         snapshot.images = Some(images);
     }
     snapshot.revision = update.revision;
-    Ok(())
+    Ok(applied)
 }
 
 #[cfg(test)]
@@ -536,5 +720,239 @@ mod tests {
         assert_eq!(omitted_rows_before_cache(Some(100), &rows(500), 1_000), 400);
         assert_eq!(omitted_rows_before_cache(Some(100), &rows(100), 1_000), 0);
         assert_eq!(omitted_rows_before_cache(None, &rows(1_000), 1_000), 900);
+        // A held cache older than the daemon's oldest row: nothing to fetch.
+        assert_eq!(omitted_rows_before_cache(Some(100), &rows(50), 1_000), 0);
+    }
+
+    fn held_case_snapshot(
+        cached: std::ops::RangeInclusive<u64>,
+        screen_rows: usize,
+    ) -> TerminalSnapshot {
+        let rows = cached
+            .clone()
+            .map(|id| history_row(id, 1))
+            .collect::<Vec<_>>();
+        TerminalSnapshot {
+            splint_id: splinterm_core::SplintId::new(),
+            incarnation: 1,
+            revision: 10,
+            columns: 1,
+            rows: screen_rows,
+            cursor_column: 0,
+            cursor_row: 0,
+            cursor_deferred_wrap: false,
+            active_screen: ActiveScreen::Normal,
+            input_modes: splinterm_protocol::TerminalInputModes {
+                application_cursor: false,
+                application_keypad: false,
+                focus_reporting: false,
+                bracketed_paste: false,
+                cursor_visible: true,
+                cursor_blink: false,
+                mouse_tracking: splinterm_protocol::MouseTracking::None,
+                sgr_mouse: false,
+            },
+            palette: vec![0; 256],
+            default_colors: [0; 3],
+            title: String::new(),
+            visible_rows: (0..screen_rows)
+                .map(|index| {
+                    let mut row = blank_row(1);
+                    row.cells[0].content = format!("s{index}");
+                    row
+                })
+                .collect(),
+            history_generation: 1,
+            oldest_available_scrollback_row_id: Some(*cached.start()),
+            newest_available_scrollback_row_id: Some(*cached.end()),
+            available_scrollback_rows: rows.len(),
+            scrollback_rows: rows,
+            omitted_oldest_scrollback_rows: 0,
+            images: None,
+            exited_code: None,
+            exited_signal: None,
+        }
+    }
+
+    /// A burst longer than one bounded update: the newest rows only, with the
+    /// screen fully replaced by new output.
+    fn burst(snapshot: &TerminalSnapshot, appended: u64) -> TerminalUpdate {
+        let newest = snapshot.newest_available_scrollback_row_id.unwrap() + appended;
+        let returned = (newest - 15..=newest)
+            .map(|id| history_row(id, 1))
+            .collect::<Vec<_>>();
+        TerminalUpdate {
+            base_revision: snapshot.revision,
+            revision: snapshot.revision + 1,
+            rows: (0..snapshot.rows)
+                .map(|index| {
+                    let mut row = blank_row(1);
+                    row.row_id = Some(newest + 1 + u64::try_from(index).unwrap());
+                    row.cells[0].content = format!("n{index}");
+                    splinterm_protocol::TerminalRowPatch { index, row }
+                })
+                .collect(),
+            scrolls: Vec::new(),
+            cursor: None,
+            title: None,
+            input_modes: None,
+            active_screen: None,
+            palette: None,
+            default_colors: None,
+            columns: None,
+            row_count: None,
+            scrollback: Some(splinterm_protocol::TerminalScrollbackUpdate {
+                transition: HistoryTransition::Append {
+                    appended_rows: usize::try_from(appended).unwrap(),
+                    trimmed_rows: 0,
+                },
+                history_generation: snapshot.history_generation,
+                oldest_available_row_id: snapshot.oldest_available_scrollback_row_id,
+                newest_available_row_id: Some(newest),
+                available_rows: snapshot.available_scrollback_rows
+                    + usize::try_from(appended).unwrap(),
+                omitted_oldest_rows: snapshot.available_scrollback_rows
+                    + usize::try_from(appended).unwrap()
+                    - returned.len(),
+                rows: returned,
+            }),
+            images: None,
+        }
+    }
+
+    fn ids(rows: &[&TerminalRow]) -> Vec<Option<u64>> {
+        rows.iter().map(|row| row.row_id).collect()
+    }
+
+    fn texts(rows: &[&TerminalRow]) -> Vec<String> {
+        rows.iter()
+            .map(|row| row.cells[0].content.clone())
+            .collect()
+    }
+
+    fn update_for_viewport(
+        snapshot: &mut TerminalSnapshot,
+        update: TerminalUpdate,
+        viewport: &mut ScrollbackViewport,
+    ) {
+        let generation = snapshot.history_generation;
+        let previous = if viewport.is_live() {
+            Vec::new()
+        } else {
+            snapshot.scrollback_rows.clone()
+        };
+        apply_terminal_update_for_viewport(snapshot, update, viewport).unwrap();
+        viewport.observe_history_change(generation, &previous, snapshot);
+        discard_lagging_history(snapshot, viewport);
+    }
+
+    #[test]
+    fn a_detached_viewport_holds_its_place_through_bursts_longer_than_an_update() {
+        let mut snapshot = held_case_snapshot(1..=100, 4);
+        let mut viewport = ScrollbackViewport::default();
+        viewport.scroll_up(10, &snapshot);
+        let before = viewport.visible_rows(&snapshot);
+        let (before_ids, before_texts) = (ids(&before), texts(&before));
+        assert_eq!(before_ids, [Some(91), Some(92), Some(93), Some(94)]);
+
+        for _ in 0..5 {
+            let update = burst(&snapshot, 40);
+            update_for_viewport(&mut snapshot, update, &mut viewport);
+            assert!(
+                !viewport.is_live(),
+                "a burst must not send the viewport live"
+            );
+            assert!(viewport.is_holding());
+            let shown = viewport.visible_rows(&snapshot);
+            assert_eq!(ids(&shown), before_ids);
+            assert_eq!(texts(&shown), before_texts);
+        }
+        assert_eq!(viewport.unseen_rows(), 200);
+        assert_eq!(snapshot.scrollback_rows.len(), 100, "the cache is held");
+        assert_eq!(snapshot.newest_available_scrollback_row_id, Some(300));
+
+        // Scrolling up still works while held, and scrolling just short of
+        // the bottom shows the held screen, never the live one.
+        viewport.scroll_up(50, &snapshot);
+        assert_eq!(viewport.offset_from_bottom(), 60);
+        viewport.scroll_down(59, &snapshot);
+        let shown = viewport.visible_rows(&snapshot);
+        assert_eq!(texts(&shown).last().map(String::as_str), Some("s2"));
+
+        // Reaching the bottom returns live and drops the lagging cache.
+        viewport.scroll_down(1, &snapshot);
+        assert!(viewport.is_live());
+        assert!(!viewport.is_holding());
+        discard_lagging_history(&mut snapshot, &viewport);
+        assert!(snapshot.scrollback_rows.is_empty());
+        assert_eq!(snapshot.omitted_oldest_scrollback_rows, 300);
+    }
+
+    #[test]
+    fn a_live_viewport_still_replaces_an_unjoinable_cache() {
+        let mut snapshot = held_case_snapshot(1..=100, 4);
+        let mut viewport = ScrollbackViewport::default();
+        let update = burst(&snapshot, 40);
+        update_for_viewport(&mut snapshot, update, &mut viewport);
+        assert!(viewport.is_live());
+        assert_eq!(snapshot.scrollback_rows.len(), 16);
+        assert_eq!(
+            snapshot.scrollback_rows.last().and_then(|row| row.row_id),
+            Some(140)
+        );
+    }
+
+    #[test]
+    fn a_detached_viewport_joins_small_appends_without_holding() {
+        let mut snapshot = held_case_snapshot(1..=100, 4);
+        let mut viewport = ScrollbackViewport::default();
+        viewport.scroll_up(10, &snapshot);
+        let mut update = burst(&snapshot, 3);
+        if let Some(scrollback) = update.scrollback.as_mut() {
+            scrollback.rows = (101..=103).map(|id| history_row(id, 1)).collect();
+            scrollback.omitted_oldest_rows = 100;
+        }
+        update_for_viewport(&mut snapshot, update, &mut viewport);
+        assert!(!viewport.is_holding());
+        assert_eq!(viewport.offset_from_bottom(), 13);
+        assert_eq!(snapshot.scrollback_rows.len(), 103);
+    }
+
+    #[test]
+    fn an_authoritative_snapshot_keeps_a_detached_viewports_history() {
+        let current = held_case_snapshot(1..=100, 4);
+        let mut viewport = ScrollbackViewport::default();
+        viewport.scroll_up(10, &current);
+
+        // Overlapping rows join the cache.
+        let mut joined = held_case_snapshot(90..=110, 4);
+        joined.scrollback_rows.drain(..4);
+        joined.oldest_available_scrollback_row_id = Some(1);
+        joined.available_scrollback_rows = 110;
+        retain_history_for_viewport(&current, &mut joined, &mut viewport);
+        assert!(!viewport.is_holding());
+        assert_eq!(joined.scrollback_rows.len(), 110);
+
+        // Disjoint rows: the viewport holds the old cache and screen.
+        let mut disjoint = held_case_snapshot(200..=215, 4);
+        disjoint.oldest_available_scrollback_row_id = Some(1);
+        disjoint.available_scrollback_rows = 215;
+        retain_history_for_viewport(&current, &mut disjoint, &mut viewport);
+        assert!(viewport.is_holding());
+        assert_eq!(disjoint.scrollback_rows, current.scrollback_rows);
+        assert_eq!(disjoint.omitted_oldest_scrollback_rows, 0);
+        viewport.observe_history_change(1, &current.scrollback_rows, &disjoint);
+        assert_eq!(viewport.offset_from_bottom(), 10);
+        assert_eq!(
+            texts(&viewport.visible_rows(&disjoint)),
+            vec!["x".to_owned(); 4]
+        );
+
+        // A new history generation still returns live.
+        let mut cleared = held_case_snapshot(1..=4, 4);
+        cleared.history_generation = 2;
+        retain_history_for_viewport(&current, &mut cleared, &mut viewport);
+        viewport.observe_history_change(1, &current.scrollback_rows, &cleared);
+        assert!(viewport.is_live());
     }
 }

@@ -42,8 +42,8 @@ pub use mode::{ActiveScreen, MouseTracking, TerminalModes};
 pub use row::Row;
 pub use snapshot::{
     CellAttributesSnapshot, CellSnapshot, CellSnapshotContent, CursorSnapshot, Dimensions,
-    RowSnapshot, ScrollbackPage, ScrollbackSnapshot, SearchMatch, SearchPage, SnapshotRequest,
-    TerminalSnapshot,
+    RowSnapshot, ScrollbackPage, ScrollbackSnapshot, SearchFrom, SearchMatch, SearchPage,
+    SnapshotRequest, TerminalSnapshot,
 };
 pub use terminal::{
     CheckpointError, MAX_IMAGE_STATE_CHECKPOINT_BYTES, MAX_TERMINAL_CHECKPOINT_BYTES,

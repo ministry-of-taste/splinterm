@@ -483,6 +483,21 @@ a hostile program running as your account.
   instead of closing the Window. A Window too small for its Splints shows them
   with less gap or none, or shows only the focused one until there is room
   again; it no longer exits.
+- A Splint's history no longer gets stuck after you leave it and come back:
+  - Taking control back, after another Window or a resize elsewhere had it,
+    restores the pane's own size. Before, the terminal kept the other size, so
+    the bottom of the output sat below the visible rows.
+  - Scrolled-up history keeps its place while a program prints quickly, and
+    you can scroll up during a burst. Before, output faster than one update
+    could hold pinned the view to the bottom.
+  - Scrolling back to live over and over while a pane is slow to refresh no
+    longer closes the Window.
+- Search finds lines deep in long history. Each daemon request reads only
+  what rows contain, not their full width, and the Window continues on its own
+  until a match turns up. Before, a wide pane searched only about its last
+  thousand lines and then showed no matches. Paging through matches in
+  history also keeps working while the terminal prints.
+- `Shift+End` at the bottom of a shell no longer types `F`.
 
 ## Known limitations
 

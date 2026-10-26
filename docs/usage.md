@@ -443,8 +443,15 @@ returns it to live output and sends no PTY bytes; a later Enter pressed while
 already live submits normally. `Ctrl+Shift+F` opens local literal scrollback
 search. Enter submits, `Ctrl+N` and
 `Ctrl+P` navigate matches, and Escape closes the trusted search surface. Search
-queries are not injected into the terminal. History paging remains bounded and
-preserves follow-live behavior when returning with `Shift+End`.
+queries are not injected into the terminal. The daemon searches a few
+milliseconds of history per request so a busy terminal never stalls; until a
+match turns up, the Window keeps asking for the next stretch and shows
+*Searching older history…*. Paging through matches already in history keeps
+working while the terminal prints. When history is replaced, for example after
+a resize reflows it or the program clears it, or when a page's match on the
+visible screen has changed, the results clear and Enter searches again. History paging remains bounded and preserves
+follow-live behavior when returning with `Shift+End`, which does nothing when
+the pane is already live.
 
 The CLI can also read bounded history pages and search without mapping a Window:
 

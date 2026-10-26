@@ -171,7 +171,9 @@ async fn run_case_in_window(
         }
         drop(sender);
         let (updates, mut update_receiver) = mpsc::channel(32);
-        let (resyncs, mut resync_receiver) = mpsc::channel(32);
+        // One slot, as in a Window: a second request while one waits is
+        // coalesced.
+        let (resyncs, mut resync_receiver) = mpsc::channel(1);
         let result = run_controller(
             connection,
             receiver,
@@ -202,6 +204,28 @@ async fn run_case_in_window(
     })
     .await
     .expect("controller protocol case must finish without hanging")
+}
+
+#[tokio::test]
+async fn resynchronizations_coalesce_while_one_waits() {
+    let id = SplintId::new();
+    let (result, _updates, resyncs) = run_case(
+        id,
+        true,
+        vec![
+            WindowCommand::Resynchronize,
+            WindowCommand::Resynchronize,
+            WindowCommand::Resynchronize,
+            WindowCommand::ReleaseControl,
+        ],
+        vec![(
+            Request::ReleaseControl { controller_id: 1 },
+            Ok(Response::Acknowledged),
+        )],
+    )
+    .await;
+    result.unwrap();
+    assert_eq!(resyncs, 1);
 }
 
 #[tokio::test]
@@ -376,6 +400,143 @@ async fn reacquire_after_control_loss_reapplies_the_latest_size_before_input() {
         })
         .collect();
     assert_eq!(control, vec![true, false, true]);
+}
+
+fn page_provenance(
+    splint_id: SplintId,
+    terminal_revision: u64,
+) -> splinterm_protocol::TerminalProvenance {
+    splinterm_protocol::TerminalProvenance {
+        lair_id: LairId::new(),
+        dojo_id: DojoId::new(),
+        splint_id,
+        incarnation: 7,
+        topology_revision: splinterm_core::TopologyRevision::new(1),
+        terminal_revision,
+        history_generation: 1,
+        title: String::new(),
+    }
+}
+
+fn page_request(splint_id: SplintId, terminal_revision: u64, before_row_id: u64) -> Request {
+    Request::ScrollbackPage {
+        splint_id,
+        incarnation: 7,
+        terminal_revision,
+        history_generation: 1,
+        before_row_id,
+        max_rows: splinterm_protocol::MAX_SCROLLBACK_PAGE_ROWS,
+    }
+}
+
+fn fetch_command(splint_id: SplintId) -> WindowCommand {
+    WindowCommand::FetchScrollback {
+        splint_id,
+        incarnation: 7,
+        terminal_revision: 5,
+        history_generation: 1,
+        before_row_id: 100,
+    }
+}
+
+/// Output kept arriving while the frontend asked for older history. The rows
+/// are re-read at the newer revision instead of resynchronizing, which used to
+/// drop a detached viewport back to live.
+#[tokio::test]
+async fn history_pages_are_reread_at_a_newer_revision_of_the_same_generation() {
+    let id = SplintId::new();
+    let row = |row_id| splinterm_protocol::TerminalRow {
+        row_id: Some(row_id),
+        linebreak: true,
+        cells: Vec::new(),
+    };
+    let (result, updates, resyncs) = run_case(
+        id,
+        true,
+        vec![fetch_command(id)],
+        vec![
+            (
+                page_request(id, 5, 100),
+                Ok(Response::ScrollbackResyncRequired {
+                    provenance: page_provenance(id, 6),
+                    current_revision: 6,
+                    history_generation: 1,
+                }),
+            ),
+            (
+                page_request(id, 6, 100),
+                Ok(Response::ScrollbackPage {
+                    provenance: page_provenance(id, 6),
+                    page: splinterm_protocol::ScrollbackPage {
+                        splint_id: id,
+                        incarnation: 7,
+                        terminal_revision: 6,
+                        history_generation: 1,
+                        oldest_available_row_id: Some(97),
+                        newest_available_row_id: Some(120),
+                        rows: vec![row(97), row(98), row(99)],
+                        has_older: false,
+                    },
+                }),
+            ),
+            (
+                Request::ReleaseControl { controller_id: 1 },
+                Ok(Response::Acknowledged),
+            ),
+        ],
+    )
+    .await;
+    result.unwrap();
+    assert_eq!(resyncs, 0);
+    let pages = updates
+        .into_iter()
+        .find_map(|update| match update {
+            WindowUpdate::ScrollbackPages(pages) => Some(pages),
+            _ => None,
+        })
+        .expect("the re-read page reaches the frontend");
+    assert_eq!(pages.len(), 1);
+    assert_eq!(pages[0].terminal_revision, 6);
+    assert_eq!(pages[0].rows.len(), 3);
+}
+
+/// A batch with no rows still ends the frontend's pending history request.
+#[tokio::test]
+async fn an_empty_history_batch_still_reaches_the_frontend() {
+    let id = SplintId::new();
+    let (result, updates, _) = run_case(
+        id,
+        true,
+        vec![fetch_command(id)],
+        vec![
+            (
+                page_request(id, 5, 100),
+                Ok(Response::ScrollbackPage {
+                    provenance: page_provenance(id, 5),
+                    page: splinterm_protocol::ScrollbackPage {
+                        splint_id: id,
+                        incarnation: 7,
+                        terminal_revision: 5,
+                        history_generation: 1,
+                        oldest_available_row_id: Some(100),
+                        newest_available_row_id: Some(120),
+                        rows: Vec::new(),
+                        has_older: false,
+                    },
+                }),
+            ),
+            (
+                Request::ReleaseControl { controller_id: 1 },
+                Ok(Response::Acknowledged),
+            ),
+        ],
+    )
+    .await;
+    result.unwrap();
+    assert!(updates.iter().any(|update| matches!(
+        update,
+        WindowUpdate::ScrollbackPages(pages) if pages.is_empty()
+    )));
 }
 
 #[tokio::test]

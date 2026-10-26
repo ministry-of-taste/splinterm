@@ -93,7 +93,7 @@ use splinterm_core::{
     Axis, DojoId, LairId, LairRetention, LayoutNode, Splint, SplintId, SplitRatio, TopologyRevision,
 };
 use splinterm_protocol::{
-    ActiveScreen, ControlTransferDecision, MouseTracking, SearchMatch, TerminalCell,
+    ActiveScreen, ControlTransferDecision, MouseTracking, SearchMatch, SearchPage, TerminalCell,
     TerminalInputModes, TerminalRow, TerminalSnapshot,
     perf_trace::{
         PerfTraceEvent, emit_perf_trace, emit_perf_trace_at, monotonic_raw_ns, perf_trace_enabled,
@@ -243,14 +243,15 @@ use tabs::{
 #[cfg(test)]
 use terminal_state::snapshot_is_newer;
 use terminal_state::{
-    MAX_CACHED_HISTORY_BYTES, MAX_CACHED_HISTORY_ROWS, apply_terminal_update,
-    bound_history_page_with_pins, changed_terminal_patch_rows, history_cache_bytes,
-    omitted_rows_before_cache, snapshot_replaces, terminal_update_changes_visible_content,
-    terminal_update_full_frame_reasons,
+    MAX_CACHED_HISTORY_BYTES, MAX_CACHED_HISTORY_ROWS, apply_terminal_update_for_viewport,
+    bound_history_page_with_pins, changed_terminal_patch_rows, discard_lagging_history,
+    history_cache_bytes, omitted_rows_before_cache, retain_history_for_viewport, snapshot_replaces,
+    terminal_update_changes_visible_content, terminal_update_full_frame_reasons,
 };
 #[cfg(test)]
 use terminal_state::{
-    apply_scrollback_update, blank_row, coalesce_snapshots, terminal_update_requires_full_frame,
+    apply_scrollback_update, apply_terminal_update, blank_row, coalesce_snapshots,
+    terminal_update_requires_full_frame,
 };
 
 const INITIAL_WIDTH: u32 = 960;
@@ -1185,9 +1186,12 @@ fn assemble_app(
                 scrollback_viewport: ScrollbackViewport::default(),
                 painted_history_status: None,
                 history_page_pending: false,
+                resync_pending: false,
+                history_page_top: None,
                 history_selection_pin_blocked: false,
                 scroll_started_at: None,
                 rendered_viewport_offset: 0,
+                rendered_row_ids: Vec::new(),
                 viewport_dirty: false,
                 updates: options.updates,
                 commands: options.commands,
@@ -1405,6 +1409,81 @@ struct SearchUiState {
     selected: usize,
     next_cursor: Option<String>,
     pending_reveal: Option<SearchMatch>,
+    /// Searches sent and not yet answered, and the query of the latest.
+    in_flight: usize,
+    submitted_query: String,
+    /// Older history is still being searched for the latest query.
+    searching: bool,
+    /// The history generation and terminal revision of the latest page:
+    /// its row ids and its cursor mean something only there.
+    page_generation: u64,
+    page_revision: u64,
+}
+
+impl SearchUiState {
+    /// Takes one search page. A page that ran out of time before finding
+    /// anything returns the cursor to read the next one with, while the
+    /// page answers the latest search and the query is unchanged. Daemon
+    /// search reads about 10 ms of rows per request, so without this a match
+    /// further back looks missing.
+    fn take_page(&mut self, page: SearchPage) -> Option<String> {
+        self.in_flight = self.in_flight.saturating_sub(1);
+        let latest = self.in_flight == 0;
+        let keep_going = latest
+            && page.matches.is_empty()
+            && page.timed_out
+            && self.input.is_some()
+            && self.submitted_query == self.query;
+        self.matches = page.matches;
+        self.selected = 0;
+        self.next_cursor = page.next_cursor;
+        self.page_generation = page.history_generation;
+        self.page_revision = page.terminal_revision;
+        self.pending_reveal = self.matches.first().cloned();
+        self.searching = keep_going && self.next_cursor.is_some();
+        if self.searching {
+            self.next_cursor.clone()
+        } else {
+            None
+        }
+    }
+
+    /// Closes the search field. Searches already sent are still counted, so
+    /// their late pages never pass for a newer search's.
+    fn close(&mut self) {
+        *self = Self {
+            in_flight: self.in_flight,
+            ..Self::default()
+        };
+    }
+
+    fn resync_required(&mut self) {
+        self.in_flight = self.in_flight.saturating_sub(1);
+        self.forget_results();
+    }
+
+    /// Whether the results name rows of history `generation`. Results from
+    /// before history was replaced name rows that no longer exist, and are
+    /// dropped; a page newer than the snapshot waits for it to catch up.
+    fn results_match(&mut self, generation: u64) -> bool {
+        match self.page_generation.cmp(&generation) {
+            std::cmp::Ordering::Less => {
+                self.forget_results();
+                false
+            }
+            std::cmp::Ordering::Greater => false,
+            std::cmp::Ordering::Equal => true,
+        }
+    }
+
+    /// Drops results whose rows are gone, as after history was replaced;
+    /// Enter searches again.
+    fn forget_results(&mut self) {
+        self.matches.clear();
+        self.next_cursor = None;
+        self.pending_reveal = None;
+        self.searching = false;
+    }
 }
 
 fn new_search_editor() -> BoundedTextEditor {
@@ -1434,10 +1513,18 @@ struct PaneView {
     image_sources: ImageContentLeaseSet,
     scrollback_viewport: ScrollbackViewport,
     painted_history_status: Option<HistoryOverlayStatus>,
+    /// A return-to-live resynchronization was sent and its authoritative
+    /// snapshot has not arrived; another would only queue behind it.
+    resync_pending: bool,
     history_page_pending: bool,
+    /// The oldest cached history row when older history was last requested.
+    /// Pages join the cache only while that row is still its first.
+    history_page_top: Option<u64>,
     history_selection_pin_blocked: bool,
     scroll_started_at: Option<Instant>,
     rendered_viewport_offset: usize,
+    /// The row ids the pane's frame was last drawn with, top to bottom.
+    rendered_row_ids: Vec<Option<u64>>,
     viewport_dirty: bool,
     updates: Option<Receiver<WindowUpdate>>,
     commands: Option<Sender<WindowCommand>>,
@@ -1536,8 +1623,29 @@ fn rebuild_pane_scaled_frame_with_context(
     Ok(true)
 }
 
+fn row_ids(display: &TerminalSnapshot) -> Vec<Option<u64>> {
+    display.visible_rows.iter().map(|row| row.row_id).collect()
+}
+
+/// Whether moving the view `delta` rows further back (or forward, when
+/// negative) shows the drawn rows `previous` shifted by `delta` in `current`.
+fn viewport_shift_matches(previous: &[Option<u64>], current: &[Option<u64>], delta: isize) -> bool {
+    let rows = current.len();
+    let count = delta.unsigned_abs();
+    if previous.len() != rows || count == 0 || count >= rows {
+        return false;
+    }
+    let (kept, shown) = if delta > 0 {
+        (&previous[..rows - count], &current[count..])
+    } else {
+        (&previous[count..], &current[..rows - count])
+    };
+    kept.iter().all(Option::is_some) && kept == shown
+}
+
 fn finish_rebuilt_pane_frame(pane: &mut PaneView) {
     pane.rendered_viewport_offset = pane.scrollback_viewport.offset_from_bottom();
+    pane.rendered_row_ids = pane.displayed_row_ids();
     pane.viewport_dirty = false;
     pane.scroll_started_at = None;
     pane.prepare_dirty_rows.fill(false);
@@ -1606,6 +1714,12 @@ impl PaneView {
     fn clear_trace_correlation(&mut self) {
         self.trace_correlation = None;
         self.trace_superseded_revisions = 0;
+    }
+
+    fn discard_lagging_history(&mut self) {
+        if let Some(snapshot) = self.snapshot.as_mut() {
+            discard_lagging_history(snapshot, &self.scrollback_viewport);
+        }
     }
 
     fn history_rows_needed_for_viewport_transition(&self) -> Vec<TerminalRow> {
@@ -1687,9 +1801,12 @@ impl PaneView {
             scrollback_viewport: ScrollbackViewport::default(),
             painted_history_status: None,
             history_page_pending: false,
+            resync_pending: false,
+            history_page_top: None,
             history_selection_pin_blocked: false,
             scroll_started_at: None,
             rendered_viewport_offset: 0,
+            rendered_row_ids: Vec::new(),
             viewport_dirty: false,
             updates: Some(options.updates),
             commands: Some(options.commands),
@@ -1724,16 +1841,43 @@ impl PaneView {
         self.history_selection_pin_blocked = false;
     }
 
+    /// The row ids this pane shows now, top to bottom.
+    fn displayed_row_ids(&self) -> Vec<Option<u64>> {
+        self.snapshot.as_ref().map_or_else(Vec::new, |snapshot| {
+            self.scrollback_viewport
+                .visible_rows(snapshot)
+                .into_iter()
+                .map(|row| row.row_id)
+                .collect()
+        })
+    }
+
+    /// The screen selections resolve against below the history cache: the
+    /// one this pane shows, which is the held screen while a viewport holds.
+    fn selection_screen(&self) -> Option<&[TerminalRow]> {
+        let snapshot = self.snapshot.as_ref()?;
+        Some(
+            self.scrollback_viewport
+                .held_screen()
+                .unwrap_or(&snapshot.visible_rows),
+        )
+    }
+
     fn display_snapshot(&self) -> Option<TerminalSnapshot> {
         let snapshot = self.snapshot.as_ref()?;
         if self.scrollback_viewport.is_live() {
             return Some(snapshot.clone());
         }
-        let cursor_row = viewport_cursor_row(
-            snapshot.cursor_row,
-            self.scrollback_viewport.offset_from_bottom(),
-            snapshot.rows,
-        );
+        // A held viewport shows an older screen; the live cursor is not on it.
+        let cursor_row = (!self.scrollback_viewport.is_holding())
+            .then(|| {
+                viewport_cursor_row(
+                    snapshot.cursor_row,
+                    self.scrollback_viewport.offset_from_bottom(),
+                    snapshot.rows,
+                )
+            })
+            .flatten();
         let mut input_modes = snapshot.input_modes;
         if cursor_row.is_none() {
             input_modes.cursor_visible = false;
@@ -1790,12 +1934,7 @@ impl PaneView {
             .snapshot
             .as_mut()
             .context("scrollback pages arrived before initial pane snapshot")?;
-        if pages.iter().any(|page| {
-            page.splint_id != snapshot.splint_id
-                || page.incarnation != snapshot.incarnation
-                || page.terminal_revision != snapshot.revision
-                || page.history_generation != snapshot.history_generation
-        }) {
+        if !pages_join_history(&pages, snapshot, self.history_page_top) {
             return Ok(false);
         }
         let first_loaded = snapshot
@@ -1808,8 +1947,10 @@ impl PaneView {
             .iter()
             .filter_map(|row| row.row_id)
             .collect::<std::collections::BTreeSet<_>>();
+        // Only a page read at this revision describes this snapshot's bounds.
         let metadata = pages
             .first()
+            .filter(|page| page.terminal_revision == snapshot.revision)
             .map(|page| (page.oldest_available_row_id, page.newest_available_row_id));
         let mut older = pages
             .into_iter()
@@ -1824,8 +1965,12 @@ impl PaneView {
             return Ok(false);
         }
         older.extend(snapshot.scrollback_rows.iter().cloned());
-        let Some(older) = bound_history_page_with_pins(older, pinned, &snapshot.visible_rows)
-        else {
+        // Selections resolve against the held screen while a view holds.
+        let screen = self
+            .scrollback_viewport
+            .held_screen()
+            .unwrap_or(&snapshot.visible_rows);
+        let Some(older) = bound_history_page_with_pins(older, pinned, screen) else {
             self.history_selection_pin_blocked = true;
             return Ok(false);
         };
@@ -1839,6 +1984,7 @@ impl PaneView {
             snapshot.oldest_available_scrollback_row_id = oldest;
             snapshot.newest_available_scrollback_row_id = newest;
         }
+        self.scrollback_viewport.reanchor(snapshot);
         Ok(true)
     }
 
@@ -1858,6 +2004,7 @@ impl PaneView {
                 image_sources,
                 authoritative,
             } => {
+                self.resync_pending &= !authoritative;
                 snapshot
                     .validate()
                     .map_err(|error| anyhow::anyhow!(error.message))?;
@@ -1874,11 +2021,19 @@ impl PaneView {
                         current.history_generation
                     });
                 let previous_rows = self.history_rows_needed_for_viewport_transition();
+                if let Some(current) = self.snapshot.as_ref() {
+                    retain_history_for_viewport(
+                        current,
+                        &mut snapshot,
+                        &mut self.scrollback_viewport,
+                    );
+                }
                 self.scrollback_viewport.observe_history_change(
                     previous_generation,
                     &previous_rows,
                     &snapshot,
                 );
+                discard_lagging_history(&mut snapshot, &self.scrollback_viewport);
                 self.clear_local_content_state();
                 self.snapshot = Some(snapshot);
                 self.image_sources = image_sources;
@@ -1919,13 +2074,18 @@ impl PaneView {
                         .snapshot
                         .as_mut()
                         .context("terminal update arrived before initial pane snapshot")?;
-                    apply_terminal_update(snapshot, update)?;
+                    apply_terminal_update_for_viewport(
+                        snapshot,
+                        update,
+                        &mut self.scrollback_viewport,
+                    )?;
                     apply_theme(snapshot, theme);
                     self.scrollback_viewport.observe_history_change(
                         previous_generation,
                         &previous_rows,
                         snapshot,
                     );
+                    discard_lagging_history(snapshot, &self.scrollback_viewport);
                 }
                 if let Some(image_sources) = image_sources {
                     self.image_sources = image_sources;
@@ -2001,16 +2161,13 @@ impl PaneView {
                 Ok(BackgroundUpdateImpact::VISUAL)
             }
             WindowUpdate::SearchResults(page) => {
-                self.search.matches = page.matches;
-                self.search.selected = 0;
-                self.search.next_cursor = page.next_cursor;
-                self.search.pending_reveal = self.search.matches.first().cloned();
+                // Ctrl+N continues once the pane has focus again.
+                let _ = self.search.take_page(page);
+                self.search.searching = false;
                 Ok(BackgroundUpdateImpact::VISUAL)
             }
             WindowUpdate::SearchResyncRequired => {
-                self.search.matches.clear();
-                self.search.next_cursor = None;
-                self.search.pending_reveal = None;
+                self.search.resync_required();
                 Ok(BackgroundUpdateImpact::VISUAL)
             }
             WindowUpdate::ScrollbackResyncRequired => {
@@ -2601,6 +2758,53 @@ impl SchedulingState {
     }
 }
 
+/// Whether a batch of older history pages may be joined to `snapshot`'s cache.
+///
+/// History rows never change within one generation, so a page read at another
+/// terminal revision still holds the right rows, but it joins the cache only if
+/// the cache still starts at `requested_top`, the row the pages were read
+/// before. Without that, a cache replaced in the meantime would get a seam.
+fn pages_join_history(
+    pages: &[splinterm_protocol::ScrollbackPage],
+    snapshot: &TerminalSnapshot,
+    requested_top: Option<u64>,
+) -> bool {
+    let same_history = pages.iter().all(|page| {
+        page.splint_id == snapshot.splint_id
+            && page.incarnation == snapshot.incarnation
+            && page.history_generation == snapshot.history_generation
+    });
+    let cache_top = snapshot.scrollback_rows.first().and_then(|row| row.row_id);
+    let same_top = cache_top.is_some() && cache_top == requested_top;
+    let same_revision = pages
+        .iter()
+        .all(|page| page.terminal_revision == snapshot.revision);
+    same_history && (same_top || same_revision)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HistoryKey {
+    Navigate(HistoryNavigation),
+    /// Handled with nothing to do; the terminal never receives it.
+    Consume,
+    Forward,
+}
+
+/// What a history shortcut does. Return to live while already live on the
+/// normal screen is consumed, so a shell never receives Shift+End and inserts
+/// a stray character; a full-screen application still receives it.
+fn history_key(action: Option<ActionId>, live: bool, screen: Option<ActiveScreen>) -> HistoryKey {
+    match action {
+        Some(ActionId::PageUp) => HistoryKey::Navigate(HistoryNavigation::PageUp),
+        Some(ActionId::PageDown) => HistoryKey::Navigate(HistoryNavigation::PageDown),
+        Some(ActionId::ReturnToLive) if !live => {
+            HistoryKey::Navigate(HistoryNavigation::ReturnToLive)
+        }
+        Some(ActionId::ReturnToLive) if screen == Some(ActiveScreen::Normal) => HistoryKey::Consume,
+        _ => HistoryKey::Forward,
+    }
+}
+
 fn try_window_command(commands: &Sender<WindowCommand>, command: WindowCommand) -> Result<()> {
     commands.try_send(command).map_err(|error| match error {
         TrySendError::Full(_) => anyhow::anyhow!("Wayland command queue overflow"),
@@ -2770,19 +2974,37 @@ fn propagate_raster_damage_through_scroll(
     }
 }
 
+/// Sends a command the Window can do without: a resynchronization, a
+/// history page or a search. When the queue is full the bridge is behind,
+/// for example while it delivers a flood of output, and the command is
+/// dropped instead of ending the Window. Returns whether it was sent.
+fn try_advisory_command(commands: &Sender<WindowCommand>, command: WindowCommand) -> Result<bool> {
+    match commands.try_send(command) {
+        Ok(()) => Ok(true),
+        Err(TrySendError::Full(_)) => Ok(false),
+        Err(TrySendError::Closed(_)) => {
+            Err(anyhow::anyhow!("Wayland command receiver disconnected"))
+        }
+    }
+}
+
+/// Asks for an authoritative snapshot when a viewport reaches live, unless
+/// one is already on its way. A dropped request is harmless: a live view
+/// already drops history that lags, and the next return to live asks again.
 fn request_return_live_resync(
     commands: Option<&Sender<WindowCommand>>,
+    pending: &mut bool,
     previous_offset: usize,
     current_offset: usize,
 ) -> Result<bool> {
-    if previous_offset == 0 || current_offset != 0 {
+    if previous_offset == 0 || current_offset != 0 || *pending {
         return Ok(false);
     }
     let Some(commands) = commands else {
         return Ok(false);
     };
-    try_window_command(commands, WindowCommand::Resynchronize)?;
-    Ok(true)
+    *pending = try_advisory_command(commands, WindowCommand::Resynchronize)?;
+    Ok(*pending)
 }
 
 /// The topology manager is still busy with earlier commands, for example
@@ -4691,7 +4913,7 @@ impl App {
         let Some(commands) = self.panes.pane.commands.as_ref() else {
             return Ok(());
         };
-        try_window_command(
+        if !try_advisory_command(
             commands,
             WindowCommand::FetchScrollback {
                 splint_id: snapshot.splint_id,
@@ -4700,13 +4922,17 @@ impl App {
                 history_generation: snapshot.history_generation,
                 before_row_id,
             },
-        )?;
+        )? {
+            return Ok(());
+        }
         self.panes.pane.history_page_pending = true;
+        self.panes.pane.history_page_top = Some(before_row_id);
         Ok(())
     }
 
     fn scroll_history(&mut self, action: MouseAction, lines: usize) -> Result<bool> {
         self.cancel_clipboard_image();
+        self.panes.pane.discard_lagging_history();
         let snapshot = self
             .panes
             .pane
@@ -4731,6 +4957,7 @@ impl App {
         let moved = current_offset != previous_offset;
         request_return_live_resync(
             self.panes.pane.commands.as_ref(),
+            &mut self.panes.pane.resync_pending,
             previous_offset,
             current_offset,
         )?;
@@ -4743,6 +4970,8 @@ impl App {
                 self.request_older_history()?;
             }
         }
+        // Scrolling back to live ends a hold; its cache no longer joins the screen.
+        self.panes.pane.discard_lagging_history();
         if !moved {
             return Ok(false);
         }
@@ -4897,7 +5126,7 @@ impl App {
                         .selection
                         .context("selection survived output")?;
                     anyhow::ensure!(
-                        selection_is_retained(snapshot, selection),
+                        selection_is_retained(snapshot, &snapshot.visible_rows, selection),
                         "selection endpoints were not retained during output"
                     );
                     probe.evidence.push(serde_json::json!({
@@ -5045,17 +5274,25 @@ impl App {
         event: &KeyEvent,
         queue_handle: &QueueHandle<Self>,
     ) -> Result<bool> {
-        let navigation = match shortcut_action_for(&self.input.keymap, event, self.input.modifiers)
-        {
-            Some(ActionId::PageUp) => HistoryNavigation::PageUp,
-            Some(ActionId::PageDown) => HistoryNavigation::PageDown,
-            Some(ActionId::ReturnToLive) if !self.panes.pane.scrollback_viewport.is_live() => {
-                HistoryNavigation::ReturnToLive
+        let action = shortcut_action_for(&self.input.keymap, event, self.input.modifiers);
+        let screen = self
+            .panes
+            .pane
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.active_screen);
+        match history_key(
+            action,
+            self.panes.pane.scrollback_viewport.is_live(),
+            screen,
+        ) {
+            HistoryKey::Navigate(navigation) => {
+                self.apply_history_navigation(navigation, queue_handle)?;
+                Ok(true)
             }
-            _ => return Ok(false),
-        };
-        self.apply_history_navigation(navigation, queue_handle)?;
-        Ok(true)
+            HistoryKey::Consume => Ok(true),
+            HistoryKey::Forward => Ok(false),
+        }
     }
 
     fn send_input(&mut self, bytes: Vec<u8>) -> Result<()> {
@@ -5342,12 +5579,7 @@ impl App {
 
     fn finish_selection(&mut self) -> Option<&[u8]> {
         self.panes.pane.selecting = false;
-        self.panes.pane.selected_text =
-            self.panes.pane.selection.and_then(|selection| {
-                self.panes.pane.snapshot.as_ref().and_then(|snapshot| {
-                    selection_text(snapshot, selection).map(String::into_bytes)
-                })
-            });
+        self.panes.pane.selected_text = self.current_selection_text();
         self.panes.pane.selected_text.as_deref()
     }
 
@@ -5398,11 +5630,20 @@ impl App {
         }
     }
 
+    /// The text the selection covers in the rows this pane shows.
+    fn current_selection_text(&self) -> Option<Vec<u8>> {
+        let selection = self.panes.pane.selection?;
+        let snapshot = self.panes.pane.snapshot.as_ref()?;
+        let screen = self.panes.pane.selection_screen()?;
+        selection_text(snapshot, screen, selection).map(String::into_bytes)
+    }
+
     fn dirty_selection(&mut self, selection: Option<Selection>) {
         let bounds = selection.and_then(|selection| {
             let snapshot = self.panes.pane.snapshot.as_ref()?;
+            let screen = self.panes.pane.selection_screen()?;
             let display = self.panes.display_snapshot_cow()?;
-            selection_display_bounds(snapshot, &display, selection)
+            selection_display_bounds(snapshot, screen, &display, selection)
         });
         if let Some((start, end)) = bounds {
             let rows = self
@@ -5446,7 +5687,10 @@ impl App {
                 .pane
                 .snapshot
                 .as_ref()
-                .is_some_and(|snapshot| selection_is_retained(snapshot, selection))
+                .zip(self.panes.pane.selection_screen())
+                .is_some_and(|(snapshot, screen)| {
+                    selection_is_retained(snapshot, screen, selection)
+                })
         });
         let copy_mode_retained = self.modal.copy_mode.is_none_or(|state| {
             self.panes
@@ -5461,7 +5705,14 @@ impl App {
             self.panes.pane.selecting = false;
             self.panes.pane.history_selection_pin_blocked = false;
         }
+        let previous_text = self.panes.pane.selected_text.take();
         self.invalidate_viewport_local_state();
+        // A finished selection that survives new output still copies. Its
+        // rows keep their text, but read them again in case one changed in
+        // place; a row that left the cache keeps the earlier text.
+        if !self.panes.pane.selecting && self.panes.pane.selection.is_some() {
+            self.panes.pane.selected_text = self.current_selection_text().or(previous_text);
+        }
     }
 
     fn recompute_hovered_url(&mut self) {
@@ -8710,6 +8961,14 @@ impl App {
         if snapshot.active_screen != ActiveScreen::Normal {
             return;
         }
+        if !self
+            .panes
+            .pane
+            .search
+            .results_match(snapshot.history_generation)
+        {
+            return;
+        }
         if self
             .panes
             .pane
@@ -8729,7 +8988,25 @@ impl App {
             self.panes.pane.search.pending_reveal = None;
             self.panes.pane.viewport_dirty = true;
             self.presentation.full_redraw = true;
-        } else if !self.panes.pane.history_page_pending {
+        } else if !self.panes.pane.history_page_pending
+            // A match newer than the cache was found after this Window's
+            // latest update; it arrives with the next ones, which retry this.
+            && snapshot
+                .scrollback_rows
+                .first()
+                .and_then(|row| row.row_id)
+                .is_none_or(|top| item.row_id < top)
+        {
+            // Nothing older can arrive: the daemon has no older history, or
+            // trimmed the match's row. Give up instead of walking forever.
+            let unreachable = snapshot.omitted_oldest_scrollback_rows == 0
+                || snapshot
+                    .oldest_available_scrollback_row_id
+                    .is_some_and(|oldest| item.row_id < oldest);
+            if unreachable {
+                self.panes.pane.search.pending_reveal = None;
+                return;
+            }
             let before_row_id = snapshot
                 .scrollback_rows
                 .first()
@@ -8739,16 +9016,47 @@ impl App {
                         .newest_available_scrollback_row_id
                         .and_then(|id| id.checked_add(1))
                 });
-            if let Some(before_row_id) = before_row_id {
-                self.panes.pane.history_page_pending = true;
-                self.send_command(WindowCommand::FetchScrollback {
-                    splint_id: snapshot.splint_id,
-                    incarnation: snapshot.incarnation,
-                    terminal_revision: snapshot.revision,
-                    history_generation: snapshot.history_generation,
-                    before_row_id,
-                });
+            let command = before_row_id.map(|before_row_id| WindowCommand::FetchScrollback {
+                splint_id: snapshot.splint_id,
+                incarnation: snapshot.incarnation,
+                terminal_revision: snapshot.revision,
+                history_generation: snapshot.history_generation,
+                before_row_id,
+            });
+            let top = snapshot.scrollback_rows.first().and_then(|row| row.row_id);
+            let sent = match (command, self.panes.pane.commands.as_ref()) {
+                // Retried with the next update while the match is unrevealed.
+                (Some(command), Some(commands)) => match try_advisory_command(commands, command) {
+                    Ok(sent) => sent,
+                    Err(error) => {
+                        self.scheduling.fail(error);
+                        false
+                    }
+                },
+                _ => false,
+            };
+            if !sent {
+                return;
             }
+            self.panes.pane.history_page_pending = true;
+            self.panes.pane.history_page_top = top;
+            // A selection pins its rows in the bounded history cache, which
+            // then refuses older pages and the walk would never arrive. The
+            // match replaces the selection once revealed, so drop it now.
+            if self.panes.pane.selection.is_some() {
+                self.clear_selection();
+            }
+            // Walk back from the oldest loaded row with the view there,
+            // detached: a live view drops history that lags new output, so
+            // each new line would restart the walk and it would never arrive.
+            if let Some(snapshot) = self.panes.pane.snapshot.as_ref() {
+                self.panes
+                    .pane
+                    .scrollback_viewport
+                    .scroll_up(snapshot.scrollback_rows.len(), snapshot);
+            }
+            self.panes.pane.viewport_dirty = true;
+            self.presentation.full_redraw = true;
         }
     }
 
@@ -8757,16 +9065,46 @@ impl App {
             return;
         };
         let query = self.panes.pane.search.query.clone();
+        let Some(commands) = self.panes.pane.commands.as_ref() else {
+            return;
+        };
         if query.is_empty() {
             return;
         }
-        self.send_command(WindowCommand::Search {
-            terminal_revision: snapshot.revision,
-            history_generation: snapshot.history_generation,
-            query,
-            case_sensitive: false,
-            cursor,
-        });
+        let continuing = cursor.is_some();
+        // A cursor continues the page it came from. Sending that page's
+        // generation and revision lets the daemon say when history has
+        // changed under it, instead of reading the cursor against other rows.
+        let (terminal_revision, history_generation) = if continuing {
+            (
+                self.panes.pane.search.page_revision,
+                self.panes.pane.search.page_generation,
+            )
+        } else {
+            (snapshot.revision, snapshot.history_generation)
+        };
+        let sent = try_advisory_command(
+            commands,
+            WindowCommand::Search {
+                terminal_revision,
+                history_generation,
+                query: query.clone(),
+                case_sensitive: false,
+                cursor,
+            },
+        );
+        let search = &mut self.panes.pane.search;
+        match sent {
+            // Counted only when sent: nothing else answers it.
+            Ok(true) => {
+                search.in_flight = search.in_flight.saturating_add(1);
+                search.submitted_query = query;
+                search.searching = continuing && search.matches.is_empty();
+            }
+            // Busy: Enter or Ctrl+N asks again.
+            Ok(false) => search.searching = false,
+            Err(error) => self.scheduling.fail(error),
+        }
     }
 
     #[allow(
@@ -9241,7 +9579,7 @@ impl App {
             match event.keysym {
                 Keysym::Escape => {
                     self.input.input_generation = self.input.input_generation.saturating_add(1);
-                    self.panes.pane.search = SearchUiState::default();
+                    self.panes.pane.search.close();
                     self.panes.pane.selection = None;
                 }
                 Keysym::Return | Keysym::KP_Enter => {
@@ -10465,6 +10803,7 @@ impl App {
                     authoritative,
                 } => {
                     self.panes.pane.history_page_pending = false;
+                    self.panes.pane.resync_pending &= !authoritative;
                     snapshot
                         .validate()
                         .map_err(|error| anyhow::anyhow!(error.message))?;
@@ -10486,11 +10825,20 @@ impl App {
                             .panes
                             .pane
                             .history_rows_needed_for_viewport_transition();
-                        self.panes.pane.scrollback_viewport.observe_history_change(
+                        let pane = &mut self.panes.pane;
+                        if let Some(current) = pane.snapshot.as_ref() {
+                            retain_history_for_viewport(
+                                current,
+                                &mut snapshot,
+                                &mut pane.scrollback_viewport,
+                            );
+                        }
+                        pane.scrollback_viewport.observe_history_change(
                             previous_generation,
                             &previous_rows,
                             &snapshot,
                         );
+                        discard_lagging_history(&mut snapshot, &pane.scrollback_viewport);
                         self.invalidate_local_content_state();
                         self.panes.pane.snapshot = Some(snapshot);
                         self.panes.pane.image_sources = image_sources;
@@ -10518,7 +10866,6 @@ impl App {
                             .filter(|row| *row < snapshot.rows)
                     });
                     let scrolls = update.scrolls.clone();
-                    let history_changed = update.scrollback.is_some();
                     let current = self
                         .panes
                         .pane
@@ -10547,20 +10894,26 @@ impl App {
                         .history_rows_needed_for_viewport_transition();
                     let trace_copied_history_bytes =
                         apply_started.map(|_| history_cache_bytes(&previous_rows));
-                    let snapshot = self
-                        .panes
-                        .pane
+                    let pane = &mut self.panes.pane;
+                    let snapshot = pane
                         .snapshot
                         .as_mut()
                         .context("terminal update arrived before initial snapshot")?;
-                    apply_terminal_update(snapshot, update)?;
+                    apply_terminal_update_for_viewport(
+                        snapshot,
+                        update,
+                        &mut pane.scrollback_viewport,
+                    )?;
                     apply_theme(snapshot, self.presentation.theme);
-                    self.panes.pane.scrollback_viewport.observe_history_change(
+                    pane.scrollback_viewport.observe_history_change(
                         previous_generation,
                         &previous_rows,
                         snapshot,
                     );
-                    if history_changed && !self.panes.pane.scrollback_viewport.is_live() {
+                    discard_lagging_history(snapshot, &pane.scrollback_viewport);
+                    // The update's dirty rows and scrolls are live-screen
+                    // positions; a view off live shows other rows there.
+                    if !self.panes.pane.scrollback_viewport.is_live() {
                         full = true;
                     }
                     let trace_pane_role = self.panes.pane.trace_pane_role("focused");
@@ -10711,12 +11064,7 @@ impl App {
                         .snapshot
                         .as_mut()
                         .context("scrollback pages arrived before initial snapshot")?;
-                    if pages.iter().any(|page| {
-                        page.splint_id != snapshot.splint_id
-                            || page.incarnation != snapshot.incarnation
-                            || page.terminal_revision != snapshot.revision
-                            || page.history_generation != snapshot.history_generation
-                    }) {
+                    if !pages_join_history(&pages, snapshot, self.panes.pane.history_page_top) {
                         continue;
                     }
                     let first_loaded = snapshot
@@ -10731,6 +11079,7 @@ impl App {
                         .collect::<std::collections::BTreeSet<_>>();
                     let metadata = pages
                         .first()
+                        .filter(|page| page.terminal_revision == snapshot.revision)
                         .map(|page| (page.oldest_available_row_id, page.newest_available_row_id));
                     let mut older = pages
                         .into_iter()
@@ -10746,11 +11095,17 @@ impl App {
                         // Keep one contiguous newest history window. If normal bounding
                         // would remove a selected endpoint, reject this older batch so the
                         // existing bounded endpoint window remains pinned and pageable.
-                        if let Some(older) = bound_history_page_with_pins(
-                            older,
-                            pinned_selection_rows,
-                            &snapshot.visible_rows,
-                        ) {
+                        // Selections resolve against the held screen while
+                        // a view holds.
+                        let screen = self
+                            .panes
+                            .pane
+                            .scrollback_viewport
+                            .held_screen()
+                            .unwrap_or(&snapshot.visible_rows);
+                        if let Some(older) =
+                            bound_history_page_with_pins(older, pinned_selection_rows, screen)
+                        {
                             snapshot.scrollback_rows = older;
                             snapshot.omitted_oldest_scrollback_rows = omitted_rows_before_cache(
                                 snapshot.oldest_available_scrollback_row_id,
@@ -10760,6 +11115,14 @@ impl App {
                             if let Some((oldest, newest)) = metadata {
                                 snapshot.oldest_available_scrollback_row_id = oldest;
                                 snapshot.newest_available_scrollback_row_id = newest;
+                            }
+                            // A full cache drops its newest rows, below the
+                            // view: keep the view on its rows, and rebuild the
+                            // frame, whose rows and drawn offset are now stale.
+                            if !self.panes.pane.scrollback_viewport.is_live() {
+                                self.panes.pane.scrollback_viewport.reanchor(snapshot);
+                                visual_changed = true;
+                                focused_visual_changed = true;
                             }
                         } else {
                             self.panes.pane.history_selection_pin_blocked = true;
@@ -10797,20 +11160,16 @@ impl App {
                     title_changed = true;
                 }
                 WindowUpdate::SearchResults(page) => {
-                    self.panes.pane.search.matches = page.matches;
-                    self.panes.pane.search.selected = 0;
-                    self.panes.pane.search.next_cursor = page.next_cursor;
-                    self.panes.pane.search.pending_reveal =
-                        self.panes.pane.search.matches.first().cloned();
+                    if let Some(cursor) = self.panes.pane.search.take_page(page) {
+                        self.submit_search(Some(cursor));
+                    }
                     title_changed = true;
                     visual_changed = true;
                     focused_visual_changed = true;
                     self.presentation.full_redraw = true;
                 }
                 WindowUpdate::SearchResyncRequired => {
-                    self.panes.pane.search.matches.clear();
-                    self.panes.pane.search.next_cursor = None;
-                    self.panes.pane.search.pending_reveal = None;
+                    self.panes.pane.search.resync_required();
                     title_changed = true;
                     visual_changed = true;
                     focused_visual_changed = true;
@@ -11008,7 +11367,22 @@ impl App {
                 .iter()
                 .filter(|dirty| **dirty)
                 .count();
+            // A view that moved since its last frame, by scrolling or by a
+            // history page joining, shows other rows in most places. The
+            // rows marked dirty above cover only what output changed, so
+            // repaint the whole pane; the draw step that would have done it
+            // for the scroll is skipped once this frame is current.
+            let shown_rows_changed = if live_viewport {
+                self.panes.pane.viewport_dirty
+            } else {
+                self.panes.pane.viewport_dirty
+                    || self.panes.pane.rendered_row_ids != row_ids(display)
+            };
+            if shown_rows_changed {
+                self.presentation.full_redraw = true;
+            }
             if full_frame_reload
+                || shown_rows_changed
                 || self.panes.pane.snapshot_frame.is_none()
                 || (!live_viewport && !cursor_only_history)
             {
@@ -11029,6 +11403,7 @@ impl App {
             }
             self.panes.pane.rendered_viewport_offset =
                 self.panes.pane.scrollback_viewport.offset_from_bottom();
+            self.panes.pane.rendered_row_ids = row_ids(display);
             self.panes.pane.viewport_dirty = false;
             self.panes.pane.prepare_dirty_rows.fill(false);
             if let Some(started) = prepare_started {
@@ -11427,11 +11802,28 @@ impl App {
                 .ok()
                 .zip(isize::try_from(self.panes.pane.rendered_viewport_offset).ok())
                 .map(|(current, rendered)| current - rendered);
+            // Output prepared but not yet painted means the pixels lag the
+            // frame; shifting them would carry the old rows along.
+            let unpainted = self.panes.pane.prepare_dirty_rows.contains(&true)
+                || self.panes.pane.raster_dirty_rows.contains(&true)
+                || self.panes.pane.surface_dirty_rows.contains(&true)
+                || !self.panes.pane.pending_scrolls.is_empty();
             self.panes.pane.prepare_dirty_rows.fill(false);
             self.panes.pane.raster_dirty_rows.fill(false);
             self.panes.pane.surface_dirty_rows.fill(false);
             self.panes.pane.pending_scrolls.clear();
-            let incremental = if display.images.is_none() {
+            // Shifting the drawn frame is right only when the rows it keeps
+            // are the rows the view now shows there. Anything else that
+            // moved the view since the last frame needs a full rebuild.
+            let shifted_rows_match = !unpainted
+                && delta.is_some_and(|delta| {
+                    viewport_shift_matches(
+                        &self.panes.pane.rendered_row_ids,
+                        &row_ids(&display),
+                        delta,
+                    )
+                });
+            let incremental = if display.images.is_none() && shifted_rows_match {
                 if let (Some(frame), Some(delta)) = (&mut self.panes.pane.snapshot_frame, delta) {
                     frame.scroll_viewport_rows_with_context(
                         &display,
@@ -11476,6 +11868,7 @@ impl App {
                 self.presentation.full_redraw = true;
             }
             self.panes.pane.rendered_viewport_offset = current_offset;
+            self.panes.pane.rendered_row_ids = row_ids(&display);
             self.panes.pane.viewport_dirty = false;
         }
         for pane in &mut self.panes.inactive_panes {
@@ -11551,8 +11944,9 @@ impl App {
         let height_i32 = i32::try_from(height).context("buffer height fits i32")?;
         let resolved_selection = self.panes.pane.selection.and_then(|selection| {
             let snapshot = self.panes.pane.snapshot.as_ref()?;
+            let screen = self.panes.pane.selection_screen()?;
             let display = self.panes.display_snapshot_cow()?;
-            selection_display_bounds(snapshot, &display, selection)
+            selection_display_bounds(snapshot, screen, &display, selection)
                 .map(|(start, end)| ((start.row, start.column), (end.row, end.column)))
         });
         let inline_picker_open = self.modal.inline_picker_open();
@@ -12074,6 +12468,7 @@ impl App {
                     &self.panes.pane.search.query,
                     self.panes.pane.search.matches.len(),
                     self.panes.pane.search.selected,
+                    self.panes.pane.search.searching,
                 )?;
             }
             self.surface.buffers[buffer_index].stale.mark_full();
@@ -16667,6 +17062,36 @@ mod tests {
     }
 
     #[test]
+    fn older_pages_join_only_an_unchanged_cache_top_or_the_same_revision() {
+        let mut current = snapshot(SplintId::new(), 1, 10);
+        current.scrollback_rows = (50..=60).map(|id| history_row(id, 0)).collect();
+        let page = |terminal_revision| splinterm_protocol::ScrollbackPage {
+            splint_id: current.splint_id,
+            incarnation: current.incarnation,
+            terminal_revision,
+            history_generation: current.history_generation,
+            oldest_available_row_id: Some(1),
+            newest_available_row_id: Some(60),
+            rows: (40..=49).map(|id| history_row(id, 0)).collect(),
+            has_older: true,
+        };
+        let later = current.revision + 3;
+        assert!(pages_join_history(&[page(later)], &current, Some(50)));
+        assert!(pages_join_history(
+            &[page(current.revision)],
+            &current,
+            Some(7)
+        ));
+        assert!(!pages_join_history(&[page(later)], &current, Some(7)));
+        assert!(!pages_join_history(&[page(later)], &current, None));
+        let mut other_generation = page(later);
+        other_generation.history_generation += 1;
+        assert!(!pages_join_history(&[other_generation], &current, Some(50)));
+        current.scrollback_rows.clear();
+        assert!(!pages_join_history(&[page(later)], &current, None));
+    }
+
+    #[test]
     fn history_merge_truncated_append_drops_disconnected_blank_prefix() {
         let returned = (74..=89).collect::<Vec<_>>();
         let current = reduce_history_merge_case(
@@ -17386,7 +17811,10 @@ mod tests {
                 column: 0,
             },
         };
-        assert_eq!(selection_text(&view, selection).as_deref(), Some("A界\nBC"));
+        assert_eq!(
+            selection_text(&view, &view.visible_rows, selection).as_deref(),
+            Some("A界\nBC")
+        );
         let stale = Selection {
             anchor: SelectionEndpoint {
                 history_generation: 2,
@@ -17394,7 +17822,7 @@ mod tests {
             },
             ..selection
         };
-        assert_eq!(selection_text(&view, stale), None);
+        assert_eq!(selection_text(&view, &view.visible_rows, stale), None);
     }
 
     #[test]
@@ -17419,19 +17847,74 @@ mod tests {
                 column: 0,
             },
         };
-        assert!(selection_is_retained(&state, selection));
+        assert!(selection_is_retained(
+            &state,
+            &state.visible_rows,
+            selection
+        ));
 
         let moved = state.visible_rows.remove(0);
         state.scrollback_rows.push(moved);
         state.rows = 1;
-        assert!(selection_is_retained(&state, selection));
+        assert!(selection_is_retained(
+            &state,
+            &state.visible_rows,
+            selection
+        ));
         state.history_generation = 2;
-        assert!(!selection_is_retained(&state, selection));
+        assert!(!selection_is_retained(
+            &state,
+            &state.visible_rows,
+            selection
+        ));
         state.history_generation = 1;
         state.scrollback_rows.clear();
-        assert!(!selection_is_retained(&state, selection));
+        assert!(!selection_is_retained(
+            &state,
+            &state.visible_rows,
+            selection
+        ));
         state.active_screen = ActiveScreen::Alternate;
-        assert!(!selection_is_retained(&state, selection));
+        assert!(!selection_is_retained(
+            &state,
+            &state.visible_rows,
+            selection
+        ));
+    }
+
+    #[test]
+    fn a_selection_on_a_held_screen_copies_its_rows() {
+        let row = |row_id, text: &str| {
+            let mut row = blank_row(2);
+            row.row_id = Some(row_id);
+            for (cell, character) in row.cells.iter_mut().zip(text.chars()) {
+                cell.content = character.to_string();
+            }
+            row
+        };
+        let mut state = snapshot(SplintId::new(), 1, 1);
+        state.columns = 2;
+        state.rows = 2;
+        state.scrollback_rows = vec![row(1, "h1")];
+        // The live screen moved on; the held one still shows rows 5 and 6.
+        state.visible_rows = vec![row(20, "n1"), row(21, "n2")];
+        let held = vec![row(5, "s1"), row(6, "s2")];
+        let endpoint = |row_id, column| SelectionEndpoint {
+            active_screen: ActiveScreen::Normal,
+            history_generation: 1,
+            row_id,
+            column,
+        };
+        let selection = Selection {
+            anchor: endpoint(1, 0),
+            end: endpoint(6, 1),
+        };
+        assert_eq!(
+            selection_text(&state, &held, selection).as_deref(),
+            Some("h1\ns1\ns2")
+        );
+        assert!(selection_is_retained(&state, &held, selection));
+        assert_eq!(selection_text(&state, &state.visible_rows, selection), None);
     }
 
     #[test]
@@ -17463,14 +17946,15 @@ mod tests {
                 column: 0,
             },
         };
-        let copied = selection_text(&state, selection).expect("loaded endpoints resolve");
+        let copied = selection_text(&state, &state.visible_rows, selection)
+            .expect("loaded endpoints resolve");
         assert_eq!(copied.lines().count(), 48);
 
         let mut display = state.clone();
         display.scrollback_rows.clear();
         display.visible_rows = rows[19..27].to_vec();
         assert_eq!(
-            selection_display_bounds(&state, &display, selection),
+            selection_display_bounds(&state, &state.visible_rows, &display, selection),
             Some((
                 CellPosition { row: 0, column: 0 },
                 CellPosition { row: 7, column: 0 },
@@ -17819,13 +18303,172 @@ mod tests {
     }
 
     #[test]
+    fn a_search_page_keeps_where_its_cursor_belongs_and_stale_results_clear() {
+        let mut search = SearchUiState {
+            in_flight: 1,
+            ..SearchUiState::default()
+        };
+        let mut page = search_page(2, false, Some("r10"));
+        page.history_generation = 4;
+        page.terminal_revision = 9;
+        assert_eq!(search.take_page(page), None);
+        assert_eq!((search.page_generation, search.page_revision), (4, 9));
+        assert!(search.pending_reveal.is_some());
+        assert!(!search.results_match(3), "the snapshot lags: wait");
+        assert!(search.pending_reveal.is_some());
+        assert!(search.results_match(4));
+        assert!(!search.results_match(5), "history was replaced");
+        assert!(search.matches.is_empty());
+        assert_eq!(search.next_cursor, None);
+        assert_eq!(search.pending_reveal, None);
+    }
+
+    fn search_page(matches: usize, timed_out: bool, cursor: Option<&str>) -> SearchPage {
+        SearchPage {
+            splint_id: SplintId::new(),
+            incarnation: 1,
+            terminal_revision: 1,
+            history_generation: 1,
+            matches: (0..matches)
+                .map(|index| SearchMatch {
+                    row_id: u64::try_from(index).unwrap(),
+                    start_column: 0,
+                    end_column: 1,
+                    preview: "x".to_owned(),
+                })
+                .collect(),
+            next_cursor: cursor.map(str::to_owned),
+            timed_out,
+        }
+    }
+
+    #[test]
+    fn a_timed_out_empty_search_page_continues_only_for_the_latest_query() {
+        let open = |query: &str, in_flight: usize| SearchUiState {
+            input: Some(new_search_editor()),
+            query: query.to_owned(),
+            submitted_query: "needle".to_owned(),
+            in_flight,
+            ..SearchUiState::default()
+        };
+
+        let mut search = open("needle", 1);
+        assert_eq!(
+            search.take_page(search_page(0, true, Some("c1"))),
+            Some("c1".to_owned())
+        );
+        assert!(search.searching);
+
+        // A match, the end of history, or an untimed empty page stops it.
+        for page in [
+            search_page(1, true, Some("c2")),
+            search_page(0, true, None),
+            search_page(0, false, Some("c2")),
+        ] {
+            let mut search = open("needle", 1);
+            assert_eq!(search.take_page(page), None);
+            assert!(!search.searching);
+        }
+
+        // An older page while a newer search is in flight, an edited query,
+        // or a closed search field never continues.
+        assert_eq!(
+            open("needle", 2).take_page(search_page(0, true, Some("c"))),
+            None
+        );
+        assert_eq!(
+            open("other", 1).take_page(search_page(0, true, Some("c"))),
+            None
+        );
+        let mut closed = open("needle", 1);
+        closed.input = None;
+        assert_eq!(closed.take_page(search_page(0, true, Some("c"))), None);
+
+        let mut resynced = open("needle", 1);
+        resynced.searching = true;
+        resynced.resync_required();
+        assert!(!resynced.searching);
+        assert_eq!(resynced.in_flight, 0);
+    }
+
+    #[test]
+    fn a_viewport_shift_reuses_the_frame_only_for_the_same_rows() {
+        let ids = |ids: &[u64]| ids.iter().copied().map(Some).collect::<Vec<_>>();
+        let drawn = ids(&[20, 21, 22, 23]);
+        // Back two rows: the drawn top two rows are now the bottom two.
+        assert!(viewport_shift_matches(&drawn, &ids(&[18, 19, 20, 21]), 2));
+        assert!(viewport_shift_matches(&drawn, &ids(&[22, 23, 24, 25]), -2));
+        // The view moved two rows by offset, but the rows below it changed:
+        // the old frame is stale.
+        assert!(!viewport_shift_matches(&drawn, &ids(&[5, 6, 19, 20]), 2));
+        assert!(!viewport_shift_matches(&drawn, &ids(&[16, 17, 18, 19]), 2));
+        assert!(!viewport_shift_matches(&drawn, &drawn, 0));
+        assert!(!viewport_shift_matches(&drawn, &ids(&[1, 2, 3, 4]), 4));
+        assert!(!viewport_shift_matches(
+            &drawn[..3],
+            &ids(&[18, 19, 20, 21]),
+            2
+        ));
+        let unknown = vec![None, None, Some(22), Some(23)];
+        assert!(!viewport_shift_matches(
+            &unknown,
+            &[None, None, None, None],
+            2
+        ));
+    }
+
+    #[test]
+    fn return_to_live_at_live_is_consumed_only_on_the_normal_screen() {
+        let normal = Some(ActiveScreen::Normal);
+        assert_eq!(
+            history_key(Some(ActionId::ReturnToLive), false, normal),
+            HistoryKey::Navigate(HistoryNavigation::ReturnToLive)
+        );
+        assert_eq!(
+            history_key(Some(ActionId::ReturnToLive), true, normal),
+            HistoryKey::Consume
+        );
+        assert_eq!(
+            history_key(
+                Some(ActionId::ReturnToLive),
+                true,
+                Some(ActiveScreen::Alternate)
+            ),
+            HistoryKey::Forward
+        );
+        assert_eq!(
+            history_key(Some(ActionId::PageUp), true, normal),
+            HistoryKey::Navigate(HistoryNavigation::PageUp)
+        );
+        assert_eq!(history_key(None, true, normal), HistoryKey::Forward);
+    }
+
+    #[test]
     fn return_to_live_queues_one_authoritative_resynchronization() {
         let (commands, mut receiver) = tokio::sync::mpsc::channel(1);
 
-        assert!(!request_return_live_resync(Some(&commands), 0, 0).unwrap());
-        assert!(!request_return_live_resync(Some(&commands), 4, 2).unwrap());
-        assert!(request_return_live_resync(Some(&commands), 2, 0).unwrap());
+        let mut pending = false;
+        assert!(!request_return_live_resync(Some(&commands), &mut pending, 0, 0).unwrap());
+        assert!(!request_return_live_resync(Some(&commands), &mut pending, 4, 2).unwrap());
+        assert!(request_return_live_resync(Some(&commands), &mut pending, 2, 0).unwrap());
+        assert!(pending);
+        // One on its way: another return to live does not queue a second.
+        assert!(!request_return_live_resync(Some(&commands), &mut pending, 2, 0).unwrap());
         assert_eq!(receiver.try_recv().unwrap(), WindowCommand::Resynchronize);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_full_command_queue_drops_advisory_commands_without_failing() {
+        let (commands, mut receiver) = tokio::sync::mpsc::channel(1);
+        commands.try_send(WindowCommand::ReleaseControl).unwrap();
+        let mut pending = false;
+        assert!(!request_return_live_resync(Some(&commands), &mut pending, 2, 0).unwrap());
+        assert!(!pending, "a dropped request is asked for again");
+        assert!(!try_advisory_command(&commands, WindowCommand::Resynchronize).unwrap());
+        assert_eq!(receiver.try_recv().unwrap(), WindowCommand::ReleaseControl);
+        drop(receiver);
+        assert!(try_advisory_command(&commands, WindowCommand::Resynchronize).is_err());
     }
 
     #[test]

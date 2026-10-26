@@ -140,10 +140,13 @@ impl KeyboardHandler for App {
             }
             return;
         }
+        // With terminal search open, Enter submits the query even while the
+        // pane is scrolled back; it returns to live only once search closes.
         if let Some(navigation) = consume_detached_enter_press(
             event.keysym,
             self.input.modifiers,
-            !self.panes.pane.scrollback_viewport.is_live(),
+            !self.panes.pane.scrollback_viewport.is_live()
+                && self.panes.pane.search.input.is_none(),
             event.raw_code,
             &mut self.modal.session_picker_consumed_keys,
         ) {

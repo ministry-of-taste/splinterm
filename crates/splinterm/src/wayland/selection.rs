@@ -1,7 +1,7 @@
 //! Pure terminal selection, copied-text, overlay-row, and URL interpretation.
 
 use splinterm_core::SplintId;
-use splinterm_protocol::{ActiveScreen, TerminalSnapshot};
+use splinterm_protocol::{ActiveScreen, TerminalRow, TerminalSnapshot};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub(super) struct CellPosition {
@@ -352,14 +352,28 @@ struct SelectionRange {
 }
 
 fn loaded_row_position(snapshot: &TerminalSnapshot, row_id: u64) -> Option<usize> {
+    loaded_row_position_on(snapshot, &snapshot.visible_rows, row_id)
+}
+
+/// A row's position in the history cache followed by `screen`: the live
+/// screen, or the one a holding viewport shows instead.
+fn loaded_row_position_on(
+    snapshot: &TerminalSnapshot,
+    screen: &[TerminalRow],
+    row_id: u64,
+) -> Option<usize> {
     snapshot
         .scrollback_rows
         .iter()
-        .chain(&snapshot.visible_rows)
+        .chain(screen)
         .position(|row| row.row_id == Some(row_id))
 }
 
-fn selection_range(snapshot: &TerminalSnapshot, selection: Selection) -> Option<SelectionRange> {
+fn selection_range(
+    snapshot: &TerminalSnapshot,
+    screen: &[TerminalRow],
+    selection: Selection,
+) -> Option<SelectionRange> {
     if selection.anchor.active_screen != snapshot.active_screen
         || selection.end.active_screen != snapshot.active_screen
         || selection.anchor.history_generation != snapshot.history_generation
@@ -367,8 +381,8 @@ fn selection_range(snapshot: &TerminalSnapshot, selection: Selection) -> Option<
     {
         return None;
     }
-    let anchor_row = loaded_row_position(snapshot, selection.anchor.row_id)?;
-    let end_row = loaded_row_position(snapshot, selection.end.row_id)?;
+    let anchor_row = loaded_row_position_on(snapshot, screen, selection.anchor.row_id)?;
+    let end_row = loaded_row_position_on(snapshot, screen, selection.end.row_id)?;
     let anchor = (anchor_row, selection.anchor.column);
     let end = (end_row, selection.end.column);
     let (start, end) = if anchor <= end {
@@ -386,16 +400,17 @@ fn selection_range(snapshot: &TerminalSnapshot, selection: Selection) -> Option<
 
 pub(super) fn selection_display_bounds(
     snapshot: &TerminalSnapshot,
+    screen: &[TerminalRow],
     display: &TerminalSnapshot,
     selection: Selection,
 ) -> Option<(CellPosition, CellPosition)> {
-    let range = selection_range(snapshot, selection)?;
+    let range = selection_range(snapshot, screen, selection)?;
     let mut selected = display
         .visible_rows
         .iter()
         .enumerate()
         .filter_map(|(display_row, row)| {
-            let loaded_row = loaded_row_position(snapshot, row.row_id?)?;
+            let loaded_row = loaded_row_position_on(snapshot, screen, row.row_id?)?;
             (loaded_row >= range.start_row && loaded_row <= range.end_row)
                 .then_some((display_row, loaded_row))
         });
@@ -441,16 +456,21 @@ pub(super) fn transient_overlay_rows(
     dirty
 }
 
-pub(super) fn selection_is_retained(snapshot: &TerminalSnapshot, selection: Selection) -> bool {
-    selection_range(snapshot, selection).is_some()
+pub(super) fn selection_is_retained(
+    snapshot: &TerminalSnapshot,
+    screen: &[TerminalRow],
+    selection: Selection,
+) -> bool {
+    selection_range(snapshot, screen, selection).is_some()
 }
 
-pub(super) fn selection_text(snapshot: &TerminalSnapshot, selection: Selection) -> Option<String> {
-    let range = selection_range(snapshot, selection)?;
-    let rows = snapshot
-        .scrollback_rows
-        .iter()
-        .chain(&snapshot.visible_rows);
+pub(super) fn selection_text(
+    snapshot: &TerminalSnapshot,
+    screen: &[TerminalRow],
+    selection: Selection,
+) -> Option<String> {
+    let range = selection_range(snapshot, screen, selection)?;
+    let rows = snapshot.scrollback_rows.iter().chain(screen);
     let mut output = String::new();
     for (row_index, row) in rows
         .enumerate()

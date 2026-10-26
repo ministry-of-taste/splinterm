@@ -7,6 +7,11 @@ pub struct ScrollbackViewport {
     offset_from_bottom: usize,
     unseen_rows: usize,
     anchor_row_id: Option<u64>,
+    /// The screen as it was when this detached viewport began holding its
+    /// history. While held, the viewport composes the cached history with this
+    /// screen instead of the live one, so new output that cannot be joined to
+    /// the cache never moves or clears what the user is reading.
+    held_screen: Option<Vec<TerminalRow>>,
 }
 
 impl ScrollbackViewport {
@@ -34,6 +39,49 @@ impl ScrollbackViewport {
         self.offset_from_bottom = 0;
         self.unseen_rows = 0;
         self.anchor_row_id = None;
+        self.held_screen = None;
+    }
+
+    /// Whether this detached viewport holds its history and screen.
+    #[must_use]
+    pub fn is_holding(&self) -> bool {
+        self.held_screen.is_some()
+    }
+
+    /// The screen a holding viewport shows in place of the live one.
+    #[must_use]
+    pub fn held_screen(&self) -> Option<&[TerminalRow]> {
+        self.held_screen.as_deref()
+    }
+
+    /// Holds the history cache and `screen`, the screen this viewport was
+    /// composed with, until the viewport returns to live. A live viewport
+    /// never holds.
+    pub fn hold(&mut self, screen: Vec<TerminalRow>) {
+        if !self.is_live() && self.held_screen.is_none() {
+            self.held_screen = Some(screen);
+        }
+    }
+
+    /// Counts rows of new output that a held viewport did not take in.
+    pub fn note_unseen(&mut self, rows: usize) {
+        if !self.is_live() {
+            self.unseen_rows = self.unseen_rows.saturating_add(rows);
+        }
+    }
+
+    /// The screen rows this viewport composes below the history cache.
+    fn screen<'a>(&'a self, snapshot: &'a TerminalSnapshot) -> &'a [TerminalRow] {
+        self.held_screen
+            .as_deref()
+            .unwrap_or(snapshot.visible_rows.as_slice())
+    }
+
+    fn total_rows(&self, snapshot: &TerminalSnapshot) -> usize {
+        snapshot
+            .scrollback_rows
+            .len()
+            .saturating_add(self.screen(snapshot).len())
     }
 
     pub fn scroll_up(&mut self, lines: usize, snapshot: &TerminalSnapshot) {
@@ -62,15 +110,12 @@ impl ScrollbackViewport {
             .iter()
             .position(|row| row.row_id == Some(row_id))
         else {
-            return snapshot
-                .visible_rows
+            return self
+                .screen(snapshot)
                 .iter()
                 .any(|row| row.row_id == Some(row_id));
         };
-        let total_rows = snapshot
-            .scrollback_rows
-            .len()
-            .saturating_add(snapshot.visible_rows.len());
+        let total_rows = self.total_rows(snapshot);
         let viewport_height = snapshot.rows.min(total_rows);
         self.offset_from_bottom = total_rows
             .saturating_sub(index.saturating_add(viewport_height))
@@ -122,10 +167,7 @@ impl ScrollbackViewport {
             .iter()
             .filter(|row| row.row_id.is_some_and(|id| !previous_ids.contains(&id)))
             .count();
-        let total_rows = snapshot
-            .scrollback_rows
-            .len()
-            .saturating_add(snapshot.visible_rows.len());
+        let total_rows = self.total_rows(snapshot);
         let viewport_height = snapshot.rows.min(total_rows);
         self.offset_from_bottom = total_rows
             .saturating_sub(anchor_index.saturating_add(viewport_height))
@@ -133,15 +175,38 @@ impl ScrollbackViewport {
         self.unseen_rows = self.unseen_rows.saturating_add(appended);
     }
 
+    /// Keeps a detached viewport on the same rows after its history cache
+    /// gained older rows above it or dropped newer ones below it, as when an
+    /// older page joins a full cache. Without this the same offset from the
+    /// bottom would show other rows.
+    pub fn reanchor(&mut self, snapshot: &TerminalSnapshot) {
+        if self.is_live() {
+            return;
+        }
+        let anchor_index = self.anchor_row_id.and_then(|anchor_row_id| {
+            snapshot
+                .scrollback_rows
+                .iter()
+                .position(|row| row.row_id == Some(anchor_row_id))
+        });
+        let total_rows = self.total_rows(snapshot);
+        let viewport_height = snapshot.rows.min(total_rows);
+        self.offset_from_bottom = anchor_index
+            .map_or(self.offset_from_bottom, |anchor_index| {
+                total_rows.saturating_sub(anchor_index.saturating_add(viewport_height))
+            })
+            .min(snapshot.scrollback_rows.len());
+        if anchor_index.is_none() {
+            self.update_anchor(snapshot);
+        }
+    }
+
     fn update_anchor(&mut self, snapshot: &TerminalSnapshot) {
         if self.is_live() {
             self.anchor_row_id = None;
             return;
         }
-        let total_rows = snapshot
-            .scrollback_rows
-            .len()
-            .saturating_add(snapshot.visible_rows.len());
+        let total_rows = self.total_rows(snapshot);
         let viewport_height = snapshot.rows.min(total_rows);
         let end = total_rows.saturating_sub(self.offset_from_bottom);
         let start = end.saturating_sub(viewport_height);
@@ -155,18 +220,13 @@ impl ScrollbackViewport {
     }
 
     #[must_use]
-    pub fn visible_rows<'a>(&self, snapshot: &'a TerminalSnapshot) -> Vec<&'a TerminalRow> {
+    pub fn visible_rows<'a>(&'a self, snapshot: &'a TerminalSnapshot) -> Vec<&'a TerminalRow> {
         if self.is_live() || snapshot.active_screen == ActiveScreen::Alternate {
             return snapshot.visible_rows.iter().collect();
         }
-        let mut rows = Vec::with_capacity(
-            snapshot
-                .scrollback_rows
-                .len()
-                .saturating_add(snapshot.visible_rows.len()),
-        );
+        let mut rows = Vec::with_capacity(self.total_rows(snapshot));
         rows.extend(snapshot.scrollback_rows.iter());
-        rows.extend(snapshot.visible_rows.iter());
+        rows.extend(self.screen(snapshot).iter());
         let viewport_height = snapshot.rows.min(rows.len());
         let end = rows.len().saturating_sub(self.offset_from_bottom);
         let start = end.saturating_sub(viewport_height);
@@ -242,6 +302,28 @@ mod tests {
                 .any(|row| row.row_id == Some(2))
         );
         assert!(!viewport.reveal_row(99, &state));
+    }
+
+    #[test]
+    fn reanchoring_keeps_the_top_row_when_a_page_joins_a_full_cache() {
+        let initial = snapshot(&["h1", "h2", "h3", "h4", "h5", "h6"], &["v1", "v2"]);
+        let mut viewport = ScrollbackViewport::default();
+        viewport.scroll_up(4, &initial);
+        let top = |viewport: &ScrollbackViewport, state: &TerminalSnapshot| {
+            viewport.visible_rows(state)[0].row_id
+        };
+        assert_eq!(top(&viewport, &initial), Some(3));
+
+        // An older page joins above and the bounded cache drops the two
+        // newest rows below the view.
+        let mut joined = initial.clone();
+        let mut older = initial.scrollback_rows[..1].to_vec();
+        older[0].row_id = Some(0);
+        joined.scrollback_rows = [older, initial.scrollback_rows[..4].to_vec()].concat();
+        viewport.reanchor(&joined);
+        assert_eq!(top(&viewport, &joined), Some(3));
+        assert_eq!(viewport.offset_from_bottom(), 2);
+        assert_eq!(viewport.unseen_rows(), 0);
     }
 
     #[test]
