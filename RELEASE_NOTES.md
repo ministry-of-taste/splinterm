@@ -367,9 +367,15 @@ a hostile program running as your account.
 - The Lair Explorer shows one line per row: the disclosure chevron and the
   name, then fixed icon columns on the right for agent access, agent status,
   whether the row is live (a filled or hollow dot), and whether a Lair is saved
-  or pinned. The selected row's status is spelled out in words in the
-  footer. The breadcrumb line is gone; the title and the filters share one
-  header line.
+  or pinned. The footer gives the selected row one short status line that
+  says only what the row does not already show, a waiting access request and
+  agents needing input or in error first, for example *1 needs input ·
+  2 working · saved*. It drops the name, a running row's "Running", a
+  disposable Lair's "Disposable", and the current Dojo's "Current", and a
+  plain running row leaves it blank. A line too long for the panel ends in an
+  ellipsis after its last whole word instead of wrapping. Assistive
+  technology still reads the full words for every row. The breadcrumb line is
+  gone; the title and the filters share one header line.
 - The Lair Explorer opens on **Live**, and its filters read Live, Saved, All
   (`f` cycles them in that order). Search looks through every Lair whatever the
   filter, so a saved or stopped Lair is found from Live too.
@@ -409,14 +415,6 @@ a hostile program running as your account.
   `lairs` title and the filters as `live · saved · all`, the chosen one in
   bold, with no rule or highlight. Beside the tab strip it is exactly the
   strip's height and its text sits on the tab labels' baseline.
-- The Explorer's footer gives the selected row one short status line instead
-  of a run-on list that wrapped onto a second line. It says only what the row
-  does not already show, agents needing input or in error first, for example
-  *1 needs input · 2 working · saved*, and drops the name, a running row's
-  "Running", a disposable Lair's "Disposable", and the current Dojo's
-  "Current"; a plain running row leaves it blank. A line too long for the
-  panel ends in an ellipsis instead of wrapping, and the list gets the freed
-  line back. Assistive technology still reads the full words.
 - `multiplexer.pane-gap` (0–64 logical px, default 0) leaves empty space
   between neighbouring Splints and around them at the Window's edges: between
   and around whole frames with `divider-style=frame`, around the centred line

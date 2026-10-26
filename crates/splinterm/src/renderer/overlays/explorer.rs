@@ -121,28 +121,27 @@ fn text_cells(text: &str) -> usize {
 }
 
 /// Fits the selected row's short status into one line of `cells` cells; it
-/// never wraps. Text that does not fit ends in `…` after the last whole part
-/// between ` · ` separators that fits, or, when not even the first part
-/// fits, after its last whole word; only a first word wider than the line is
-/// cut, at a character boundary.
+/// never wraps. Text that does not fit is filled word by word, into the next
+/// part where it has room, and ends in `…` after the last whole word that
+/// fits, never after a dangling ` · `. So an agent's detail keeps its first
+/// words on a narrow panel. Only a first word wider than the line is cut, at
+/// a character boundary.
 fn fit_status_line(text: &str, cells: usize) -> String {
     if text_cells(text) <= cells {
         return text.to_owned();
     }
-    // The longest prefix that ends before `boundary` and leaves a cell for
-    // the ellipsis. Prefix widths only grow, so the scan stops at the first
-    // one too wide.
-    let fitting = |boundary: &str| {
-        text.match_indices(boundary)
-            .map(|(end, _)| text[..end].trim_end())
-            .filter(|shown| !shown.is_empty())
-            .take_while(|shown| text_cells(shown) < cells)
-            .last()
-    };
-    fitting(" · ").or_else(|| fitting(" ")).map_or_else(
-        || truncate_picker_text(text, cells),
-        |shown| format!("{shown}…"),
-    )
+    // Every prefix that ends a word, without a separator or space left at its
+    // end, that leaves a cell for the ellipsis. Prefix widths never shrink,
+    // so the scan stops at the first one too wide.
+    text.match_indices(' ')
+        .map(|(end, _)| text[..end].trim_end().trim_end_matches('·').trim_end())
+        .filter(|shown| !shown.is_empty())
+        .take_while(|shown| text_cells(shown) < cells)
+        .last()
+        .map_or_else(
+            || truncate_picker_text(text, cells),
+            |shown| format!("{shown}…"),
+        )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1625,9 +1624,9 @@ mod tests {
     }
 
     #[test]
-    fn status_line_never_wraps_and_ends_in_an_ellipsis_between_parts() {
-        let status = "agent asking for access · 1 needs input · 2 working · saved";
-        let first_word = text_cells("agent");
+    fn status_line_never_wraps_and_fills_word_by_word_before_an_ellipsis() {
+        let status = "asking for access · 1 needs input · 2 working · saved";
+        let first_word = text_cells("asking");
         for cells in 0..=90 {
             let fitted = fit_status_line(status, cells);
             assert!(text_cells(&fitted) <= cells, "{cells}: {fitted:?}");
@@ -1642,30 +1641,40 @@ mod tests {
             }
             assert!(fitted.ends_with('…'), "{cells}: {fitted:?}");
             let shown = fitted.trim_end_matches('…');
-            assert!(
-                !shown.ends_with(" ·") && !shown.ends_with(' '),
-                "{fitted:?}"
-            );
+            assert!(!shown.ends_with('·') && !shown.ends_with(' '), "{fitted:?}");
             // Whole words, unless the first word alone is wider than the line.
             if first_word < cells {
                 assert!(
                     status.starts_with(shown) && status[shown.len()..].starts_with(' '),
                     "{cells}: cut a word in {fitted:?}"
                 );
-            }
-            // Once the first part fits, the cut falls between parts.
-            if text_cells("agent asking for access") < cells {
-                assert!(status[shown.len()..].starts_with(" · "), "{fitted:?}");
+                // As many words as fit: the next one would not.
+                let rest = &status[shown.len()..];
+                let after = rest.trim_start_matches([' ', '·']);
+                let next = after.split(' ').next().unwrap();
+                let longer = &status[..shown.len() + rest.len() - after.len() + next.len()];
+                assert!(text_cells(longer) >= cells, "{cells}: {fitted:?}");
             }
         }
+        // The default panel holds about 28 cells: an agent's detail keeps its
+        // first words instead of vanishing after the state.
+        assert_eq!(
+            fit_status_line("needs input · waiting for approval", 28),
+            "needs input · waiting for…"
+        );
+        // A blocker after a short state fills the same way.
+        assert_eq!(
+            fit_status_line("starting · Work is still starting", 28),
+            "starting · Work is still…"
+        );
         // A narrow panel: the attention parts first, then the ellipsis.
         assert_eq!(
             fit_status_line("1 needs input · 2 working · 1 done · saved", 26),
             "1 needs input · 2 working…"
         );
-        assert_eq!(fit_status_line(status, 30), "agent asking for access…");
-        assert_eq!(fit_status_line(status, 16), "agent asking…");
-        assert_eq!(fit_status_line(status, 4), "age…");
+        assert_eq!(fit_status_line(status, 30), "asking for access · 1 needs…");
+        assert_eq!(fit_status_line(status, 16), "asking for…");
+        assert_eq!(fit_status_line(status, 4), "ask…");
         // Wide characters count two cells.
         assert_eq!(fit_status_line("作業中 · saved", 8), "作業中…");
         assert_eq!(fit_status_line("2 working", 9), "2 working");

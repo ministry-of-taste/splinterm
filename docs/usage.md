@@ -186,26 +186,32 @@ every row:
 A column appears only while some row in the Explorer uses it, except the live
 dot, which is always there. A long name is ellipsized before the first icon in
 its row; it never runs under one. The footer's first line is a short status
-for the selected row that says only what the row does not already show, most
-urgent first: agent states (needs input, then error, working, done, idle),
-access marks, and anything out of the ordinary, for example
+for the selected row that says only what the row does not already show, in
+this order: a waiting access request (*asking for access*), agent states
+(needs input, then error, working, done, idle), a lifecycle out of the
+ordinary, the retention or *open here*, why the row cannot be opened, and
+which agents can reach it, for example
 *1 needs input · 2 working · saved · agent connected*. It never repeats the
 name, which is highlighted just above, and it leaves out the ordinary: a
 running row's lifecycle, a disposable Lair's retention (every new Lair starts
 disposable), and the current Dojo's attachment. A plain running row leaves the
 line blank. The line never wraps; what does not fit ends in an ellipsis after
-the last whole part that fits. Assistive technology still reads the full words
-for every row, ordinary states included, for example *Agent connected ·
-Running · Saved · 1 working*. The footer's second line shows the search field
+the last whole word that fits, so an agent's detail keeps its first words, for
+example *needs input · waiting for…*. Assistive technology still reads the
+full words for every row, ordinary states included, for example *Agent
+connected · Running · Saved · 1 working*. The footer's second line shows the
+search field
 while you search, a navigation notice such as *Refreshing navigation…* when
 there is one, and otherwise who has the keyboard: *↑↓ move · F filter · Esc
 terminal* while the Explorer has focus, *Click rows · terminal input active*
 while the terminal does.
 
 Parent rows summarize runtime state independently of retention and window
-attachment. A saved Lair can still be running. A Dojo marked **Not open here**
-can also be running; it is not attached to this Window. **Current** identifies
-the active Dojo, while **Open here** identifies another attached tab. A stopped
+attachment. A saved Lair can still be running, and a Dojo not open in this
+Window can be running too. The current-row dot marks the active Dojo, the
+footer says *open here* for another Dojo attached to this Window as a tab,
+and it says nothing about attachment otherwise. Assistive technology reads
+**Current**, **Open here**, or **Not open here** for every Dojo. A stopped
 restorable Dojo opens a restore confirmation rather than reporting a permission
 failure. Detached starting or mixed-state Dojos still cannot be attached;
 Explorer explains this lifecycle restriction instead of calling it a denial.

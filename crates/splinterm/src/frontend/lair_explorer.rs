@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use splinterm_core::{LairRetention, SplintId};
 
 use super::{
-    agent_access::{AccessMarks, AccessReach, mark_text, waiting_text},
+    agent_access::{AccessMarks, AccessReach, mark_text},
     agent_status::{self, AgentAggregate, AgentGlyphs, AgentSpinner},
     text_edit::BoundedTextEditor,
     topology::LairExplorerActivationTarget,
@@ -903,7 +903,7 @@ impl LairExplorerUi {
                 ),
             );
             let status = brief_status([
-                waiting_text(waiting).map(|text| lower_first(&text)),
+                waiting_brief(waiting),
                 self.aggregate_brief(&aggregate),
                 lifecycle_brief(lair.lifecycle()),
                 retention_brief(lair.retention),
@@ -990,7 +990,7 @@ impl LairExplorerUi {
             self.aggregate_brief(&aggregate),
             lifecycle_brief(dojo.lifecycle()),
             attachment_brief,
-            blocker.map(lower_first),
+            blocker.map(str::to_owned),
             mark_text(whole, part, 0).map(|text| lower_first(&text)),
         ]);
         rows.push(LairExplorerRow {
@@ -1043,7 +1043,7 @@ impl LairExplorerUi {
             pending.then(|| "pending".to_owned()),
             self.splint_brief(splint.agent_status.as_ref()),
             lifecycle_brief(splint.lifecycle),
-            blocker.map(lower_first),
+            blocker.map(str::to_owned),
             mark_text(reach, AccessReach::None, 0).map(|text| lower_first(&text)),
         ]);
         LairExplorerRow {
@@ -1384,7 +1384,20 @@ fn brief_status(parts: impl IntoIterator<Item = Option<String>>) -> String {
         .join(" · ")
 }
 
-/// Splinterm's own sentence-case words in the footer's lowercase style.
+/// A waiting access request on the footer's short status line, e.g.
+/// "asking for access" or "2 asking for access"; the access icon and the
+/// accessible text already say an agent is asking.
+fn waiting_brief(waiting: u32) -> Option<String> {
+    match waiting {
+        0 => None,
+        1 => Some("asking for access".to_owned()),
+        count => Some(format!("{count} asking for access")),
+    }
+}
+
+/// Splinterm's own sentence-case agent words, such as access marks, in the
+/// footer's lowercase style. Blocker messages keep their own case, since
+/// they name product nouns such as Dojo and Window.
 fn lower_first(text: &str) -> String {
     let mut characters = text.chars();
     characters.next().map_or_else(String::new, |first| {
@@ -2515,7 +2528,7 @@ pub(super) mod tests {
         );
         assert_eq!(
             explorer.rows()[2].status,
-            "error · waiting for approval · refreshing topology"
+            "error · waiting for approval · Refreshing topology"
         );
         explorer.mark_disconnected();
         let rows = explorer.rows();
@@ -2525,7 +2538,7 @@ pub(super) mod tests {
         );
         assert_eq!(
             rows[2].status,
-            "agent status unavailable · endpoint is disconnected"
+            "agent status unavailable · Endpoint is disconnected"
         );
         assert_eq!(column(&rows[2]).as_deref(), Some("    "));
         assert_eq!(column(&rows[1]).as_deref(), Some("    "));
@@ -2695,7 +2708,7 @@ pub(super) mod tests {
         assert_eq!(brief("shell"), "agent connected");
         assert_eq!(
             brief("notes"),
-            "agent asking for access · unavailable · pinned · agent can reach"
+            "asking for access · unavailable · pinned · agent can reach"
         );
 
         // A remembered grant for the whole workspace marks it, not its rows.
