@@ -531,15 +531,21 @@ pub(in crate::app) fn terminal_action_matches(
     )
 }
 
-pub(in crate::app) async fn apply_prepared_pane_resize(
+/// Applies the pane's latest requested size once this pane controls it.
+///
+/// Called whenever control is (re)acquired. Another client can resize the
+/// Splint while this pane does not control it, and the frontend never resends
+/// a size it already sent, so every acquisition re-applies the size the pane
+/// last asked for, even one the daemon already applied once.
+pub(in crate::app) async fn apply_requested_pane_resize(
     control: &mut Connection,
     controller_id: Option<u64>,
-    prepared_resize: &mut Option<PaneResize>,
+    requested_resize: Option<PaneResize>,
     splint_id: SplintId,
     incarnation: u64,
 ) -> Result<()> {
     let (Some(controller_id), Some((columns, rows, pixel_width, pixel_height))) =
-        (controller_id, prepared_resize.take())
+        (controller_id, requested_resize)
     else {
         return Ok(());
     };
@@ -561,7 +567,7 @@ pub(in crate::app) async fn apply_prepared_pane_resize(
         Err(error) => return Err(error),
     };
     if !terminal_action_matches(&response, splint_id, incarnation) {
-        bail!("splinterd did not acknowledge prepared pane resize");
+        bail!("splinterd did not acknowledge the requested pane resize");
     }
     Ok(())
 }
@@ -569,11 +575,11 @@ pub(in crate::app) async fn apply_prepared_pane_resize(
 pub(in crate::app) async fn ensure_pane_control(
     control: &mut Connection,
     active_controller: &mut Option<u64>,
-    prepared_resize: &mut Option<PaneResize>,
+    requested_resize: &mut Option<PaneResize>,
     updates: &mpsc::Sender<WindowUpdate>,
     splint_id: SplintId,
     incarnation: u64,
-    apply_prepared_resize: bool,
+    apply_requested_resize: bool,
 ) -> Result<Option<u64>> {
     if let Some(controller_id) = *active_controller {
         return Ok(Some(controller_id));
@@ -593,11 +599,11 @@ pub(in crate::app) async fn ensure_pane_control(
     };
     *active_controller = Some(controller_id);
     let _ = updates.send(WindowUpdate::Control(true)).await;
-    if apply_prepared_resize {
-        apply_prepared_pane_resize(
+    if apply_requested_resize {
+        apply_requested_pane_resize(
             control,
             *active_controller,
-            prepared_resize,
+            *requested_resize,
             splint_id,
             incarnation,
         )
@@ -643,15 +649,12 @@ pub(in crate::app) async fn handle_scrollback_fetch(
 
 pub(in crate::app) fn resolved_resize_request(
     controller_id: Option<u64>,
-    prepared_resize: &mut Option<PaneResize>,
+    requested_resize: &mut Option<PaneResize>,
     identity: (SplintId, u64),
     resize: PaneResize,
 ) -> Option<Request> {
-    let Some(controller_id) = controller_id else {
-        *prepared_resize = Some(resize);
-        return None;
-    };
-    *prepared_resize = None;
+    *requested_resize = Some(resize);
+    let controller_id = controller_id?;
     let (splint_id, incarnation) = identity;
     Some(Request::Resize {
         controller_id,
@@ -667,7 +670,7 @@ pub(in crate::app) fn resolved_resize_request(
 pub(in crate::app) async fn active_resize_request(
     control: &mut Connection,
     active_controller: &mut Option<u64>,
-    prepared_resize: &mut Option<PaneResize>,
+    requested_resize: &mut Option<PaneResize>,
     updates: &mpsc::Sender<WindowUpdate>,
     identity: (SplintId, u64),
     resize: PaneResize,
@@ -676,7 +679,7 @@ pub(in crate::app) async fn active_resize_request(
     let controller_id = ensure_pane_control(
         control,
         active_controller,
-        prepared_resize,
+        requested_resize,
         updates,
         splint_id,
         incarnation,
@@ -685,7 +688,7 @@ pub(in crate::app) async fn active_resize_request(
     .await?;
     Ok(resolved_resize_request(
         controller_id,
-        prepared_resize,
+        requested_resize,
         (splint_id, incarnation),
         resize,
     ))
@@ -790,7 +793,7 @@ pub(in crate::app) async fn drive_controller(
     cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     let mut active_controller = controller_id;
-    let mut prepared_resize = None;
+    let mut requested_resize = None;
     let mut pending_resize = None;
     let mut resize_deadline = None;
     let mut deferred_command = None;
@@ -840,10 +843,10 @@ pub(in crate::app) async fn drive_controller(
                             && pending_resize.is_none()
                             && !outputs.handoff.input_paused()
                         {
-                            apply_prepared_pane_resize(
+                            apply_requested_pane_resize(
                                 &mut control,
                                 active_controller,
-                                &mut prepared_resize,
+                                requested_resize,
                                 splint_id,
                                 incarnation,
                             ).await?;
@@ -935,7 +938,7 @@ pub(in crate::app) async fn drive_controller(
                     let controller_id = match ensure_pane_control(
                         &mut control,
                         &mut active_controller,
-                        &mut prepared_resize,
+                        &mut requested_resize,
                         &outputs.updates,
                         splint_id,
                         incarnation,
@@ -995,7 +998,7 @@ pub(in crate::app) async fn drive_controller(
                     let request = match active_resize_request(
                         &mut control,
                         &mut active_controller,
-                        &mut prepared_resize,
+                        &mut requested_resize,
                         &outputs.updates,
                         (splint_id, incarnation),
                         (columns, rows, pixel_width, pixel_height),
@@ -1019,7 +1022,7 @@ pub(in crate::app) async fn drive_controller(
                 } => {
                     let Some(request) = resolved_resize_request(
                         active_controller,
-                        &mut prepared_resize,
+                        &mut requested_resize,
                         (splint_id, incarnation),
                         (columns, rows, pixel_width, pixel_height),
                     ) else {
@@ -1066,7 +1069,7 @@ pub(in crate::app) async fn drive_controller(
                     match ensure_pane_control(
                         &mut control,
                         &mut active_controller,
-                        &mut prepared_resize,
+                        &mut requested_resize,
                         &outputs.updates,
                         splint_id,
                         incarnation,
@@ -1129,10 +1132,10 @@ pub(in crate::app) async fn drive_controller(
                         Ok(_) => bail!("splinterd did not grant forced control"),
                     };
                     let _ = outputs.updates.send(WindowUpdate::Control(true)).await;
-                    apply_prepared_pane_resize(
+                    apply_requested_pane_resize(
                         &mut control,
                         active_controller,
-                        &mut prepared_resize,
+                        requested_resize,
                         splint_id,
                         incarnation,
                     )
