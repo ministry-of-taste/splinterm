@@ -8922,6 +8922,15 @@ impl App {
                 .and_then(|row| row.row_id)
                 .is_none_or(|top| item.row_id < top)
         {
+            // Walk back from the oldest loaded row with the view there,
+            // detached: a live view drops history that lags new output, so
+            // each new line would restart the walk and it would never arrive.
+            self.panes
+                .pane
+                .scrollback_viewport
+                .scroll_up(snapshot.scrollback_rows.len(), snapshot);
+            self.panes.pane.viewport_dirty = true;
+            self.presentation.full_redraw = true;
             let before_row_id = snapshot
                 .scrollback_rows
                 .first()
