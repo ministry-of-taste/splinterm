@@ -125,23 +125,47 @@ fn text_cells(text: &str) -> usize {
 /// part where it has room, and ends in `…` after the last whole word that
 /// fits, never after a dangling ` · `. So an agent's detail keeps its first
 /// words on a narrow panel. Only a first word wider than the line is cut, at
-/// a character boundary.
+/// a character boundary. The line never ends on a bare count such as the `1`
+/// of `1 done`: it backs off to the word before.
 fn fit_status_line(text: &str, cells: usize) -> String {
     if text_cells(text) <= cells {
         return text.to_owned();
     }
-    // Every prefix that ends a word, without a separator or space left at its
-    // end, that leaves a cell for the ellipsis. Prefix widths never shrink,
-    // so the scan stops at the first one too wide.
+    // Every prefix that ends a word other than a count, without a separator
+    // or space left at its end, that leaves a cell for the ellipsis. Prefix
+    // widths never shrink, so the scan stops at the first one too wide.
     text.match_indices(' ')
-        .map(|(end, _)| text[..end].trim_end().trim_end_matches('·').trim_end())
-        .filter(|shown| !shown.is_empty())
+        .map(|(end, _)| trim_status_tail(&text[..end]))
+        .filter(|shown| !shown.is_empty() && !ends_on_count(shown))
         .take_while(|shown| text_cells(shown) < cells)
         .last()
-        .map_or_else(
-            || truncate_picker_text(text, cells),
-            |shown| format!("{shown}…"),
-        )
+        .map_or_else(|| cut_status_line(text, cells), |shown| format!("{shown}…"))
+}
+
+/// No whole word fits: cuts at a character boundary, leaving no separator,
+/// space, or bare count before the ellipsis.
+fn cut_status_line(text: &str, cells: usize) -> String {
+    if cells == 0 {
+        return String::new();
+    }
+    let cut = truncate_picker_text(text, cells);
+    let mut shown = trim_status_tail(cut.strip_suffix('…').unwrap_or(&cut));
+    while ends_on_count(shown) {
+        shown = trim_status_tail(&shown[..shown.rfind(' ').unwrap_or(0)]);
+    }
+    format!("{shown}…")
+}
+
+/// `text` without a trailing ` · ` separator or spaces.
+fn trim_status_tail(text: &str) -> &str {
+    text.trim_end().trim_end_matches('·').trim_end()
+}
+
+/// Whether `text` ends on a word that is only a count, such as `1`.
+fn ends_on_count(text: &str) -> bool {
+    text.rsplit(' ')
+        .next()
+        .is_some_and(|word| !word.is_empty() && word.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1626,36 +1650,55 @@ mod tests {
     #[test]
     fn status_line_never_wraps_and_fills_word_by_word_before_an_ellipsis() {
         let status = "asking for access · 1 needs input · 2 working · saved";
-        let first_word = text_cells("asking");
-        for cells in 0..=90 {
-            let fitted = fit_status_line(status, cells);
-            assert!(text_cells(&fitted) <= cells, "{cells}: {fitted:?}");
-            assert!(!fitted.contains('\n'), "{cells}: {fitted:?}");
-            if text_cells(status) <= cells {
-                assert_eq!(fitted, status);
-                continue;
-            }
-            if cells == 0 {
-                assert!(fitted.is_empty());
-                continue;
-            }
-            assert!(fitted.ends_with('…'), "{cells}: {fitted:?}");
-            let shown = fitted.trim_end_matches('…');
-            assert!(!shown.ends_with('·') && !shown.ends_with(' '), "{fitted:?}");
-            // Whole words, unless the first word alone is wider than the line.
-            if first_word < cells {
+        let counts = "1 error · 1 working · 1 done · 1 idle";
+        let is_count = |word: &str| !word.is_empty() && word.bytes().all(|b| b.is_ascii_digit());
+        for (text, first_unit) in [(status, "asking"), (counts, "1 error")] {
+            for cells in 0..=90 {
+                let fitted = fit_status_line(text, cells);
+                assert!(text_cells(&fitted) <= cells, "{cells}: {fitted:?}");
+                assert!(!fitted.contains('\n'), "{cells}: {fitted:?}");
+                if text_cells(text) <= cells {
+                    assert_eq!(fitted, text);
+                    continue;
+                }
+                if cells == 0 {
+                    assert!(fitted.is_empty());
+                    continue;
+                }
+                assert!(fitted.ends_with('…'), "{cells}: {fitted:?}");
+                let shown = fitted.trim_end_matches('…');
+                assert!(!shown.ends_with('·') && !shown.ends_with(' '), "{fitted:?}");
+                // Never a bare count before the ellipsis, such as `· 1…`.
                 assert!(
-                    status.starts_with(shown) && status[shown.len()..].starts_with(' '),
-                    "{cells}: cut a word in {fitted:?}"
+                    !is_count(shown.rsplit(' ').next().unwrap()),
+                    "{cells}: {fitted:?}"
                 );
-                // As many words as fit: the next one would not.
-                let rest = &status[shown.len()..];
-                let after = rest.trim_start_matches([' ', '·']);
-                let next = after.split(' ').next().unwrap();
-                let longer = &status[..shown.len() + rest.len() - after.len() + next.len()];
-                assert!(text_cells(longer) >= cells, "{cells}: {fitted:?}");
+                // Whole words, unless the first word, with its count, is
+                // wider than the line.
+                if text_cells(first_unit) < cells {
+                    assert!(
+                        text.starts_with(shown) && text[shown.len()..].starts_with(' '),
+                        "{cells}: cut a word in {fitted:?}"
+                    );
+                    // As many words as fit: the next one, with the word after
+                    // it when it is a count, would not.
+                    let rest = &text[shown.len()..];
+                    let after = rest.trim_start_matches([' ', '·']);
+                    let mut words = after.split(' ');
+                    let next = words.next().unwrap();
+                    let mut end = shown.len() + rest.len() - after.len() + next.len();
+                    if is_count(next) {
+                        end += 1 + words.next().unwrap().len();
+                    }
+                    assert!(text_cells(&text[..end]) >= cells, "{cells}: {fitted:?}");
+                }
             }
         }
+        // A Lair's counts never end on the next count's number.
+        assert_eq!(fit_status_line(counts, 34), "1 error · 1 working · 1 done…");
+        assert_eq!(fit_status_line(counts, 12), "1 error…");
+        assert_eq!(fit_status_line(counts, 4), "1 e…");
+        assert_eq!(fit_status_line(counts, 3), "…");
         // The default panel holds about 28 cells: an agent's detail keeps its
         // first words instead of vanishing after the state.
         assert_eq!(
@@ -1673,6 +1716,7 @@ mod tests {
             "1 needs input · 2 working…"
         );
         assert_eq!(fit_status_line(status, 30), "asking for access · 1 needs…");
+        assert_eq!(fit_status_line(status, 22), "asking for access…");
         assert_eq!(fit_status_line(status, 16), "asking for…");
         assert_eq!(fit_status_line(status, 4), "ask…");
         // Wide characters count two cells.
