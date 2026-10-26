@@ -1414,6 +1414,10 @@ struct SearchUiState {
     submitted_query: String,
     /// Older history is still being searched for the latest query.
     searching: bool,
+    /// The history generation and terminal revision of the latest page:
+    /// its row ids and its cursor mean something only there.
+    page_generation: u64,
+    page_revision: u64,
 }
 
 impl SearchUiState {
@@ -1433,6 +1437,8 @@ impl SearchUiState {
         self.matches = page.matches;
         self.selected = 0;
         self.next_cursor = page.next_cursor;
+        self.page_generation = page.history_generation;
+        self.page_revision = page.terminal_revision;
         self.pending_reveal = self.matches.first().cloned();
         self.searching = keep_going && self.next_cursor.is_some();
         if self.searching {
@@ -1453,6 +1459,26 @@ impl SearchUiState {
 
     fn resync_required(&mut self) {
         self.in_flight = self.in_flight.saturating_sub(1);
+        self.forget_results();
+    }
+
+    /// Whether the results name rows of history `generation`. Results from
+    /// before history was replaced name rows that no longer exist, and are
+    /// dropped; a page newer than the snapshot waits for it to catch up.
+    fn results_match(&mut self, generation: u64) -> bool {
+        match self.page_generation.cmp(&generation) {
+            std::cmp::Ordering::Less => {
+                self.forget_results();
+                false
+            }
+            std::cmp::Ordering::Greater => false,
+            std::cmp::Ordering::Equal => true,
+        }
+    }
+
+    /// Drops results whose rows are gone, as after history was replaced;
+    /// Enter searches again.
+    fn forget_results(&mut self) {
         self.matches.clear();
         self.next_cursor = None;
         self.pending_reveal = None;
@@ -1939,8 +1965,12 @@ impl PaneView {
             return Ok(false);
         }
         older.extend(snapshot.scrollback_rows.iter().cloned());
-        let Some(older) = bound_history_page_with_pins(older, pinned, &snapshot.visible_rows)
-        else {
+        // Selections resolve against the held screen while a view holds.
+        let screen = self
+            .scrollback_viewport
+            .held_screen()
+            .unwrap_or(&snapshot.visible_rows);
+        let Some(older) = bound_history_page_with_pins(older, pinned, screen) else {
             self.history_selection_pin_blocked = true;
             return Ok(false);
         };
@@ -8931,6 +8961,14 @@ impl App {
         if snapshot.active_screen != ActiveScreen::Normal {
             return;
         }
+        if !self
+            .panes
+            .pane
+            .search
+            .results_match(snapshot.history_generation)
+        {
+            return;
+        }
         if self
             .panes
             .pane
@@ -8959,24 +8997,16 @@ impl App {
                 .and_then(|row| row.row_id)
                 .is_none_or(|top| item.row_id < top)
         {
-            // A selection pins its rows in the bounded history cache, which
-            // then refuses older pages and the walk would never arrive. The
-            // match replaces the selection once revealed, so drop it now.
-            if self.panes.pane.selection.is_some() {
-                self.clear_selection();
-            }
-            let Some(snapshot) = self.panes.pane.snapshot.as_ref() else {
+            // Nothing older can arrive: the daemon has no older history, or
+            // trimmed the match's row. Give up instead of walking forever.
+            let unreachable = snapshot.omitted_oldest_scrollback_rows == 0
+                || snapshot
+                    .oldest_available_scrollback_row_id
+                    .is_some_and(|oldest| item.row_id < oldest);
+            if unreachable {
+                self.panes.pane.search.pending_reveal = None;
                 return;
-            };
-            // Walk back from the oldest loaded row with the view there,
-            // detached: a live view drops history that lags new output, so
-            // each new line would restart the walk and it would never arrive.
-            self.panes
-                .pane
-                .scrollback_viewport
-                .scroll_up(snapshot.scrollback_rows.len(), snapshot);
-            self.panes.pane.viewport_dirty = true;
-            self.presentation.full_redraw = true;
+            }
             let before_row_id = snapshot
                 .scrollback_rows
                 .first()
@@ -8994,17 +9024,39 @@ impl App {
                 before_row_id,
             });
             let top = snapshot.scrollback_rows.first().and_then(|row| row.row_id);
-            if let (Some(command), Some(commands)) = (command, self.panes.pane.commands.as_ref()) {
+            let sent = match (command, self.panes.pane.commands.as_ref()) {
                 // Retried with the next update while the match is unrevealed.
-                match try_advisory_command(commands, command) {
-                    Ok(true) => {
-                        self.panes.pane.history_page_pending = true;
-                        self.panes.pane.history_page_top = top;
+                (Some(command), Some(commands)) => match try_advisory_command(commands, command) {
+                    Ok(sent) => sent,
+                    Err(error) => {
+                        self.scheduling.fail(error);
+                        false
                     }
-                    Ok(false) => {}
-                    Err(error) => self.scheduling.fail(error),
-                }
+                },
+                _ => false,
+            };
+            if !sent {
+                return;
             }
+            self.panes.pane.history_page_pending = true;
+            self.panes.pane.history_page_top = top;
+            // A selection pins its rows in the bounded history cache, which
+            // then refuses older pages and the walk would never arrive. The
+            // match replaces the selection once revealed, so drop it now.
+            if self.panes.pane.selection.is_some() {
+                self.clear_selection();
+            }
+            // Walk back from the oldest loaded row with the view there,
+            // detached: a live view drops history that lags new output, so
+            // each new line would restart the walk and it would never arrive.
+            if let Some(snapshot) = self.panes.pane.snapshot.as_ref() {
+                self.panes
+                    .pane
+                    .scrollback_viewport
+                    .scroll_up(snapshot.scrollback_rows.len(), snapshot);
+            }
+            self.panes.pane.viewport_dirty = true;
+            self.presentation.full_redraw = true;
         }
     }
 
@@ -9020,11 +9072,22 @@ impl App {
             return;
         }
         let continuing = cursor.is_some();
+        // A cursor continues the page it came from. Sending that page's
+        // generation and revision lets the daemon say when history has
+        // changed under it, instead of reading the cursor against other rows.
+        let (terminal_revision, history_generation) = if continuing {
+            (
+                self.panes.pane.search.page_revision,
+                self.panes.pane.search.page_generation,
+            )
+        } else {
+            (snapshot.revision, snapshot.history_generation)
+        };
         let sent = try_advisory_command(
             commands,
             WindowCommand::Search {
-                terminal_revision: snapshot.revision,
-                history_generation: snapshot.history_generation,
+                terminal_revision,
+                history_generation,
                 query: query.clone(),
                 case_sensitive: false,
                 cursor,
@@ -10803,7 +10866,6 @@ impl App {
                             .filter(|row| *row < snapshot.rows)
                     });
                     let scrolls = update.scrolls.clone();
-                    let history_changed = update.scrollback.is_some();
                     let current = self
                         .panes
                         .pane
@@ -10849,7 +10911,9 @@ impl App {
                         snapshot,
                     );
                     discard_lagging_history(snapshot, &pane.scrollback_viewport);
-                    if history_changed && !self.panes.pane.scrollback_viewport.is_live() {
+                    // The update's dirty rows and scrolls are live-screen
+                    // positions; a view off live shows other rows there.
+                    if !self.panes.pane.scrollback_viewport.is_live() {
                         full = true;
                     }
                     let trace_pane_role = self.panes.pane.trace_pane_role("focused");
@@ -11031,11 +11095,17 @@ impl App {
                         // Keep one contiguous newest history window. If normal bounding
                         // would remove a selected endpoint, reject this older batch so the
                         // existing bounded endpoint window remains pinned and pageable.
-                        if let Some(older) = bound_history_page_with_pins(
-                            older,
-                            pinned_selection_rows,
-                            &snapshot.visible_rows,
-                        ) {
+                        // Selections resolve against the held screen while
+                        // a view holds.
+                        let screen = self
+                            .panes
+                            .pane
+                            .scrollback_viewport
+                            .held_screen()
+                            .unwrap_or(&snapshot.visible_rows);
+                        if let Some(older) =
+                            bound_history_page_with_pins(older, pinned_selection_rows, screen)
+                        {
                             snapshot.scrollback_rows = older;
                             snapshot.omitted_oldest_scrollback_rows = omitted_rows_before_cache(
                                 snapshot.oldest_available_scrollback_row_id,
@@ -11732,6 +11802,12 @@ impl App {
                 .ok()
                 .zip(isize::try_from(self.panes.pane.rendered_viewport_offset).ok())
                 .map(|(current, rendered)| current - rendered);
+            // Output prepared but not yet painted means the pixels lag the
+            // frame; shifting them would carry the old rows along.
+            let unpainted = self.panes.pane.prepare_dirty_rows.contains(&true)
+                || self.panes.pane.raster_dirty_rows.contains(&true)
+                || self.panes.pane.surface_dirty_rows.contains(&true)
+                || !self.panes.pane.pending_scrolls.is_empty();
             self.panes.pane.prepare_dirty_rows.fill(false);
             self.panes.pane.raster_dirty_rows.fill(false);
             self.panes.pane.surface_dirty_rows.fill(false);
@@ -11739,9 +11815,14 @@ impl App {
             // Shifting the drawn frame is right only when the rows it keeps
             // are the rows the view now shows there. Anything else that
             // moved the view since the last frame needs a full rebuild.
-            let shifted_rows_match = delta.is_some_and(|delta| {
-                viewport_shift_matches(&self.panes.pane.rendered_row_ids, &row_ids(&display), delta)
-            });
+            let shifted_rows_match = !unpainted
+                && delta.is_some_and(|delta| {
+                    viewport_shift_matches(
+                        &self.panes.pane.rendered_row_ids,
+                        &row_ids(&display),
+                        delta,
+                    )
+                });
             let incremental = if display.images.is_none() && shifted_rows_match {
                 if let (Some(frame), Some(delta)) = (&mut self.panes.pane.snapshot_frame, delta) {
                     frame.scroll_viewport_rows_with_context(
@@ -18219,6 +18300,27 @@ mod tests {
             },
         );
         assert_eq!(pending.map(|update| update.generation), Some(13));
+    }
+
+    #[test]
+    fn a_search_page_keeps_where_its_cursor_belongs_and_stale_results_clear() {
+        let mut search = SearchUiState {
+            in_flight: 1,
+            ..SearchUiState::default()
+        };
+        let mut page = search_page(2, false, Some("r10"));
+        page.history_generation = 4;
+        page.terminal_revision = 9;
+        assert_eq!(search.take_page(page), None);
+        assert_eq!((search.page_generation, search.page_revision), (4, 9));
+        assert!(search.pending_reveal.is_some());
+        assert!(!search.results_match(3), "the snapshot lags: wait");
+        assert!(search.pending_reveal.is_some());
+        assert!(search.results_match(4));
+        assert!(!search.results_match(5), "history was replaced");
+        assert!(search.matches.is_empty());
+        assert_eq!(search.next_cursor, None);
+        assert_eq!(search.pending_reveal, None);
     }
 
     fn search_page(matches: usize, timed_out: bool, cursor: Option<&str>) -> SearchPage {

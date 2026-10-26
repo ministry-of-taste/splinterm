@@ -495,8 +495,8 @@ a hostile program running as your account.
 - Search finds lines deep in long history. Each daemon request reads only
   what rows contain, not their full width, and the Window continues on its own
   until a match turns up. Before, a wide pane searched only about its last
-  thousand lines and then showed no matches. Search also keeps working while
-  the terminal prints.
+  thousand lines and then showed no matches. Paging through matches in
+  history also keeps working while the terminal prints.
 - `Shift+End` at the bottom of a shell no longer types `F`.
 
 ## Known limitations

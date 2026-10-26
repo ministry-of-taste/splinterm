@@ -139,14 +139,16 @@ pub(super) fn omitted_rows_before_cache(
     rows: &[TerminalRow],
     available_rows: usize,
 ) -> usize {
-    oldest_available_row_id
-        .zip(rows.first().and_then(|row| row.row_id))
-        .and_then(|(oldest, first)| first.checked_sub(oldest))
-        .and_then(|omitted| usize::try_from(omitted).ok())
-        .map_or_else(
-            || available_rows.saturating_sub(rows.len()),
-            |omitted| omitted.min(available_rows),
-        )
+    match (
+        oldest_available_row_id,
+        rows.first().and_then(|row| row.row_id),
+    ) {
+        // A cache that starts at or before the daemon's oldest row, as a held
+        // cache can after the daemon trims, has nothing older to fetch.
+        (Some(oldest), Some(first)) => usize::try_from(first.saturating_sub(oldest))
+            .map_or(available_rows, |omitted| omitted.min(available_rows)),
+        _ => available_rows.saturating_sub(rows.len()),
+    }
 }
 
 fn bound_history_cache(rows: &mut Vec<TerminalRow>, keep_oldest: bool) {
@@ -718,6 +720,8 @@ mod tests {
         assert_eq!(omitted_rows_before_cache(Some(100), &rows(500), 1_000), 400);
         assert_eq!(omitted_rows_before_cache(Some(100), &rows(100), 1_000), 0);
         assert_eq!(omitted_rows_before_cache(None, &rows(1_000), 1_000), 900);
+        // A held cache older than the daemon's oldest row: nothing to fetch.
+        assert_eq!(omitted_rows_before_cache(Some(100), &rows(50), 1_000), 0);
     }
 
     fn held_case_snapshot(

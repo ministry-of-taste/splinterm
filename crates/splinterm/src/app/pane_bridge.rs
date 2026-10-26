@@ -663,7 +663,11 @@ pub(in crate::app) async fn handle_scrollback_fetch(
         .updates
         .send(WindowUpdate::ScrollbackResyncRequired)
         .await;
-    Ok(outputs.resyncs.send(()).await.is_ok())
+    // As for Resynchronize: one already waiting covers it.
+    Ok(!matches!(
+        outputs.resyncs.try_send(()),
+        Err(mpsc::error::TrySendError::Closed(()))
+    ))
 }
 
 pub(in crate::app) fn resolved_resize_request(
