@@ -1191,6 +1191,7 @@ fn assemble_app(
                 history_selection_pin_blocked: false,
                 scroll_started_at: None,
                 rendered_viewport_offset: 0,
+                rendered_row_ids: Vec::new(),
                 viewport_dirty: false,
                 updates: options.updates,
                 commands: options.commands,
@@ -1496,6 +1497,8 @@ struct PaneView {
     history_selection_pin_blocked: bool,
     scroll_started_at: Option<Instant>,
     rendered_viewport_offset: usize,
+    /// The row ids the pane's frame was last drawn with, top to bottom.
+    rendered_row_ids: Vec<Option<u64>>,
     viewport_dirty: bool,
     updates: Option<Receiver<WindowUpdate>>,
     commands: Option<Sender<WindowCommand>>,
@@ -1594,8 +1597,29 @@ fn rebuild_pane_scaled_frame_with_context(
     Ok(true)
 }
 
+fn row_ids(display: &TerminalSnapshot) -> Vec<Option<u64>> {
+    display.visible_rows.iter().map(|row| row.row_id).collect()
+}
+
+/// Whether moving the view `delta` rows further back (or forward, when
+/// negative) shows the drawn rows `previous` shifted by `delta` in `current`.
+fn viewport_shift_matches(previous: &[Option<u64>], current: &[Option<u64>], delta: isize) -> bool {
+    let rows = current.len();
+    let count = delta.unsigned_abs();
+    if previous.len() != rows || count == 0 || count >= rows {
+        return false;
+    }
+    let (kept, shown) = if delta > 0 {
+        (&previous[..rows - count], &current[count..])
+    } else {
+        (&previous[count..], &current[..rows - count])
+    };
+    kept.iter().all(Option::is_some) && kept == shown
+}
+
 fn finish_rebuilt_pane_frame(pane: &mut PaneView) {
     pane.rendered_viewport_offset = pane.scrollback_viewport.offset_from_bottom();
+    pane.rendered_row_ids = pane.displayed_row_ids();
     pane.viewport_dirty = false;
     pane.scroll_started_at = None;
     pane.prepare_dirty_rows.fill(false);
@@ -1756,6 +1780,7 @@ impl PaneView {
             history_selection_pin_blocked: false,
             scroll_started_at: None,
             rendered_viewport_offset: 0,
+            rendered_row_ids: Vec::new(),
             viewport_dirty: false,
             updates: Some(options.updates),
             commands: Some(options.commands),
@@ -1788,6 +1813,17 @@ impl PaneView {
         self.selecting = false;
         self.hovered_url = None;
         self.history_selection_pin_blocked = false;
+    }
+
+    /// The row ids this pane shows now, top to bottom.
+    fn displayed_row_ids(&self) -> Vec<Option<u64>> {
+        self.snapshot.as_ref().map_or_else(Vec::new, |snapshot| {
+            self.scrollback_viewport
+                .visible_rows(snapshot)
+                .into_iter()
+                .map(|row| row.row_id)
+                .collect()
+        })
     }
 
     /// The screen selections resolve against below the history cache: the
@@ -11273,6 +11309,7 @@ impl App {
             }
             self.panes.pane.rendered_viewport_offset =
                 self.panes.pane.scrollback_viewport.offset_from_bottom();
+            self.panes.pane.rendered_row_ids = row_ids(display);
             self.panes.pane.viewport_dirty = false;
             self.panes.pane.prepare_dirty_rows.fill(false);
             if let Some(started) = prepare_started {
@@ -11675,7 +11712,13 @@ impl App {
             self.panes.pane.raster_dirty_rows.fill(false);
             self.panes.pane.surface_dirty_rows.fill(false);
             self.panes.pane.pending_scrolls.clear();
-            let incremental = if display.images.is_none() {
+            // Shifting the drawn frame is right only when the rows it keeps
+            // are the rows the view now shows there. Anything else that
+            // moved the view since the last frame needs a full rebuild.
+            let shifted_rows_match = delta.is_some_and(|delta| {
+                viewport_shift_matches(&self.panes.pane.rendered_row_ids, &row_ids(&display), delta)
+            });
+            let incremental = if display.images.is_none() && shifted_rows_match {
                 if let (Some(frame), Some(delta)) = (&mut self.panes.pane.snapshot_frame, delta) {
                     frame.scroll_viewport_rows_with_context(
                         &display,
@@ -11720,6 +11763,7 @@ impl App {
                 self.presentation.full_redraw = true;
             }
             self.panes.pane.rendered_viewport_offset = current_offset;
+            self.panes.pane.rendered_row_ids = row_ids(&display);
             self.panes.pane.viewport_dirty = false;
         }
         for pane in &mut self.panes.inactive_panes {
@@ -18219,6 +18263,32 @@ mod tests {
         resynced.resync_required();
         assert!(!resynced.searching);
         assert_eq!(resynced.in_flight, 0);
+    }
+
+    #[test]
+    fn a_viewport_shift_reuses_the_frame_only_for_the_same_rows() {
+        let ids = |ids: &[u64]| ids.iter().copied().map(Some).collect::<Vec<_>>();
+        let drawn = ids(&[20, 21, 22, 23]);
+        // Back two rows: the drawn top two rows are now the bottom two.
+        assert!(viewport_shift_matches(&drawn, &ids(&[18, 19, 20, 21]), 2));
+        assert!(viewport_shift_matches(&drawn, &ids(&[22, 23, 24, 25]), -2));
+        // The view moved two rows by offset, but the rows below it changed:
+        // the old frame is stale.
+        assert!(!viewport_shift_matches(&drawn, &ids(&[5, 6, 19, 20]), 2));
+        assert!(!viewport_shift_matches(&drawn, &ids(&[16, 17, 18, 19]), 2));
+        assert!(!viewport_shift_matches(&drawn, &drawn, 0));
+        assert!(!viewport_shift_matches(&drawn, &ids(&[1, 2, 3, 4]), 4));
+        assert!(!viewport_shift_matches(
+            &drawn[..3],
+            &ids(&[18, 19, 20, 21]),
+            2
+        ));
+        let unknown = vec![None, None, Some(22), Some(23)];
+        assert!(!viewport_shift_matches(
+            &unknown,
+            &[None, None, None, None],
+            2
+        ));
     }
 
     #[test]
