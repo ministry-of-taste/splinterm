@@ -488,7 +488,7 @@ fn push_access(source: &mut ChromeSource, access: Option<LairExplorerAccess>, ic
         (Some(LairExplorerAccess::Reachable), false) => source.push_str("a "),
         (Some(LairExplorerAccess::Connected), false) => source.push_str("A "),
         (Some(LairExplorerAccess::Asking), false) => {
-            source.push_tinted(ChromeTint::Asking, |source| {
+            source.push_tinted(ChromeTint::AskingText, |source| {
                 source.push_str("A?");
             })
         }
@@ -650,13 +650,17 @@ fn footer_lines(footer: Rect, scale_120: u32, inset: u32) -> Vec<Rect> {
 /// so it does not take the shell's menu alpha. Text and icons stay opaque.
 /// `[colors] explorer-background` and `explorer-alpha` replace the panel's
 /// colour and coverage; its text colours are then chosen against that colour.
+/// `status_colors` is `[explorer] status-colors`.
 #[must_use]
-pub(crate) fn lair_explorer_palette(theme: ResolvedTheme) -> SessionPickerPalette {
+pub(crate) fn lair_explorer_palette(
+    theme: ResolvedTheme,
+    status_colors: bool,
+) -> SessionPickerPalette {
     let mut panel_theme = theme;
     panel_theme.roles.surface = theme.explorer_background();
     let mut palette = chrome_panel_palette(panel_theme, ChromeSurface::Menu);
     palette.panel_fill = premultiplied_theme_rgba(palette.panel, theme.explorer_alpha());
-    palette
+    palette.with_status_colors(status_colors)
 }
 
 /// Where one header filter's text goes, in buffer px.
@@ -2604,7 +2608,7 @@ mod tests {
             explorer_alpha: Some(u16::MAX),
             ..ChromeColorOverrides::NONE
         });
-        let palette = lair_explorer_palette(light);
+        let palette = lair_explorer_palette(light, true);
         assert_eq!(palette.panel_fill, [0xf0, 0xf0, 0xf0, 0xff]);
         let expected = chrome_panel_palette(
             ResolvedTheme {
@@ -2617,14 +2621,14 @@ mod tests {
             ChromeSurface::Menu,
         );
         assert_eq!(palette.primary, expected.primary);
-        assert_ne!(palette.primary, lair_explorer_palette(theme).primary);
+        assert_ne!(palette.primary, lair_explorer_palette(theme, true).primary);
 
         let alpha_only = theme.with_chrome_overrides(ChromeColorOverrides {
             explorer_alpha: Some(u16::MAX),
             ..ChromeColorOverrides::NONE
         });
         assert_eq!(
-            lair_explorer_palette(alpha_only).panel_fill,
+            lair_explorer_palette(alpha_only, true).panel_fill,
             [0x80, 0x40, 0x20, 0xff]
         );
     }
@@ -2640,14 +2644,14 @@ mod tests {
             },
             ..ResolvedTheme::default()
         };
-        let palette = lair_explorer_palette(theme);
+        let palette = lair_explorer_palette(theme, true);
         // The same premultiplied glass as the tab strip and the terminal.
         assert_eq!(
             palette.panel_fill,
             premultiplied_theme_rgba(theme.roles.surface, theme.background_alpha)
         );
         assert_eq!(palette.panel_fill, [0x40, 0x20, 0x10, 0x7f]);
-        let opaque = lair_explorer_palette(ResolvedTheme::default());
+        let opaque = lair_explorer_palette(ResolvedTheme::default(), true);
         assert_eq!(opaque.panel_fill[3], 0xff);
 
         let id = NavigationNodeId::Lair(LairId::new());
@@ -2736,6 +2740,17 @@ mod tests {
     }
 
     #[test]
+    fn the_ascii_asking_marker_is_tinted_as_text() {
+        let marker = |icons| {
+            let mut source = ChromeSource::default();
+            push_access(&mut source, Some(LairExplorerAccess::Asking), icons);
+            source.tint_at(0)
+        };
+        assert_eq!(marker(true), Some(ChromeTint::Asking));
+        assert_eq!(marker(false), Some(ChromeTint::AskingText));
+    }
+
+    #[test]
     fn status_glyphs_and_the_asking_marker_take_their_tints_on_their_row() {
         use crate::color::{NON_TEXT_MIN_CONTRAST, contrast_ratio};
         use crate::frontend::{AgentAggregate, AgentGlyphs, AgentSpinner};
@@ -2745,7 +2760,7 @@ mod tests {
         let context = RenderContext::new(u16::MAX);
         let scale = 120;
         let theme = ResolvedTheme::default();
-        let palette = lair_explorer_palette(theme);
+        let palette = lair_explorer_palette(theme, true);
         let paint_one = |entry: &LairExplorerRow, palette: SessionPickerPalette, selected: bool| {
             let rows = [entry.clone()];
             let surface = Rect {

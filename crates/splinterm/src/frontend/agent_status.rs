@@ -116,13 +116,21 @@ pub(crate) enum AgentGlyphs {
 }
 
 impl AgentGlyphs {
-    /// Dots when asked for; otherwise icons, or ASCII when the embedded icon
-    /// face cannot be loaded.
-    pub(crate) const fn select(icons_available: bool, style: StatusGlyphs) -> Self {
-        match (style, icons_available) {
-            (StatusGlyphs::Dots, _) => Self::Dots,
-            (StatusGlyphs::Icons, true) => Self::Icons,
-            (StatusGlyphs::Icons, false) => Self::Ascii,
+    /// Every dot, for a font coverage check.
+    pub(crate) const DOTS: &'static str = "◆▲■□";
+
+    /// Dots or icons as asked for, or ASCII when the interface font's own
+    /// faces do not draw every dot ([`Self::DOTS`]) or the embedded icon
+    /// face cannot be loaded; never a replacement glyph.
+    pub(crate) const fn select(
+        icons_available: bool,
+        dots_available: bool,
+        style: StatusGlyphs,
+    ) -> Self {
+        match style {
+            StatusGlyphs::Dots if dots_available => Self::Dots,
+            StatusGlyphs::Icons if icons_available => Self::Icons,
+            StatusGlyphs::Dots | StatusGlyphs::Icons => Self::Ascii,
         }
     }
 
@@ -675,14 +683,16 @@ mod tests {
     #[test]
     fn ascii_is_used_only_when_icons_are_unavailable() {
         assert_eq!(AgentGlyphs::default(), AgentGlyphs::Icons);
-        assert_eq!(
-            AgentGlyphs::select(true, StatusGlyphs::Icons),
-            AgentGlyphs::Icons
-        );
-        assert_eq!(
-            AgentGlyphs::select(false, StatusGlyphs::Icons),
-            AgentGlyphs::Ascii
-        );
+        for dots_available in [true, false] {
+            assert_eq!(
+                AgentGlyphs::select(true, dots_available, StatusGlyphs::Icons),
+                AgentGlyphs::Icons
+            );
+            assert_eq!(
+                AgentGlyphs::select(false, dots_available, StatusGlyphs::Icons),
+                AgentGlyphs::Ascii
+            );
+        }
         let blocked = [status(AgentState::NeedsInput, true)];
         let aggregate = AgentAggregate::from_statuses(&blocked);
         let ascii = aggregate
@@ -990,13 +1000,26 @@ mod tests {
 
     #[test]
     fn dots_give_each_state_its_own_one_cell_shape() {
-        // Dots are asked for, so they need no icon face.
+        // Dots are asked for, so they need no icon face, but they do need
+        // the interface font to draw every dot itself: otherwise needs input
+        // and error would both be a replacement glyph, so ASCII is used.
         for icons_available in [true, false] {
             assert_eq!(
-                AgentGlyphs::select(icons_available, StatusGlyphs::Dots),
+                AgentGlyphs::select(icons_available, true, StatusGlyphs::Dots),
                 AgentGlyphs::Dots
             );
+            assert_eq!(
+                AgentGlyphs::select(icons_available, false, StatusGlyphs::Dots),
+                AgentGlyphs::Ascii
+            );
         }
+        assert_eq!(
+            AgentGlyphs::DOTS,
+            PRIORITY
+                .iter()
+                .filter_map(|state| AgentGlyphs::dot(*state))
+                .collect::<String>()
+        );
         assert_eq!(AgentGlyphs::Dots.column_cells(), 2);
         let dots: Vec<_> = PRIORITY
             .iter()

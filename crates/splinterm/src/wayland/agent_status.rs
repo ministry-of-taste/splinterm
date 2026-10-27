@@ -12,10 +12,46 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 
 use super::{App, DojoId, QueueHandle, SplintId};
-use crate::config::AgentStatusStyle;
-use crate::frontend::{AgentAggregate, AgentGlyphs, AgentSpinner};
+use crate::config::{AgentStatusStyle, StatusGlyphs};
+use crate::frontend::{AgentAggregate, AgentGlyphs, AgentSpinner, LairExplorerUi};
 use crate::navigation_projection::WindowAgentStatus;
-use crate::renderer::{ChromeSource, chrome_icons_available};
+use crate::renderer::{ChromeSource, chrome_icons_available, chrome_primary_faces_cover};
+
+/// The status glyphs `[explorer] status-glyphs` asks for, as far as the
+/// fonts draw them. Dots the interface font cannot draw itself fall back to
+/// ASCII, reported once.
+fn select_glyphs(style: StatusGlyphs) -> AgentGlyphs {
+    let dots_available =
+        style == StatusGlyphs::Dots && chrome_primary_faces_cover(AgentGlyphs::DOTS);
+    let glyphs = AgentGlyphs::select(chrome_icons_available(), dots_available, style);
+    if style == StatusGlyphs::Dots && glyphs != AgentGlyphs::Dots {
+        static REPORTED: std::sync::Once = std::sync::Once::new();
+        REPORTED.call_once(|| {
+            eprintln!(
+                "splinterm: the interface font does not draw {}; status-glyphs=dots uses ASCII status glyphs",
+                AgentGlyphs::DOTS
+            );
+        });
+    }
+    glyphs
+}
+
+/// Applies a changed style to the tab badges and the Explorer, the glyphs
+/// chosen by `select`; returns whether the chrome must be redrawn.
+fn apply_agent_status_style(
+    agent: &mut TabAgentStatus,
+    explorer: &mut LairExplorerUi,
+    style: AgentStatusStyle,
+    select: impl FnOnce(StatusGlyphs) -> AgentGlyphs,
+) -> bool {
+    if agent.style == style {
+        return false;
+    }
+    agent.style = style;
+    agent.glyphs = select(style.glyphs);
+    explorer.set_agent_glyphs(agent.glyphs);
+    true
+}
 
 #[allow(
     clippy::struct_excessive_bools,
@@ -45,7 +81,7 @@ impl TabAgentStatus {
         Self {
             status: WindowAgentStatus::default(),
             enabled,
-            glyphs: AgentGlyphs::select(chrome_icons_available(), style.glyphs),
+            glyphs: select_glyphs(style.glyphs),
             style,
             spinner: AgentSpinner::STATIC,
             last_spinner_step: Instant::now(),
@@ -139,14 +175,12 @@ impl App {
     /// Applies `[explorer] status-colors` and `status-glyphs`; returns
     /// whether the chrome must be redrawn.
     pub(super) fn set_agent_status_style(&mut self, style: AgentStatusStyle) -> bool {
-        let agent = &mut self.tab_state.agent;
-        if agent.style == style {
-            return false;
-        }
-        agent.style = style;
-        agent.glyphs = AgentGlyphs::select(chrome_icons_available(), style.glyphs);
-        self.explorer.set_agent_glyphs(agent.glyphs);
-        true
+        apply_agent_status_style(
+            &mut self.tab_state.agent,
+            &mut self.explorer,
+            style,
+            select_glyphs,
+        )
     }
 
     pub(super) fn set_agent_status_presentation(&mut self, enabled: bool) -> bool {
@@ -243,6 +277,37 @@ mod tests {
                 stale_minutes: None,
             },
         }
+    }
+
+    #[test]
+    fn a_changed_status_style_switches_tab_and_explorer_glyphs() {
+        let mut agent = TabAgentStatus::new(true, AgentStatusStyle::default());
+        let mut explorer = LairExplorerUi::default();
+        let dots = AgentStatusStyle {
+            colors: false,
+            glyphs: StatusGlyphs::Dots,
+        };
+        let select = |style: StatusGlyphs| {
+            assert_eq!(style, StatusGlyphs::Dots);
+            AgentGlyphs::Dots
+        };
+        assert!(apply_agent_status_style(
+            &mut agent,
+            &mut explorer,
+            dots,
+            select
+        ));
+        assert_eq!(agent.glyphs(), AgentGlyphs::Dots);
+        assert!(!agent.colors());
+        // The Explorer already draws dots.
+        assert!(!explorer.set_agent_glyphs(AgentGlyphs::Dots));
+        // Unchanged: nothing to redraw, and no glyph selection at all.
+        assert!(!apply_agent_status_style(
+            &mut agent,
+            &mut explorer,
+            dots,
+            |_| unreachable!("an unchanged style selects no glyphs")
+        ));
     }
 
     #[test]

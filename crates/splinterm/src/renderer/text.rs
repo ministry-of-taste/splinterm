@@ -29,6 +29,30 @@ use super::{
 /// glyphs larger than their rows were clipped into unreadable fragments.
 pub(crate) const CHROME_MAXIMUM_LINE_HEIGHT: u32 = 24;
 
+/// Whether the interface font's own faces, regular and bold, draw every
+/// character of `text`. A fallback face does not count: it could be missing,
+/// fall back to a replacement glyph, or be a CJK face whose full-width
+/// shapes spill into the next cell.
+pub(crate) fn chrome_primary_faces_cover(text: &str) -> bool {
+    super::compatibility_render_context().is_ok_and(|context| {
+        context.font_generation().is_ok_and(|generation| {
+            [ChromeTextStyle::Regular, ChromeTextStyle::Bold]
+                .into_iter()
+                .all(|style| {
+                    let face = &generation.faces
+                        [super::frame::primary_face_index(&chrome_attributes(style))];
+                    face.covers_text(text)
+                        && super::fonts::with_font_ref(face, |font, _coords| {
+                            Ok(text
+                                .chars()
+                                .all(|character| font.charmap().map(character) != 0))
+                        })
+                        .unwrap_or(false)
+                })
+        })
+    })
+}
+
 /// The tallest chrome text cell, in buffer pixels, at `scale_120`.
 pub(crate) const fn chrome_maximum_cell_height(scale_120: u32) -> u32 {
     CHROME_MAXIMUM_LINE_HEIGHT.saturating_mul(scale_120) / 120
@@ -748,7 +772,7 @@ mod tests {
         assert_eq!(cut.tints(), [(3, 4, ChromeTint::StatusWorking)]);
         assert!(outer.with_prefix_text("xab…".into(), 3).tints().is_empty());
         // Tints are part of the source, so a cache keyed by it tells them apart.
-        assert_ne!(outer, ChromeSource::from(outer.text()));
+        assert_ne!(outer, outer.untinted());
     }
 
     #[test]

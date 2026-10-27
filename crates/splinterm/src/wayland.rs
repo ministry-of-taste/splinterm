@@ -12485,8 +12485,10 @@ impl App {
                 self.surface.scale_120,
                 self.presentation.renderer_generation,
                 layout,
-                crate::renderer::lair_explorer_palette(self.presentation.theme)
-                    .with_status_colors(self.tab_state.agent.colors()),
+                crate::renderer::lair_explorer_palette(
+                    self.presentation.theme,
+                    self.tab_state.agent.colors(),
+                ),
                 &rows,
                 self.explorer.selected(),
                 self.explorer.query(),

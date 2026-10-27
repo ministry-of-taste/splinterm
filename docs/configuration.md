@@ -138,7 +138,7 @@ substitution, but do not sandbox hostile processes running as your own user.
 | `multiplexer.frame-title` | top-frame title source: `splint` or `none`; inert outside frame style | splint |
 | `explorer.full-height` | a docked Lair Explorer runs the Window's full height and the tab strip begins at its right edge, above the terminal only; `no` puts the Explorer below a full-width tab strip. An Explorer too wide to dock opens over the terminal below the tab strip either way; configuration reload applies it | strict boolean; yes |
 | `explorer.agent-status` | show explicitly reported agent status in the Explorer, on Dojo tabs, and in navigation accessibility; `no` hides it all; configuration reload applies it | yes |
-| `explorer.status-colors` | colour agent status glyphs in the Explorer and on Dojo tabs by state, the access "Asking" marker, and the remote host tag; see [Status colours](#status-colours). `no` draws them in the colour of the text around them; configuration reload applies it | strict boolean; yes |
+| `explorer.status-colors` | colour agent status glyphs in the Explorer and on Dojo tabs by state, and the access "Asking" marker; see [Status colours](#status-colours). `no` draws them in the colour of the text around them; the remote host tag is not a status and keeps its colour. Configuration reload applies it | strict boolean; yes |
 | `explorer.status-glyphs` | `icons` draws two-cell icons; `dots` draws one-cell shapes: ◆ needs input, ▲ error, ■ done, □ idle, the Braille spinner for working, and `~` after a stale status. Every state keeps its own shape in both, so colour is never the only signal; configuration reload applies it | icons |
 | `integration.dialog-shortcut` | the chord that engages a waiting trusted dialog's keyboard, as a click inside does, without answering it: `ctrl+alt+` and one letter or digit (modifiers in any order; no `shift`, and no Super chords), or `none` to turn it off. When Hyprland maps dialogs without focus (the Omarchy integration), Splinterm also binds it while a dialog waits, so it reaches the dialog from any Window ([Trusted dialogs](usage.md#trusted-dialogs)); read when a dialog starts | ctrl+alt+g |
 
@@ -863,14 +863,17 @@ Agent status glyphs take herdr's colours: working in warning, needs input
 and error in danger (each with its own glyph), done in info, idle in
 success, and a stale status, its marker included, in faint text. The access
 "Asking" marker is warning and the remote host tag is remote-marker. A tab
-badge colours its glyph, not its count. Each colour is checked against what
-it is actually drawn on, the Explorer panel or its selected row, the tab
-strip or the selected tab's body, and mixed toward readable text until
-glyphs reach 3:1 and the remote tag, which is text, 4.5:1. Status is never
-colour alone: every state has its own glyph shape in both
-`explorer.status-glyphs` styles, and accessible text and search always use
-state words. `explorer.status-colors=no` draws all of them in the colour of
-the text around them. JSON and built-in themes take the same roles from
+badge colours its glyph, not its count. Each colour is checked against the
+opaque colour it is drawn on, the Explorer panel or its selected row, the
+tab strip or the selected tab's body, and mixed toward readable text until
+glyphs reach 3:1 and text, the remote tag and the ASCII `A?` marker,
+4.5:1. Under translucent glass the backdrop shows through and can lower
+that contrast, as it does for ordinary chrome text. Status is never colour
+alone: every state has its own glyph shape in both `explorer.status-glyphs`
+styles, and accessible text and search always use state words.
+`explorer.status-colors=no` draws status glyphs and the "Asking" marker in
+the colour of the text around them; the remote tag is not a status and
+stays remote-marker. JSON and built-in themes take the same roles from
 their ANSI colours.
 
 ### Glassy Windows

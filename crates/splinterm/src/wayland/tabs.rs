@@ -1005,8 +1005,10 @@ impl App {
     ) -> Result<()> {
         let position = |value| i32::try_from(value).unwrap_or(i32::MAX);
         // Status tints for each tab body a badge can sit on, kept at their
-        // floors against it; none for `[explorer] status-colors=no`.
-        let strip_tints = status_colors.then(|| ChromeTints::on(&theme.roles, theme.roles.surface));
+        // floors against it; none for `[explorer] status-colors=no`. The
+        // remote tag is not a status and keeps its remote-marker color.
+        let strip_tints = ChromeTints::on(&theme.roles, theme.roles.surface);
+        let badge_tints = status_colors.then_some(strip_tints);
         let active_tints =
             status_colors.then(|| ChromeTints::on(&theme.roles, theme.active_tab_background));
         let strip = Self::buffer_rect(layout.rect, scale_120)?;
@@ -1083,7 +1085,7 @@ impl App {
                 let y = label_rect.y.saturating_add(
                     label_rect.height.saturating_sub(label.text.pixel_height()) / 2,
                 );
-                let tints = if active { active_tints } else { strip_tints };
+                let tints = if active { active_tints } else { badge_tints };
                 label.text.paint_colored(
                     canvas,
                     width,
@@ -1139,7 +1141,7 @@ impl App {
             (width, height),
             layout.host_rect,
             scale_120,
-            strip_tints.map_or(theme.roles.text, |tints| tints.color(ChromeTint::Remote)),
+            strip_tints.color(ChromeTint::Remote),
             host_text,
         )?;
         Ok(())
@@ -1301,6 +1303,8 @@ mod tests {
                     roles: crate::theme::ChromeRoles {
                         surface: 0,
                         text: foreground,
+                        // Readable on the surface, so painted as given.
+                        remote_marker: foreground,
                         ..crate::theme::ChromeRoles::default()
                     },
                     ..ResolvedTheme::default()
@@ -2307,14 +2311,11 @@ mod tests {
                 "{state:?} on the active tab"
             );
             assert!(paints(&tinted, remote));
-            // status-colors=no: the badge takes the label colors and the
-            // remote tag the text color.
+            // status-colors=no paints exactly an untinted badge; the remote
+            // tag is not a status and keeps remote-marker.
             let off = paint(&badge, false);
-            assert!(
-                !paints(&off, strip.color(tint)) || strip.color(tint) == theme.roles.text_muted
-            );
-            assert!(paints(&off, theme.roles.text));
-            assert!(!paints(&off, remote));
+            assert!(off == paint(&badge.untinted(), true), "{state:?}");
+            assert!(paints(&off, remote));
         }
     }
 }

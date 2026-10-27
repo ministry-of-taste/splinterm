@@ -321,11 +321,13 @@ a hostile program running as your account.
   `needs_input` and `error` in danger (each with its own glyph), `done` in
   info, `idle` in success, and a stale status faint. The access "Asking"
   marker is warning and the remote host tag takes the theme's remote-marker
-  colour. Each colour is kept readable against what it is drawn on: the
-  Explorer, its selected row, the tab strip, or the selected tab.
-  `[explorer] status-colors=no` turns the colours off, and
+  colour. Each colour is kept readable against the opaque colour it is
+  drawn on: the Explorer, its selected row, the tab strip, or the selected
+  tab; translucent glass can lower it, as it does for ordinary text.
+  `[explorer] status-colors=no` turns the status colours off, and
   `[explorer] status-glyphs=dots` draws one-cell shapes (◆ ▲ ■ □) instead
-  of icons. **Reload configuration** applies both.
+  of icons, or the ASCII glyphs when the interface font cannot draw them.
+  **Reload configuration** applies both.
 - Explorer search matches state words such as `needs input` or `stale`. The
   palette command **Clear agent status** clears the focused Splint's status.
 - `inspect` and `topology` machine output carry an optional `agent_status`.

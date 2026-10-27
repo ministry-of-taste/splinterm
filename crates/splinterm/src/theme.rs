@@ -412,14 +412,16 @@ pub(crate) enum ChromeTint {
     StatusDone,
     StatusIdle,
     StatusStale,
-    /// The access "Asking" marker.
+    /// The access "Asking" marker icon.
     Asking,
+    /// The access "Asking" marker in ASCII, `A?`, which is text.
+    AskingText,
     /// The remote host tag, which is text.
     Remote,
 }
 
 impl ChromeTint {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
         Self::StatusNeedsInput,
         Self::StatusError,
         Self::StatusWorking,
@@ -427,6 +429,7 @@ impl ChromeTint {
         Self::StatusIdle,
         Self::StatusStale,
         Self::Asking,
+        Self::AskingText,
         Self::Remote,
     ];
 
@@ -439,7 +442,8 @@ impl ChromeTint {
             Self::StatusIdle => 4,
             Self::StatusStale => 5,
             Self::Asking => 6,
-            Self::Remote => 7,
+            Self::AskingText => 7,
+            Self::Remote => 8,
         }
     }
 
@@ -451,16 +455,16 @@ impl ChromeTint {
             Self::StatusDone => roles.status_done,
             Self::StatusIdle => roles.status_idle,
             Self::StatusStale => roles.status_stale,
-            Self::Asking => roles.warning,
+            Self::Asking | Self::AskingText => roles.warning,
             Self::Remote => roles.remote_marker,
         }
     }
 
-    /// Glyphs keep the non-text floor, 3:1; the remote tag is text and
-    /// keeps 4.5:1.
+    /// Glyphs keep the non-text floor, 3:1; the ASCII "Asking" marker and
+    /// the remote tag are text and keep 4.5:1.
     const fn floor(self) -> f64 {
         match self {
-            Self::Remote => TEXT_MIN_CONTRAST,
+            Self::AskingText | Self::Remote => TEXT_MIN_CONTRAST,
             _ => NON_TEXT_MIN_CONTRAST,
         }
     }
@@ -469,7 +473,7 @@ impl ChromeTint {
 /// Every [`ChromeTint`]'s color on one background, each kept at its floor
 /// against that background by mixing toward `text` corrected for it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ChromeTints([u32; 8]);
+pub(crate) struct ChromeTints([u32; 9]);
 
 impl ChromeTints {
     #[must_use]
@@ -586,7 +590,7 @@ mod tests {
             let tints = ChromeTints::on(&roles, background);
             for tint in ChromeTint::ALL {
                 let contrast = contrast_ratio(tints.color(tint), background);
-                let floor = if tint == ChromeTint::Remote {
+                let floor = if matches!(tint, ChromeTint::AskingText | ChromeTint::Remote) {
                     TEXT_MIN_CONTRAST
                 } else {
                     NON_TEXT_MIN_CONTRAST

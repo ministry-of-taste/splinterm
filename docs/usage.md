@@ -281,12 +281,15 @@ built into Splinterm, drawn at the interface font's ascender height in the
 colour of their state's role (see
 [Status colours](configuration.md#status-colours)), or in the row's text
 colour with `[explorer] status-colors=no`. `[explorer] status-glyphs=dots`
-draws the one-cell dots from the interface font instead. The access
-"Asking" marker is drawn in warning. Every state differs by shape and by
-text, never by colour or motion alone. The icons do not depend on the
-interface font; if the built-in icon data could not be loaded, Splinterm
-would show the ASCII fallbacks instead of a missing-glyph box. Icons are visual only: accessible text and search use the
-state words.
+draws the one-cell dots from the interface font instead; when the
+interface font itself does not draw all four dots, Splinterm says so once
+on standard error and shows the ASCII fallbacks, so needs input and error
+never share a missing-glyph box. The access "Asking" marker is drawn in
+warning. Every state differs by shape and by text, never by colour or
+motion alone. The icons do not depend on the interface font; if the
+built-in icon data could not be loaded, Splinterm would show the ASCII
+fallbacks instead of a missing-glyph box. Icons are visual only:
+accessible text and search use the state words.
 
 A fresh **working** status is a Braille spinner (`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`), the one moving
 part, in the Explorer and on Dojo tabs. Splinterm draws Braille itself, so it
