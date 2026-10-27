@@ -267,22 +267,29 @@ finished, through `splinterm agent-status`, the MCP tool, or an agent hook (see
 explicitly reported. It never guesses from terminal text, titles, prompts, or
 output, and a status is display data: it cannot approve, type, or take control.
 
-| State | Icon | ASCII fallback | Text |
-| --- | --- | --- | --- |
-| working | a Braille spinner, `⠋` at rest | the same spinner | Working |
-| needs input | `message-question` (a speech bubble with `?`) | `?` | Needs input |
-| done | `circle-check` | `+` | Done |
-| error | `alert-circle` (a circle with `!`) | `!` | Error |
-| idle | `point` (a small ring) | `-` | Idle |
-| stale marker | `clock` | `~` | stale (no report for N min) |
+| State | Icon | ASCII fallback | Dot | Colour | Text |
+| --- | --- | --- | --- | --- | --- |
+| working | a Braille spinner, `⠋` at rest | the same spinner | the same spinner | warning | Working |
+| needs input | `message-question` (a speech bubble with `?`) | `?` | `◆` | danger | Needs input |
+| done | `circle-check` | `+` | `■` | info | Done |
+| error | `alert-circle` (a circle with `!`) | `!` | `▲` | danger | Error |
+| idle | `point` (a small ring) | `-` | `□` | success | Idle |
+| stale marker | `clock` | `~` | `~` | faint, for the glyph too | stale (no report for N min) |
 
 The icons are a small subset of [Tabler Icons](https://tabler.io/icons) (MIT)
-built into Splinterm, drawn in the row's text colour at the interface font's
-ascender height. Every state differs by shape and by text, never by colour or
-motion alone. They do not depend on the interface font; if the built-in icon
-data could not be loaded, Splinterm would show the ASCII fallbacks instead of a
-missing-glyph box. Icons are visual only: accessible text and search use the
-state words.
+built into Splinterm, drawn at the interface font's ascender height in the
+colour of their state's role (see
+[Status colours](configuration.md#status-colours)), or in the row's text
+colour with `[explorer] status-colors=no`. `[explorer] status-glyphs=dots`
+draws the one-cell dots from the interface font instead; when the
+interface font itself does not draw all four dots, Splinterm says so once
+on standard error and shows the ASCII fallbacks, so needs input and error
+never share a missing-glyph box. The access "Asking" marker is drawn in
+warning. Every state differs by shape and by text, never by colour or
+motion alone. The icons do not depend on the interface font; if the
+built-in icon data could not be loaded, Splinterm would show the ASCII
+fallbacks instead of a missing-glyph box. Icons are visual only:
+accessible text and search use the state words.
 
 A fresh **working** status is a Braille spinner (`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`), the one moving
 part, in the Explorer and on Dojo tabs. Splinterm draws Braille itself, so it

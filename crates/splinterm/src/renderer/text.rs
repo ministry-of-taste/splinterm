@@ -9,6 +9,7 @@ use splinterm_protocol::{
 use unicode_width::UnicodeWidthChar;
 
 use crate::geometry::Rect;
+use crate::theme::ChromeTint;
 
 use super::{
     GlyphKey, RenderContext, SnapshotFrame, SnapshotGlyph, blend_glyph,
@@ -27,6 +28,30 @@ use super::{
 /// Past that it stops growing, because chrome rows have fixed heights:
 /// glyphs larger than their rows were clipped into unreadable fragments.
 pub(crate) const CHROME_MAXIMUM_LINE_HEIGHT: u32 = 24;
+
+/// Whether the interface font's own faces, regular and bold, draw every
+/// character of `text`. A fallback face does not count: it could be missing,
+/// fall back to a replacement glyph, or be a CJK face whose full-width
+/// shapes spill into the next cell.
+pub(crate) fn chrome_primary_faces_cover(text: &str) -> bool {
+    super::compatibility_render_context().is_ok_and(|context| {
+        context.font_generation().is_ok_and(|generation| {
+            [ChromeTextStyle::Regular, ChromeTextStyle::Bold]
+                .into_iter()
+                .all(|style| {
+                    let face = &generation.faces
+                        [super::frame::primary_face_index(&chrome_attributes(style))];
+                    face.covers_text(text)
+                        && super::fonts::with_font_ref(face, |font, _coords| {
+                            Ok(text
+                                .chars()
+                                .all(|character| font.charmap().map(character) != 0))
+                        })
+                        .unwrap_or(false)
+                })
+        })
+    })
+}
 
 /// The tallest chrome text cell, in buffer pixels, at `scale_120`.
 pub(crate) const fn chrome_maximum_cell_height(scale_120: u32) -> u32 {
@@ -55,11 +80,18 @@ fn text_cells(text: &str) -> usize {
 /// Each icon holds [`ChromeIcon::CELLS`] spaces in `text` and is drawn from the
 /// embedded icon face. Icons enter only through [`Self::push_icon`]: no
 /// character in a label, title, or agent detail ever becomes an icon.
+///
+/// A run of cells may carry a [`ChromeTint`]: the painter draws its glyphs
+/// in that role's color for the background it paints on, instead of the
+/// line's own color. The tag, not the color, is part of the source, so a
+/// text cache keyed by source stays valid when colors change.
 #[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
 pub(crate) struct ChromeSource {
     text: String,
     /// `(first cell, icon)`, in cell order.
     icons: Vec<(u32, ChromeIcon)>,
+    /// `(first cell, end cell, tint)`, in cell order, never overlapping.
+    tints: Vec<(u32, u32, ChromeTint)>,
 }
 
 impl ChromeSource {
@@ -100,6 +132,45 @@ impl ChromeSource {
         self
     }
 
+    /// Pushes what `push` adds, tinted by `tint`.
+    pub(crate) fn push_tinted(
+        &mut self,
+        tint: ChromeTint,
+        push: impl FnOnce(&mut Self),
+    ) -> &mut Self {
+        let start = u32::try_from(self.cells()).unwrap_or(u32::MAX);
+        push(self);
+        let end = u32::try_from(self.cells()).unwrap_or(u32::MAX);
+        if end > start {
+            self.tints.push((start, end, tint));
+        }
+        self
+    }
+
+    /// The tinted runs, as `(first cell, end cell, tint)`.
+    #[cfg(test)]
+    pub(crate) fn tints(&self) -> &[(u32, u32, ChromeTint)] {
+        &self.tints
+    }
+
+    /// This source without its tints: every glyph in the line's color.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn untinted(&self) -> Self {
+        Self {
+            tints: Vec::new(),
+            ..self.clone()
+        }
+    }
+
+    /// The tint of the cell at `column`, if any.
+    pub(crate) fn tint_at(&self, column: u32) -> Option<ChromeTint> {
+        self.tints
+            .iter()
+            .find(|(start, end, _)| (*start..*end).contains(&column))
+            .map(|(_, _, tint)| *tint)
+    }
+
     pub(crate) fn push_source(&mut self, other: &Self) -> &mut Self {
         let offset = u32::try_from(self.cells()).unwrap_or(u32::MAX);
         self.icons.extend(
@@ -108,6 +179,14 @@ impl ChromeSource {
                 .iter()
                 .map(|(cell, icon)| (cell.saturating_add(offset), *icon)),
         );
+        self.tints
+            .extend(other.tints.iter().map(|(start, end, tint)| {
+                (
+                    start.saturating_add(offset),
+                    end.saturating_add(offset),
+                    *tint,
+                )
+            }));
         self.text.push_str(&other.text);
         self
     }
@@ -123,6 +202,12 @@ impl ChromeSource {
                 .iter()
                 .copied()
                 .filter(|(cell, _)| cell.saturating_add(ChromeIcon::CELLS) <= kept_cells)
+                .collect(),
+            tints: self
+                .tints
+                .iter()
+                .filter(|(start, _, _)| *start < kept_cells)
+                .map(|(start, end, tint)| (*start, (*end).min(kept_cells), *tint))
                 .collect(),
         }
     }
@@ -159,6 +244,7 @@ impl From<&str> for ChromeSource {
         Self {
             text: text.to_owned(),
             icons: Vec::new(),
+            tints: Vec::new(),
         }
     }
 }
@@ -168,6 +254,7 @@ impl From<String> for ChromeSource {
         Self {
             text,
             icons: Vec::new(),
+            tints: Vec::new(),
         }
     }
 }
@@ -433,7 +520,21 @@ impl ChromeText {
         clip: Rect,
         color: u32,
     ) {
-        let foreground = packed_rgb(color);
+        self.paint_colored(canvas, width, height, origin, clip, |_| color);
+    }
+
+    /// Paints like [`Self::paint`], each glyph in `color_at` its first
+    /// cell's column: how a [`ChromeSource`]'s tints reach the canvas
+    /// without a separate text load.
+    pub(crate) fn paint_colored(
+        &self,
+        canvas: &mut [u8],
+        width: u32,
+        height: u32,
+        origin: (u32, u32),
+        clip: Rect,
+        color_at: impl Fn(u32) -> u32,
+    ) {
         let clip = (
             i32::try_from(clip.x).unwrap_or(i32::MAX),
             i32::try_from(clip.y).unwrap_or(i32::MAX),
@@ -457,7 +558,7 @@ impl ChromeText {
                     - round_to_i32(placed.y_offset)
                     - glyph.top,
                 glyph,
-                foreground,
+                packed_rgb(color_at(placed.column)),
                 Some(clip),
             );
         }
@@ -620,6 +721,106 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn tints_follow_their_cells_through_composition_and_truncation() {
+        let mut source = ChromeSource::from("ab");
+        source.push_tinted(ChromeTint::StatusWorking, |source| {
+            source.push_str("cd");
+        });
+        // Pushing nothing adds no run.
+        source.push_tinted(ChromeTint::StatusDone, |_| {});
+        source.push_str("e");
+        source.push_tinted(ChromeTint::Asking, |source| {
+            source.push_icon(ChromeIcon::LockQuestion);
+        });
+        assert_eq!(
+            source.tints(),
+            [
+                (2, 4, ChromeTint::StatusWorking),
+                (5, 7, ChromeTint::Asking)
+            ]
+        );
+        let mut outer = ChromeSource::from("x");
+        outer.push_source(&source);
+        assert_eq!(
+            outer.tints(),
+            [
+                (3, 5, ChromeTint::StatusWorking),
+                (6, 8, ChromeTint::Asking)
+            ]
+        );
+        let tints: Vec<_> = (0..9).map(|column| outer.tint_at(column)).collect();
+        assert_eq!(
+            tints,
+            [
+                None,
+                None,
+                None,
+                Some(ChromeTint::StatusWorking),
+                Some(ChromeTint::StatusWorking),
+                None,
+                Some(ChromeTint::Asking),
+                Some(ChromeTint::Asking),
+                None
+            ]
+        );
+        // Truncation keeps a cut run only up to the kept cells.
+        let cut = outer.with_prefix_text("xabc…".into(), 4);
+        assert_eq!(cut.tints(), [(3, 4, ChromeTint::StatusWorking)]);
+        assert!(outer.with_prefix_text("xab…".into(), 3).tints().is_empty());
+        // Tints are part of the source, so a cache keyed by it tells them apart.
+        assert_ne!(outer, outer.untinted());
+    }
+
+    #[test]
+    fn paint_colored_paints_each_tinted_column_in_its_color() {
+        let mut source = ChromeSource::from("ii");
+        source.push_tinted(ChromeTint::StatusWorking, |source| {
+            source.push_str("ll");
+        });
+        source.push_str("ii");
+        for scale in [120, 180, 240] {
+            let text =
+                ChromeText::load_source_styled(&source, scale, ChromeTextStyle::Regular).unwrap();
+            let cell = text.frame.cell_width;
+            let (width, height) = (text.pixel_width(), text.pixel_height());
+            let clip = Rect {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            };
+            let mut canvas = vec![0; (width * height * 4) as usize];
+            text.paint_colored(&mut canvas, width, height, (0, 0), clip, |column| {
+                if source.tint_at(column).is_some() {
+                    0x00_ff_00
+                } else {
+                    0xff_00_00
+                }
+            });
+            let (mut green, mut red) = (0, 0);
+            for (index, pixel) in canvas.chunks_exact(4).enumerate() {
+                let column = u32::try_from(index).unwrap() % width / cell;
+                // BGRA: green is byte 1, red byte 2.
+                if pixel[1] > 0 {
+                    green += 1;
+                    assert!((2..4).contains(&column), "green at column {column}");
+                }
+                if pixel[2] > 0 {
+                    red += 1;
+                    assert!(!(2..4).contains(&column), "red at column {column}");
+                }
+            }
+            assert!(green > 0 && red > 0, "scale {scale}");
+            // One color everywhere is exactly `paint`.
+            let mut plain = vec![0; canvas.len()];
+            text.paint(&mut plain, width, height, (0, 0), clip, 0xff_00_00);
+            let mut colored = vec![0; canvas.len()];
+            text.paint_colored(&mut colored, width, height, (0, 0), clip, |_| 0xff_00_00);
+            assert_eq!(plain, colored);
         }
     }
 }

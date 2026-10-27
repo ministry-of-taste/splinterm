@@ -6,6 +6,7 @@ use super::{
     logical_extent_to_buffer, pane_stream_has_terminal_notice, premultiplied_theme_rgba,
     rect_contains, sanitized_tab_label,
 };
+use crate::theme::{ChromeTint, ChromeTints};
 
 /// Install new streams for durable IDs that were retired and added in one update.
 /// Shared by visible and hidden tabs; preserve pane positions and logical focus.
@@ -994,6 +995,7 @@ impl App {
         layout: &TabStripLayout,
         scale_120: u32,
         theme: ResolvedTheme,
+        status_colors: bool,
         active_dojo: DojoId,
         labels: &HashMap<DojoId, CachedFrameTitle>,
         close_text: Option<&ChromeText>,
@@ -1002,6 +1004,13 @@ impl App {
         border_cell: Option<(u32, u32)>,
     ) -> Result<()> {
         let position = |value| i32::try_from(value).unwrap_or(i32::MAX);
+        // Status tints for each tab body a badge can sit on, kept at their
+        // floors against it; none for `[explorer] status-colors=no`. The
+        // remote tag is not a status and keeps its remote-marker color.
+        let strip_tints = ChromeTints::on(&theme.roles, theme.roles.surface);
+        let badge_tints = status_colors.then_some(strip_tints);
+        let active_tints =
+            status_colors.then(|| ChromeTints::on(&theme.roles, theme.active_tab_background));
         let strip = Self::buffer_rect(layout.rect, scale_120)?;
         fill_rect(
             canvas,
@@ -1076,13 +1085,18 @@ impl App {
                 let y = label_rect.y.saturating_add(
                     label_rect.height.saturating_sub(label.text.pixel_height()) / 2,
                 );
-                label.text.paint(
+                let tints = if active { active_tints } else { badge_tints };
+                label.text.paint_colored(
                     canvas,
                     width,
                     height,
                     (label_rect.x, y),
                     label_rect,
-                    foreground,
+                    |column| {
+                        tints
+                            .zip(label.source.tint_at(column))
+                            .map_or(foreground, |(tints, tint)| tints.color(tint))
+                    },
                 );
             }
             let close = Self::buffer_rect(tab.close_rect, scale_120)?;
@@ -1127,7 +1141,7 @@ impl App {
             (width, height),
             layout.host_rect,
             scale_120,
-            theme.roles.text,
+            strip_tints.color(ChromeTint::Remote),
             host_text,
         )?;
         Ok(())
@@ -1289,6 +1303,8 @@ mod tests {
                     roles: crate::theme::ChromeRoles {
                         surface: 0,
                         text: foreground,
+                        // Readable on the surface, so painted as given.
+                        remote_marker: foreground,
                         ..crate::theme::ChromeRoles::default()
                     },
                     ..ResolvedTheme::default()
@@ -1301,6 +1317,7 @@ mod tests {
                     &layout,
                     scale,
                     theme,
+                    false,
                     DojoId::new(),
                     &HashMap::new(),
                     None,
@@ -1317,6 +1334,7 @@ mod tests {
                     &layout,
                     scale,
                     theme,
+                    false,
                     DojoId::new(),
                     &HashMap::new(),
                     None,
@@ -1390,6 +1408,7 @@ mod tests {
             &layout,
             120,
             theme,
+            true,
             active_dojo,
             &HashMap::new(),
             None,
@@ -1443,6 +1462,7 @@ mod tests {
             &layout,
             120,
             overridden,
+            true,
             active_dojo,
             &HashMap::new(),
             None,
@@ -1563,6 +1583,7 @@ mod tests {
             &layout,
             120,
             theme,
+            true,
             active_dojo,
             &HashMap::new(),
             None,
@@ -1677,6 +1698,7 @@ mod tests {
                                 &layout,
                                 scale,
                                 theme,
+                                true,
                                 ids[1],
                                 &HashMap::new(),
                                 None,
@@ -1899,6 +1921,7 @@ mod tests {
                             &layout,
                             scale,
                             ResolvedTheme::default(),
+                            true,
                             dojo,
                             &labels,
                             Some(&close),
@@ -2189,5 +2212,110 @@ mod tests {
         // At the default 26 px, scale 1.25 draws a 33 px buffer strip.
         let layout = tab_strip_layout(640, DEFAULT_TAB_STRIP_LOGICAL_HEIGHT, &ids, 1).unwrap();
         assert_eq!(App::buffer_rect(layout.rect, 150).unwrap().height, 33);
+    }
+
+    #[test]
+    fn tab_badges_and_the_remote_tag_take_status_colors_on_their_tab_bodies() {
+        use super::{CachedFrameTitle, ChromeSource, ChromeText, ChromeTextStyle};
+        use crate::color::{NON_TEXT_MIN_CONTRAST, TEXT_MIN_CONTRAST, contrast_ratio};
+        use crate::frontend::{AgentAggregate, AgentGlyphs, AgentSpinner, badged_tab_label};
+        use crate::navigation_projection::NavigationAgentStatus;
+        use crate::theme::{ChromeTint, ChromeTints};
+        use splinterm_protocol::AgentState;
+
+        let paints = |canvas: &[u8], color: u32| {
+            let [red, green, blue, _] = opaque_rgba(color);
+            canvas
+                .chunks_exact(4)
+                .any(|pixel| pixel[..3] == [blue, green, red])
+        };
+        let theme = ResolvedTheme::default();
+        let scale = 120;
+        let (active, other) = (DojoId::new(), DojoId::new());
+        let logical_width = 420;
+        let layout = super::remote_header_layout(
+            logical_width,
+            DEFAULT_TAB_STRIP_LOGICAL_HEIGHT,
+            &[active, other],
+            0,
+            180,
+        )
+        .unwrap();
+        let width = super::logical_extent_to_buffer(logical_width, scale).unwrap();
+        let height =
+            super::logical_extent_to_buffer(DEFAULT_TAB_STRIP_LOGICAL_HEIGHT, scale).unwrap();
+        let host = ChromeText::load("Remote: node", scale).unwrap();
+        let paint = |badge: &ChromeSource, status_colors: bool| {
+            let source = badged_tab_label(Some(badge), "work", 20);
+            let labels = [active, other].map(|dojo| {
+                let text = ChromeText::load_source_styled(&source, scale, ChromeTextStyle::Regular)
+                    .unwrap();
+                (
+                    dojo,
+                    CachedFrameTitle {
+                        source: source.clone(),
+                        maximum_cells: 0,
+                        scale_120: scale,
+                        bold: false,
+                        text,
+                    },
+                )
+            });
+            let mut canvas = vec![0; (width * height * 4) as usize];
+            App::paint_tab_strip(
+                &mut canvas,
+                width,
+                height,
+                &layout,
+                scale,
+                theme,
+                status_colors,
+                active,
+                &HashMap::from(labels),
+                None,
+                None,
+                Some(&host),
+                None,
+            )
+            .unwrap();
+            canvas
+        };
+        let strip = ChromeTints::on(&theme.roles, theme.roles.surface);
+        let body = ChromeTints::on(&theme.roles, theme.active_tab_background);
+        let remote = strip.color(ChromeTint::Remote);
+        assert!(contrast_ratio(remote, theme.roles.surface) >= TEXT_MIN_CONTRAST);
+        for state in [
+            AgentState::NeedsInput,
+            AgentState::Error,
+            AgentState::Working,
+            AgentState::Done,
+            AgentState::Idle,
+        ] {
+            let status = NavigationAgentStatus {
+                state,
+                detail: None,
+                stale: false,
+                stale_minutes: None,
+            };
+            let badge = AgentAggregate::from_statuses(&[status])
+                .tab_badge(AgentGlyphs::Icons, AgentSpinner::STATIC)
+                .unwrap();
+            let tint = crate::frontend::state_tint(state, false);
+            // Each glyph keeps 3:1 on the body it is painted on.
+            let body_contrast = contrast_ratio(body.color(tint), theme.active_tab_background);
+            assert!(body_contrast >= NON_TEXT_MIN_CONTRAST);
+            let tinted = paint(&badge, true);
+            assert!(paints(&tinted, strip.color(tint)), "{state:?} on the strip");
+            assert!(
+                paints(&tinted, body.color(tint)),
+                "{state:?} on the active tab"
+            );
+            assert!(paints(&tinted, remote));
+            // status-colors=no paints exactly an untinted badge; the remote
+            // tag is not a status and keeps remote-marker.
+            let off = paint(&badge, false);
+            assert!(off == paint(&badge.untinted(), true), "{state:?}");
+            assert!(paints(&off, remote));
+        }
     }
 }

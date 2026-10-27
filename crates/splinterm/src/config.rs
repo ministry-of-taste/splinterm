@@ -29,8 +29,8 @@ use crate::{
     keymap::{KeymapProfile, ResolvedKeymap, resolve_keymap},
     preset::PresetCatalog,
     theme::{
-        BuiltinThemeProvider, ChromeRoles, RoleHints, TerminalPalette, ThemeComponents, ThemeInput,
-        ThemeProvider, ThemeShellInput, active_tab_foreground_fallback, derive,
+        Appearance, BuiltinThemeProvider, ChromeRoles, RoleHints, TerminalPalette, ThemeComponents,
+        ThemeInput, ThemeProvider, ThemeShellInput, active_tab_foreground_fallback, derive,
     },
 };
 
@@ -122,6 +122,8 @@ pub struct AppConfig {
     /// Whether explicitly reported agent status is shown in the Explorer, on
     /// Dojo tabs, and in navigation accessibility (`[explorer] agent-status`).
     pub explorer_agent_status: bool,
+    /// `[explorer] status-colors` and `status-glyphs`.
+    pub explorer_status_style: AgentStatusStyle,
     /// Whether a shown tab strip draws a full-width bottom border in the
     /// light `line` Splint divider stroke and colour, under the active tab's
     /// thicker underline (`[multiplexer] tab-strip-border`, default on).
@@ -153,6 +155,36 @@ pub enum StartupMode {
     #[default]
     NewDojo,
     DojoPicker,
+}
+
+/// How agent status is drawn in the Explorer and on Dojo tabs
+/// (`[explorer] status-colors` and `status-glyphs`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AgentStatusStyle {
+    /// Agent status glyphs, the access "Asking" marker and the remote host
+    /// tag take their status colors; off, they take the text around them.
+    pub colors: bool,
+    pub glyphs: StatusGlyphs,
+}
+
+impl Default for AgentStatusStyle {
+    fn default() -> Self {
+        Self {
+            colors: true,
+            glyphs: StatusGlyphs::Icons,
+        }
+    }
+}
+
+/// `[explorer] status-glyphs`. Each state keeps its own shape in both, so
+/// color is never the only signal.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum StatusGlyphs {
+    /// Two-cell icons from the embedded icon face.
+    #[default]
+    Icons,
+    /// One-cell geometric shapes from the chrome font.
+    Dots,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -262,6 +294,7 @@ impl Default for AppConfig {
             preset_catalog: Some(PresetCatalog::bundled()),
             allow_unrestricted_commands: false,
             explorer_agent_status: true,
+            explorer_status_style: AgentStatusStyle::default(),
             tab_strip_border: true,
             explorer_full_height: true,
             omarchy_integration_hint: true,
@@ -1281,6 +1314,18 @@ fn parse_with_base(text: &str, config_dir: &Path) -> Result<ConfigLoad> {
                 config.pane_gap = parse_range(value, 0, MAX_PANE_GAP, index)?;
                 false
             }
+            "explorer.status-colors" => {
+                config.explorer_status_style.colors = parse_bool(value, index)?;
+                false
+            }
+            "explorer.status-glyphs" => {
+                config.explorer_status_style.glyphs = match value.to_ascii_lowercase().as_str() {
+                    "icons" => StatusGlyphs::Icons,
+                    "dots" => StatusGlyphs::Dots,
+                    _ => bail!("line {}: status-glyphs must be icons or dots", index + 1),
+                };
+                false
+            }
             "explorer.agent-status" => {
                 config.explorer_agent_status = parse_bool(value, index)?;
                 false
@@ -1555,6 +1600,8 @@ pub struct ResolvedTheme {
     /// Coverage of Splinterm's own chrome backgrounds, and the Explorer's
     /// panel colour. Splinterm owns these; themes do not set them.
     pub chrome: ChromeBackgrounds,
+    /// Whether the theme is dark or light; see `crate::theme::Appearance`.
+    pub appearance: Appearance,
     /// Omarchy shell settings layered from `shell.toml`; Omarchy's defaults
     /// for other theme sources.
     pub shell: OmarchyShellSettings,
@@ -1658,6 +1705,7 @@ impl ResolvedTheme {
             background_blur: input.shell.background_blur,
             chrome: ChromeBackgrounds::default(),
             shell: input.shell.settings,
+            appearance: input.appearance,
         }
     }
 
@@ -1797,6 +1845,9 @@ impl ThemePalette {
         let url = parse_color(&self.url)?;
         let hints = RoleHints {
             accent: Some(accent),
+            // A JSON theme carries its muted color in ANSI 8, as
+            // `tools/generate-omarchy-theme.py` fills it from `muted`.
+            text_muted: Some(ansi[8]),
             divider: optional(self.pane_border.as_deref(), parse_color)?,
             focus_ring: optional(self.pane_border_active.as_deref(), parse_color)?,
             ..RoleHints::default()
@@ -1818,6 +1869,7 @@ impl ThemePalette {
                 background_blur: self.blur,
                 settings: OmarchyShellSettings::default(),
             },
+            appearance: Appearance::of_background(background),
         })
     }
 }
@@ -1864,25 +1916,60 @@ fn omarchy_role(colors: &HashMap<String, String>, keys: &[&str]) -> Result<Optio
         .with_context(|| format!("active Omarchy colors.toml has invalid {key}"))
 }
 
+/// Like [`omarchy_role`] for a key Splinterm did not read before semantic
+/// roles: an invalid value never rejects a theme that loaded before. It is
+/// skipped, the cascade goes on, and `diagnostics` says so.
+fn omarchy_hint(
+    colors: &HashMap<String, String>,
+    keys: &[&str],
+    diagnostics: &mut Vec<String>,
+) -> Option<u32> {
+    keys.iter().find_map(|key| {
+        let value = colors.get(*key).filter(|value| !value.is_empty())?;
+        parse_color(value)
+            .inspect_err(|_| {
+                diagnostics.push(format!(
+                    "active Omarchy colors.toml {key} {value:?} is not #RRGGBB; ignoring it"
+                ));
+            })
+            .ok()
+    })
+}
+
 /// Selected-Dojo-tab body: canonical `lighter_background`, then the legacy
 /// short name. Omarchy's last resort, `color0`/`background`, is the terminal
 /// background itself and would hide the selected tab, so Splinterm keeps its
 /// Foot `bright0` ramp instead.
 const OMARCHY_LIGHTER_BACKGROUND_KEYS: [&str; 2] = ["lighter_background", "lighter_bg"];
-/// Inactive-tab text: `muted`, then Omarchy's `color8` and `dark_foreground`
-/// (legacy `dark_fg`) fallbacks, then Foot `bright0`, which Omarchy's stock
-/// template renders from the same resolved `muted`.
+/// The keys the inactive-tab text read before semantic roles, in their old
+/// order: `muted`, then Omarchy's `color8` and `dark_foreground` (legacy
+/// `dark_fg`) fallbacks. They are still read strictly in this order, so a
+/// theme that was rejected before is still rejected and no other is.
 const OMARCHY_MUTED_KEYS: [&str; 4] = ["muted", "color8", "dark_foreground", "dark_fg"];
 /// Application accent: `accent`, a legacy `cursor`, then `blue` before its
 /// ANSI `color4` alias.
 const OMARCHY_ACCENT_KEYS: [&str; 4] = ["accent", "cursor", "blue", "color4"];
+
+/// Plan 0064's cascades for the role hints read since semantic roles; see
+/// [`omarchy_theme_input`].
+const OMARCHY_TEXT_MUTED_KEYS: [&str; 3] = ["muted", "dark_foreground", "dark_fg"];
+const OMARCHY_DARK_BACKGROUND_KEYS: [&str; 2] = ["dark_background", "dark_bg"];
+const OMARCHY_SELECTION_KEYS: [&str; 2] = ["selection_background", "selection"];
+const OMARCHY_DIVIDER_KEYS: [&str; 3] = ["border", "muted", "color8"];
+const OMARCHY_FOCUS_RING_KEYS: [&str; 1] = ["active_border_color"];
+const OMARCHY_DANGER_KEYS: [&str; 2] = ["red", "color1"];
+const OMARCHY_WARNING_KEYS: [&str; 3] = ["warning", "yellow", "color3"];
+const OMARCHY_SUCCESS_KEYS: [&str; 3] = ["success", "green", "color2"];
+const OMARCHY_INFO_KEYS: [&str; 2] = ["cyan", "color6"];
+const OMARCHY_REMOTE_MARKER_KEYS: [&str; 3] = ["signal", "magenta", "color5"];
 
 /// Returns the effective Foot palette for the selected color theme.
 ///
 /// Foot 1.27.0 parses the deprecated `[colors]` section into the same dark
 /// theme as `[colors-dark]` and `[colors2]` into the light theme, one key at a
 /// time in file order, so the sections merge and the last assignment wins.
-fn foot_color_values(raw: &str) -> Result<HashMap<String, String>> {
+/// Also returns the appearance `initial-color-theme` names, when it names one.
+fn foot_color_values(raw: &str) -> Result<(HashMap<String, String>, Option<Appearance>)> {
     let mut main = HashMap::new();
     let mut dark = HashMap::new();
     let mut light = HashMap::new();
@@ -1907,12 +1994,10 @@ fn foot_color_values(raw: &str) -> Result<HashMap<String, String>> {
         };
         values.insert(key.trim().to_ascii_lowercase(), value.trim().to_owned());
     }
-    match main
-        .get("initial-color-theme")
-        .map_or("dark", String::as_str)
-    {
-        "light" => Ok(light),
-        "dark" => Ok(dark),
+    let named = main.get("initial-color-theme");
+    match named.map_or("dark", String::as_str) {
+        "light" => Ok((light, named.map(|_| Appearance::Light))),
+        "dark" => Ok((dark, named.map(|_| Appearance::Dark))),
         _ => bail!("active Omarchy foot.ini initial-color-theme must be dark or light"),
     }
 }
@@ -1928,19 +2013,42 @@ fn foot_theme_color(values: &HashMap<String, String>, key: &str) -> Result<u32> 
 
 #[cfg(test)]
 fn resolve_omarchy_theme(colors_raw: &str, foot_raw: &str) -> Result<ResolvedTheme> {
-    omarchy_theme_input(colors_raw, foot_raw).map(|input| ResolvedTheme::from_input(&input))
+    omarchy_theme_input(colors_raw, foot_raw, &mut Vec::new())
+        .map(|input| ResolvedTheme::from_input(&input))
 }
 
 /// Reads an Omarchy theme: the terminal palette, alpha and blur from the
 /// generated `foot.ini`, and role hints from `colors.toml`.
 ///
-/// Only the keys Splinterm read before roles existed are hints so far
-/// (`lighter_background`, `muted`, `accent` and their aliases). The pane
-/// border keeps Foot `bright0` (ANSI 8) through the `divider` hint, where a
-/// JSON or built-in theme derives it from surface and text.
-fn omarchy_theme_input(colors_raw: &str, foot_raw: &str) -> Result<ThemeInput> {
+/// Each hint takes the first valid key of its Plan 0064 cascade, so a
+/// semantic key wins over the named hue, which wins over its ANSI alias:
+///
+/// | Role | `colors.toml` keys | Without one |
+/// |---|---|---|
+/// | surface-raised | `lighter_background` | mix toward text |
+/// | surface-sunken | `dark_background` | mix toward black |
+/// | selection | `selection_background`, `selection` | Foot selection |
+/// | divider | `border`, `muted`, `color8` | Foot `bright0` |
+/// | focus-ring | `active_border_color` | accent |
+/// | text-muted | `muted`, `dark_foreground` | text mixed 30% to surface |
+/// | accent | `accent`, `cursor`, `blue`, `color4` | Foot cursor |
+/// | danger | `red`, `color1` | Foot `regular1` |
+/// | warning | `warning`, `yellow`, `color3` | Foot `regular3` |
+/// | success | `success`, `green`, `color2` | Foot `regular2` |
+/// | info | `cyan`, `color6` | Foot `regular6` |
+/// | remote-marker | `signal`, `magenta`, `color5` | Foot `regular5` |
+///
+/// The appearance is `mode`, else Foot's `initial-color-theme`, else the
+/// background's. The keys read before semantic roles (`lighter_background`,
+/// `muted`, `accent` and their cascades) still reject an invalid value; an
+/// invalid value of any other key is skipped with a note in `diagnostics`.
+fn omarchy_theme_input(
+    colors_raw: &str,
+    foot_raw: &str,
+    diagnostics: &mut Vec<String>,
+) -> Result<ThemeInput> {
     let colors = omarchy_color_values(colors_raw);
-    let foot = foot_color_values(foot_raw)?;
+    let (foot, foot_appearance) = foot_color_values(foot_raw)?;
     if foot.is_empty() {
         bail!("active Omarchy foot.ini has no palette for the selected initial-color-theme");
     }
@@ -1974,13 +2082,37 @@ fn omarchy_theme_input(colors_raw: &str, foot_raw: &str) -> Result<ThemeInput> {
         .transpose()
         .context("active Omarchy foot.ini has invalid cursor")?
         .unwrap_or(foreground);
+    // The keys read before semantic roles keep their strictness.
+    let surface_raised = omarchy_role(&colors, &OMARCHY_LIGHTER_BACKGROUND_KEYS)?;
+    omarchy_role(&colors, &OMARCHY_MUTED_KEYS)?;
+    let accent = omarchy_role(&colors, &OMARCHY_ACCENT_KEYS)?.unwrap_or(cursor);
+    let mut hint = |keys: &[&str]| omarchy_hint(&colors, keys, diagnostics);
     let hints = RoleHints {
-        surface_raised: omarchy_role(&colors, &OMARCHY_LIGHTER_BACKGROUND_KEYS)?,
-        text_muted: omarchy_role(&colors, &OMARCHY_MUTED_KEYS)?,
-        accent: Some(omarchy_role(&colors, &OMARCHY_ACCENT_KEYS)?.unwrap_or(cursor)),
-        divider: Some(ansi[8]),
-        ..RoleHints::default()
+        surface_raised,
+        surface_sunken: hint(&OMARCHY_DARK_BACKGROUND_KEYS),
+        selection: hint(&OMARCHY_SELECTION_KEYS),
+        divider: Some(hint(&OMARCHY_DIVIDER_KEYS).unwrap_or(ansi[8])),
+        focus_ring: hint(&OMARCHY_FOCUS_RING_KEYS),
+        text_muted: hint(&OMARCHY_TEXT_MUTED_KEYS),
+        accent: Some(accent),
+        danger: hint(&OMARCHY_DANGER_KEYS),
+        warning: hint(&OMARCHY_WARNING_KEYS),
+        success: hint(&OMARCHY_SUCCESS_KEYS),
+        info: hint(&OMARCHY_INFO_KEYS),
+        remote_marker: hint(&OMARCHY_REMOTE_MARKER_KEYS),
     };
+    let mode = colors.get("mode").filter(|value| !value.is_empty());
+    let appearance = mode
+        .and_then(|value| {
+            Appearance::parse(value).or_else(|| {
+                diagnostics.push(format!(
+                    "active Omarchy colors.toml mode {value:?} is not dark or light; ignoring it"
+                ));
+                None
+            })
+        })
+        .or(foot_appearance)
+        .unwrap_or_else(|| Appearance::of_background(background));
     let alpha = foot.get("alpha").map_or(Ok(1.0), |value| {
         value
             .parse::<f32>()
@@ -2014,6 +2146,7 @@ fn omarchy_theme_input(colors_raw: &str, foot_raw: &str) -> Result<ThemeInput> {
             background_blur: blur,
             settings: OmarchyShellSettings::default(),
         },
+        appearance,
     })
 }
 
@@ -2106,10 +2239,32 @@ fn load_omarchy_input_with_status(
         omarchy_theme_identity(theme_dir) == before,
         "active Omarchy theme changed while its palette was loading"
     );
-    omarchy_theme_input(&colors, &foot).map(|input| ThemeInputLoad {
+    let mut diagnostics = Vec::new();
+    let input = omarchy_theme_input(&colors, &foot, &mut diagnostics)?;
+    for diagnostic in diagnostics {
+        if first_theme_diagnostic(&diagnostic) {
+            eprintln!("splinterm theme: {diagnostic}");
+        }
+    }
+    Ok(ThemeInputLoad {
         input,
         used_omarchy_fallback: false,
     })
+}
+
+/// Whether this process has not reported `diagnostic` before, recording it.
+/// The theme watcher reloads a theme on every change, and a value Splinterm
+/// ignores is reported once rather than on every reload.
+fn first_theme_diagnostic(diagnostic: &str) -> bool {
+    static REPORTED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let mut reported = REPORTED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if reported.iter().any(|seen| seen == diagnostic) {
+        return false;
+    }
+    reported.push(diagnostic.to_owned());
+    true
 }
 
 /// One Omarchy theme directory as a theme provider: its `colors.toml` and
@@ -2900,6 +3055,34 @@ mod tests {
     }
 
     #[test]
+    fn explorer_status_colors_and_glyphs_default_on_and_icons() {
+        let defaults = AppConfig::default().explorer_status_style;
+        assert!(defaults.colors);
+        assert_eq!(defaults.glyphs, StatusGlyphs::Icons);
+        let loaded = parse("[explorer]\nstatus-colors=no\nstatus-glyphs=dots\n").unwrap();
+        assert!(loaded.diagnostics.is_empty());
+        assert_eq!(
+            loaded.config.explorer_status_style,
+            AgentStatusStyle {
+                colors: false,
+                glyphs: StatusGlyphs::Dots,
+            }
+        );
+        let icons = parse("[explorer]\nstatus-glyphs=Icons\n").unwrap();
+        assert_eq!(
+            icons.config.explorer_status_style.glyphs,
+            StatusGlyphs::Icons
+        );
+        assert!(parse("[explorer]\nstatus-glyphs=ascii\n").is_err());
+        assert!(parse("[explorer]\nstatus-colors=maybe\n").is_err());
+        let shipped = parse(include_str!("../../../config/splinterm/config.ini")).unwrap();
+        assert_eq!(
+            shipped.config.explorer_status_style,
+            AgentStatusStyle::default()
+        );
+    }
+
+    #[test]
     fn explorer_full_height_defaults_on_and_can_be_turned_off() {
         assert!(AppConfig::default().explorer_full_height);
         assert!(parse("[explorer]\n").unwrap().config.explorer_full_height);
@@ -3141,27 +3324,78 @@ mod tests {
 
     #[test]
     fn stock_omarchy_4_themes_drive_the_selected_tab_from_lighter_background() {
-        // (fixture, selected tab, accent, muted, terminal background)
+        // (fixture, selected tab, accent, active border, muted, terminal
+        // background)
         let expected = [
-            ("tokyo-night", 0x24283b, 0x7aa2f7, 0x414868, 0x1a1b26),
-            ("flexoki-light", 0xe6e4d9, 0x205ea6, 0xb7b5ac, 0xfffcf0),
-            ("last-horizon", 0x0c0b0c, 0xb59790, 0x584e51, 0x0c0b0c),
-            ("legacy-gruvbox", 0x3c3836, 0x7daea3, 0x665c54, 0x282828),
-            // No lighter_background or lighter_bg: Foot bright0 (color8).
-            ("alacritty-kanagawa", 0x727169, 0x7e9cd8, 0x727169, 0x1f1f28),
+            (
+                "tokyo-night",
+                0x24283b,
+                0x7aa2f7,
+                0x7aa2f7,
+                Some(0x414868),
+                0x1a1b26,
+            ),
+            (
+                "flexoki-light",
+                0xe6e4d9,
+                0x205ea6,
+                0x205ea6,
+                Some(0xb7b5ac),
+                0xfffcf0,
+            ),
+            // Its active_border_color is the focus ring.
+            (
+                "last-horizon",
+                0x0c0b0c,
+                0xb59790,
+                0xd6d3de,
+                Some(0x584e51),
+                0x0c0b0c,
+            ),
+            (
+                "legacy-gruvbox",
+                0x3c3836,
+                0x7daea3,
+                0x7daea3,
+                Some(0x665c54),
+                0x282828,
+            ),
+            // No lighter_background or lighter_bg: Foot bright0 (color8). No
+            // muted or dark_foreground: the inactive tab mixes the text.
+            (
+                "alacritty-kanagawa",
+                0x727169,
+                0x7e9cd8,
+                0x7e9cd8,
+                None,
+                0x1f1f28,
+            ),
         ];
-        for ((name, colors, foot), (expected_name, tab, accent, muted, background)) in
-            OMARCHY4_FIXTURES.iter().zip(expected)
+        for (
+            (name, colors, foot),
+            (expected_name, tab, accent, active_border, muted, background),
+        ) in OMARCHY4_FIXTURES.iter().zip(expected)
         {
             assert_eq!(*name, expected_name);
             let theme = resolve_omarchy_theme(colors, foot).unwrap();
             assert_eq!(theme.active_tab_background, tab, "{name} selected tab");
             assert_eq!(theme.ui_accent(), accent, "{name} accent");
-            assert_eq!(theme.pane_border_active(), accent, "{name} active border");
+            assert_eq!(
+                theme.pane_border_active(),
+                active_border,
+                "{name} active border"
+            );
             assert_eq!(theme.background, background, "{name} background");
             assert_eq!(
                 theme.inactive_tab_foreground(),
-                inactive_tab_foreground_fallback(theme.background, theme.foreground, muted),
+                muted.map_or_else(
+                    || mixed_muted(&theme),
+                    |muted| inactive_tab_foreground_fallback(
+                        theme.background,
+                        theme.foreground,
+                        muted
+                    )
+                ),
                 "{name} inactive tab"
             );
             assert_eq!(
@@ -3190,10 +3424,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(both.active_tab_background, 0x22_22_22);
-        assert_eq!(
-            both.inactive_tab_foreground(),
-            inactive_tab_foreground_fallback(both.background, both.foreground, 0x33_33_33)
-        );
+        // An empty muted is absent: color8 is the divider, and the inactive
+        // tab, with no muted or dark_foreground, mixes the text.
+        assert_eq!(both.pane_border(), 0x33_33_33);
+        assert_eq!(both.inactive_tab_foreground(), mixed_muted(&both));
         assert_eq!(both.ui_accent(), 0x44_44_44);
 
         let legacy =
@@ -3594,6 +3828,17 @@ mod tests {
         assert!((inactive_contrast(&theme) - 5.13).abs() < 0.01);
     }
 
+    /// Plan 0064's text-muted without a hint: text mixed 30% toward the
+    /// surface in linear light, kept at 4.5:1.
+    fn mixed_muted(theme: &ResolvedTheme) -> u32 {
+        use crate::color::{contrast_corrected, contrast_corrected_toward, mix_linear};
+        contrast_corrected_toward(
+            mix_linear(theme.foreground, theme.background, 0.30),
+            contrast_corrected(theme.foreground, theme.background),
+            theme.background,
+        )
+    }
+
     #[test]
     fn inactive_tab_foreground_keeps_a_readable_muted_color_or_mixes_toward_foreground() {
         // A muted color that meets the floor is used as is.
@@ -3647,6 +3892,7 @@ mod tests {
             .unwrap()
             .resolve()
             .unwrap();
+        // A JSON theme's ANSI 8 is its muted color.
         assert_eq!(derived.inactive_tab_foreground(), 0x92_83_74);
 
         // An explicit role is used verbatim, even below the floor.
@@ -3677,22 +3923,27 @@ mod tests {
     }
 
     #[test]
-    fn native_inactive_tab_foreground_prefers_omarchy_muted_then_foot_bright0() {
+    fn native_inactive_tab_foreground_prefers_omarchy_muted_then_mixes_text() {
         let foot = complete_foot_palette("0e1216", "ebebeb", "354a60", "ebebeb")
             .replace("bright0=000008", "bright0=7c7e80");
         let muted = resolve_omarchy_theme("muted=\"#928374\"\n", &foot).unwrap();
         assert_eq!(muted.inactive_tab_foreground(), 0x92_83_74);
+        let dark_foreground =
+            resolve_omarchy_theme("dark_foreground=\"#928374\"\n", &foot).unwrap();
+        assert_eq!(dark_foreground.inactive_tab_foreground(), 0x92_83_74);
 
-        let bright0 = resolve_omarchy_theme("accent=\"#00aaff\"\n", &foot).unwrap();
-        assert_eq!(bright0.ansi[8], 0x7c_7e_80);
-        assert_eq!(bright0.inactive_tab_foreground(), 0x7c_7e_80);
-        assert!(inactive_contrast(&bright0) >= INACTIVE_TAB_MIN_CONTRAST);
-
-        // The near-black helper bright0 fails the floor and is mixed toward the
-        // foreground rather than used.
+        // Neither Foot bright0 nor color8 is a muted color: the inactive tab
+        // mixes the text toward the surface.
+        for colors in ["accent=\"#00aaff\"\n", "color8=\"#7c7e80\"\n"] {
+            let mixed = resolve_omarchy_theme(colors, &foot).unwrap();
+            assert_eq!(mixed.ansi[8], 0x7c_7e_80);
+            assert_eq!(mixed.inactive_tab_foreground(), mixed_muted(&mixed));
+            assert_eq!(mixed.inactive_tab_foreground(), 0xc9_c9_c9);
+            assert!(inactive_contrast(&mixed) >= INACTIVE_TAB_MIN_CONTRAST);
+        }
         let faint = complete_foot_palette("0e1216", "ebebeb", "354a60", "ebebeb");
         let faint = resolve_omarchy_theme("", &faint).unwrap();
-        assert_ne!(faint.inactive_tab_foreground(), faint.ansi[8]);
+        assert_eq!(faint.inactive_tab_foreground(), mixed_muted(&faint));
         assert!(inactive_contrast(&faint) >= INACTIVE_TAB_MIN_CONTRAST);
 
         assert!(resolve_omarchy_theme("muted=\"nope\"\n", &foot).is_err());
@@ -4320,10 +4571,14 @@ mod tests {
     /// The colors each source paints: background, foreground, cursor,
     /// selection, selection text, URL, selected tab body and label, inactive
     /// tab label, accent, pane border, active pane border, then alpha and
-    /// blur. Every row but `semantic-keys` was recorded from the resolver
-    /// before chrome roles existed (Plan 0064 milestone 2); the
-    /// `semantic-keys` fixture is new with roles, and its row records what
-    /// the role resolver gives it.
+    /// blur. The rows were recorded from the resolver before chrome roles
+    /// existed (Plan 0064 milestone 2), except for the `semantic-keys`
+    /// fixture, new with roles, and three colors milestone 3 changed on
+    /// purpose: `alacritty-kanagawa`'s inactive tab label (was 8d8b7d),
+    /// which names no `muted` or `dark_foreground` and now mixes its text;
+    /// `last-horizon`'s active pane border (b59790), now its
+    /// `active_border_color`; and `semantic-keys`' pane border (6a6488),
+    /// now its `border`.
     #[allow(clippy::type_complexity)]
     const PROVIDER_PINS: [(&str, [u32; 12], u16, bool); 9] = [
         (
@@ -4375,7 +4630,7 @@ mod tests {
             "last-horizon",
             [
                 0x0c0b0c, 0xfafcfb, 0xe2dddc, 0x584e51, 0xe2dddc, 0xb59790, 0x0c0b0c, 0xfafcfb,
-                0x817a7c, 0xb59790, 0x584e51, 0xb59790,
+                0x817a7c, 0xb59790, 0x584e51, 0xd6d3de,
             ],
             u16::MAX,
             true,
@@ -4393,7 +4648,7 @@ mod tests {
             "alacritty-kanagawa",
             [
                 0x1f1f28, 0xdcd7ba, 0xdcd7ba, 0x2d4f67, 0xdcd7ba, 0x7e9cd8, 0x727169, 0xdcd7ba,
-                0x8d8b7d, 0x7e9cd8, 0x727169, 0x7e9cd8,
+                0xbcb8a0, 0x7e9cd8, 0x727169, 0x7e9cd8,
             ],
             u16::MAX,
             true,
@@ -4402,7 +4657,7 @@ mod tests {
             "semantic-keys",
             [
                 0x14111f, 0xd8d4ea, 0xf2efff, 0x2a2540, 0xf2efff, 0x5ec4ff, 0x1f1a30, 0xd8d4ea,
-                0x8680a1, 0x5ec4ff, 0x6a6488, 0x5ec4ff,
+                0x8680a1, 0x5ec4ff, 0x3d3654, 0x5ec4ff,
             ],
             u16::MAX,
             true,
@@ -4410,7 +4665,7 @@ mod tests {
     ];
 
     #[test]
-    fn provider_themes_keep_the_colors_they_painted_before_roles() {
+    fn provider_themes_paint_their_pinned_colors() {
         let themes = provider_themes();
         assert_eq!(themes.len(), PROVIDER_PINS.len());
         for ((name, theme), (pinned, colors, alpha, blur)) in themes.into_iter().zip(PROVIDER_PINS)
@@ -4502,28 +4757,218 @@ mod tests {
     }
 
     #[test]
-    fn omarchy_semantic_keys_do_not_change_painted_colors_yet() {
+    fn omarchy_semantic_keys_change_their_roles() {
         let (colors, foot) = SEMANTIC_KEYS_FIXTURE;
-        let semantic_keys = ["warning", "success", "signal", "border", "dark_background"];
-        for key in semantic_keys {
-            assert!(colors.contains(&format!("\n{key} = ")), "{key}");
-        }
+        let theme = resolve_omarchy_theme(colors, foot).unwrap();
+        let roles = theme.roles;
+        // The theme puts ultraviolet in its ANSI yellow slot on purpose:
+        // `warning` wins over both `yellow` and ANSI 3.
+        assert_eq!(theme.ansi[3], 0x9b_6b_ff);
+        assert_eq!(roles.warning, 0xff_b3_47);
+        assert_eq!(roles.status_working, roles.warning);
+        assert_eq!(roles.success, 0x5f_d7_8f);
+        assert_eq!(roles.remote_marker, 0xff_5f_d2);
+        assert_eq!(roles.divider, 0x3d_36_54);
+        assert_eq!(theme.pane_border(), 0x3d_36_54);
+        assert_eq!(roles.surface_sunken, 0x0d_0b_15);
+        assert_eq!(roles.surface_raised, 0x1f_1a_30);
+        assert_eq!(roles.selection, 0x2a_25_40);
+        assert_eq!(roles.danger, 0xff_5f_6d);
+        assert_eq!(roles.info, 0x4f_d1_c5);
+        assert_eq!(theme.appearance, Appearance::Dark);
+        // Without its semantic keys the named hues, then muted, take over.
         let without = colors
             .lines()
             .filter(|line| {
-                !semantic_keys
+                !["warning", "signal", "border"]
                     .iter()
                     .any(|key| line.starts_with(&format!("{key} = ")))
             })
             .collect::<Vec<_>>()
             .join("\n");
-        let theme = resolve_omarchy_theme(colors, foot).unwrap();
-        assert_eq!(theme, resolve_omarchy_theme(&without, foot).unwrap());
-        // Until semantic keys are read, warning follows the ANSI yellow slot,
-        // which this theme makes ultraviolet.
-        assert_eq!(theme.ansi[3], 0x9b_6b_ff);
-        assert_eq!(theme.roles.warning, theme.ansi[3]);
-        assert_eq!(theme.roles.surface_raised, 0x1f_1a_30);
+        let hues = resolve_omarchy_theme(&without, foot).unwrap().roles;
+        assert_eq!(hues.warning, 0x9b_6b_ff);
+        assert_eq!(hues.remote_marker, 0xff_5f_d2);
+        assert_eq!(hues.divider, 0x6a_64_88);
+    }
+
+    #[test]
+    fn omarchy_role_cascades_take_their_first_key_then_ansi() {
+        use crate::color::{
+            NON_TEXT_MIN_CONTRAST, contrast_corrected, contrast_floor_toward, mix_linear,
+        };
+        type ReadRole = fn(&ChromeRoles) -> u32;
+
+        let foot = complete_foot_palette("101112", "d0d1d2", "203040", "d0d1d2");
+        // Each role's cascade, first key first, with values that clear 3:1 on
+        // the dark background so no floor moves them.
+        let cascades: [(&str, &[&str], ReadRole); 9] = [
+            ("surface_sunken", &["dark_background", "dark_bg"], |roles| {
+                roles.surface_sunken
+            }),
+            (
+                "selection",
+                &["selection_background", "selection"],
+                |roles| roles.selection,
+            ),
+            ("divider", &["border", "muted", "color8"], |roles| {
+                roles.divider
+            }),
+            ("focus_ring", &["active_border_color", "accent"], |roles| {
+                roles.focus_ring
+            }),
+            ("danger", &["red", "color1"], |roles| roles.danger),
+            ("warning", &["warning", "yellow", "color3"], |roles| {
+                roles.warning
+            }),
+            ("success", &["success", "green", "color2"], |roles| {
+                roles.success
+            }),
+            ("info", &["cyan", "color6"], |roles| roles.info),
+            ("remote_marker", &["signal", "magenta", "color5"], |roles| {
+                roles.remote_marker
+            }),
+        ];
+        let values = ["#ff8080", "#80ff80", "#8080ff"];
+        for (role, keys, read) in cascades {
+            for first in 0..keys.len() {
+                let colors = keys[first..]
+                    .iter()
+                    .zip(&values[first..])
+                    .map(|(key, value)| format!("{key} = \"{value}\"\n"))
+                    .collect::<Vec<_>>()
+                    .concat();
+                let roles = resolve_omarchy_theme(&colors, &foot).unwrap().roles;
+                assert_eq!(
+                    read(&roles),
+                    parse_color(values[first]).unwrap(),
+                    "{role} from {}",
+                    keys[first]
+                );
+            }
+            // No key: the ANSI hue, raised to 3:1, or the derived fallback.
+            let theme = resolve_omarchy_theme("", &foot).unwrap();
+            let readable = contrast_corrected(theme.foreground, theme.background);
+            let floored = |ansi: u32| {
+                contrast_floor_toward(ansi, readable, theme.background, NON_TEXT_MIN_CONTRAST)
+            };
+            let fallback = match role {
+                "surface_sunken" => mix_linear(theme.background, 0, 0.06),
+                "selection" => 0x20_30_40,
+                "divider" => theme.ansi[8],
+                "focus_ring" => theme.roles.accent,
+                "danger" => floored(theme.ansi[1]),
+                "warning" => floored(theme.ansi[3]),
+                "success" => floored(theme.ansi[2]),
+                "info" => floored(theme.ansi[6]),
+                _ => floored(theme.ansi[5]),
+            };
+            assert_eq!(read(&theme.roles), fallback, "{role} without a key");
+        }
+    }
+
+    #[test]
+    fn omarchy_appearance_follows_mode_then_foot_then_the_background() {
+        let dark = complete_foot_palette("101112", "d0d1d2", "203040", "d0d1d2");
+        let light = complete_foot_palette("f0f0e0", "202020", "c0c0c0", "202020");
+        let named = |palette: &str, theme: &str| {
+            format!("[main]\ninitial-color-theme={theme}\n{palette}").replace(
+                "[colors-dark]",
+                if theme == "light" {
+                    "[colors-light]"
+                } else {
+                    "[colors-dark]"
+                },
+            )
+        };
+        let appearance =
+            |colors: &str, foot: &str| resolve_omarchy_theme(colors, foot).unwrap().appearance;
+        // The background alone.
+        assert_eq!(appearance("", &dark), Appearance::Dark);
+        assert_eq!(appearance("", &light), Appearance::Light);
+        // Foot's initial-color-theme wins over the background.
+        assert_eq!(appearance("", &named(&light, "dark")), Appearance::Dark);
+        assert_eq!(appearance("", &named(&dark, "light")), Appearance::Light);
+        // colors.toml mode wins over both.
+        assert_eq!(
+            appearance("mode = \"light\"\n", &named(&dark, "dark")),
+            Appearance::Light
+        );
+        assert_eq!(appearance("mode = \"dark\"\n", &light), Appearance::Dark);
+        // An unknown mode is ignored with a diagnostic.
+        let mut diagnostics = Vec::new();
+        let input = omarchy_theme_input("mode = \"dusk\"\n", &light, &mut diagnostics).unwrap();
+        assert_eq!(input.appearance, Appearance::Light);
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].contains("mode \"dusk\""), "{diagnostics:?}");
+        // The stock fixtures: flexoki is light, the others dark.
+        for (name, colors, foot) in OMARCHY4_FIXTURES {
+            let expected = if name == "flexoki-light" {
+                Appearance::Light
+            } else {
+                Appearance::Dark
+            };
+            assert_eq!(appearance(colors, foot), expected, "{name}");
+        }
+        // JSON and built-in themes take their background's.
+        assert_eq!(ResolvedTheme::default().appearance, Appearance::Dark);
+        assert_eq!(json_theme(JSON_THEME).appearance, Appearance::Dark);
+        assert_eq!(Appearance::of_background(0xff_ff_ff), Appearance::Light);
+        assert_eq!(Appearance::of_background(0), Appearance::Dark);
+    }
+
+    #[test]
+    fn invalid_new_omarchy_keys_are_skipped_once_and_old_keys_stay_strict() {
+        let foot = complete_foot_palette("101112", "d0d1d2", "203040", "d0d1d2");
+        // A key read only since semantic roles never rejects the theme: it is
+        // skipped, its cascade goes on, and a diagnostic says so.
+        let mut diagnostics = Vec::new();
+        let input = omarchy_theme_input(
+            "warning = \"nope\"\nyellow = \"#ffaa00\"\nborder = \"rgba(1,2,3)\"\nsignal = \"#12345\"\n",
+            &foot,
+            &mut diagnostics,
+        )
+        .unwrap();
+        let roles = derive(&input);
+        assert_eq!(roles.warning, 0xff_aa_00);
+        assert_eq!(roles.divider, input.terminal.ansi[8]);
+        assert_eq!(diagnostics.len(), 3, "{diagnostics:?}");
+        for key in [
+            "warning \"nope\"",
+            "border \"rgba(1,2,3)\"",
+            "signal \"#12345\"",
+        ] {
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.contains(key)),
+                "{key}: {diagnostics:?}"
+            );
+        }
+        // The keys read before keep rejecting an invalid value.
+        for colors in [
+            "muted = \"nope\"\n",
+            "color8 = \"nope\"\n",
+            "lighter_background = \"nope\"\n",
+            "accent = \"nope\"\n",
+        ] {
+            assert!(resolve_omarchy_theme(colors, &foot).is_err(), "{colors}");
+        }
+        // dark_foreground was strict only when muted and color8 were absent.
+        assert!(resolve_omarchy_theme("dark_foreground = \"nope\"\n", &foot).is_err());
+        let mut diagnostics = Vec::new();
+        omarchy_theme_input(
+            "color8 = \"#444444\"\ndark_foreground = \"nope\"\n",
+            &foot,
+            &mut diagnostics,
+        )
+        .unwrap();
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        // Each diagnostic is reported once per process, however often the
+        // watcher reloads the theme.
+        let diagnostic = "test diagnostic reported once";
+        assert!(first_theme_diagnostic(diagnostic));
+        assert!(!first_theme_diagnostic(diagnostic));
     }
 
     #[test]

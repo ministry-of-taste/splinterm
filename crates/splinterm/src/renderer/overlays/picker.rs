@@ -16,6 +16,7 @@ use crate::{
     config::{OmarchyShellSettings, ResolvedTheme},
     frontend::PickerHitTarget,
     geometry::Rect,
+    theme::ChromeTints,
 };
 
 use super::super::{
@@ -639,6 +640,10 @@ pub(crate) struct SessionPickerPalette {
     pub(crate) highlight_primary: u32,
     pub(crate) highlight_secondary: u32,
     pub(crate) shadow: [u8; 4],
+    /// Status tints on the opaque panel and on the selected fill;
+    /// `None` when `[explorer] status-colors=no`.
+    pub(crate) status_tints: Option<ChromeTints>,
+    pub(crate) selected_status_tints: Option<ChromeTints>,
 }
 
 impl SessionPickerPalette {
@@ -653,6 +658,26 @@ impl SessionPickerPalette {
         } else {
             (self.primary, self.secondary)
         }
+    }
+
+    /// The status tints for a row on the panel or the selected fill.
+    pub(crate) const fn row_tints(&self, selected: bool) -> Option<ChromeTints> {
+        if selected {
+            self.selected_status_tints
+        } else {
+            self.status_tints
+        }
+    }
+
+    /// This palette with status tints, or without them for
+    /// `[explorer] status-colors=no`.
+    #[must_use]
+    pub(crate) const fn with_status_colors(mut self, enabled: bool) -> Self {
+        if !enabled {
+            self.status_tints = None;
+            self.selected_status_tints = None;
+        }
+        self
     }
 }
 
@@ -708,6 +733,8 @@ pub(crate) fn session_picker_palette(theme: ResolvedTheme) -> SessionPickerPalet
         highlight_primary,
         highlight_secondary,
         shadow: [0, 0, 0, 89],
+        status_tints: Some(ChromeTints::on(&roles, roles.surface)),
+        selected_status_tints: Some(ChromeTints::on(&roles, selected_fill)),
     }
 }
 
@@ -785,12 +812,16 @@ pub(super) struct SessionPickerTextKey {
 #[derive(Default)]
 pub(crate) struct SessionPickerTextCache {
     entries: HashMap<SessionPickerTextKey, ChromeText>,
+    /// The truncated source an entry was shaped from, when it is not the
+    /// key's own source: its tints are the ones that were drawn.
+    truncated: HashMap<SessionPickerTextKey, ChromeSource>,
     recent_frames: VecDeque<HashSet<SessionPickerTextKey>>,
 }
 
 impl SessionPickerTextCache {
     pub(crate) fn clear(&mut self) {
         self.entries.clear();
+        self.truncated.clear();
         self.recent_frames.clear();
     }
 
@@ -805,6 +836,7 @@ impl SessionPickerTextCache {
             .flat_map(HashSet::iter)
             .collect::<HashSet<_>>();
         self.entries.retain(|key, _| retained.contains(key));
+        self.truncated.retain(|key, _| retained.contains(key));
     }
 
     #[cfg(test)]
@@ -891,7 +923,14 @@ fn truncate_picker_source(source: &ChromeSource, maximum_cells: usize) -> Chrome
         return source.clone();
     }
     let text = truncate_picker_text(source.text(), maximum_cells);
-    source.with_prefix_text(text, maximum_cells.saturating_sub(1))
+    // The cells before the ellipsis: one fewer than the budget allows when
+    // a wide character did not fit.
+    let kept = text
+        .chars()
+        .map(|character| character.width().unwrap_or(0).min(2))
+        .sum::<usize>()
+        .saturating_sub(1);
+    source.with_prefix_text(text, kept)
 }
 
 fn editable_search_text(query: &str, maximum_cells: usize) -> String {
@@ -1044,6 +1083,47 @@ pub(super) fn paint_picker_source_within(
     color: u32,
     maximum_cell_height: u32,
 ) -> Result<()> {
+    paint_picker_source_tinted(
+        cache,
+        context,
+        used,
+        canvas,
+        canvas_width,
+        canvas_height,
+        source,
+        style,
+        scale_120,
+        renderer_generation,
+        clip,
+        alignment,
+        color,
+        None,
+        maximum_cell_height,
+    )
+}
+
+/// Paints like [`paint_picker_source_within`], each tinted run of `source`
+/// in its color from `tints`, the tints for the background it paints on.
+/// `None` paints every glyph in `color`, as `[explorer] status-colors=no`
+/// asks.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn paint_picker_source_tinted(
+    cache: &mut SessionPickerTextCache,
+    context: &RenderContext,
+    used: &mut HashSet<SessionPickerTextKey>,
+    canvas: &mut [u8],
+    canvas_width: u32,
+    canvas_height: u32,
+    source: &ChromeSource,
+    style: ChromeTextStyle,
+    scale_120: u32,
+    renderer_generation: u64,
+    clip: Rect,
+    alignment: PickerTextAlignment,
+    color: u32,
+    tints: Option<ChromeTints>,
+    maximum_cell_height: u32,
+) -> Result<()> {
     if source.is_empty() || clip.width == 0 || clip.height == 0 {
         return Ok(());
     }
@@ -1075,10 +1155,14 @@ pub(super) fn paint_picker_source_within(
                 usize::try_from(clip.width / text.frame.cell_width.max(1)).unwrap_or(usize::MAX);
             let truncated = truncate_picker_source(source, maximum_cells);
             text = load(&truncated)?;
+            cache.truncated.insert(key.clone(), truncated);
         }
         cache.entries.insert(key.clone(), text);
     }
     let text = &cache.entries[&key];
+    // Tints follow the cells actually drawn: a truncated line's ellipsis
+    // takes the line's color, never a clipped glyph's tint.
+    let drawn = cache.truncated.get(&key).unwrap_or(source);
     let x = match alignment {
         PickerTextAlignment::Left => clip.x,
         PickerTextAlignment::Center => clip
@@ -1091,7 +1175,18 @@ pub(super) fn paint_picker_source_within(
     let y = clip
         .y
         .saturating_add(clip.height.saturating_sub(text.pixel_height()) / 2);
-    text.paint(canvas, canvas_width, canvas_height, (x, y), clip, color);
+    text.paint_colored(
+        canvas,
+        canvas_width,
+        canvas_height,
+        (x, y),
+        clip,
+        |column| {
+            tints
+                .zip(drawn.tint_at(column))
+                .map_or(color, |(tints, tint)| tints.color(tint))
+        },
+    );
     used.insert(key);
     Ok(())
 }
@@ -2001,6 +2096,82 @@ mod tests {
         // Labels never become icons, even when they contain icon codepoints.
         let spoof = ChromeSource::from("\u{f98b} label");
         assert!(spoof.icons().is_empty());
+    }
+
+    #[test]
+    fn a_truncated_tinted_line_paints_its_ellipsis_in_the_line_color() {
+        use crate::theme::{ChromeTint, ChromeTints};
+
+        let tinted = |text: &str| {
+            let mut source = ChromeSource::default();
+            source.push_tinted(ChromeTint::StatusError, |source| {
+                source.push_str(text);
+            });
+            source
+        };
+        // The tint stops where the kept cells do, also when a wide
+        // character gave its cell to the ellipsis.
+        let cut = truncate_picker_source(&tinted("xxxxxx"), 4);
+        assert_eq!(cut.text(), "xxx…");
+        assert_eq!(cut.tint_at(2), Some(ChromeTint::StatusError));
+        assert_eq!(cut.tint_at(3), None);
+        let wide = truncate_picker_source(&tinted("界界界"), 4);
+        assert_eq!(wide.text(), "界…");
+        assert_eq!(wide.tint_at(1), Some(ChromeTint::StatusError));
+        assert_eq!(wide.tint_at(2), None);
+
+        // Painted: the cached, truncated source decides each cell's color.
+        let context = RenderContext::new(u16::MAX);
+        let mut cache = SessionPickerTextCache::default();
+        let mut used = HashSet::new();
+        let scale = 360;
+        let cell = picker_cell_width(
+            &mut cache,
+            &context,
+            &mut used,
+            ChromeTextStyle::Regular,
+            scale,
+            0,
+        )
+        .unwrap();
+        let tints = ChromeTints::on(&ChromeRoles::default(), 0);
+        let (width, height) = (cell * 8, 160);
+        let plain = 0x00ff_ffff;
+        let paints = |canvas: &[u8], color: u32| {
+            let [_, red, green, blue] = color.to_be_bytes();
+            canvas
+                .chunks_exact(4)
+                .any(|pixel| pixel[..3] == [blue, green, red])
+        };
+        for _ in 0..2 {
+            // The second paint reads the cache.
+            let mut canvas = vec![0; (width * height * 4) as usize];
+            paint_picker_source_tinted(
+                &mut cache,
+                &context,
+                &mut used,
+                &mut canvas,
+                width,
+                height,
+                &tinted("xxxxxxxxxx"),
+                ChromeTextStyle::Regular,
+                scale,
+                0,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: cell * 4,
+                    height,
+                },
+                PickerTextAlignment::Left,
+                plain,
+                Some(tints),
+                u32::MAX,
+            )
+            .unwrap();
+            assert!(paints(&canvas, tints.color(ChromeTint::StatusError)));
+            assert!(paints(&canvas, plain), "the ellipsis is the line's color");
+        }
     }
 
     #[test]

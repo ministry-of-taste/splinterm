@@ -1245,7 +1245,10 @@ fn assemble_app(
             topology_settings: options.topology_settings,
             session_switch_pending: false,
             deferred_topology_updates: Vec::new(),
-            agent: agent_status::TabAgentStatus::new(options.agent_status_presentation),
+            agent: agent_status::TabAgentStatus::new(
+                options.agent_status_presentation,
+                options.agent_status_style,
+            ),
             layout_ledger: options.layout_ledger.take(),
         },
         modal: ModalState {
@@ -6482,7 +6485,10 @@ impl App {
                 self.input.prefix_timeout =
                     std::time::Duration::from_millis(loaded.config.prefix_timeout_ms);
                 self.input.prefix_state.clear();
-                if self.set_agent_status_presentation(loaded.config.explorer_agent_status) {
+                let presentation =
+                    self.set_agent_status_presentation(loaded.config.explorer_agent_status);
+                let style = self.set_agent_status_style(loaded.config.explorer_status_style);
+                if presentation || style {
                     self.presentation.full_redraw = true;
                 }
                 if self.presentation.tab_strip_border != loaded.config.tab_strip_border {
@@ -12445,6 +12451,7 @@ impl App {
                 layout,
                 self.surface.scale_120,
                 self.presentation.theme,
+                self.tab_state.agent.colors(),
                 active_dojo,
                 &self.tab_state.tab_label_cache,
                 self.tab_state.tab_close_text.as_ref().map(|(_, text)| text),
@@ -12478,7 +12485,10 @@ impl App {
                 self.surface.scale_120,
                 self.presentation.renderer_generation,
                 layout,
-                crate::renderer::lair_explorer_palette(self.presentation.theme),
+                crate::renderer::lair_explorer_palette(
+                    self.presentation.theme,
+                    self.tab_state.agent.colors(),
+                ),
                 &rows,
                 self.explorer.selected(),
                 self.explorer.query(),

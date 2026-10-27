@@ -17,6 +17,7 @@ use crate::{
     frontend::{LairExplorerAccess, LairExplorerFilter, LairExplorerRow},
     geometry::Rect,
     navigation_projection::NavigationNodeId,
+    theme::ChromeTint,
 };
 use splinterm_core::LairRetention;
 
@@ -27,8 +28,8 @@ use super::{
     },
     picker::{
         ChromeSurface, PickerTextAlignment, SessionPickerPalette, SessionPickerTextCache,
-        chrome_panel_palette, editable_text, paint_picker_source, paint_picker_source_within,
-        paint_picker_text, picker_cell_width, truncate_picker_text,
+        chrome_panel_palette, editable_text, paint_picker_source, paint_picker_source_tinted,
+        paint_picker_source_within, paint_picker_text, picker_cell_width, truncate_picker_text,
     },
 };
 
@@ -479,10 +480,18 @@ fn push_access(source: &mut ChromeSource, access: Option<LairExplorerAccess>, ic
         (None, _) => source.push_str("  "),
         (Some(LairExplorerAccess::Reachable), true) => source.push_icon(ChromeIcon::Plug),
         (Some(LairExplorerAccess::Connected), true) => source.push_icon(ChromeIcon::PlugConnected),
-        (Some(LairExplorerAccess::Asking), true) => source.push_icon(ChromeIcon::LockQuestion),
+        (Some(LairExplorerAccess::Asking), true) => {
+            source.push_tinted(ChromeTint::Asking, |source| {
+                source.push_icon(ChromeIcon::LockQuestion);
+            })
+        }
         (Some(LairExplorerAccess::Reachable), false) => source.push_str("a "),
         (Some(LairExplorerAccess::Connected), false) => source.push_str("A "),
-        (Some(LairExplorerAccess::Asking), false) => source.push_str("A?"),
+        (Some(LairExplorerAccess::Asking), false) => {
+            source.push_tinted(ChromeTint::AskingText, |source| {
+                source.push_str("A?");
+            })
+        }
     };
 }
 
@@ -641,13 +650,17 @@ fn footer_lines(footer: Rect, scale_120: u32, inset: u32) -> Vec<Rect> {
 /// so it does not take the shell's menu alpha. Text and icons stay opaque.
 /// `[colors] explorer-background` and `explorer-alpha` replace the panel's
 /// colour and coverage; its text colours are then chosen against that colour.
+/// `status_colors` is `[explorer] status-colors`.
 #[must_use]
-pub(crate) fn lair_explorer_palette(theme: ResolvedTheme) -> SessionPickerPalette {
+pub(crate) fn lair_explorer_palette(
+    theme: ResolvedTheme,
+    status_colors: bool,
+) -> SessionPickerPalette {
     let mut panel_theme = theme;
     panel_theme.roles.surface = theme.explorer_background();
     let mut palette = chrome_panel_palette(panel_theme, ChromeSurface::Menu);
     palette.panel_fill = premultiplied_theme_rgba(palette.panel, theme.explorer_alpha());
-    palette
+    palette.with_status_colors(status_colors)
 }
 
 /// Where one header filter's text goes, in buffer px.
@@ -970,7 +983,7 @@ pub(crate) fn paint_lair_explorer(
             PickerTextAlignment::Left,
             primary,
         )?;
-        paint_picker_source(
+        paint_picker_source_tinted(
             cache,
             context,
             &mut used,
@@ -984,6 +997,8 @@ pub(crate) fn paint_lair_explorer(
             columns_paint_clip(columns_clip, right),
             PickerTextAlignment::Left,
             primary,
+            palette.row_tints(is_selected),
+            u32::MAX,
         )?;
     }
 
@@ -2593,7 +2608,7 @@ mod tests {
             explorer_alpha: Some(u16::MAX),
             ..ChromeColorOverrides::NONE
         });
-        let palette = lair_explorer_palette(light);
+        let palette = lair_explorer_palette(light, true);
         assert_eq!(palette.panel_fill, [0xf0, 0xf0, 0xf0, 0xff]);
         let expected = chrome_panel_palette(
             ResolvedTheme {
@@ -2606,14 +2621,14 @@ mod tests {
             ChromeSurface::Menu,
         );
         assert_eq!(palette.primary, expected.primary);
-        assert_ne!(palette.primary, lair_explorer_palette(theme).primary);
+        assert_ne!(palette.primary, lair_explorer_palette(theme, true).primary);
 
         let alpha_only = theme.with_chrome_overrides(ChromeColorOverrides {
             explorer_alpha: Some(u16::MAX),
             ..ChromeColorOverrides::NONE
         });
         assert_eq!(
-            lair_explorer_palette(alpha_only).panel_fill,
+            lair_explorer_palette(alpha_only, true).panel_fill,
             [0x80, 0x40, 0x20, 0xff]
         );
     }
@@ -2629,14 +2644,14 @@ mod tests {
             },
             ..ResolvedTheme::default()
         };
-        let palette = lair_explorer_palette(theme);
+        let palette = lair_explorer_palette(theme, true);
         // The same premultiplied glass as the tab strip and the terminal.
         assert_eq!(
             palette.panel_fill,
             premultiplied_theme_rgba(theme.roles.surface, theme.background_alpha)
         );
         assert_eq!(palette.panel_fill, [0x40, 0x20, 0x10, 0x7f]);
-        let opaque = lair_explorer_palette(ResolvedTheme::default());
+        let opaque = lair_explorer_palette(ResolvedTheme::default(), true);
         assert_eq!(opaque.panel_fill[3], 0xff);
 
         let id = NavigationNodeId::Lair(LairId::new());
@@ -2714,5 +2729,119 @@ mod tests {
                 .flat_map(|y| (24..120).map(move |x| (x, y)))
                 .any(|(x, y)| pixel(x, y)[3] == 0xff)
         );
+    }
+
+    /// Whether any pixel of a BGRA canvas is exactly `color`.
+    fn paints_color(canvas: &[u8], color: u32) -> bool {
+        let [red, green, blue, _] = rgba(color);
+        canvas
+            .chunks_exact(4)
+            .any(|pixel| pixel[..3] == [blue, green, red])
+    }
+
+    #[test]
+    fn the_ascii_asking_marker_is_tinted_as_text() {
+        let marker = |icons| {
+            let mut source = ChromeSource::default();
+            push_access(&mut source, Some(LairExplorerAccess::Asking), icons);
+            source.tint_at(0)
+        };
+        assert_eq!(marker(true), Some(ChromeTint::Asking));
+        assert_eq!(marker(false), Some(ChromeTint::AskingText));
+    }
+
+    #[test]
+    fn status_glyphs_and_the_asking_marker_take_their_tints_on_their_row() {
+        use crate::color::{NON_TEXT_MIN_CONTRAST, contrast_ratio};
+        use crate::frontend::{AgentAggregate, AgentGlyphs, AgentSpinner};
+        use crate::navigation_projection::NavigationAgentStatus;
+        use splinterm_protocol::AgentState;
+
+        let context = RenderContext::new(u16::MAX);
+        let scale = 120;
+        let theme = ResolvedTheme::default();
+        let palette = lair_explorer_palette(theme, true);
+        let paint_one = |entry: &LairExplorerRow, palette: SessionPickerPalette, selected: bool| {
+            let rows = [entry.clone()];
+            let surface = Rect {
+                x: 0,
+                y: 0,
+                width: 1000,
+                height: HEADER_HEIGHT + HEADER_SPACER + FOOTER_HEIGHT + ROW_HEIGHT,
+            };
+            let layout = lair_explorer_layout(surface, 640, &rows, None, 0).unwrap();
+            let mut canvas = vec![0; (surface.width * surface.height * 4) as usize];
+            paint(
+                &context,
+                &mut canvas,
+                surface.width,
+                surface.height,
+                scale,
+                &layout,
+                palette,
+                &rows,
+                selected.then_some(entry.id),
+                false,
+                LairExplorerFilter::All,
+            );
+            canvas
+        };
+        for state in [
+            AgentState::NeedsInput,
+            AgentState::Error,
+            AgentState::Working,
+            AgentState::Done,
+            AgentState::Idle,
+        ] {
+            for is_stale in [false, true] {
+                let status = NavigationAgentStatus {
+                    state,
+                    detail: None,
+                    stale: is_stale,
+                    stale_minutes: is_stale.then_some(2),
+                };
+                let column = AgentAggregate::from_statuses(&[status])
+                    .glyph_column(AgentGlyphs::Icons, AgentSpinner::STATIC);
+                let mut entry = row(NavigationNodeId::Lair(LairId::new()));
+                entry.agent_column = Some(column.clone());
+                entry.access = Some(LairExplorerAccess::Asking);
+                let tint = crate::frontend::state_tint(state, is_stale);
+                for selected in [false, true] {
+                    let what = format!("{state:?} stale={is_stale} selected={selected}");
+                    let tints = palette.row_tints(selected).unwrap();
+                    let background = if selected {
+                        palette.selected_fill
+                    } else {
+                        palette.panel
+                    };
+                    for marked in [tint, ChromeTint::Asking] {
+                        let color = tints.color(marked);
+                        assert!(
+                            contrast_ratio(color, background) >= NON_TEXT_MIN_CONTRAST,
+                            "{what} {marked:?}"
+                        );
+                    }
+                    let tinted = paint_one(&entry, palette, selected);
+                    assert!(paints_color(&tinted, tints.color(tint)), "{what}");
+                    assert!(
+                        paints_color(&tinted, tints.color(ChromeTint::Asking)),
+                        "{what}"
+                    );
+                    // status-colors=no paints every mark in the row's text
+                    // color, exactly as an untinted source does.
+                    let off = paint_one(&entry, palette.with_status_colors(false), selected);
+                    let mut plain = entry.clone();
+                    plain.agent_column = Some(column.untinted());
+                    let untinted = paint_one(&plain, palette.with_status_colors(false), selected);
+                    assert_eq!(off, untinted, "{what}");
+                    assert!(!paints_color(&off, tints.color(tint)), "{what}");
+                    assert!(
+                        !paints_color(&off, tints.color(ChromeTint::Asking)),
+                        "{what}"
+                    );
+                    assert_ne!(off, tinted, "{what}");
+                }
+            }
+        }
     }
 }

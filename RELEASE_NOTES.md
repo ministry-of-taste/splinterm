@@ -317,6 +317,17 @@ a hostile program running as your account.
   and holds still with `SPLINTERM_REDUCED_MOTION=1`; every other state is a
   static icon. States differ by shape and by text, never by colour or motion
   alone.
+- Status glyphs take herdr's colours from the theme: `working` in warning,
+  `needs_input` and `error` in danger (each with its own glyph), `done` in
+  info, `idle` in success, and a stale status faint. The access "Asking"
+  marker is warning and the remote host tag takes the theme's remote-marker
+  colour. Each colour is kept readable against the opaque colour it is
+  drawn on: the Explorer, its selected row, the tab strip, or the selected
+  tab; translucent glass can lower it, as it does for ordinary text.
+  `[explorer] status-colors=no` turns the status colours off, and
+  `[explorer] status-glyphs=dots` draws one-cell shapes (◆ ▲ ■ □) instead
+  of icons, or the ASCII glyphs when the interface font cannot draw them.
+  **Reload configuration** applies both.
 - Explorer search matches state words such as `needs input` or `stale`. The
   palette command **Clear agent status** clears the focused Splint's status.
 - `inspect` and `topology` machine output carry an optional `agent_status`.
@@ -430,6 +441,13 @@ a hostile program running as your account.
 - Splinterm reads Omarchy 4's theme location and colour names, and follows
   theme switches without a restart. Non-Omarchy desktops use the built-in
   palette quietly.
+- Window chrome takes a theme's semantic colour keys before its named hues
+  and ANSI colours, so a theme that deliberately puts another colour in its
+  ANSI yellow slot keeps its own `warning`. Pane borders follow `border` and
+  the active pane border `active_border_color` when a theme names them, and
+  a theme with no `muted` or `dark_foreground` mixes its inactive tab
+  labels from its text. An invalid value in a key Splinterm newly reads is
+  skipped with one diagnostic instead of rejecting the theme.
 - Glassy Windows: the terminal background, padding, tab strip, and docked Lair
   Explorer turn translucent with blur when glass is on, while text and icons
   stay opaque and crisp. The selected Dojo tab stays opaque, so it stands
