@@ -228,28 +228,62 @@ pub fn shown(text: &str, maximum_scalars: usize) -> String {
     shown_escaping(text, maximum_scalars, unsafe_display_character)
 }
 
-/// A name or path inside a list row or the consent prompt: also escapes the
-/// quotes and the separator the row puts around and between names, so a
-/// name cannot fake another segment of the row. The prompt escapes names
-/// and paths with this too, so a name reads the same in the prompt that
-/// approves it and in the list later. Whitespace is not collapsed: tabs,
-/// newlines, and the other control whitespace are escaped like any unsafe
-/// character, and spaces stay as they are.
+/// Whether `character` is a quote, or looks like one, or is the separator
+/// the list puts between names. A name shows each as `\u{…}`, so it can
+/// neither close the quotes the list and the prompt put around it nor
+/// imitate them, and so fake the fixed wording around it.
+const fn quote_like(character: char) -> bool {
+    matches!(
+        character,
+        '\'' | '‘'
+            | '’'
+            | '‚'
+            | '‛'
+            | 'ʼ'
+            | '′'
+            | '‵'
+            | '＇'
+            | '`'
+            | '´'
+            | '"'
+            | '“'
+            | '”'
+            | '„'
+            | '‟'
+            | '″'
+            | '‶'
+            | '＂'
+            | '·'
+    )
+}
+
+/// A name or path inside a list row or the consent prompt: also escapes
+/// every quote and quote look-alike ([`quote_like`]) and the separator the
+/// row puts between names, so a name cannot fake another segment of the
+/// row or the prompt's sentence, and shows a run of spaces as one space,
+/// so it cannot line its own text up as if it were the prompt's. The
+/// prompt escapes names and paths with this too, so a name reads the same
+/// in the prompt that approves it and in the list later. Tabs, newlines,
+/// and the other control whitespace are escaped like any unsafe character.
 #[must_use]
 pub fn shown_name(text: &str, maximum_scalars: usize) -> String {
-    shown_escaping(text, maximum_scalars, |character| {
-        unsafe_display_character(character) || matches!(character, '‘' | '’' | '·')
+    let mut collapsed = String::with_capacity(text.len());
+    for character in text.chars() {
+        if !(character == ' ' && collapsed.ends_with(' ')) {
+            collapsed.push(character);
+        }
+    }
+    shown_escaping(&collapsed, maximum_scalars, |character| {
+        unsafe_display_character(character) || quote_like(character)
     })
 }
 
-/// [`shown_name`] for the consent prompt, which quotes names with ASCII `'`:
-/// that quote is escaped too, so a name cannot close its quote early and
-/// make its own text read as the prompt's fixed wording.
+/// [`shown_name`] for the consent prompt, which quotes names with ASCII
+/// `'`; [`shown_name`] escapes that quote too, so a name reads the same in
+/// both.
 #[must_use]
 pub fn shown_prompt_name(text: &str, maximum_scalars: usize) -> String {
-    shown_escaping(text, maximum_scalars, |character| {
-        unsafe_display_character(character) || matches!(character, '‘' | '’' | '·' | '\'')
-    })
+    shown_name(text, maximum_scalars)
 }
 
 fn shown_escaping(text: &str, maximum_scalars: usize, escape: impl Fn(char) -> bool) -> String {
@@ -2057,15 +2091,17 @@ pub(crate) mod tests {
         );
     }
 
-    /// The consent prompt escapes as `shown_name` does (plus its own `'`), so
-    /// a hostile name reads the same in the prompt and in the list: no whitespace is
-    /// collapsed, and tabs and newlines are escaped like any control.
+    /// The consent prompt escapes as `shown_name` does, so a hostile name
+    /// reads the same in the prompt and in the list: a run of spaces shows
+    /// as one, and tabs and newlines are escaped like any control.
     #[test]
     fn a_hostile_agent_name_is_listed_in_the_prompts_escaped_form() {
         let hostile = "evil\u{1b}[31mRED\u{202e}gpj.exe\u{7}\tend";
         let escaped = "evil\\u{001b}[31mRED\\u{202e}gpj.exe\\u{0007}\\u{0009}end";
         assert_eq!(shown_name(hostile, 64), escaped);
-        assert_eq!(shown_name("a  b\nc", 64), "a  b\\u{000a}c");
+        assert_eq!(shown_prompt_name(hostile, 64), escaped);
+        assert_eq!(shown_name("a  b\nc", 64), "a b\\u{000a}c");
+        assert_eq!(shown_name("a   \t b", 64), "a \\u{0009} b");
         let lair_id = LairId::new();
         let mut agent = entry(remembered_key(), AccessEntryKind::Remembered, lair_id);
         agent.identity.display_name = Some("gpj\u{202e}\u{7}\tx".into());
@@ -2078,6 +2114,33 @@ pub(crate) mod tests {
             row.title
         );
         assert!(!row.title.chars().any(unsafe_display_character));
+    }
+
+    /// A name cannot forge the prompt's request sentence with a quote
+    /// look-alike: every quote, prime, accent and modifier letter that reads
+    /// as one is escaped, in the prompt and the list alike, and spaces
+    /// cannot line it up.
+    #[test]
+    fn quote_look_alikes_cannot_forge_the_request_sentence() {
+        let forged = "Claude Code\u{2bc} wants Look access to \u{2bc}Workspace";
+        let shown = shown_prompt_name(forged, 128);
+        assert_eq!(
+            shown,
+            "Claude Code\\u{02bc} wants Look access to \\u{02bc}Workspace"
+        );
+        assert_eq!(shown_name(forged, 128), shown);
+        for quote in [
+            '\'', '‘', '’', '‚', '‛', 'ʼ', '′', '‵', '＇', '`', '´', '"', '“', '”', '„', '‟', '″',
+            '‶', '＂', '·',
+        ] {
+            let shown = shown_name(&format!("a{quote}b"), 64);
+            assert_eq!(shown, format!("a\\u{{{:04x}}}b", u32::from(quote)));
+            assert!(!shown.contains(quote), "{quote:?}");
+        }
+        assert_eq!(
+            shown_name("Claude    wants   Look", 64),
+            "Claude wants Look"
+        );
     }
 
     #[test]

@@ -438,13 +438,15 @@ The prompt is deliberate by default:
 - Choosing a longer duration shows who shares it, and, when your answer would
   replace an earlier one for the same agent and workspace, what it replaces.
 
-The prompt shows the request as one sentence with the agent's reported name,
-followed by a note that the agent names itself and Splinterm cannot verify that
-name, then its exact executable path, the workspace name with its short ID, the
-level with one line of what it allows, and the exact scopes. Names and paths
-are shown escaped, as data, in the same form
-as the **Agent access** list: a control or bidirectional character appears as an
-escape such as `\u{202e}`, so the name you approve reads the same in the list.
+The prompt shows the request as one sentence with the agent's reported name.
+When the agent reported a name, a note follows that the agent names itself and
+Splinterm cannot verify that name. Then come its exact executable path, the
+workspace name with its short ID, the level with one line of what it allows,
+and the exact scopes. Names and paths are shown escaped, as data, in the same
+form as the **Agent access** list: a control or bidirectional character, and
+every quote or quote look-alike, appears as an escape such as `\u{202e}`, and
+a run of spaces as one space, so the name you approve reads the same in the
+list and cannot imitate the prompt's own wording.
 
 A request that a grant already covers is answered at once, without a prompt.
 Prompts appear one at a time; further requests wait their turn. If you do not

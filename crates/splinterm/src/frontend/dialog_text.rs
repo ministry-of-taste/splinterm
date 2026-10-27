@@ -322,8 +322,19 @@ pub const fn chrome_rows(grid_rows: usize) -> ChromeRows {
     }
 }
 
+/// The column boundary the two buttons meet at in a box `columns` wide:
+/// the grid's middle. The buttons are painted split there, and a click
+/// answers by the button it is inside, so this one boundary, never the
+/// Window's middle, separates no from yes; the labels
+/// ([`button_columns`]) keep at least a column clear of it.
+#[must_use]
+pub const fn button_split_column(columns: usize) -> usize {
+    columns / 2
+}
+
 /// The columns, from first to past the last, a button's label may take:
-/// the left (deny) half or the right (allow) half of a box `columns` wide.
+/// the left (deny) half or the right (allow) half of a box `columns` wide,
+/// each at least a column clear of [`button_split_column`].
 #[must_use]
 pub const fn button_columns(columns: usize, allow: bool) -> (usize, usize) {
     let room = button_label_columns(columns);
@@ -823,14 +834,55 @@ impl DialogInk {
 /// The palette slot of the selection fill behind a selected choice.
 pub const SELECTION_SLOT: usize = 9;
 
+/// What a dialog cell sits on, when not the dialog's background: each fill
+/// takes a palette slot, so a glyph's anti-aliased edge blends into the
+/// colour it really sits on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DialogFill {
+    /// The dialog's background: the snapshot's default background.
+    #[default]
+    Background,
+    /// The selection fill behind a selected choice.
+    Selection,
+    /// The red button's tint, behind the Deny label and keys.
+    DenyTint,
+    /// The green button's tint, behind the Allow label and keys.
+    AllowTint,
+    /// The green button's dimmed tint, while it cannot say yes.
+    AllowTintDimmed,
+}
+
+impl DialogFill {
+    /// Every fill that takes a palette slot.
+    pub const SLOTTED: [Self; 4] = [
+        Self::Selection,
+        Self::DenyTint,
+        Self::AllowTint,
+        Self::AllowTintDimmed,
+    ];
+
+    /// The palette slot it is drawn from, or `None` for the default
+    /// background.
+    #[must_use]
+    pub const fn slot(self) -> Option<usize> {
+        match self {
+            Self::Background => None,
+            Self::Selection => Some(SELECTION_SLOT),
+            Self::DenyTint => Some(10),
+            Self::AllowTint => Some(11),
+            Self::AllowTintDimmed => Some(12),
+        }
+    }
+}
+
 /// One cell of a composed dialog.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DialogCell {
     pub character: char,
     pub ink: DialogInk,
     pub bold: bool,
-    /// Whether it sits on the selection fill.
-    pub selected: bool,
+    /// What it sits on.
+    pub fill: DialogFill,
 }
 
 /// What the box shows besides the body: the button keys and labels'
@@ -847,9 +899,9 @@ pub struct DialogChrome {
     /// The legend's forms, best first, each as runs of text and ink. The
     /// first that fits inside the frame is shown; none, when none fits.
     pub legend: Vec<Vec<(String, DialogInk)>>,
-    /// The time left to answer, such as "0:42", set into the frame's top
-    /// edge at its right end; dropped, never cut, when it would not fit
-    /// beside the whole title.
+    /// The time left to answer, such as "cancels in 0:42", set into the
+    /// frame's top edge at its right end; dropped, never cut, when it would
+    /// not fit beside the whole title.
     pub countdown: Option<String>,
 }
 
@@ -946,39 +998,7 @@ pub fn compose(
         };
         compose_body_row(row, row_text, *style, columns);
     }
-    for (allow, label) in [(false, text.deny_label()), (true, text.allow_label())] {
-        let (start, end) = button_columns(columns, allow);
-        let (label_ink, keys_ink) = match (allow, chrome.allow_enabled) {
-            (false, _) => (DialogInk::DenyLabel, DialogInk::DenyKeys),
-            (true, true) => (DialogInk::AllowLabel, DialogInk::AllowKeys),
-            (true, false) => (DialogInk::AllowOff, DialogInk::AllowOff),
-        };
-        let keys = if allow {
-            &chrome.allow_keys
-        } else {
-            &chrome.deny_keys
-        };
-        for (row, shown, ink, bold) in [
-            (places.label, fitted(label, end - start), label_ink, true),
-            (places.keys, fitted(keys, end - start), keys_ink, false),
-        ] {
-            let width = shown.chars().count();
-            let column = start + (end - start - width) / 2;
-            if let Some(row) = rows.get_mut(row) {
-                put(
-                    row,
-                    column,
-                    end,
-                    &shown,
-                    DialogCell {
-                        ink,
-                        bold,
-                        ..DialogCell::default()
-                    },
-                );
-            }
-        }
-    }
+    compose_buttons(&mut rows, text, chrome, columns, places);
     let room = text_columns(columns);
     if let Some(form) = chrome.legend.iter().find(|form| {
         form.iter()
@@ -1005,6 +1025,65 @@ pub fn compose(
     rows
 }
 
+/// The buttons' labels and their keys, centred in their halves of the
+/// box, each on its button's tint.
+fn compose_buttons(
+    rows: &mut ComposedRows,
+    text: &DialogText,
+    chrome: &DialogChrome,
+    columns: usize,
+    places: ChromeRows,
+) {
+    for (allow, label) in [(false, text.deny_label()), (true, text.allow_label())] {
+        let (start, end) = button_columns(columns, allow);
+        // Each sits on its button's tint, so its glyphs' edges blend into
+        // the tint, not the background.
+        let (label_ink, keys_ink, fill) = match (allow, chrome.allow_enabled) {
+            (false, _) => (
+                DialogInk::DenyLabel,
+                DialogInk::DenyKeys,
+                DialogFill::DenyTint,
+            ),
+            (true, true) => (
+                DialogInk::AllowLabel,
+                DialogInk::AllowKeys,
+                DialogFill::AllowTint,
+            ),
+            (true, false) => (
+                DialogInk::AllowOff,
+                DialogInk::AllowOff,
+                DialogFill::AllowTintDimmed,
+            ),
+        };
+        let keys = if allow {
+            &chrome.allow_keys
+        } else {
+            &chrome.deny_keys
+        };
+        for (row, shown, ink, bold) in [
+            (places.label, fitted(label, end - start), label_ink, true),
+            (places.keys, fitted(keys, end - start), keys_ink, false),
+        ] {
+            let width = shown.chars().count();
+            let column = start + (end - start - width) / 2;
+            if let Some(row) = rows.get_mut(row) {
+                put(
+                    row,
+                    column,
+                    end,
+                    &shown,
+                    DialogCell {
+                        ink,
+                        bold,
+                        fill,
+                        ..DialogCell::default()
+                    },
+                );
+            }
+        }
+    }
+}
+
 /// One body row in its style, inset inside the frame.
 fn compose_body_row(row: &mut Vec<DialogCell>, text: &str, style: RowStyle, columns: usize) {
     let inside_end = columns.saturating_sub(FRAME_INSET_COLUMNS);
@@ -1013,7 +1092,7 @@ fn compose_body_row(row: &mut Vec<DialogCell>, text: &str, style: RowStyle, colu
         // The selection fill runs across the box, inside the frame.
         let fill = DialogCell {
             character: ' ',
-            selected: true,
+            fill: DialogFill::Selection,
             ..DialogCell::default()
         };
         row.clear();
@@ -1032,7 +1111,11 @@ fn compose_body_row(row: &mut Vec<DialogCell>, text: &str, style: RowStyle, colu
     let cell = DialogCell {
         ink,
         bold,
-        selected,
+        fill: if selected {
+            DialogFill::Selection
+        } else {
+            DialogFill::Background
+        },
         ..DialogCell::default()
     };
     let lead: String = text.chars().take(style.lead).collect();
@@ -1081,14 +1164,10 @@ fn cell_attributes(cell: DialogCell) -> CellAttributes {
         cell.ink.slot().map_or((ColorSource::Default, 0), |slot| {
             (ColorSource::Base16, u32::try_from(slot).unwrap_or(0))
         });
-    let (background_source, background) = if cell.selected {
-        (
-            ColorSource::Base16,
-            u32::try_from(SELECTION_SLOT).unwrap_or(0),
-        )
-    } else {
-        (ColorSource::Default, 0)
-    };
+    let (background_source, background) =
+        cell.fill.slot().map_or((ColorSource::Default, 0), |slot| {
+            (ColorSource::Base16, u32::try_from(slot).unwrap_or(0))
+        });
     CellAttributes {
         bold: cell.bold,
         dim: false,
@@ -1463,7 +1542,7 @@ mod tests {
             assert_eq!(deny_end - deny_start, button_label_columns(columns));
             assert_eq!(allow_end - allow_start, button_label_columns(columns));
             // Inside the frame, and each wholly on its own side of the
-            // middle, where the pointer's halves meet.
+            // split the buttons meet at.
             assert_eq!(deny_start, FRAME_INSET_COLUMNS);
             assert_eq!(allow_end, columns - FRAME_INSET_COLUMNS);
             assert!(2 * deny_end < columns, "{columns}");
@@ -1527,8 +1606,12 @@ mod tests {
         assert_eq!(group.chars().count(), columns - FRAME_INSET_COLUMNS);
         // The selected choice fills inside the frame, its text in accent.
         assert_eq!(rows[5].len(), columns - 1);
-        assert!(!rows[5][0].selected);
-        assert!(rows[5][1..].iter().all(|cell| cell.selected));
+        assert_eq!(rows[5][0].fill, DialogFill::Background);
+        assert!(
+            rows[5][1..]
+                .iter()
+                .all(|cell| cell.fill == DialogFill::Selection)
+        );
         assert_eq!(rows[5][2].ink, DialogInk::SelectedText);
         // The labels and keys centred in their halves, Deny on the left.
         let places = chrome_rows(grid_rows);
@@ -1610,16 +1693,20 @@ mod tests {
         assert_eq!(rows[places.keys][g].ink, DialogInk::AllowOff);
         // No legend form fits, so none shows.
         assert!(rows[places.legend].is_empty());
-        // Each ink but the default takes its own palette slot, apart from
-        // the selection's.
+        // Each ink but the default, and each fill but the background,
+        // takes its own palette slot.
         let mut slots: Vec<usize> = DialogInk::SLOTTED
             .iter()
             .filter_map(|ink| ink.slot())
+            .chain(DialogFill::SLOTTED.iter().filter_map(|fill| fill.slot()))
             .collect();
-        slots.push(SELECTION_SLOT);
         slots.sort_unstable();
         slots.dedup();
-        assert_eq!(slots.len(), DialogInk::SLOTTED.len() + 1);
+        assert_eq!(
+            slots.len(),
+            DialogInk::SLOTTED.len() + DialogFill::SLOTTED.len()
+        );
+        assert_eq!(DialogFill::Selection.slot(), Some(SELECTION_SLOT));
         assert!(slots.iter().all(|slot| *slot < 16));
     }
 
@@ -1665,5 +1752,49 @@ mod tests {
         let body = layout(&variants, 0, text_columns(64), usize::MAX);
         let plain = row_string(&compose(&variants[0], &body, &none, 64, 10)[0]);
         assert_eq!(plain.trim(), title);
+    }
+
+    /// Each label keeps at least a column clear of the split the buttons
+    /// meet at, at every width, and its cells sit on its button's tint (the
+    /// dimmed one while the dialog cannot say yes), so a glyph's edge blends
+    /// into the colour behind it.
+    #[test]
+    fn the_labels_keep_clear_of_the_split_and_sit_on_their_tints() {
+        for columns in 8..=200 {
+            let split = button_split_column(columns);
+            let (_, deny_end) = button_columns(columns, false);
+            let (allow_start, _) = button_columns(columns, true);
+            assert!(deny_end < split && allow_start > split, "{columns}");
+        }
+        let variants = boxed();
+        let (columns, grid_rows) = (64, 14);
+        let places = chrome_rows(grid_rows);
+        for allow_enabled in [true, false] {
+            let chrome = DialogChrome {
+                deny_keys: "esc · d · ↵".to_owned(),
+                allow_keys: "g".to_owned(),
+                allow_enabled,
+                ..DialogChrome::default()
+            };
+            let body = layout(&variants, 0, text_columns(columns), 7);
+            let rows = compose(&variants[0], &body, &chrome, columns, grid_rows);
+            for row in [places.label, places.keys] {
+                let mut sides = [false, false];
+                for (column, cell) in rows[row].iter().enumerate() {
+                    if cell.character == ' ' && cell.fill == DialogFill::Background {
+                        continue;
+                    }
+                    let allow = column >= button_split_column(columns);
+                    sides[usize::from(allow)] = true;
+                    let expected = match (allow, allow_enabled) {
+                        (false, _) => DialogFill::DenyTint,
+                        (true, true) => DialogFill::AllowTint,
+                        (true, false) => DialogFill::AllowTintDimmed,
+                    };
+                    assert_eq!(cell.fill, expected, "row {row} column {column}");
+                }
+                assert_eq!(sides, [true, true], "row {row}");
+            }
+        }
     }
 }

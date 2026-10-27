@@ -299,16 +299,24 @@ a hostile program running as your account.
 - Trusted dialogs are redrawn as one box: a thin `warning` frame with a
   lowercase title such as "agent access request" set into it, the request as
   one sentence, the details as an aligned table, the durations as list rows
-  with the chosen one highlighted, and two labelled buttons below, a red
-  **Deny** (left) and a green **Allow** (right) that names exactly what it
-  grants, each with its keys under its label. The frame's bottom edge says
-  how to engage the keyboard until you click or press the dialog shortcut,
-  then which keys answer. The access prompt now says that the agent names
-  itself and Splinterm cannot verify that name. A button label too long for
-  its half counts as hidden text, so the dialog can then only be declined.
-  The box casts the same hard shadow as the in-Window popups. The upgrade and
-  restart questions count their time to answer down at the right of the top
-  edge, such as `0:42`; the access prompt shows no countdown.
+  with the chosen one highlighted, and two labelled buttons below: a red no
+  button on the left and a green yes button on the right that names exactly
+  what it does, such as **Allow Look once**, **Proceed, close 2 Windows**, or
+  **Restart now, end 4 shells**, each with its keys under its label. Only a
+  click inside the green button says yes. The frame's bottom edge says how to
+  engage the keyboard until you click or press the dialog shortcut, then
+  which keys answer. When the agent reported a name, the access prompt now
+  says that the agent names itself and Splinterm cannot verify that name. A
+  button label too long for its half counts as hidden text, so the dialog
+  can then only be declined. The box casts the same hard shadow as the
+  in-Window popups. The upgrade and restart questions count their time to
+  answer down at the right of the top edge, such as `cancels in 0:42`; the
+  access prompt shows no countdown. Trusted dialogs always use the default,
+  even padding, whatever `[main] padding-*` says.
+- Names in the access prompt and the **Agent access** list show every quote
+  and quote look-alike (such as `ʼ`, `′`, `“`, or a backtick) as an escape
+  such as `\u{02bc}`, and a run of spaces as one space, so a name cannot
+  imitate the prompt's wording.
 
 ## Agent status
 

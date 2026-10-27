@@ -96,8 +96,8 @@ const PROMPT_LINE_CHARS: usize = 100;
 /// workspace name) as one line of display text, escaped exactly as the
 /// **Agent access** list escapes it, so the name approved here reads the
 /// same there later: every unsafe character, tabs and newlines among them,
-/// the list's quotes and separator, and the prompt's own `'` quote are shown
-/// as `\u{…}`, and spaces stay as they are. At most `maximum` characters,
+/// every quote and quote look-alike, and the list's separator are shown as
+/// `\u{…}`, and a run of spaces as one space. At most `maximum` characters,
 /// the last an ellipsis when it was cut; an escape is never cut in two.
 fn display_name(value: &str, maximum: usize) -> String {
     let shown = splinterm::frontend::shown_prompt_name(value, maximum);
@@ -424,8 +424,20 @@ fn global_dialog_shortcut() -> bool {
 /// theme as of opening, with its `[colors]` keys ([`dialog_theme`]).
 pub(in crate::app) fn configure_dialog_renderer(config: &AppConfig) -> Result<ResolvedTheme> {
     let theme = dialog_theme(super::theme_watch::load_dialog_theme(config));
-    super::sessions::configure_picker_renderer(config, theme)?;
+    super::sessions::configure_picker_renderer(&dialog_config(config), theme)?;
     Ok(theme)
+}
+
+/// The configuration a trusted dialog draws with: the person's, but with
+/// the default, even padding whatever `[main] padding-*` says. Lopsided
+/// padding would move the grid, and the button labels on it, away from
+/// the middle of the Window, which no answer depends on but which a person
+/// reads as the line between no and yes.
+fn dialog_config(config: &AppConfig) -> AppConfig {
+    AppConfig {
+        padding: splinterm::geometry::TerminalPadding::DEFAULT,
+        ..config.clone()
+    }
 }
 
 /// What a trusted dialog keeps of the person's theme: its colors only. It is
@@ -840,8 +852,9 @@ mod tests {
                 assert!(joined.contains(&shared));
             }
             let text = layout.rows.join("\n");
-            // The tab is escaped as the list shows it; spaces stay.
-            assert!(text.contains("'Agent  \\u{0009} name"), "{text}");
+            // The tab is escaped as the list shows it, and the run of spaces
+            // shows as one.
+            assert!(text.contains("'Agent \\u{0009} name"), "{text}");
             assert!(text.contains(&format!("{}…", "a".repeat(10))));
             assert!(text.contains(&format!("'{}…'", "n".repeat(59))));
             // The natural size keeps every row of the text.
@@ -1042,5 +1055,37 @@ mod tests {
         assert!(!dialog.background_blur);
         assert_eq!(dialog.background, 0x10_20_30);
         assert_eq!(dialog.roles, theme.roles);
+    }
+
+    /// A trusted dialog keeps the person's font but never their padding:
+    /// lopsided `[main] padding-*` cannot move its grid off the middle.
+    #[test]
+    fn trusted_dialogs_draw_with_even_padding() {
+        for padding in [
+            splinterm::geometry::TerminalPadding {
+                left: 400,
+                right: 12,
+                top: 0,
+                bottom: 900,
+            },
+            splinterm::geometry::TerminalPadding {
+                left: 12,
+                right: 400,
+                top: 30,
+                bottom: 0,
+            },
+        ] {
+            let config = splinterm::config::AppConfig {
+                padding,
+                font: "Lopsided Mono".to_owned(),
+                ..splinterm::config::AppConfig::default()
+            };
+            let dialog = super::dialog_config(&config);
+            assert_eq!(
+                dialog.padding,
+                splinterm::geometry::TerminalPadding::DEFAULT
+            );
+            assert_eq!(dialog.font, config.font);
+        }
     }
 }

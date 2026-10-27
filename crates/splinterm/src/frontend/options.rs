@@ -73,6 +73,11 @@ struct AccessConsentDialog {
     render: AccessConsentRenderer,
 }
 
+/// How much sooner than the asker's wait a dialog's countdown runs out:
+/// the asker starts its clock before the dialog process starts, so the
+/// countdown never still shows time once the asker has stopped waiting.
+pub(crate) const COUNTDOWN_MARGIN: Duration = Duration::from_secs(1);
+
 /// A trusted dialog Window's answer channel and kind. Build it with
 /// [`TrustedConsentUi::access_consent`], [`TrustedConsentUi::upgrade`], or
 /// [`TrustedConsentUi::restart`].
@@ -201,12 +206,16 @@ impl TrustedConsentUi {
     /// edge then counts it down. It only shows the time; the asker ends the
     /// dialog when it runs out, as before. A zero wait, from an asker that
     /// sent none, shows no countdown.
+    ///
+    /// The asker started its clock before this dialog started, so the time
+    /// shown is [`COUNTDOWN_MARGIN`] short of `within`: it reaches "0:00"
+    /// no later than the asker stops waiting.
     #[must_use]
     pub fn with_respond_within(mut self, within: Duration) -> Self {
         self.deadline = if within.is_zero() {
             None
         } else {
-            Instant::now().checked_add(within)
+            Instant::now().checked_add(within.saturating_sub(COUNTDOWN_MARGIN))
         };
         self
     }
@@ -351,22 +360,31 @@ impl TrustedConsentUi {
         }
     }
 
-    /// The time left to answer at `now`, as "m:ss", rounded up, so it
-    /// shows "0:00" only once the time is up. `None` without a deadline.
+    /// The time left to answer at `now`, after what happens then, such as
+    /// "cancels in 0:18": the time as "m:ss", rounded up, so it shows
+    /// "0:00" only once the time is up. `None` without a deadline.
     fn countdown(&self, now: Instant) -> Option<String> {
         let left = self.deadline?.saturating_duration_since(now);
         let seconds = left.as_secs() + u64::from(left.subsec_nanos() > 0);
-        Some(format!("{}:{:02}", seconds / 60, seconds % 60))
+        Some(format!(
+            "{} {}:{:02}",
+            self.kind.countdown_verb(),
+            seconds / 60,
+            seconds % 60
+        ))
     }
 
     /// How long until the countdown the frame shows changes, from `now`:
-    /// the Window wakes then to draw it again. `None` without one, or once
-    /// it shows "0:00".
+    /// the Window wakes then to draw it again, at once while what it shows
+    /// is out of date. `None` without one, or once it shows "0:00".
     pub(crate) fn countdown_wait(&self, now: Instant) -> Option<Duration> {
+        if self.countdown_stale(now) {
+            return Some(Duration::ZERO);
+        }
         self.frame?;
         let left = self.deadline?.saturating_duration_since(now);
         if left.is_zero() {
-            return (self.countdown_shown != self.countdown(now)).then_some(Duration::ZERO);
+            return None;
         }
         // The shown second changes when `left` crosses a whole second; a
         // millisecond past it, so the Window never wakes just before.
@@ -1379,10 +1397,15 @@ mod tests {
     #[test]
     fn a_known_deadline_counts_down_at_the_frame_right_and_changes_nothing() {
         let (decision, _answers) = std::sync::mpsc::channel();
+        let before = Instant::now();
         let mut dialog = TrustedConsentUi::upgrade(decision)
             .with_respond_within(Duration::from_secs(125))
             .with_text(consent_text(0));
-        assert!(dialog.deadline.is_some());
+        // The asker started its clock first, so the dialog counts down a
+        // second short of its wait.
+        let set = dialog.deadline.unwrap();
+        assert!(set >= before + Duration::from_secs(124), "{set:?}");
+        assert!(set <= Instant::now() + Duration::from_secs(124), "{set:?}");
         let start = Instant::now();
         dialog.deadline = Some(start + Duration::from_secs(125));
         // Nothing to count down before the dialog has a layout.
@@ -1390,7 +1413,7 @@ mod tests {
         assert!(!dialog.countdown_stale(start));
         let snapshot = dialog.lay_out(narrow_frame(), start).unwrap();
         let top = top_row(&snapshot);
-        assert!(top.ends_with("2:05"), "{top:?}");
+        assert!(top.ends_with(" cancels in 2:05"), "{top:?}");
         // It ends inside the frame, two columns in from the grid's edge.
         assert_eq!(top.chars().count(), 40 - dialog_text::FRAME_INSET_COLUMNS);
         let millisecond = Duration::from_millis(1);
@@ -1406,6 +1429,8 @@ mod tests {
         );
         let next = start + Duration::from_secs(1) + millisecond;
         assert!(dialog.countdown_stale(next));
+        // Out of date: wake at once.
+        assert_eq!(dialog.countdown_wait(next), Some(Duration::ZERO));
         assert!(top_row(&dialog.render(next).unwrap()).ends_with("2:04"));
         assert!(!dialog.countdown_stale(next));
         // Half a second left still shows a whole one.
@@ -1471,5 +1496,17 @@ mod tests {
         let redrawn = snapshot_text(&dialog.render(start).unwrap());
         assert!(!redrawn.contains("click inside"), "{redrawn}");
         assert_eq!(dialog.engagement_redraw(), None);
+    }
+
+    /// The restart question's countdown says that the time running out
+    /// means Not now.
+    #[test]
+    fn the_restart_countdown_says_not_now() {
+        let (decision, _answers) = std::sync::mpsc::channel();
+        let mut dialog = TrustedConsentUi::restart(decision)
+            .with_respond_within(Duration::from_secs(120))
+            .with_text(consent_text(0));
+        let top = top_row(&dialog.lay_out(narrow_frame(), Instant::now()).unwrap());
+        assert!(top.ends_with(" not now in 1:59"), "{top:?}");
     }
 }

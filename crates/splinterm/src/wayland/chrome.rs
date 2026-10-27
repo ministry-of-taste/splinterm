@@ -14,8 +14,8 @@ use crate::{
     frontend::{
         DialogFrame, DialogText, TrustedInput, dialog_font_step,
         dialog_text::{
-            DialogInk, NATURAL_MAX_TEXT_COLUMNS, SELECTION_SLOT, chrome_rows, natural_columns,
-            natural_rows, text_columns, text_rows,
+            DialogFill, DialogInk, NATURAL_MAX_TEXT_COLUMNS, button_split_column, chrome_rows,
+            natural_columns, natural_rows, text_columns, text_rows,
         },
     },
     geometry::{CellGeometry, Rect, TerminalPadding, WindowGeometry, logical_extent_to_buffer},
@@ -181,7 +181,7 @@ const SHADOW_DARKNESS: f64 = 0.35;
 /// Where a trusted dialog's box goes in its buffer, in buffer pixels: the
 /// frame, the openings in its edges for the title and the legend, and the
 /// two buttons. Drawing ([`paint_trusted_consent_chrome`]) and hit testing
-/// ([`App::trusted_consent_action_area_at`]) both take it from
+/// ([`App::trusted_consent_button_at`]) both take it from
 /// [`trusted_chrome`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct TrustedChrome {
@@ -202,12 +202,27 @@ pub(super) struct TrustedChrome {
     shadow: Vec<Rect>,
 }
 
-/// Whether a click `y` logical pixels down a Window at `scale_120` is on
-/// the rows of `chrome`'s buttons, which share their rows.
-fn buttons_hit(y: f64, scale_120: u32, chrome: &TrustedChrome) -> bool {
-    let y = y * f64::from(scale_120) / f64::from(SCALE_DENOMINATOR);
-    let top = chrome.deny.y;
-    y >= f64::from(top) && y < f64::from(top.saturating_add(chrome.deny.height))
+/// The button a click at (`x`, `y`) logical pixels in a Window at
+/// `scale_120` is on: `Some(true)` only inside the painted green (yes)
+/// button, `Some(false)` inside the red (no) one, and `None` anywhere
+/// else: the gap between them, the frame and its margin, the shadow, the
+/// padding. Nothing outside the green button can say yes.
+fn button_at(x: f64, y: f64, scale_120: u32, chrome: &TrustedChrome) -> Option<bool> {
+    let to_buffer = |logical: f64| logical * f64::from(scale_120) / f64::from(SCALE_DENOMINATOR);
+    let (x, y) = (to_buffer(x), to_buffer(y));
+    let inside = |button: Rect| {
+        x >= f64::from(button.x)
+            && x < f64::from(button.x.saturating_add(button.width))
+            && y >= f64::from(button.y)
+            && y < f64::from(button.y.saturating_add(button.height))
+    };
+    if inside(chrome.allow) {
+        Some(true)
+    } else if inside(chrome.deny) {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 /// The openings, as `(x, end)` buffer spans, a frame line through `row`
@@ -291,8 +306,8 @@ fn shadow_bands(geometry: &WindowGeometry, scale_120: u32, width: u32, height: u
 }
 
 /// The red (left) and green (right) buttons between `left` and `right` and
-/// from `top` to `bottom`, split at `middle`, where the pointer's halves
-/// meet: each keeps clear of it by half of `gap`.
+/// from `top` to `bottom`, split at `middle`: each keeps clear of it by
+/// half of `gap`.
 fn button_pair(
     middle: u32,
     gap: u32,
@@ -324,11 +339,11 @@ fn button_pair(
 ///
 /// The frame runs through the middle of the grid's first and last rows and
 /// columns, open where the title (first row) and the legend (last row)
-/// show. The buttons span the box inside the frame, split at the middle of
-/// the buffer, as the pointer's halves are, and take the label and keys
-/// rows ([`chrome_rows`]) with a little room above and below, never
-/// reaching the body above or the legend below. Without a grid the buttons
-/// take the bottom fifth inside a frame at the buffer's edge.
+/// show. The buttons span the box inside the frame, split at the grid's
+/// middle column boundary ([`button_split_column`]), and take the label
+/// and keys rows ([`chrome_rows`]) with a little room above and below,
+/// never reaching the body above or the legend below. Without a grid the
+/// buttons take the bottom fifth inside a frame at the buffer's edge.
 pub(super) fn trusted_chrome(
     width: u32,
     height: u32,
@@ -339,16 +354,16 @@ pub(super) fn trusted_chrome(
     let line = scaled_pixels(FRAME_LINE_PIXELS, scale_120, 2);
     let edge = scaled_pixels(BUTTON_EDGE_PIXELS, scale_120, 1);
     let gap = scaled_pixels(BUTTON_GAP_PIXELS, scale_120, 4);
-    let buttons =
-        |gap, left, right, top, bottom| button_pair(width / 2, gap, (left, right), (top, bottom));
     let Some(geometry) = geometry else {
         let inset = line.saturating_mul(4);
-        let (deny, allow) = buttons(
+        let (deny, allow) = button_pair(
+            width / 2,
             gap,
-            inset,
-            width.saturating_sub(inset),
-            height.saturating_mul(78) / 100,
-            height.saturating_sub(inset),
+            (inset, width.saturating_sub(inset)),
+            (
+                height.saturating_mul(78) / 100,
+                height.saturating_sub(inset),
+            ),
         );
         return TrustedChrome {
             frame: Rect {
@@ -401,15 +416,26 @@ pub(super) fn trusted_chrome(
     let button_height = scaled_pixels(BUTTON_HEIGHT_PIXELS, scale_120, 0)
         .clamp(cell_height * 2 + cell_height / 2, cell_height * 3);
     let room = (button_height - cell_height * 2) / 2;
-    // Never more than half a cell, so the labels, which keep a column clear
-    // of the middle ([`dialog_text::button_columns`]), stay inside their
-    // buttons even where the grid sits a little off the buffer's middle.
-    let (deny, allow) = buttons(
+    // The buttons meet at the grid's middle column boundary, where the
+    // labels' halves meet ([`button_split_column`]), wherever the grid sits
+    // in the Window. The gap is never more than half a cell, so the labels,
+    // which keep a column clear of it ([`dialog_text::button_columns`]),
+    // stay inside their buttons.
+    let split = grid.x.saturating_add(
+        u32::try_from(button_split_column(
+            usize::try_from(geometry.columns).unwrap_or(0),
+        ))
+        .unwrap_or(0)
+        .saturating_mul(cell_width),
+    );
+    let (deny, allow) = button_pair(
+        split,
         gap.min(cell_width / 2).max(2),
-        middle_x(1),
-        middle_x(last_column.saturating_sub(1)),
-        row_top(places.label).saturating_sub(room),
-        row_top(places.keys + 1).saturating_add(room).min(height),
+        (middle_x(1), middle_x(last_column.saturating_sub(1))),
+        (
+            row_top(places.label).saturating_sub(room),
+            row_top(places.keys + 1).saturating_add(room).min(height),
+        ),
     );
     TrustedChrome {
         frame: Rect {
@@ -454,10 +480,6 @@ impl App {
         )
     }
 
-    /// Whether a click `y` logical pixels down this trusted dialog falls on
-    /// the rows of its buttons, exactly where
-    /// [`paint_trusted_consent_chrome`] paints them. The pointer's side of
-    /// the Window's middle picks the button.
     /// How long until a trusted dialog's countdown needs drawing again;
     /// `None` without a dialog that counts down.
     pub(super) fn trusted_countdown_timeout(&self) -> Option<std::time::Duration> {
@@ -480,7 +502,11 @@ impl App {
         }
     }
 
-    pub(super) fn trusted_consent_action_area_at(&self, y: f64) -> bool {
+    /// The button a click at (`x`, `y`) logical pixels in this trusted
+    /// dialog is on, exactly where [`paint_trusted_consent_chrome`] paints
+    /// it ([`button_at`]): `Some(true)` only inside the green button,
+    /// `Some(false)` inside the red one, `None` anywhere else.
+    pub(super) fn trusted_consent_button_at(&self, x: f64, y: f64) -> Option<bool> {
         let scale_120 = self.surface.scale_120;
         let content = self.content_rect();
         let geometry = self.panes.pane.snapshot_frame.as_ref().and_then(|frame| {
@@ -503,7 +529,8 @@ impl App {
             },
             |geometry| (geometry.buffer_width(), geometry.buffer_height()),
         );
-        buttons_hit(
+        button_at(
+            x,
             y,
             scale_120,
             &self.trusted_consent_action_top(width, height, geometry.as_ref()),
@@ -877,6 +904,18 @@ impl TrustedConsentColors {
         }
     }
 
+    /// The color behind a dialog cell on `fill`: the same colors the chrome
+    /// paints the selection and the buttons in.
+    pub(super) const fn fill(&self, fill: DialogFill) -> u32 {
+        match fill {
+            DialogFill::Background => self.background,
+            DialogFill::Selection => self.selection,
+            DialogFill::DenyTint => self.deny_tint,
+            DialogFill::AllowTint => self.allow_tint,
+            DialogFill::AllowTintDimmed => self.allow_tint_dimmed,
+        }
+    }
+
     /// The color a dialog cell in `ink` is drawn in.
     pub(super) const fn ink(&self, ink: DialogInk) -> u32 {
         match ink {
@@ -965,7 +1004,7 @@ fn is_green_hue(hue: f64) -> bool {
 /// `theme` with the trusted dialog's colors written into it: its
 /// background, text and the roles its chrome paints, and the palette slots
 /// its snapshot's cells are drawn from (`dialog_text::DialogInk::slot`,
-/// [`SELECTION_SLOT`]). The dialog's Window draws with this theme from its
+/// [`DialogFill::slot`]). The dialog's Window draws with this theme from its
 /// first frame, so its snapshot's colors, its padding and its chrome all
 /// agree, and deriving the colors from it again gives the same colors.
 pub(super) fn trusted_dialog_theme(theme: ResolvedTheme) -> ResolvedTheme {
@@ -986,8 +1025,10 @@ pub(super) fn trusted_dialog_theme(theme: ResolvedTheme) -> ResolvedTheme {
             *slot = colors.ink(ink);
         }
     }
-    if let Some(slot) = theme.ansi.get_mut(SELECTION_SLOT) {
-        *slot = colors.selection;
+    for fill in DialogFill::SLOTTED {
+        if let Some(slot) = fill.slot().and_then(|slot| theme.ansi.get_mut(slot)) {
+            *slot = colors.fill(fill);
+        }
     }
     theme
 }
@@ -1900,6 +1941,80 @@ mod tests {
         canvas[index..index + 4].try_into().unwrap()
     }
 
+    /// What a click on the centre of buffer pixel (`x`, `y`) answers: the
+    /// pixel's centre in logical pixels, as the pointer reports it.
+    fn hit(x: u32, y: u32, scale_120: u32, chrome: &TrustedChrome) -> Option<bool> {
+        let logical = |pixel: u32| {
+            (f64::from(pixel) + 0.5) * f64::from(SCALE_DENOMINATOR) / f64::from(scale_120)
+        };
+        button_at(logical(x), logical(y), scale_120, chrome)
+    }
+
+    /// Only a click inside the painted green button says yes. Every pixel
+    /// of the buffer around the buttons' rows (the gap between them, the
+    /// frame and its margin, the right shadow band, the padding) says yes
+    /// exactly where the green button is, and no pixel of a cell that shows
+    /// part of the red button's label or keys does.
+    fn assert_only_the_green_button_grants(
+        chrome: &TrustedChrome,
+        snapshot: &TerminalSnapshot,
+        geometry: &WindowGeometry,
+        scale_120: u32,
+        size: &str,
+    ) {
+        let (width, height) = (geometry.buffer_width(), geometry.buffer_height());
+        let allow = chrome.allow;
+        let rows_top = chrome.deny.y.saturating_sub(geometry.cell.height);
+        let rows_end = (chrome.deny.y + chrome.deny.height + geometry.cell.height).min(height);
+        for y in rows_top..rows_end {
+            for x in 0..width {
+                let in_allow = (allow.x..allow.x + allow.width).contains(&x)
+                    && (allow.y..allow.y + allow.height).contains(&y);
+                assert_eq!(
+                    hit(x, y, scale_120, chrome) == Some(true),
+                    in_allow,
+                    "{size}: buffer pixel {x},{y}"
+                );
+            }
+        }
+        for band in &chrome.shadow {
+            for y in band.y..band.y + band.height {
+                for x in band.x..band.x + band.width {
+                    assert_ne!(
+                        hit(x, y, scale_120, chrome),
+                        Some(true),
+                        "{size}: shadow {x},{y}"
+                    );
+                }
+            }
+        }
+        let grid = geometry.grid_rect;
+        let (cell_width, cell_height) = (geometry.cell.width, geometry.cell.height);
+        let places = chrome_rows(geometry.rows as usize);
+        let split = button_split_column(geometry.columns as usize);
+        let mut deny_cells = 0;
+        for row in [places.label, places.keys] {
+            for column in visible_columns(snapshot, row) {
+                if column as usize >= split {
+                    continue;
+                }
+                deny_cells += 1;
+                let x = grid.x + column * cell_width;
+                let y = grid.y + u32::try_from(row).unwrap() * cell_height;
+                for pixel_y in y..y + cell_height {
+                    for pixel_x in x..x + cell_width {
+                        assert_eq!(
+                            hit(pixel_x, pixel_y, scale_120, chrome),
+                            Some(false),
+                            "{size}: red label row {row} column {column} at {pixel_x},{pixel_y}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(deny_cells > 0, "{size}");
+    }
+
     fn overlaps(a: Rect, b: Rect) -> bool {
         a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height
     }
@@ -1938,6 +2053,89 @@ mod tests {
                         "{size}: {band:?} on row {row} column {column}"
                     );
                 }
+            }
+        }
+    }
+
+    /// Lopsided padding, which a trusted dialog's child never draws with
+    /// (it keeps the default, even padding), still cannot put a label on
+    /// the other button: the buttons split at the grid's middle column
+    /// boundary, not the Window's middle, each label and its keys sit inside
+    /// their own button, and only the green button says yes, either way
+    /// round, at 1x and at 1.25x.
+    #[test]
+    fn lopsided_padding_keeps_each_label_on_its_own_button() {
+        let variants = restart_text();
+        for (left, right) in [(400, 12), (12, 400)] {
+            let padding = TerminalPadding {
+                left,
+                right,
+                ..TerminalPadding::DEFAULT
+            };
+            for scale_120 in [SCALE_DENOMINATOR, 150] {
+                let size = format!("padding {left}/{right} at {scale_120}");
+                let natural = WindowGeometry::for_grid(
+                    u32::try_from(natural_columns(&variants)).unwrap(),
+                    u32::try_from(natural_rows(&variants)).unwrap(),
+                    cell(),
+                    padding,
+                    scale_120,
+                )
+                .unwrap();
+                let fit = trusted_dialog_fit(
+                    content(natural.logical_width(), natural.logical_height()),
+                    cell(),
+                    padding,
+                    scale_120,
+                    &variants,
+                )
+                .unwrap();
+                assert!(fit.fits(), "{size}: {fit:?}");
+                let mut dialog = restart_dialog();
+                let snapshot = laid_out(&mut dialog, &fit);
+                let geometry = fit.geometry;
+                let chrome = trusted_chrome(
+                    geometry.buffer_width(),
+                    geometry.buffer_height(),
+                    scale_120,
+                    Some(&geometry),
+                    &snapshot.visible_rows,
+                );
+                let split_column = button_split_column(geometry.columns as usize);
+                let split = geometry.grid_rect.x
+                    + u32::try_from(split_column).unwrap() * geometry.cell.width;
+                assert!(
+                    chrome.deny.x + chrome.deny.width <= split && split <= chrome.allow.x,
+                    "{size}: {chrome:?}"
+                );
+                // Far from the Window's middle, which no longer decides.
+                assert!(
+                    geometry.buffer_width() / 2 < chrome.deny.x + chrome.deny.width
+                        || geometry.buffer_width() / 2 > chrome.allow.x,
+                    "{size}: {chrome:?}"
+                );
+                let places = chrome_rows(geometry.rows as usize);
+                let (cell_width, cell_height) = (geometry.cell.width, geometry.cell.height);
+                for row in [places.label, places.keys] {
+                    for column in visible_columns(&snapshot, row) {
+                        let x = geometry.grid_rect.x + column * cell_width + cell_width / 2;
+                        let y = geometry.grid_rect.y
+                            + u32::try_from(row).unwrap() * cell_height
+                            + cell_height / 2;
+                        assert_eq!(
+                            hit(x, y, scale_120, &chrome),
+                            Some(column as usize >= split_column),
+                            "{size}: row {row} column {column}"
+                        );
+                    }
+                }
+                assert!(
+                    row_text(&snapshot, places.label).contains("Not now"),
+                    "{size}"
+                );
+                assert_only_the_green_button_grants(
+                    &chrome, &snapshot, &geometry, scale_120, &size,
+                );
             }
         }
     }
@@ -2023,9 +2221,7 @@ mod tests {
                     );
                 }
             }
-            let below = f64::from(bottom + offset / 2) * f64::from(SCALE_DENOMINATOR)
-                / f64::from(scale_120);
-            assert!(!buttons_hit(below, scale_120, &chrome), "{scale_120}");
+            assert_only_the_green_button_grants(&chrome, &snapshot, &geometry, scale_120, "");
         }
     }
 
@@ -2115,11 +2311,12 @@ mod tests {
                     for column in visible_columns(&snapshot, row) {
                         let x = grid.x + column * cell_width;
                         let end = x + cell_width;
-                        let button = if x >= buffer_width / 2 {
-                            chrome.allow
-                        } else {
-                            chrome.deny
-                        };
+                        let button =
+                            if column as usize >= button_split_column(geometry.columns as usize) {
+                                chrome.allow
+                            } else {
+                                chrome.deny
+                            };
                         assert!(
                             x >= button.x + chrome.edge
                                 && end + chrome.edge <= button.x + button.width,
@@ -2165,19 +2362,34 @@ mod tests {
                         "{size}: title column {column}"
                     );
                 }
-                // The painted red edge and the hit test agree on every
-                // buffer row.
+                // The painted edges and the hit test agree on every buffer
+                // row: red on the red button's left edge, green on the
+                // green button's right edge.
+                let allow_edge = opaque_pixel(if dialog.clipped() {
+                    colors.allow_dimmed
+                } else {
+                    colors.allow
+                });
+                let allow_right = chrome.allow.x + chrome.allow.width - 1;
                 for y in 0..buffer_height {
                     let painted_red = pixel_at(&canvas, buffer_width, chrome.deny.x, y)
                         == opaque_pixel(colors.deny);
-                    let logical_y =
-                        (f64::from(y) + 0.5) * f64::from(SCALE_DENOMINATOR) / f64::from(scale_120);
+                    let painted_green =
+                        pixel_at(&canvas, buffer_width, allow_right, y) == allow_edge;
                     assert_eq!(
-                        buttons_hit(logical_y, scale_120, &chrome),
+                        hit(chrome.deny.x, y, scale_120, &chrome) == Some(false),
                         painted_red,
                         "{size} at buffer row {y}"
                     );
+                    assert_eq!(
+                        hit(allow_right, y, scale_120, &chrome) == Some(true),
+                        painted_green,
+                        "{size} at buffer row {y}"
+                    );
                 }
+                assert_only_the_green_button_grants(
+                    &chrome, &snapshot, &geometry, scale_120, &size,
+                );
                 assert_answer_rows(&dialog, &shown_rows(&snapshot), &size);
             }
         }
@@ -2401,8 +2613,16 @@ mod tests {
     fn without_a_grid_the_buttons_take_the_bottom_fifth() {
         let chrome = trusted_chrome(400, 300, SCALE_DENOMINATOR, None, &[]);
         assert_eq!(chrome.deny.y, 234);
-        assert!(buttons_hit(250.0, SCALE_DENOMINATOR, &chrome));
-        assert!(!buttons_hit(200.0, SCALE_DENOMINATOR, &chrome));
+        assert_eq!(
+            button_at(100.0, 250.0, SCALE_DENOMINATOR, &chrome),
+            Some(false)
+        );
+        assert_eq!(
+            button_at(300.0, 250.0, SCALE_DENOMINATOR, &chrome),
+            Some(true)
+        );
+        assert_eq!(button_at(200.0, 250.0, SCALE_DENOMINATOR, &chrome), None);
+        assert_eq!(button_at(300.0, 200.0, SCALE_DENOMINATOR, &chrome), None);
         assert!(chrome.deny.x + chrome.deny.width < 200);
         assert!(chrome.allow.x > 200);
     }
@@ -3104,7 +3324,15 @@ mod tests {
                 let slot = ink.slot().unwrap();
                 assert_eq!(dialog.ansi[slot], colors.ink(ink), "{name}: {ink:?}");
             }
-            assert_eq!(dialog.ansi[SELECTION_SLOT], colors.selection, "{name}");
+            for fill in DialogFill::SLOTTED {
+                let slot = fill.slot().unwrap();
+                assert_eq!(dialog.ansi[slot], colors.fill(fill), "{name}: {fill:?}");
+            }
+            assert_eq!(
+                dialog.ansi[DialogFill::Selection.slot().unwrap()],
+                colors.selection,
+                "{name}"
+            );
             assert_eq!(dialog.foreground, colors.text, "{name}");
         }
         assert_eq!(DialogInk::Text.slot(), None);

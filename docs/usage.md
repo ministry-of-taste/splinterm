@@ -597,12 +597,15 @@ Each dialog is one box: a thin frame with its title set into the top edge,
 its text, and two buttons at the bottom, a red no button on the left and a
 green yes button on the right that names exactly what it does, such as
 **Allow Look once** or **Restart now, end 4 shells**. Under each button's
-label are the keys that give that answer. The frame's bottom edge says how to
-engage the keyboard until you do, then which keys answer. The box casts a
-hard shadow, as the popups inside a Window do. The upgrade and restart
-questions show the time left to answer, such as `0:42`, at the right end of
-the top edge; when it runs out, the question ends as it always has. The
-access prompt shows no countdown.
+label are the keys that give that answer. Only a click inside the green
+button says yes; a click anywhere else, even beside it, does not. The frame's
+bottom edge says how to engage the keyboard until you do, then which keys
+answer. The box casts a hard shadow, as the popups inside a Window do. The
+upgrade and restart questions show the time left to answer at the right end
+of the top edge, such as `cancels in 0:42` or `not now in 1:58`; when it runs
+out, the question ends as it always has. The access prompt shows no
+countdown. Trusted dialogs always use the default, even padding, whatever
+`[main] padding-*` says.
 
 Each dialog asks for one fixed size: the size at which all of its text fits
 above the buttons, but never larger than the screen space the compositor

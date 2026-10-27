@@ -186,8 +186,9 @@ impl PointerHandler for App {
                     }
                     if self.modal.trusted_consent.is_some() && button == BTN_LEFT {
                         let (x, y) = event.position;
-                        let in_action_area = self.trusted_consent_action_area_at(y);
-                        let proceed_area = x >= f64::from(self.surface.logical_width) / 2.0;
+                        // Only a click inside the painted green button can
+                        // say yes; one inside the red button says no.
+                        let on_button = self.trusted_consent_button_at(x, y);
                         let Some(consent) = self.modal.trusted_consent.as_mut() else {
                             continue;
                         };
@@ -195,10 +196,10 @@ impl PointerHandler for App {
                         // A click inside is the only thing that engages a
                         // trusted dialog's keyboard; focus never does.
                         consent.engage(now);
-                        // The bottom action areas, below the text, answer; a
-                        // click on a duration's row only selects it.
-                        let input = if in_action_area {
-                            consent.action_area_input(proceed_area, now)
+                        // The buttons answer; a click on a duration's row
+                        // only selects it.
+                        let input = if let Some(proceed) = on_button {
+                            consent.action_area_input(proceed, now)
                         } else {
                             match cell {
                                 Some(position) => consent.row_input(position.row, now),

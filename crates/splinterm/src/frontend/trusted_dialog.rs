@@ -303,6 +303,16 @@ impl AccessChoice {
 }
 
 impl TrustedDialogKind {
+    /// What happens when the time to answer runs out, before the time
+    /// left in the frame's countdown, such as "cancels in 0:18".
+    pub(crate) const fn countdown_verb(self) -> &'static str {
+        match self {
+            Self::AccessConsent => "denies in",
+            Self::Upgrade => "cancels in",
+            Self::Restart => "not now in",
+        }
+    }
+
     /// What the dialog shows in place of its answer hints while part of its
     /// text is hidden: it cannot say yes until the Window is larger.
     pub(crate) const fn clipped_notice(self) -> &'static str {
