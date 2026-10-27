@@ -656,6 +656,10 @@ pub(crate) struct SessionPickerPalette {
     /// `›`: mixed toward the primary text until it keeps 4.5:1 there, and on
     /// a translucent panel until it reads at the primary text's coverage.
     pub(crate) accent_text: u32,
+    /// The accent as text on the selected fill, such as a selected list
+    /// row's title and `›`: mixed toward the selected text until it keeps
+    /// 4.5:1 there. The selected fill is opaque, so it needs no coverage.
+    pub(crate) selected_accent: u32,
     pub(crate) shadow: [u8; 4],
     /// Status tints on the opaque panel and on the selected fill;
     /// `None` when `[explorer] status-colors=no`.
@@ -749,6 +753,12 @@ fn panel_palette(theme: ResolvedTheme, panel: u32) -> SessionPickerPalette {
         TEXT_MIN_CONTRAST,
     );
     let accent_text = contrast_floor_toward(roles.accent, primary, panel, TEXT_MIN_CONTRAST);
+    let selected_accent = contrast_floor_toward(
+        roles.accent,
+        selected_primary,
+        selected_fill,
+        TEXT_MIN_CONTRAST,
+    );
     // A focus ring too close to the frame colour reads as no focus, so the
     // accent takes its place, unless `[colors] focus-ring` chose it.
     let focused_frame = if roles.verbatim.contains(Role::FocusRing)
@@ -794,6 +804,7 @@ fn panel_palette(theme: ResolvedTheme, panel: u32) -> SessionPickerPalette {
         selected_danger,
         highlight_danger,
         accent_text,
+        selected_accent,
         shadow: [0, 0, 0, 89],
         status_tints: Some(ChromeTints::on(&roles, panel)),
         selected_status_tints: Some(ChromeTints::on(&roles, selected_fill)),

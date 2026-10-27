@@ -12505,6 +12505,7 @@ impl App {
             command_palette_layout(
                 self.content_rect(),
                 &placeholders,
+                &access.row_groups(),
                 access.selected_index(),
                 access.visible_start(),
                 PaletteShape::AgentAccess,
@@ -12514,6 +12515,7 @@ impl App {
             command_palette_layout(
                 self.content_rect(),
                 &placeholders,
+                &help.row_groups(),
                 help.selected_index(),
                 help.visible_start(),
                 PaletteShape::BindingHelp,
@@ -12523,12 +12525,25 @@ impl App {
                 command_palette_layout(
                     self.content_rect(),
                     palette.filtered(),
+                    &palette.row_groups(),
                     palette.selected_index(),
                     palette.visible_start(),
                     PaletteShape::Commands,
                 )
             })
         };
+        // The layout keeps the selected row in view around its group headers;
+        // the list scrolls on from where it put the window.
+        if let Some(layout) = &command_palette_layout {
+            let start = layout.visible_start;
+            if let Some(access) = self.modal.agent_access.as_mut() {
+                access.set_visible_start(start);
+            } else if let Some(help) = self.modal.binding_help.as_mut() {
+                help.set_visible_start(start);
+            } else if let Some(palette) = self.modal.command_palette.as_mut() {
+                palette.set_visible_start(start);
+            }
+        }
         let dojo_prompt_layout = self
             .modal
             .dojo_prompt

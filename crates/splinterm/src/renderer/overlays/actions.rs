@@ -7,9 +7,8 @@ use unicode_width::UnicodeWidthChar;
 use crate::frontend::{TAB_MENU_ACTIONS, tab_menu_descriptor};
 use crate::{
     frontend::{
-        AgentAccessUi, BindingHelpUi, BuiltInCommandId, COMMAND_PALETTE_PAGE_ITEMS,
-        CommandPaletteUi, DojoPromptUi, TabContextMenuUi, TabMenuActionId, TerminationDecision,
-        command_descriptor,
+        AgentAccessUi, BindingHelpUi, BuiltInCommandId, CommandPaletteUi, DojoPromptUi,
+        TabContextMenuUi, TabMenuActionId, TerminationDecision, command_descriptor, shortcut_chips,
     },
     geometry::Rect,
     keymap::ResolvedKeymap,
@@ -20,6 +19,11 @@ use super::{
     chrome_box::{
         BOX_CLEARANCE, BOX_EDGE, ChromeBox, ChromePainter, opaque, paint_outline, paint_scrim,
         shadow_rect,
+    },
+    chrome_rows::{
+        GROUP_HEIGHT, LIST_MAXIMUM_ROWS, ListRow, ROW_HEIGHT, ROW_PADDING, RowState,
+        paint_group_header, paint_row, row_columns, starts_group, title_match, visible_window,
+        window_height,
     },
     picker::{
         PickerTextAlignment, ROW_HOVER_ALPHA, ROW_PRESS_ALPHA, SessionPickerPalette,
@@ -38,13 +42,16 @@ const INPUT_INSET: u32 = 10;
 const HEADER_HEIGHT: u32 = BOX_EDGE + BOX_CLEARANCE + INPUT_HEIGHT + RULE_GAP * 2 + 1;
 /// Everything below the list: the clearance and the frame.
 const FOOTER_HEIGHT: u32 = BOX_CLEARANCE + BOX_EDGE;
-/// Agent access's line under its list: what the selected entry is, or a
-/// notice.
+/// The detail line under the key bindings' and Agent access's lists: what
+/// the selected row is, or a notice.
 const DETAIL_HEIGHT: u32 = 28;
-const ROW_HEIGHT: u32 = 48;
+/// A list longer than its window keeps this height while it scrolls.
+#[allow(clippy::cast_possible_truncation, reason = "ten rows")]
+const LIST_HEIGHT: u32 = ROW_HEIGHT * LIST_MAXIMUM_ROWS as u32;
 /// The command palette's and Agent access's width at most.
 const COMMAND_PALETTE_WIDTH: u32 = 560;
-/// The key bindings list's width at most: its rows carry a source column.
+/// The key bindings list's width at most: its rows lead with a chips
+/// column.
 const BINDING_HELP_WIDTH: u32 = 640;
 const PANEL_HORIZONTAL_MARGIN: u32 = 24;
 const PANEL_VERTICAL_MARGIN: u32 = 16;
@@ -52,11 +59,6 @@ const PANEL_VERTICAL_MARGIN: u32 = 16;
 /// least [`PANEL_MINIMUM_TOP`] below it.
 const PANEL_TOP_PERCENT: u32 = 15;
 const PANEL_MINIMUM_TOP: u32 = 48;
-/// The shortcut column's width at most; a longer shortcut keeps its key
-/// behind `…`.
-const SHORTCUT_COLUMN_WIDTH: u32 = 136;
-const CONTENT_INSET: u32 = 24;
-const ROW_GUTTER_Y: u32 = 2;
 const TAB_MENU_WIDTH: u32 = 156;
 const TAB_MENU_ROW_HEIGHT: u32 = 28;
 const TAB_MENU_PADDING: u32 = 2;
@@ -196,10 +198,11 @@ fn wrap_preview_body(body: &str, maximum_cells: usize) -> Vec<String> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CommandPaletteRowLayout {
     pub(crate) command: BuiltInCommandId,
+    /// The whole 28 px row, the inside of the frame wide.
     pub(crate) rect: Rect,
-    pub(crate) category: Rect,
-    pub(crate) title: Rect,
-    pub(crate) shortcut: Rect,
+    /// The group header above the row, when the row starts a group, and
+    /// its label.
+    pub(crate) header: Option<(Rect, &'static str)>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -211,15 +214,15 @@ pub(crate) struct CommandPaletteLayout {
     /// The 1 px rule under the input line.
     pub(crate) rule: Rect,
     pub(crate) list: Rect,
-    /// Agent access's line under the list.
+    /// The detail line under the list, with a rule along its top: what the
+    /// selected key binding or Agent access entry is.
     pub(crate) detail: Option<Rect>,
     pub(crate) rows: Vec<CommandPaletteRowLayout>,
     pub(crate) visible_start: usize,
-    pub(crate) compact: bool,
 }
 
 /// Which list the palette's panel holds: the key bindings list is wider,
-/// and Agent access has a detail line under its rows.
+/// and key bindings and Agent access have a detail line under their rows.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PaletteShape {
     Commands,
@@ -237,8 +240,8 @@ impl PaletteShape {
 
     const fn detail_height(self) -> u32 {
         match self {
-            Self::AgentAccess => DETAIL_HEIGHT,
-            Self::Commands | Self::BindingHelp => 0,
+            Self::BindingHelp | Self::AgentAccess => DETAIL_HEIGHT,
+            Self::Commands => 0,
         }
     }
 }
@@ -246,6 +249,10 @@ impl PaletteShape {
 /// The palette's panel in `content`: top-anchored at 15% of its height (at
 /// least 48 px down), as wide as its shape allows but 24 px clear of each
 /// side, moved up when its rows would not fit below.
+///
+/// `groups` holds each row's group, or is empty for a flat list: a header
+/// goes above each row that starts a group. The list shows at most ten
+/// rows; a list longer than its window keeps one height while it scrolls.
 #[must_use]
 #[allow(
     clippy::too_many_lines,
@@ -254,6 +261,7 @@ impl PaletteShape {
 pub(crate) fn command_palette_layout(
     content: Rect,
     filtered: &[BuiltInCommandId],
+    groups: &[&'static str],
     selected: usize,
     requested_start: usize,
     shape: PaletteShape,
@@ -276,27 +284,27 @@ pub(crate) fn command_palette_layout(
         return None;
     }
     let panel_width = available_width.min(shape.maximum_width());
-    let available_list_height = available_height.saturating_sub(chrome_height);
-    let capacity = usize::try_from(available_list_height / ROW_HEIGHT)
-        .unwrap_or(0)
-        .min(COMMAND_PALETTE_PAGE_ITEMS);
-    let visible_count = filtered.len().min(capacity);
-    let mut visible_start = requested_start.min(filtered.len().saturating_sub(visible_count));
-    if !filtered.is_empty() {
-        let selected = selected.min(filtered.len() - 1);
-        if selected < visible_start {
-            visible_start = selected;
-        } else if selected >= visible_start.saturating_add(visible_count) {
-            visible_start = selected.saturating_add(1).saturating_sub(visible_count);
-        }
-    }
-    // No partial row: when not even one row fits, the list is empty.
-    let list_height = if capacity == 0 {
+    let budget = available_height
+        .saturating_sub(chrome_height)
+        .min(LIST_HEIGHT);
+    // A window too short for a header and its row shows the rows alone.
+    let groups = if groups.len() == filtered.len() && budget >= ROW_HEIGHT + GROUP_HEIGHT {
+        groups
+    } else {
+        &[]
+    };
+    let window = visible_window(filtered.len(), groups, selected, requested_start, budget);
+    let whole =
+        filtered.len() <= LIST_MAXIMUM_ROWS && window_height(groups, 0, filtered.len()) <= budget;
+    // No partial row: when not even one fits, the list is empty.
+    let list_height = if budget < ROW_HEIGHT {
         0
     } else if filtered.is_empty() {
         ROW_HEIGHT
+    } else if whole {
+        window_height(groups, 0, filtered.len())
     } else {
-        ROW_HEIGHT.saturating_mul(u32::try_from(visible_count).unwrap_or(u32::MAX))
+        budget
     };
     let panel_height = chrome_height.saturating_add(list_height);
     let x = content
@@ -344,73 +352,31 @@ pub(crate) fn command_palette_layout(
         width: inner_width,
         height: shape.detail_height(),
     });
-    let compact = panel_width < 420;
-    // The category column costs a command title its room in a 560 px
-    // palette; Agent access keeps it, as its kind is a word only there.
-    let show_category = !compact && (shape != PaletteShape::Commands || panel_width >= 600);
-    let rows = filtered
-        .iter()
-        .copied()
-        .skip(visible_start)
-        .take(visible_count)
-        .enumerate()
-        .map(|(slot, command)| {
-            let slot_y = list
-                .y
-                .saturating_add(ROW_HEIGHT.saturating_mul(u32::try_from(slot).unwrap_or(u32::MAX)));
-            let vertical_gutter = ROW_GUTTER_Y.min(ROW_HEIGHT / 4);
+    let mut row_y = list.y;
+    let rows = window
+        .clone()
+        .map(|index| {
+            let header = starts_group(groups, index).then(|| {
+                let header = Rect {
+                    x: list.x,
+                    y: row_y,
+                    width: list.width,
+                    height: GROUP_HEIGHT,
+                };
+                row_y = row_y.saturating_add(GROUP_HEIGHT);
+                (header, groups[index])
+            });
             let rect = Rect {
                 x: list.x,
-                y: slot_y.saturating_add(vertical_gutter),
+                y: row_y,
                 width: list.width,
-                height: ROW_HEIGHT.saturating_sub(vertical_gutter.saturating_mul(2)),
+                height: ROW_HEIGHT,
             };
-            let inset = CONTENT_INSET.min(rect.width / 6);
-            let shortcut_width = if compact {
-                0
-            } else {
-                (rect.width / 4).min(SHORTCUT_COLUMN_WIDTH)
-            };
-            let content_x = rect.x.saturating_add(inset).saturating_add(20);
-            let category_width = if show_category {
-                72.min(rect.width / 5)
-            } else {
-                0
-            };
-            let category_gap = if category_width == 0 { 0 } else { 12 };
-            let title_x = content_x
-                .saturating_add(category_width)
-                .saturating_add(category_gap);
+            row_y = row_y.saturating_add(ROW_HEIGHT);
             CommandPaletteRowLayout {
-                command,
+                command: filtered[index],
                 rect,
-                category: Rect {
-                    x: content_x,
-                    y: rect.y,
-                    width: category_width,
-                    height: rect.height,
-                },
-                title: Rect {
-                    x: title_x,
-                    y: rect.y,
-                    width: rect
-                        .x
-                        .saturating_add(rect.width)
-                        .saturating_sub(title_x)
-                        .saturating_sub(shortcut_width)
-                        .saturating_sub(inset),
-                    height: rect.height,
-                },
-                shortcut: Rect {
-                    x: rect
-                        .x
-                        .saturating_add(rect.width)
-                        .saturating_sub(shortcut_width)
-                        .saturating_sub(inset),
-                    y: rect.y,
-                    width: shortcut_width,
-                    height: rect.height,
-                },
+                header,
             }
         })
         .collect();
@@ -421,8 +387,7 @@ pub(crate) fn command_palette_layout(
         list,
         detail,
         rows,
-        visible_start,
-        compact,
+        visible_start: window.start,
     })
 }
 
@@ -589,15 +554,6 @@ fn match_count_label(shown: usize, total: usize, query: &str) -> String {
     }
 }
 
-/// One read-only list row: category, title, one-line form, and the text in
-/// the shortcut column.
-struct ListRowText<'a> {
-    category: &'a str,
-    title: &'a str,
-    compact: &'a str,
-    trailing: &'a str,
-}
-
 /// Where the input line's parts go, in buffer px: the `›`, the text, and
 /// the block cursor after it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -757,20 +713,17 @@ pub(crate) fn paint_command_palette(
     let rule = painter.buffer_rect(layout.rule);
     painter.fill(rule, opaque(palette.frame));
     paint_palette_list(&mut painter, layout, &palette, state, keymap, pressed, body)?;
-    if let (Some(detail), PaletteBody::AgentAccess(access)) = (layout.detail, body) {
+    if let Some(detail) = layout.detail {
+        let text = match body {
+            PaletteBody::AgentAccess(access) => Some(access.footer()),
+            PaletteBody::BindingHelp(help) => help
+                .rows()
+                .get(help.selected_index())
+                .map(|row| row.detail.clone()),
+            PaletteBody::Commands => None,
+        };
         let detail = painter.buffer_rect(detail);
-        let inset = painter.scaled(INPUT_INSET).min(detail.width / 4);
-        painter.text(
-            &access.footer(),
-            ChromeTextStyle::Regular,
-            Rect {
-                x: detail.x.saturating_add(inset),
-                width: detail.width.saturating_sub(inset.saturating_mul(2)),
-                ..detail
-            },
-            PickerTextAlignment::Left,
-            palette.secondary,
-        )?;
+        paint_detail_line(&mut painter, &palette, detail, text.as_deref())?;
     }
     chrome.paint_frame(
         &mut painter,
@@ -785,7 +738,7 @@ pub(crate) fn paint_command_palette(
     Ok(())
 }
 
-/// The palette's rows, or the line that says none match.
+/// The palette's group headers and rows, or the line that says none match.
 fn paint_palette_list(
     painter: &mut ChromePainter<'_>,
     layout: &CommandPaletteLayout,
@@ -795,7 +748,6 @@ fn paint_palette_list(
     pressed: Option<BuiltInCommandId>,
     body: PaletteBody<'_>,
 ) -> Result<()> {
-    let inset = painter.scaled(CONTENT_INSET);
     let empty_label = match body {
         PaletteBody::BindingHelp(help) if help.rows().is_empty() => {
             Some("No matching keybindings".to_owned())
@@ -807,50 +759,168 @@ fn paint_palette_list(
         _ => None,
     };
     if let Some(empty_label) = empty_label.as_deref().filter(|_| layout.list.height > 0) {
-        let empty = painter.buffer_rect(layout.list);
+        let list = painter.buffer_rect(layout.list);
+        let row = Rect {
+            height: painter.scaled(ROW_HEIGHT).min(list.height),
+            ..list
+        };
+        let clip = title_column(painter, row)?;
         painter.text(
             empty_label,
             ChromeTextStyle::Regular,
-            Rect {
-                x: empty.x.saturating_add(inset),
-                width: empty.width.saturating_sub(inset.saturating_mul(2)),
-                ..empty
-            },
+            clip,
             PickerTextAlignment::Left,
             palette.secondary,
         )?;
     }
-    match body {
-        PaletteBody::BindingHelp(help) => {
-            let rows = help
-                .rows()
-                .iter()
-                .map(|row| ListRowText {
-                    category: &row.source,
-                    title: &row.action,
-                    compact: &row.compact,
-                    trailing: &row.shortcut,
-                })
-                .collect::<Vec<_>>();
-            paint_list_rows(painter, layout, palette, &rows, help.selected_index())
+    let query = body.query(state);
+    for (offset, row) in layout.rows.iter().enumerate() {
+        if let Some((header, label)) = row.header {
+            let header = painter.buffer_rect(header);
+            paint_group_header(painter, palette, header, label)?;
         }
-        PaletteBody::AgentAccess(access) => {
-            let rows = access
-                .rows()
-                .iter()
-                .map(|row| ListRowText {
-                    category: row.category,
-                    title: &row.title,
-                    compact: &row.compact,
-                    trailing: &row.status,
-                })
-                .collect::<Vec<_>>();
-            paint_list_rows(painter, layout, palette, &rows, access.selected_index())
-        }
-        PaletteBody::Commands => {
-            paint_command_rows(painter, layout, palette, state, keymap, pressed)
+        let index = layout.visible_start.saturating_add(offset);
+        let rect = painter.buffer_rect(row.rect);
+        match body {
+            PaletteBody::Commands => {
+                paint_command_row(painter, palette, rect, row.command, state, keymap, pressed)?;
+            }
+            PaletteBody::BindingHelp(help) => {
+                let Some(binding) = help.rows().get(index) else {
+                    continue;
+                };
+                let trailing = if binding.user {
+                    "user"
+                } else if query.is_empty() {
+                    ""
+                } else {
+                    binding.group
+                };
+                paint_row(
+                    painter,
+                    palette,
+                    rect,
+                    &ListRow {
+                        title: &binding.title,
+                        matched: title_match(&binding.title, query),
+                        chips: &binding.chips,
+                        chip_column: true,
+                        trailing,
+                        trailing_accent: binding.user,
+                        state: RowState {
+                            selected: index == help.selected_index(),
+                            ..RowState::default()
+                        },
+                    },
+                )?;
+            }
+            PaletteBody::AgentAccess(access) => {
+                let Some(entry) = access.rows().get(index) else {
+                    continue;
+                };
+                paint_row(
+                    painter,
+                    palette,
+                    rect,
+                    &ListRow {
+                        title: &entry.title,
+                        matched: title_match(&entry.title, query),
+                        chips: &[],
+                        chip_column: false,
+                        trailing: &entry.status,
+                        trailing_accent: false,
+                        state: RowState {
+                            selected: index == access.selected_index(),
+                            ..RowState::default()
+                        },
+                    },
+                )?;
+            }
         }
     }
+    Ok(())
+}
+
+/// Where a list row's title goes in `row` (buffer px), for a line that
+/// lines up with the titles.
+fn title_column(painter: &mut ChromePainter<'_>, row: Rect) -> Result<Rect> {
+    let cell = painter.cell(ChromeTextStyle::Regular)?;
+    Ok(row_columns(row, painter.scaled(ROW_PADDING), cell.0, 0, 0).title)
+}
+
+/// The detail line under a list in `rect` (buffer px): a rule along its
+/// top and `text` in secondary text where the titles start.
+fn paint_detail_line(
+    painter: &mut ChromePainter<'_>,
+    palette: &SessionPickerPalette,
+    rect: Rect,
+    text: Option<&str>,
+) -> Result<()> {
+    let rule = Rect {
+        height: painter.border().min(rect.height),
+        ..rect
+    };
+    painter.fill(rule, opaque(palette.frame));
+    let Some(text) = text else {
+        return Ok(());
+    };
+    let clip = title_column(painter, rect)?;
+    painter.text(
+        text,
+        ChromeTextStyle::Regular,
+        clip,
+        PickerTextAlignment::Left,
+        palette.secondary,
+    )
+}
+
+/// One command row: its title with the query's characters marked, its
+/// binding's chips at the end, or a live badge, or its group while a query
+/// filters the list. Selected, hovered, pressed, disabled, and Terminate in
+/// danger.
+fn paint_command_row(
+    painter: &mut ChromePainter<'_>,
+    palette: &SessionPickerPalette,
+    rect: Rect,
+    command: BuiltInCommandId,
+    state: &CommandPaletteUi,
+    keymap: &ResolvedKeymap,
+    pressed: Option<BuiltInCommandId>,
+) -> Result<()> {
+    let enabled = state.command_enabled(command);
+    let descriptor = command_descriptor(command);
+    let badge = state.badge(command);
+    let chips = if badge.is_some() {
+        Vec::new()
+    } else {
+        shortcut_chips(descriptor.shortcut(keymap))
+    };
+    let query = state.query();
+    let trailing = match &badge {
+        Some(badge) => badge.as_str(),
+        None if chips.is_empty() && !query.is_empty() => descriptor.category.group_label(),
+        None => "",
+    };
+    paint_row(
+        painter,
+        palette,
+        rect,
+        &ListRow {
+            title: descriptor.title,
+            matched: title_match(descriptor.title, query),
+            chips: &chips,
+            chip_column: false,
+            trailing,
+            trailing_accent: badge.is_some(),
+            state: RowState {
+                selected: enabled && state.selected_command() == Some(command),
+                hovered: enabled && state.hovered() == Some(command),
+                pressed: enabled && pressed == Some(command),
+                disabled: !enabled,
+                danger: enabled && command.destructive(),
+            },
+        },
+    )
 }
 
 /// The selected row's fill and accent rail.
@@ -864,151 +934,6 @@ fn paint_selected_row(painter: &mut ChromePainter<'_>, rect: Rect, palette: &Ses
         },
         opaque(palette.selected_rail),
     );
-}
-
-/// The key bindings' or Agent access's read-only rows.
-fn paint_list_rows(
-    painter: &mut ChromePainter<'_>,
-    layout: &CommandPaletteLayout,
-    palette: &SessionPickerPalette,
-    list_rows: &[ListRowText<'_>],
-    selected_index: usize,
-) -> Result<()> {
-    for (offset, row) in layout.rows.iter().enumerate() {
-        let index = layout.visible_start.saturating_add(offset);
-        let Some(list_row) = list_rows.get(index) else {
-            continue;
-        };
-        let rect = painter.buffer_rect(row.rect);
-        let is_selected = index == selected_index;
-        if is_selected {
-            paint_selected_row(painter, rect, palette);
-        }
-        let (primary, secondary) = palette.row_text(is_selected, false);
-        if row.category.width > 0 {
-            let clip = painter.buffer_rect(row.category);
-            painter.text(
-                list_row.category,
-                ChromeTextStyle::Regular,
-                clip,
-                PickerTextAlignment::Left,
-                secondary,
-            )?;
-        }
-        let clip = painter.buffer_rect(row.title);
-        painter.text(
-            if layout.compact {
-                list_row.compact
-            } else {
-                list_row.title
-            },
-            if is_selected {
-                ChromeTextStyle::Bold
-            } else {
-                ChromeTextStyle::Regular
-            },
-            clip,
-            PickerTextAlignment::Left,
-            primary,
-        )?;
-        if !layout.compact {
-            let clip = painter.buffer_rect(row.shortcut);
-            painter.text_keep_end(list_row.trailing, ChromeTextStyle::Regular, clip, secondary)?;
-        }
-    }
-    Ok(())
-}
-
-/// The command rows: selected, hovered, pressed, disabled, and Terminate in
-/// danger.
-fn paint_command_rows(
-    painter: &mut ChromePainter<'_>,
-    layout: &CommandPaletteLayout,
-    palette: &SessionPickerPalette,
-    state: &CommandPaletteUi,
-    keymap: &ResolvedKeymap,
-    pressed: Option<BuiltInCommandId>,
-) -> Result<()> {
-    let inset = painter.scaled(CONTENT_INSET);
-    let selected = state.selected_command();
-    for row in &layout.rows {
-        let rect = painter.buffer_rect(row.rect);
-        let enabled = state.command_enabled(row.command);
-        let is_selected = enabled && selected == Some(row.command);
-        if is_selected {
-            paint_selected_row(painter, rect, palette);
-        } else if enabled && state.hovered() == Some(row.command) {
-            painter.blend(rect, translucent(palette.selected_fill, ROW_HOVER_ALPHA));
-        }
-        if enabled && pressed == Some(row.command) {
-            painter.blend(rect, translucent(palette.selected_rail, ROW_PRESS_ALPHA));
-        }
-        let highlighted = enabled
-            && !is_selected
-            && (state.hovered() == Some(row.command) || pressed == Some(row.command));
-        let (row_primary, row_secondary) = palette.row_text(is_selected, highlighted);
-        let primary = if enabled {
-            row_primary
-        } else {
-            palette.secondary
-        };
-        if is_selected {
-            let marker = Rect {
-                x: rect.x.saturating_add(inset / 2),
-                width: painter.scaled(20),
-                ..rect
-            };
-            painter.text(
-                "›",
-                ChromeTextStyle::Bold,
-                marker,
-                PickerTextAlignment::Left,
-                primary,
-            )?;
-        }
-        let descriptor = command_descriptor(row.command);
-        if row.category.width > 0 {
-            let clip = painter.buffer_rect(row.category);
-            painter.text(
-                descriptor.category.label(),
-                ChromeTextStyle::Regular,
-                clip,
-                PickerTextAlignment::Left,
-                row_secondary,
-            )?;
-        }
-        let clip = painter.buffer_rect(row.title);
-        painter.text(
-            descriptor.title,
-            if is_selected {
-                ChromeTextStyle::Bold
-            } else {
-                ChromeTextStyle::Regular
-            },
-            clip,
-            PickerTextAlignment::Left,
-            row_label_color(
-                palette,
-                enabled && row.command.destructive(),
-                is_selected,
-                highlighted,
-                primary,
-            ),
-        )?;
-        if !layout.compact {
-            let clip = painter.buffer_rect(row.shortcut);
-            let badge = state.badge(row.command);
-            painter.text_keep_end(
-                badge
-                    .as_deref()
-                    .unwrap_or_else(|| descriptor.shortcut(keymap)),
-                ChromeTextStyle::Regular,
-                clip,
-                row_secondary,
-            )?;
-        }
-    }
-    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1558,7 +1483,7 @@ mod tests {
     use super::{
         super::{
             super::{ChromeText, text::chrome_maximum_cell_height},
-            chrome_box::{BOX_LABEL_INSET, truncate_text_start},
+            chrome_box::BOX_LABEL_INSET,
             picker::picker_buffer_rect as buffer_rect,
         },
         *,
@@ -1607,7 +1532,6 @@ mod tests {
         style: ChromeTextStyle,
         scale: u32,
         clip_width: u32,
-        keep_end: bool,
     ) {
         let mut canvas = vec![0_u8; 4];
         let mut painter = ChromePainter::new(cache, context, &mut canvas, 1, 1, scale, 1);
@@ -1617,13 +1541,9 @@ mod tests {
             width: clip_width,
             height: 1,
         };
-        if keep_end {
-            painter.text_keep_end(source, style, clip, 0).unwrap();
-        } else {
-            painter
-                .text(source, style, clip, PickerTextAlignment::Left, 0)
-                .unwrap();
-        }
+        painter
+            .text(source, style, clip, PickerTextAlignment::Left, 0)
+            .unwrap();
         painter.finish();
     }
 
@@ -1678,7 +1598,6 @@ mod tests {
             assert!(line.y.saturating_add(line.height) <= body.y.saturating_add(body.height));
         }
     }
-
     #[test]
     fn layout_is_bounded_selected_visible_and_hit_targets_are_half_open() {
         let commands = vec![
@@ -1686,95 +1605,151 @@ mod tests {
             BuiltInCommandId::SplitHorizontal,
             BuiltInCommandId::SplitVertical,
         ];
-        for content in [
-            Rect {
-                x: 0,
-                y: 34,
-                width: 960,
-                height: 566,
-            },
-            Rect {
-                x: 0,
-                y: 34,
-                width: 360,
-                height: 240,
-            },
-        ] {
-            let layout =
-                command_palette_layout(content, &commands, 2, 0, PaletteShape::Commands).unwrap();
-            assert!(layout.panel.x >= content.x && layout.panel.y >= content.y);
-            assert!(layout.panel.x + layout.panel.width <= content.x + content.width);
-            assert!(layout.panel.y + layout.panel.height <= content.y + content.height);
-            assert!(layout.rows.iter().any(|row| row.command == commands[2]));
-            for row in &layout.rows {
-                assert_eq!(row.rect.height, ROW_HEIGHT - ROW_GUTTER_Y * 2);
-                // Rows fill the inside of the frame.
-                assert_eq!(row.rect.x, layout.panel.x + BOX_EDGE);
-                assert_eq!(
-                    row.rect.x + row.rect.width + BOX_EDGE,
-                    layout.panel.x + layout.panel.width
-                );
-                assert!(row.rect.y >= layout.rule.y + layout.rule.height);
-                assert!(row.title.x >= row.rect.x + CONTENT_INSET);
-                // A 560 px palette gives its titles the category's room.
-                assert_eq!(row.category.width, 0);
-                if !layout.compact {
-                    assert!(row.title.x >= row.category.x + row.category.width);
+        for groups in [&[][..], &["dojo", "pane", "pane"][..]] {
+            for content in [
+                Rect {
+                    x: 0,
+                    y: 34,
+                    width: 960,
+                    height: 566,
+                },
+                Rect {
+                    x: 0,
+                    y: 34,
+                    width: 360,
+                    height: 240,
+                },
+            ] {
+                let layout = command_palette_layout(
+                    content,
+                    &commands,
+                    groups,
+                    2,
+                    0,
+                    PaletteShape::Commands,
+                )
+                .unwrap();
+                assert!(layout.panel.x >= content.x && layout.panel.y >= content.y);
+                assert!(layout.panel.x + layout.panel.width <= content.x + content.width);
+                assert!(layout.panel.y + layout.panel.height <= content.y + content.height);
+                assert!(layout.rows.iter().any(|row| row.command == commands[2]));
+                let mut y = layout.list.y;
+                for (offset, row) in layout.rows.iter().enumerate() {
+                    let index = layout.visible_start + offset;
+                    // A header sits right above the row that starts its
+                    // group, and rows follow one another without gaps.
+                    match row.header {
+                        Some((header, label)) => {
+                            assert_eq!(label, groups[index]);
+                            assert_eq!((header.y, header.height), (y, GROUP_HEIGHT));
+                            assert_eq!((header.x, header.width), (row.rect.x, row.rect.width));
+                            y += GROUP_HEIGHT;
+                        }
+                        None => assert!(!starts_group(groups, index)),
+                    }
+                    assert_eq!((row.rect.y, row.rect.height), (y, ROW_HEIGHT));
+                    y += ROW_HEIGHT;
+                    // Rows fill the inside of the frame.
+                    assert_eq!(row.rect.x, layout.panel.x + BOX_EDGE);
                     assert_eq!(
-                        row.shortcut.width,
-                        (row.rect.width / 4).min(SHORTCUT_COLUMN_WIDTH)
+                        row.rect.x + row.rect.width + BOX_EDGE,
+                        layout.panel.x + layout.panel.width
                     );
-                    assert!(row.shortcut.width > 60);
+                    assert!(row.rect.y >= layout.rule.y + layout.rule.height);
+                    assert_eq!(
+                        command_palette_hit_test(
+                            &layout,
+                            (f64::from(row.rect.x), f64::from(row.rect.y))
+                        ),
+                        Some(row.command)
+                    );
+                    assert_ne!(
+                        command_palette_hit_test(
+                            &layout,
+                            (
+                                f64::from(row.rect.x + row.rect.width),
+                                f64::from(row.rect.y)
+                            )
+                        ),
+                        Some(row.command)
+                    );
+                    if let Some((header, _)) = row.header {
+                        // A header is not a hit target.
+                        assert_eq!(
+                            command_palette_hit_test(
+                                &layout,
+                                (f64::from(header.x), f64::from(header.y))
+                            ),
+                            None
+                        );
+                    }
                 }
-                assert_eq!(
-                    command_palette_hit_test(
-                        &layout,
-                        (f64::from(row.rect.x), f64::from(row.rect.y))
-                    ),
-                    Some(row.command)
-                );
-                assert_ne!(
-                    command_palette_hit_test(
-                        &layout,
-                        (
-                            f64::from(row.rect.x + row.rect.width),
-                            f64::from(row.rect.y)
-                        )
-                    ),
-                    Some(row.command)
-                );
+                assert!(y <= layout.list.y + layout.list.height);
             }
         }
     }
 
     /// Every command's title fits its slot whole in the 560 px palette with
-    /// the default chrome cell, bold as when it is selected.
+    /// the default chrome cell, beside its binding's chips.
     #[test]
     fn every_command_title_fits_the_560_px_palette() {
+        use super::super::chrome_rows::chips_width;
+
         let content = Rect {
             x: 0,
             y: 0,
             width: 1280,
             height: 800,
         };
-        let layout =
-            command_palette_layout(content, BuiltInCommandId::ALL, 0, 0, PaletteShape::Commands)
-                .unwrap();
+        let layout = command_palette_layout(
+            content,
+            BuiltInCommandId::ALL,
+            &[],
+            0,
+            0,
+            PaletteShape::Commands,
+        )
+        .unwrap();
         assert_eq!(layout.panel.width, 560);
-        let slot = buffer_rect(layout.rows[0].title, 120);
         let render_context = RenderContext::new(u16::MAX);
-        for descriptor in BuiltInCommandId::ALL
-            .iter()
-            .map(|id| command_descriptor(*id))
-        {
-            for style in [ChromeTextStyle::Regular, ChromeTextStyle::Bold] {
-                let width = text_width(&render_context, descriptor.title, style, 120);
-                assert!(
-                    width <= slot.width,
-                    "{:?} ({width} px) does not fit {} px",
-                    descriptor.title,
-                    slot.width
+        let mut cache = SessionPickerTextCache::default();
+        let regular = cache
+            .cell_metrics(&render_context, ChromeTextStyle::Regular, 120, 1)
+            .unwrap();
+        let bold = cache
+            .cell_metrics(&render_context, ChromeTextStyle::Bold, 120, 1)
+            .unwrap();
+        let row = buffer_rect(layout.rows[0].rect, 120);
+        for keymap in [
+            ResolvedKeymap::default(),
+            crate::keymap::built_in_keymap(crate::keymap::KeymapProfile::OmarchyTmux),
+        ] {
+            for descriptor in BuiltInCommandId::ALL
+                .iter()
+                .map(|id| command_descriptor(*id))
+            {
+                let chips = shortcut_chips(descriptor.shortcut(&keymap));
+                let columns = row_columns(
+                    row,
+                    ROW_PADDING,
+                    regular.0,
+                    0,
+                    chips_width(&chips, regular, 120),
                 );
+                for (style, cell) in [
+                    (ChromeTextStyle::Regular, regular),
+                    (ChromeTextStyle::Bold, bold),
+                ] {
+                    let width = text_width(&render_context, descriptor.title, style, 120);
+                    assert!(
+                        width <= columns.title.width
+                            && super::super::chrome_rows::text_cells(descriptor.title) * cell.0
+                                <= columns.title.width,
+                        "{:?} ({width} px) does not fit {} px",
+                        descriptor.title,
+                        columns.title.width
+                    );
+                }
             }
         }
     }
@@ -1816,7 +1791,8 @@ mod tests {
                     PaletteBody::Commands => state.filtered().to_vec(),
                     _ => vec![BuiltInCommandId::RecentSessions; rows],
                 };
-                let Some(layout) = command_palette_layout(content, &filtered, 0, 0, shape) else {
+                let Some(layout) = command_palette_layout(content, &filtered, &[], 0, 0, shape)
+                else {
                     continue;
                 };
                 let mut canvas = vec![0_u8; usize::try_from(width * height * 4).unwrap()];
@@ -1852,7 +1828,7 @@ mod tests {
         };
         let commands = [BuiltInCommandId::NewDojo];
         let layout =
-            command_palette_layout(content, &commands, 0, 0, PaletteShape::Commands).unwrap();
+            command_palette_layout(content, &commands, &[], 0, 0, PaletteShape::Commands).unwrap();
         assert!(layout.rows.is_empty());
         assert_eq!(layout.list.height, 0);
         assert_eq!(
@@ -1864,7 +1840,8 @@ mod tests {
         assert!(layout.list.y + layout.list.height <= layout.panel.y + layout.panel.height);
         // Agent access's detail line needs more than this.
         assert!(
-            command_palette_layout(content, &commands, 0, 0, PaletteShape::AgentAccess).is_none()
+            command_palette_layout(content, &commands, &[], 0, 0, PaletteShape::AgentAccess)
+                .is_none()
         );
     }
 
@@ -1886,7 +1863,7 @@ mod tests {
                 (PaletteShape::BindingHelp, 640),
                 (PaletteShape::AgentAccess, 560),
             ] {
-                let layout = command_palette_layout(content, commands, 0, 0, shape).unwrap();
+                let layout = command_palette_layout(content, commands, &[], 0, 0, shape).unwrap();
                 let panel = layout.panel;
                 assert_eq!(panel.width, (width - 48).min(maximum), "{width}x{height}");
                 assert_eq!(panel.x - content.x, (width - panel.width) / 2);
@@ -1894,8 +1871,7 @@ mod tests {
                 let lowest = content.y + height - 16 - panel.height;
                 assert_eq!(panel.y, (content.y + top).min(lowest), "{width}x{height}");
                 assert!(panel.y >= content.y + 16);
-                assert_eq!(layout.compact, panel.width < 420);
-                assert_eq!(layout.detail.is_some(), shape == PaletteShape::AgentAccess);
+                assert_eq!(layout.detail.is_some(), shape != PaletteShape::Commands);
                 if let Some(detail) = layout.detail {
                     assert_eq!(detail.y, layout.list.y + layout.list.height);
                     assert_eq!(
@@ -1913,9 +1889,10 @@ mod tests {
             height: 1000,
         };
         let layout =
-            command_palette_layout(content, commands, 0, 0, PaletteShape::Commands).unwrap();
+            command_palette_layout(content, commands, &[], 0, 0, PaletteShape::Commands).unwrap();
         assert_eq!(layout.panel.y, 150);
-        assert_eq!(layout.rows.len(), COMMAND_PALETTE_PAGE_ITEMS);
+        assert_eq!(layout.rows.len(), LIST_MAXIMUM_ROWS);
+        assert_eq!(layout.list.height, LIST_HEIGHT);
     }
 
     /// The input line sits inside the frame below the title, whatever the
@@ -1929,9 +1906,15 @@ mod tests {
             width: 960,
             height: 566,
         };
-        let layout =
-            command_palette_layout(content, BuiltInCommandId::ALL, 0, 0, PaletteShape::Commands)
-                .unwrap();
+        let layout = command_palette_layout(
+            content,
+            BuiltInCommandId::ALL,
+            &[],
+            0,
+            0,
+            PaletteShape::Commands,
+        )
+        .unwrap();
         for scale in [120, 150, 180, 240] {
             for context in [
                 RenderContext::new(u16::MAX),
@@ -2047,10 +2030,72 @@ mod tests {
             width: 640,
             height: 400,
         };
-        let layout = command_palette_layout(content, &[], 0, 0, PaletteShape::Commands).unwrap();
+        let layout =
+            command_palette_layout(content, &[], &[], 0, 0, PaletteShape::Commands).unwrap();
         assert!(layout.rows.is_empty());
         assert_eq!(layout.list.height, ROW_HEIGHT);
         assert_eq!(command_palette_hit_test(&layout, (10.0, 100.0)), None);
+    }
+
+    /// With no query the palette shows its groups and keeps one height
+    /// while it scrolls; filtering lists one ranked run without headers,
+    /// ten rows at most, and a short result is only as tall as its rows.
+    #[test]
+    fn the_palette_groups_without_a_query_and_lists_flat_while_filtering() {
+        let content = Rect {
+            x: 0,
+            y: 34,
+            width: 960,
+            height: 900,
+        };
+        let layout = |state: &CommandPaletteUi| {
+            command_palette_layout(
+                content,
+                state.filtered(),
+                &state.row_groups(),
+                state.selected_index(),
+                state.visible_start(),
+                PaletteShape::Commands,
+            )
+            .unwrap()
+        };
+        let mut state = CommandPaletteUi::new(palette_context());
+        let groups = state.row_groups();
+        let first = layout(&state);
+        assert_eq!(first.list.height, LIST_HEIGHT);
+        assert_eq!(first.rows[0].header.map(|(_, label)| label), Some("app"));
+        assert!(first.rows.len() <= LIST_MAXIMUM_ROWS);
+        assert!(first.rows.iter().filter(|row| row.header.is_some()).count() >= 2);
+        assert!(
+            window_height(
+                &groups,
+                first.visible_start,
+                first.visible_start + first.rows.len()
+            ) <= LIST_HEIGHT
+        );
+        // Moving to the end scrolls; the panel keeps its place and height.
+        assert!(state.select_last());
+        let last = layout(&state);
+        assert_eq!(last.panel, first.panel);
+        assert!(
+            last.rows
+                .iter()
+                .any(|row| Some(row.command) == state.selected_command())
+        );
+        assert!(last.visible_start > 0);
+        // Filtering: no headers, ten rows at most.
+        assert!(state.append_text("o"));
+        assert!(state.row_groups().is_empty());
+        assert!(state.filtered().len() > LIST_MAXIMUM_ROWS);
+        let filtered = layout(&state);
+        assert!(filtered.rows.iter().all(|row| row.header.is_none()));
+        assert_eq!(filtered.rows.len(), LIST_MAXIMUM_ROWS);
+        assert_eq!(filtered.list.height, LIST_HEIGHT);
+        while state.backspace() {}
+        assert!(state.append_text("split"));
+        let few = layout(&state);
+        assert_eq!(few.rows.len(), 2);
+        assert_eq!(few.list.height, 2 * ROW_HEIGHT);
     }
 
     #[test]
@@ -2193,7 +2238,6 @@ mod tests {
                 ChromeTextStyle::Regular,
                 scale,
                 clip,
-                false,
             );
             assert!(
                 cache.drawn().any(|(text, _)| text.ends_with('…')
@@ -2205,8 +2249,7 @@ mod tests {
     }
 
     #[test]
-    fn editable_fields_keep_their_caret_and_shortcuts_keep_their_key() {
-        assert_eq!(truncate_text_start("Ctrl+Shift+P", 7), "…hift+P");
+    fn editable_fields_keep_their_caret() {
         assert_eq!(editable_text("> ", "dojo", 20), "> dojo_");
         assert_eq!(editable_text("> ", "my-long-dojo-name", 12), "> …ojo-name_");
 
@@ -2224,17 +2267,6 @@ mod tests {
             let short = editable_field_text(&mut painter, "> ", "dojo", clip).unwrap();
             assert_eq!(short, "> dojo_");
             painter.finish();
-            let shortcut = "Ctrl+Shift+PageDown";
-            paint_label(
-                &mut cache,
-                &context,
-                shortcut,
-                ChromeTextStyle::Regular,
-                scale,
-                cell * 10,
-                true,
-            );
-            assert!(cache.contains_source("…+PageDown"), "scale {scale}");
         }
     }
 
@@ -2248,7 +2280,8 @@ mod tests {
 
         for height in [
             TAB_MENU_ROW_HEIGHT,
-            ROW_HEIGHT - ROW_GUTTER_Y * 2,
+            ROW_HEIGHT,
+            GROUP_HEIGHT,
             INPUT_HEIGHT,
             DETAIL_HEIGHT,
             PREVIEW_LINE_HEIGHT,
@@ -2280,15 +2313,7 @@ mod tests {
                 let clip = buffer_rect(layout.rows[0].title, scale);
                 for style in [ChromeTextStyle::Regular, ChromeTextStyle::Bold] {
                     let full_width = text_width(&context, action.title, style, scale);
-                    paint_label(
-                        &mut cache,
-                        &context,
-                        action.title,
-                        style,
-                        scale,
-                        clip.width,
-                        false,
-                    );
+                    paint_label(&mut cache, &context, action.title, style, scale, clip.width);
                     let (drawn, _) = cache
                         .drawn()
                         .find(|(text, drawn_style)| {
@@ -2687,6 +2712,7 @@ mod tests {
         let layout = command_palette_layout(
             content,
             state.filtered(),
+            &state.row_groups(),
             state.selected_index(),
             state.visible_start(),
             PaletteShape::Commands,
@@ -2728,6 +2754,10 @@ mod tests {
         assert!(cache.contains_source(&state.total().to_string()));
         assert!(cache.contains_source("type a command"));
         assert!(cache.contains_source("›"));
+        // Groups with no query, and the bindings as chips.
+        assert!(cache.contains_source("app"));
+        assert!(cache.contains_source("ctrl"));
+        assert!(!cache.contains_source("APP"));
         for (key, verb) in PaletteBody::Commands.legend() {
             assert!(cache.contains_source(key) && cache.contains_source(verb));
         }
@@ -2737,6 +2767,7 @@ mod tests {
         let help_layout = command_palette_layout(
             content,
             &vec![BuiltInCommandId::RecentSessions; help.rows().len()],
+            &help.row_groups(),
             0,
             0,
             PaletteShape::BindingHelp,
@@ -2751,6 +2782,15 @@ mod tests {
         assert!(cache.contains_source("filter by key or name"));
         assert!(cache.contains_source("key bindings"));
         assert!(cache.contains_source("pgup pgdn"));
+        // Human titles, chips, and the selected binding's config name and
+        // source on the detail line.
+        let selected = &help.rows()[help.selected_index()];
+        assert!(cache.contains_source(&selected.title));
+        assert!(cache.contains_source(&selected.chips[0]));
+        assert!(cache.contains_source(selected.group));
+        assert!(cache.drawn().any(|(text, _)| text == selected.detail
+            || (text.ends_with('…') && selected.detail.starts_with(text.trim_end_matches('…')))));
+        assert!(!cache.contains_source(&selected.action));
 
         // The access list paints its rows as words, never colour alone.
         let lair_id = LairId::new();
@@ -2763,6 +2803,7 @@ mod tests {
         let access_layout = command_palette_layout(
             content,
             &vec![BuiltInCommandId::RecentSessions; access.rows().len()],
+            &access.row_groups(),
             0,
             0,
             PaletteShape::AgentAccess,
@@ -2776,7 +2817,7 @@ mod tests {
         );
         assert!(cache.contains_source("search agent access"));
         assert!(cache.contains_source("agent access"));
-        assert!(cache.contains_source("ALWAYS"));
+        assert!(cache.contains_source("always"));
         assert!(cache.contains_source("not connected"));
         // The detail line, whole or ending in `…`.
         let footer = access.footer();
@@ -2792,7 +2833,7 @@ mod tests {
 
         assert!(help.append_text("definitely absent xyz"));
         let empty_layout =
-            command_palette_layout(content, &[], 0, 0, PaletteShape::BindingHelp).unwrap();
+            command_palette_layout(content, &[], &[], 0, 0, PaletteShape::BindingHelp).unwrap();
         // The cache keeps three frames; repaint until the help list's
         // placeholder has aged out.
         for _ in 0..3 {
@@ -2824,6 +2865,7 @@ mod tests {
         let layout = command_palette_layout(
             content,
             state.filtered(),
+            &state.row_groups(),
             state.selected_index(),
             state.visible_start(),
             PaletteShape::Commands,
@@ -2862,6 +2904,25 @@ mod tests {
             let [_, red, green, blue] = color.to_be_bytes();
             [blue, green, red, u8::MAX]
         };
+        // The matched characters are bold, the rest of the title regular.
+        assert!(
+            cache
+                .drawn()
+                .any(|(text, style)| text == "Split" && style == ChromeTextStyle::Bold)
+        );
+        assert!(cache.drawn().any(|(text, style)| {
+            text == " pane horizontally" && style == ChromeTextStyle::Regular
+        }));
+        // The selected row is the selection fill edge to edge: no rail.
+        let selected = layout.rows[0].rect;
+        assert_eq!(state.selected_command(), Some(layout.rows[0].command));
+        for x in [selected.x, selected.x + 1, selected.x + selected.width - 1] {
+            assert_eq!(
+                pixel(x, selected.y + selected.height - 1),
+                bgra(palette.selected_fill),
+                "x {x}"
+            );
+        }
         let cell = cache
             .cell_metrics(&render_context, ChromeTextStyle::Regular, 120, 1)
             .unwrap();
@@ -2910,6 +2971,7 @@ mod tests {
         let layout = command_palette_layout(
             content,
             state.filtered(),
+            &state.row_groups(),
             state.selected_index(),
             state.visible_start(),
             PaletteShape::Commands,

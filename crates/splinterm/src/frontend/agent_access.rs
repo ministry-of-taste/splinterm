@@ -23,7 +23,8 @@ use super::{action_menu::TerminationDecision, text_edit::BoundedTextEditor};
 
 /// Entries one Window reads at most: eight inventory pages.
 pub const MAX_WINDOW_ACCESS_ENTRIES: usize = 512;
-pub(crate) const AGENT_ACCESS_PAGE_ITEMS: usize = 7;
+/// Rows the Agent access list shows at once at most.
+pub(crate) const AGENT_ACCESS_PAGE_ITEMS: usize = 10;
 const MAX_QUERY_BYTES: usize = 256;
 const MAX_QUERY_SCALARS: usize = 128;
 /// Scalars of one agent, workspace, or rule name shown in a row.
@@ -414,6 +415,17 @@ const fn category(entry: &AccessEntry) -> &'static str {
     }
 }
 
+/// The group header an entry shows under while nothing filters the list.
+const fn group(entry: &AccessEntry) -> &'static str {
+    match entry.kind {
+        AccessEntryKind::Remembered => "always",
+        AccessEntryKind::WorkspaceSession => "while open",
+        AccessEntryKind::Once => "once",
+        AccessEntryKind::Pending => "waiting",
+        AccessEntryKind::PersistentPolicy => "policy",
+    }
+}
+
 fn title(entry: &AccessEntry) -> String {
     let agent = agent_text(entry);
     let access = access_text(entry);
@@ -548,6 +560,8 @@ pub fn revoke_target(entry: &AccessEntry) -> Option<AccessRevokeTarget> {
 pub(crate) struct AccessRow {
     pub(crate) key: AccessEntryKey,
     pub(crate) category: &'static str,
+    /// The group header it shows under.
+    pub(crate) group: &'static str,
     pub(crate) title: String,
     pub(crate) status: String,
     /// The row in one line, for a narrow palette.
@@ -574,6 +588,7 @@ impl AccessRow {
         Self {
             key: entry.key.clone(),
             category,
+            group: group(entry),
             compact: format!("{category} · {title} — {status}"),
             title,
             status,
@@ -708,6 +723,16 @@ impl AgentAccessUi {
         &self.rows
     }
 
+    /// Each listed row's group header, when the list shows groups: with no
+    /// query. Filtering shows one list, so this is empty.
+    pub(crate) fn row_groups(&self) -> Vec<&'static str> {
+        if self.editor.text().is_empty() {
+            self.rows.iter().map(|row| row.group).collect()
+        } else {
+            Vec::new()
+        }
+    }
+
     /// How many entries the list shows with no query.
     pub(crate) fn total(&self) -> usize {
         self.all_rows.len()
@@ -719,6 +744,12 @@ impl AgentAccessUi {
 
     pub(crate) const fn visible_start(&self) -> usize {
         self.visible_start
+    }
+
+    /// Where the layout put the list's window, so scrolling goes on from
+    /// there.
+    pub(crate) fn set_visible_start(&mut self, visible_start: usize) {
+        self.visible_start = visible_start;
     }
 
     pub(crate) fn query(&self) -> &str {

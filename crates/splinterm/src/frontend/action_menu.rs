@@ -17,7 +17,8 @@ use super::{
 
 const MAX_QUERY_BYTES: usize = 256;
 const MAX_QUERY_SCALARS: usize = 128;
-pub(crate) const COMMAND_PALETTE_PAGE_ITEMS: usize = 7;
+/// Rows the palette shows at once at most.
+pub(crate) const COMMAND_PALETTE_PAGE_ITEMS: usize = 10;
 const MAX_DOJO_NAME_BYTES: usize = 128;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1325,6 +1326,24 @@ impl CommandCategory {
             Self::Control => "CONTROL",
         }
     }
+
+    /// The group header the palette shows above this category's commands.
+    pub(crate) const fn group_label(self) -> &'static str {
+        match self {
+            Self::Application => "app",
+            Self::Dojos => "dojo",
+            Self::Tabs => "tab",
+            Self::Panes => "pane",
+            Self::History => "history",
+            Self::View => "view",
+            Self::Control => "control",
+        }
+    }
+
+    /// Where the category's group sits in the palette, first to last.
+    const fn order(self) -> u8 {
+        self as u8
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1989,6 +2008,48 @@ fn descriptor_matches(descriptor: BuiltInCommandDescriptor, query: &str) -> bool
             .any(|keyword| keyword.contains(&query))
 }
 
+/// The commands the palette lists for `query`, in its order. With no query
+/// they go by group, so each group's header shows once; while filtering they
+/// are ranked: a title that starts with the query, then one with a word that
+/// does, then one that contains it, then a keyword or group match. Ties keep
+/// the catalog's order.
+fn palette_commands(retention: LairRetention, query: &str) -> Vec<BuiltInCommandId> {
+    let mut commands = BUILT_IN_COMMANDS
+        .iter()
+        .copied()
+        .filter(|descriptor| lifecycle_command_visible(descriptor.id, retention))
+        .filter(|descriptor| descriptor_matches(*descriptor, query))
+        .collect::<Vec<_>>();
+    if query.is_empty() {
+        commands.sort_by_key(|descriptor| descriptor.category.order());
+    } else {
+        let query = query.to_lowercase();
+        commands.sort_by_key(|descriptor| title_rank(descriptor.title, &query));
+    }
+    commands
+        .into_iter()
+        .map(|descriptor| descriptor.id)
+        .collect()
+}
+
+/// How well `title` matches the lowercase `query`: 0 when it starts with
+/// it, 1 when one of its words does, 2 when it contains it, 3 otherwise.
+fn title_rank(title: &str, query: &str) -> u8 {
+    let title = title.to_lowercase();
+    if title.starts_with(query) {
+        0
+    } else if title
+        .match_indices(query)
+        .any(|(index, _)| title[..index].ends_with(' '))
+    {
+        1
+    } else if title.contains(query) {
+        2
+    } else {
+        3
+    }
+}
+
 /// Whether a palette command is disabled while the Window is paused for a
 /// daemon handoff (Plan 0061 M3.12a): it changes the session, opens a prompt
 /// that only leads to such a change, attaches another Lair's panes, takes or
@@ -2156,11 +2217,7 @@ impl CommandPaletteUi {
                 MAX_QUERY_SCALARS,
                 false,
             ),
-            filtered: BUILT_IN_COMMANDS
-                .iter()
-                .filter(|command| lifecycle_command_visible(command.id, lair_retention))
-                .map(|command| command.id)
-                .collect(),
+            filtered: palette_commands(lair_retention, ""),
             selected: 0,
             visible_start: 0,
             hovered: None,
@@ -2185,6 +2242,18 @@ impl CommandPaletteUi {
         &self.filtered
     }
 
+    /// Each listed command's group header, when the palette shows groups:
+    /// with no query. Filtering shows one ranked list, so this is empty.
+    pub(crate) fn row_groups(&self) -> Vec<&'static str> {
+        if !self.editor.text().is_empty() {
+            return Vec::new();
+        }
+        self.filtered
+            .iter()
+            .map(|command| command_descriptor(*command).category.group_label())
+            .collect()
+    }
+
     /// How many commands the palette lists with no query: its match count's
     /// total.
     pub(crate) fn total(&self) -> usize {
@@ -2200,6 +2269,12 @@ impl CommandPaletteUi {
 
     pub(crate) const fn visible_start(&self) -> usize {
         self.visible_start
+    }
+
+    /// Where the layout put the list's window, so scrolling goes on from
+    /// there.
+    pub(crate) fn set_visible_start(&mut self, visible_start: usize) {
+        self.visible_start = visible_start;
     }
 
     pub(crate) fn selected_command(&self) -> Option<BuiltInCommandId> {
@@ -2336,15 +2411,7 @@ impl CommandPaletteUi {
 
     fn refilter(&mut self) {
         let selected = self.selected_command();
-        self.filtered = BUILT_IN_COMMANDS
-            .iter()
-            .copied()
-            .filter(|descriptor| {
-                lifecycle_command_visible(descriptor.id, self.context.lair_retention)
-            })
-            .filter(|descriptor| descriptor_matches(*descriptor, self.editor.text()))
-            .map(|descriptor| descriptor.id)
-            .collect();
+        self.filtered = palette_commands(self.context.lair_retention, self.editor.text());
         self.selected = selected
             .filter(|selected| self.command_enabled(*selected))
             .and_then(|selected| {
@@ -3109,6 +3176,53 @@ mod tests {
         );
     }
 
+    /// With no query the palette lists its commands group by group, each
+    /// group once; while filtering it ranks them by title and shows no
+    /// groups.
+    #[test]
+    fn the_palette_groups_without_a_query_and_ranks_while_filtering() {
+        let mut palette = palette();
+        let groups = palette.row_groups();
+        assert_eq!(groups.len(), palette.filtered().len());
+        let orders = palette
+            .filtered()
+            .iter()
+            .map(|command| command_descriptor(*command).category.order())
+            .collect::<Vec<_>>();
+        assert!(orders.windows(2).all(|pair| pair[0] <= pair[1]));
+        let mut seen = Vec::new();
+        for (index, group) in groups.iter().enumerate() {
+            if index == 0 || groups[index - 1] != *group {
+                assert!(!seen.contains(group), "{group} shows twice");
+                seen.push(*group);
+            }
+        }
+        assert_eq!(seen.first(), Some(&"app"));
+        assert!(seen.contains(&"dojo") && seen.contains(&"pane"));
+
+        assert!(palette.append_text("zoom"));
+        assert!(palette.row_groups().is_empty());
+        assert_eq!(
+            palette.filtered()[..4],
+            [
+                BuiltInCommandId::ZoomIn,
+                BuiltInCommandId::ZoomOut,
+                BuiltInCommandId::ToggleFocusedPaneZoom,
+                BuiltInCommandId::ResetZoom,
+            ]
+        );
+        let ranks = palette
+            .filtered()
+            .iter()
+            .map(|command| title_rank(command_descriptor(*command).title, "zoom"))
+            .collect::<Vec<_>>();
+        assert!(ranks.windows(2).all(|pair| pair[0] <= pair[1]), "{ranks:?}");
+        assert_eq!(title_rank("Zoom in", "zoom"), 0);
+        assert_eq!(title_rank("Reset zoom", "zoom"), 1);
+        assert_eq!(title_rank("Unzoomed", "zoom"), 2);
+        assert_eq!(title_rank("Close tab", "zoom"), 3);
+    }
+
     #[test]
     fn lifecycle_commands_show_only_actions_applicable_to_the_captured_lair() {
         let disposable = palette();
@@ -3266,11 +3380,9 @@ mod tests {
             palette.selected_command(),
             Some(BuiltInCommandId::DenyControlTransfer)
         );
+        // Titles that start with the query rank first.
         assert!(palette.append_text("zoom"));
-        assert_eq!(
-            palette.selected_command(),
-            Some(BuiltInCommandId::ToggleFocusedPaneZoom)
-        );
+        assert_eq!(palette.selected_command(), Some(BuiltInCommandId::ZoomIn));
         assert!(!palette.select_first());
         assert!(palette.select_last());
         assert_eq!(

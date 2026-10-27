@@ -528,6 +528,15 @@ a hostile program running as your account.
   moved into the top edge, ahead of the count, and stay there as the Window
   narrows. Every modal list and prompt now dims the Window by the same
   half-strength scrim.
+- Their rows are one line, 28 px: the selected row on the selection fill
+  with its title and `›` in the accent (no side rail, no bold), the
+  characters you typed in the accent and bold, and each binding as key
+  chips such as `ctrl` `shift` `p`. With nothing typed, the command palette
+  and the key bindings list go group by group under small headers; typing
+  lists the best title matches first, with the group named on rows that
+  have no binding. The key bindings list puts its chips first, says what
+  each binding does in words, and shows the selected one's config name and
+  source under the list. Each list shows up to ten rows.
 - Trusted dialogs (access consent, upgrade, restart) take your theme and its
   `[colors]` keys as they open, always opaque: the frame in `warning`, the
   left "no" button's edge and label in `danger` and the right "yes" button's

@@ -4,20 +4,46 @@ use unicode_casefold::UnicodeCaseFold;
 
 use crate::{
     frontend::{action_menu::action_search_metadata, text_edit::BoundedTextEditor},
-    keymap::{ActionId, ResolvedKeymap},
+    keymap::{ActionId, BindingSource, ResolvedKeymap},
 };
 
-pub(crate) const BINDING_HELP_PAGE_ITEMS: usize = 7;
+/// Rows the key bindings list shows at once at most.
+pub(crate) const BINDING_HELP_PAGE_ITEMS: usize = 10;
 const MAX_QUERY_BYTES: usize = 256;
 const MAX_QUERY_SCALARS: usize = 128;
+
+/// The key bindings list's groups in order: each search category and the
+/// group header it shows under.
+const GROUPS: [(&str, &str); 8] = [
+    ("APP", "app"),
+    ("DOJO", "dojo"),
+    ("TAB", "tab"),
+    ("PANE", "pane"),
+    ("HISTORY", "history"),
+    ("VIEW", "view"),
+    ("CONTROL", "control"),
+    ("COPY MODE", "copy mode"),
+];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct BindingHelpRow {
     id: usize,
     pub(crate) shortcut: String,
+    /// The action's config name, as a keybinding file names it.
     pub(crate) action: String,
     pub(crate) source: String,
     pub(crate) compact: String,
+    /// What the binding does, in words.
+    pub(crate) title: String,
+    /// Its keys, one chip each: `ctrl`, `shift`, `↵`.
+    pub(crate) chips: Vec<String>,
+    /// The group header it shows under.
+    pub(crate) group: &'static str,
+    /// The selected row's detail line: config name and source.
+    pub(crate) detail: String,
+    /// Whether the binding comes from the person's own file.
+    pub(crate) user: bool,
+    group_order: usize,
     search_fields: Vec<String>,
 }
 
@@ -37,6 +63,109 @@ struct MatchScore {
     penalty: usize,
 }
 
+/// One copy-mode key row: its keys as text and as chips, what it does, and
+/// its search keywords.
+struct CopyRow {
+    shortcut: &'static str,
+    action: &'static str,
+    title: &'static str,
+    compact: &'static str,
+    chips: &'static [&'static str],
+    keywords: &'static [&'static str],
+}
+
+const COPY_ROWS: [CopyRow; 3] = [
+    CopyRow {
+        shortcut: "copy: h/j/k/l · arrows · w/b/e · 0/$ · Home/End · PgUp/PgDn",
+        action: "move copy cursor",
+        title: "Move the copy cursor",
+        compact: "copy: h/j/k/l · arrows · w/b/e · 0/$ · Home/End · PgUp/PgDn — move",
+        chips: &["h", "j", "k", "l", "w", "b", "e", "0", "$"],
+        keywords: &["copy", "cursor", "move", "navigate", "history"],
+    },
+    CopyRow {
+        shortcut: "copy: v",
+        action: "begin selection",
+        title: "Start selection",
+        compact: "copy: v — begin selection",
+        chips: &["v"],
+        keywords: &["copy", "select", "selection", "mark", "history"],
+    },
+    CopyRow {
+        shortcut: "copy: y / Escape",
+        action: "copy and exit / cancel",
+        title: "Copy and exit, or cancel",
+        compact: "copy: y / Escape — copy and exit / cancel",
+        chips: &["y", "esc"],
+        keywords: &["copy", "yank", "exit", "cancel", "history"],
+    },
+];
+
+/// A binding's keys as chips, from its display (`Ctrl+Shift+Enter`,
+/// `Prefix ?`): lowercase modifiers and names, glyphs for the arrows and
+/// Enter, one chip per key.
+pub(crate) fn shortcut_chips(display: &str) -> Vec<String> {
+    let mut chips = Vec::new();
+    for word in display.split_whitespace() {
+        let mut keys = word.split('+').collect::<Vec<_>>();
+        // `Ctrl++` names the plus key itself.
+        if keys.len() >= 2 && keys.ends_with(&["", ""]) {
+            keys.truncate(keys.len() - 2);
+            keys.push("+");
+        }
+        chips.extend(
+            keys.into_iter()
+                .filter(|key| !key.is_empty())
+                .map(chip_token),
+        );
+    }
+    chips
+}
+
+fn chip_token(key: &str) -> String {
+    let glyph = match key {
+        "Enter" | "Return" => "↵",
+        "Escape" => "esc",
+        "Left" => "←",
+        "Right" => "→",
+        "Up" => "↑",
+        "Down" => "↓",
+        "PageUp" => "pgup",
+        "PageDown" => "pgdn",
+        "Plus" => "+",
+        "Minus" => "-",
+        "Equal" => "=",
+        "Slash" => "/",
+        "Backslash" => "\\",
+        "BracketLeft" => "[",
+        "BracketRight" => "]",
+        "Insert" => "ins",
+        other => return other.to_lowercase(),
+    };
+    glyph.to_owned()
+}
+
+/// The group a search category shows under, and where that group sits.
+fn group(category: &str) -> (usize, &'static str) {
+    GROUPS
+        .iter()
+        .position(|(label, _)| *label == category)
+        .map_or((0, GROUPS[0].1), |index| (index, GROUPS[index].1))
+}
+
+/// A config name in words, for an action without a title of its own:
+/// `pane.split-right` reads "Split right".
+fn humanized(config_name: &str) -> String {
+    let name = config_name
+        .rsplit_once('.')
+        .map_or(config_name, |(_, name)| name)
+        .replace('-', " ");
+    let mut characters = name.chars();
+    characters.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(characters).collect()
+    })
+}
+
 impl BindingHelpUi {
     pub(crate) fn new(keymap: &ResolvedKeymap) -> Self {
         let mut rows = keymap
@@ -53,12 +182,23 @@ impl BindingHelpUi {
                     });
                 let shortcut = binding.display().to_owned();
                 let source = binding.source().short_label();
+                let (group_order, group) = group(category);
                 BindingHelpRow {
                     id,
+                    chips: shortcut_chips(&shortcut),
                     shortcut: shortcut.clone(),
                     action: config_name.to_owned(),
+                    detail: format!("{config_name} · {source}"),
                     source: source.clone(),
                     compact: format!("{shortcut} — {config_name}"),
+                    title: if label == config_name {
+                        humanized(config_name)
+                    } else {
+                        label.to_owned()
+                    },
+                    group,
+                    user: matches!(binding.source(), BindingSource::User { .. }),
+                    group_order,
                     search_fields: search_fields(
                         label,
                         config_name,
@@ -70,44 +210,34 @@ impl BindingHelpUi {
                 }
             })
             .collect::<Vec<_>>();
-        let mut push_copy_row =
-            |shortcut: &str, action: &str, compact: &str, keywords: &'static [&'static str]| {
-                let id = rows.len();
-                let source = "copy mode".to_owned();
-                rows.push(BindingHelpRow {
-                    id,
-                    shortcut: shortcut.into(),
-                    action: action.into(),
-                    source: source.clone(),
-                    compact: compact.into(),
-                    search_fields: search_fields(
-                        action,
-                        action,
-                        shortcut,
-                        &source,
-                        "COPY MODE",
-                        keywords,
-                    ),
-                });
-            };
-        push_copy_row(
-            "copy: h/j/k/l · arrows · w/b/e · 0/$ · Home/End · PgUp/PgDn",
-            "move copy cursor",
-            "copy: h/j/k/l · arrows · w/b/e · 0/$ · Home/End · PgUp/PgDn — move",
-            &["copy", "cursor", "move", "navigate", "history"],
-        );
-        push_copy_row(
-            "copy: v",
-            "begin selection",
-            "copy: v — begin selection",
-            &["copy", "select", "selection", "mark", "history"],
-        );
-        push_copy_row(
-            "copy: y / Escape",
-            "copy and exit / cancel",
-            "copy: y / Escape — copy and exit / cancel",
-            &["copy", "yank", "exit", "cancel", "history"],
-        );
+        for copy in &COPY_ROWS {
+            let id = rows.len();
+            let source = "copy mode".to_owned();
+            let (group_order, group) = group("COPY MODE");
+            rows.push(BindingHelpRow {
+                id,
+                shortcut: copy.shortcut.into(),
+                action: copy.action.into(),
+                source: source.clone(),
+                compact: copy.compact.into(),
+                title: copy.title.into(),
+                chips: copy.chips.iter().map(|chip| (*chip).to_owned()).collect(),
+                group,
+                detail: copy.shortcut.into(),
+                user: false,
+                group_order,
+                search_fields: search_fields(
+                    copy.action,
+                    copy.action,
+                    copy.shortcut,
+                    &source,
+                    "COPY MODE",
+                    copy.keywords,
+                ),
+            });
+        }
+        // Group by group, in the keymap's order within each.
+        rows.sort_by_key(|row| row.group_order);
         let mut ui = Self {
             all_rows: rows.clone(),
             rows,
@@ -143,6 +273,16 @@ impl BindingHelpUi {
         &self.rows
     }
 
+    /// Each listed row's group header, when the list shows groups: with no
+    /// query. Filtering shows one ranked list, so this is empty.
+    pub(crate) fn row_groups(&self) -> Vec<&'static str> {
+        if self.editor.text().is_empty() {
+            self.rows.iter().map(|row| row.group).collect()
+        } else {
+            Vec::new()
+        }
+    }
+
     /// How many bindings the list shows with no query.
     pub(crate) fn total(&self) -> usize {
         self.all_rows.len()
@@ -154,6 +294,12 @@ impl BindingHelpUi {
 
     pub(crate) const fn visible_start(&self) -> usize {
         self.visible_start
+    }
+
+    /// Where the layout put the list's window, so scrolling goes on from
+    /// there.
+    pub(crate) fn set_visible_start(&mut self, visible_start: usize) {
+        self.visible_start = visible_start;
     }
 
     #[cfg(test)]
@@ -606,6 +752,61 @@ mod tests {
                 help.rows().iter().any(|row| row.action == action),
                 "query {shortcut:?} did not find {action}"
             );
+        }
+    }
+
+    #[test]
+    fn chips_are_lowercase_keys_with_glyph_arrows_and_enter() {
+        let chips = shortcut_chips;
+        assert_eq!(chips("Ctrl+Shift+Enter"), ["ctrl", "shift", "↵"]);
+        assert_eq!(chips("Ctrl+Shift+P"), ["ctrl", "shift", "p"]);
+        assert_eq!(chips("Prefix ?"), ["prefix", "?"]);
+        assert_eq!(chips("Prefix Shift+C"), ["prefix", "shift", "c"]);
+        assert_eq!(chips("Ctrl+Shift+PageDown"), ["ctrl", "shift", "pgdn"]);
+        assert_eq!(chips("Shift+Up"), ["shift", "↑"]);
+        assert_eq!(chips("Alt+Left"), ["alt", "←"]);
+        assert_eq!(chips("Ctrl+Plus"), ["ctrl", "+"]);
+        assert_eq!(chips("Ctrl++"), ["ctrl", "+"]);
+        assert_eq!(chips("Escape"), ["esc"]);
+        assert_eq!(chips("Ctrl+Tab"), ["ctrl", "tab"]);
+        assert!(chips("").is_empty());
+        assert_eq!(humanized("pane.split-right"), "Split right");
+        assert_eq!(humanized("reload"), "Reload");
+    }
+
+    /// Rows say what a binding does in words, show its keys as chips, go
+    /// group by group with copy mode last, and carry the config name and
+    /// source for the detail line.
+    #[test]
+    fn rows_have_human_titles_chips_groups_and_a_detail_line() {
+        for profile in [KeymapProfile::Splinterm, KeymapProfile::OmarchyTmux] {
+            let keymap = built_in_keymap(profile);
+            let mut help = BindingHelpUi::new(&keymap);
+            let groups = help.row_groups();
+            assert_eq!(groups.len(), help.rows().len());
+            let orders = help
+                .rows()
+                .iter()
+                .map(|row| row.group_order)
+                .collect::<Vec<_>>();
+            assert!(orders.windows(2).all(|pair| pair[0] <= pair[1]));
+            assert_eq!(groups.last(), Some(&"copy mode"));
+            for row in help.rows() {
+                assert!(!row.chips.is_empty(), "{}", row.action);
+                assert!(!row.title.is_empty());
+                assert_ne!(row.title, row.action, "{}", row.action);
+                assert!(GROUPS.iter().any(|(_, group)| *group == row.group));
+                assert!(!row.user);
+                if row.group == "copy mode" {
+                    assert_eq!(row.detail, row.shortcut);
+                } else {
+                    assert_eq!(row.detail, format!("{} · {}", row.action, row.source));
+                    assert_eq!(row.chips, shortcut_chips(&row.shortcut));
+                }
+            }
+            assert!(help.append_text("split"));
+            assert!(help.row_groups().is_empty());
+            assert!(!help.rows().is_empty());
         }
     }
 }
