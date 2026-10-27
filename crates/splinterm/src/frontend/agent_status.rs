@@ -250,6 +250,22 @@ pub(crate) fn splint_text(status: &NavigationAgentStatus) -> String {
     text
 }
 
+/// One Splint's status for the Explorer footer's short status line, e.g.
+/// "needs input · waiting for approval" or "working · stale 2 min". The
+/// detail is the agent's own text and keeps its case.
+pub(crate) fn splint_brief(status: &NavigationAgentStatus) -> String {
+    let mut text = state_text(status.state).to_lowercase();
+    if status.stale {
+        let minutes = status.stale_minutes.unwrap_or(0).max(1);
+        let _ = write!(text, " · stale {minutes} min");
+    }
+    if let Some(detail) = &status.detail {
+        text.push_str(" · ");
+        text.push_str(detail);
+    }
+    text
+}
+
 /// Words Explorer search matches for a Splint, e.g. `needs input needs_input`.
 pub(crate) fn search_terms(status: &NavigationAgentStatus) -> String {
     let state = state_text(status.state).to_lowercase();
@@ -317,9 +333,20 @@ impl AgentAggregate {
         )
     }
 
-    /// Counts in words for the Explorer footer and accessibility, e.g.
-    /// "1 needs input, 2 working".
+    /// Counts in words for accessibility, e.g. "1 needs input, 2 working".
     pub(crate) fn counts_words(&self) -> String {
+        self.counts().join(", ")
+    }
+
+    /// Counts for the Explorer footer's short status line, most urgent
+    /// first, e.g. "1 needs input · 2 working".
+    pub(crate) fn counts_brief(&self) -> String {
+        self.counts().join(" · ")
+    }
+
+    /// One phrase per group, most urgent first; a state no Splint is in is
+    /// left out.
+    fn counts(&self) -> Vec<String> {
         self.groups
             .iter()
             .map(|(state, is_stale, count)| {
@@ -329,8 +356,7 @@ impl AgentAggregate {
                     if *is_stale { " (stale)" } else { "" }
                 )
             })
-            .collect::<Vec<_>>()
-            .join(", ")
+            .collect()
     }
 
     /// One Dojo tab badge: the aggregate glyph, a count when more than one

@@ -185,20 +185,33 @@ every row:
 
 A column appears only while some row in the Explorer uses it, except the live
 dot, which is always there. A long name is ellipsized before the first icon in
-its row; it never runs under one. The footer spells out the selected row in
-words, for example *work · Agent connected · Running · Saved · 1 working*,
-wrapping onto a second line between words and ending in an ellipsis after the
-last whole word that fits. These are the same words that assistive technology
-reads for the row. Below them, the footer shows the search field while you
-search, a navigation notice such as *Refreshing navigation…* when there is
-one, and otherwise who has the keyboard: *↑↓ move · F filter · Esc terminal*
-while the Explorer has focus, *Click rows · terminal input active* while the
-terminal does.
+its row; it never runs under one. The footer's first line is a short status
+for the selected row that says only what the row does not already show, in
+this order: a waiting access request (*asking for access*), agent states
+(needs input, then error, working, done, idle), a lifecycle out of the
+ordinary, the retention or *open here*, why the row cannot be opened, and
+which agents can reach it, for example
+*1 needs input · 2 working · saved · agent connected*. It never repeats the
+name, which is highlighted just above, and it leaves out the ordinary: a
+running row's lifecycle, a disposable Lair's retention (every new Lair starts
+disposable), and the current Dojo's attachment. A plain running row leaves the
+line blank. The line never wraps; what does not fit ends in an ellipsis after
+the last whole word that fits, so an agent's detail keeps its first words, for
+example *needs input · waiting for…*. Assistive technology still reads the
+full words for every row, ordinary states included, for example *Agent
+connected · Running · Saved · 1 working*. The footer's second line shows the
+search field
+while you search, a navigation notice such as *Refreshing navigation…* when
+there is one, and otherwise who has the keyboard: *↑↓ move · F filter · Esc
+terminal* while the Explorer has focus, *Terminal has keys · click to move*
+while the terminal does. Clicking a row gives the Explorer the keys.
 
 Parent rows summarize runtime state independently of retention and window
-attachment. A saved Lair can still be running. A Dojo marked **Not open here**
-can also be running; it is not attached to this Window. **Current** identifies
-the active Dojo, while **Open here** identifies another attached tab. A stopped
+attachment. A saved Lair can still be running, and a Dojo not open in this
+Window can be running too. The current-row dot marks the active Dojo, the
+footer says *open here* for another Dojo attached to this Window as a tab,
+and it says nothing about attachment otherwise. Assistive technology reads
+**Current**, **Open here**, or **Not open here** for every Dojo. A stopped
 restorable Dojo opens a restore confirmation rather than reporting a permission
 failure. Detached starting or mixed-state Dojos still cannot be attached;
 Explorer explains this lifecycle restriction instead of calling it a denial.
@@ -279,15 +292,18 @@ has keyboard focus: in an unfocused Window, with `SPLINTERM_REDUCED_MOTION=1`,
 and for a stale working status it holds its first frame, `⠋`. Every other
 state is a static icon.
 
-- **Splint rows** show the icon in the agent status column, and the footer adds
-  the state to the selected row's words, for example *shell · Running · Needs
-  input · waiting for approval*. The agent's free-text detail appears only
-  there, wrapped and ellipsized between words.
+- **Splint rows** show the icon in the agent status column, and the footer's
+  status line names the selected row's state, for example *needs input ·
+  waiting for approval*, or *working · stale 2 min* for a stale report. The
+  agent's free-text detail appears only there and in the row's accessible
+  words, ellipsized when the line is too narrow.
 - **Dojo and Lair rows** show the most urgent icon of the Splints inside them,
-  and their words count each state, joined with ", ", for example *editor ·
-  Running · Current · 1 needs input, 2 working*. Priority is needs input, then
-  error, working, done, and idle; stale statuses rank last. The icon column
-  appears while any Splint in the Explorer has a status.
+  and the footer counts the states that some Splint is in, most urgent first,
+  for example *1 needs input · 2 working*. Their accessible words join the
+  counts with ", ", for example *Running · Current · 1 needs input, 2
+  working*. Priority is needs input, then error, working, done, and idle;
+  stale statuses rank last. The icon column appears while any Splint in the
+  Explorer has a status.
 - **Dojo tabs** show one badge before the label: the most urgent icon, with a
   count when several Splints share it (the needs-input icon followed by `2`).
   The badge takes space from the label, never from the close control, so on a
@@ -296,9 +312,9 @@ state is a static icon.
 - **Stale.** `working` and `needs input` expire unless the agent reports again,
   after two minutes by default. Splinterm then keeps the last icon (a stale
   working spinner stops on its first frame) and adds the clock icon after it
-  in the Explorer column and the tab badge, and the Explorer's words read
-  *Working · stale (no report for 2 min)*. A stale status is dropped after 15
-  more minutes.
+  in the Explorer column and the tab badge; the Explorer's accessible words
+  read *Working · stale (no report for 2 min)* and its footer *working ·
+  stale 2 min*. A stale status is dropped after 15 more minutes.
 - **Unavailable.** While the Explorer's view of the daemon is stale or
   disconnected, the words read *Agent status unavailable* and the column is
   blank instead of showing the last value.
