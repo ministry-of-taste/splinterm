@@ -159,9 +159,9 @@ use crate::renderer::{
     PaletteShape, PickerHitTarget, RenderContext, SessionPickerPurpose, SessionPickerTextCache,
     SnapshotFrame, SnapshotOverlays, TabContextMenuLayout, TextRow, background_bgra,
     chrome_panel_fill, chrome_panel_palette, clear_snapshot_caches, command_palette_hit_test,
-    command_palette_layout, command_palette_row_hit_test, dojo_prompt_hit_test, dojo_prompt_layout,
-    explorer_minimum_docked_terminal_width, fill_rect, history_overlay_layout,
-    lair_explorer_action_hit_test, lair_explorer_agent_hit_test,
+    command_palette_layout, command_palette_row_hit_test, dojo_prompt_button_width,
+    dojo_prompt_hit_test, dojo_prompt_layout, explorer_minimum_docked_terminal_width, fill_rect,
+    history_overlay_layout, lair_explorer_action_hit_test, lair_explorer_agent_hit_test,
     lair_explorer_agents_label_hit_test, lair_explorer_chrome_cell_width,
     lair_explorer_disclosure_hit_test, lair_explorer_filter_hit_test,
     lair_explorer_footer_hit_test, lair_explorer_hit_test, lair_explorer_shown_layout,
@@ -12582,7 +12582,6 @@ impl App {
         });
         let inline_picker_open = self.modal.inline_picker_open();
         let command_palette_open = self.modal.command_palette.is_some();
-        let dojo_prompt_open = self.modal.dojo_prompt.is_some();
         let picker_layout = if inline_picker_open {
             let content = self.content_rect();
             let picker = self
@@ -12642,11 +12641,24 @@ impl App {
                 palette.set_visible_start(start);
             }
         }
-        let dojo_prompt_layout = self
-            .modal
-            .dojo_prompt
-            .as_ref()
-            .and_then(|prompt| dojo_prompt_layout(self.content_rect(), prompt));
+        let dojo_prompt_layout = if let Some(prompt) = self.modal.dojo_prompt.as_ref() {
+            let button_width = dojo_prompt_button_width(
+                &mut self.modal.dojo_prompt_text_cache,
+                &self.presentation.render_context,
+                prompt,
+                self.surface.scale_120,
+                self.presentation.renderer_generation,
+            )?;
+            dojo_prompt_layout(self.content_rect(), prompt, button_width)
+        } else {
+            None
+        };
+        // A Window too short or narrow for the prompt shows none, so none
+        // stays open to take keys for choices nobody can see: it cancels.
+        if dojo_prompt_layout.is_none() {
+            self.close_dojo_prompt();
+        }
+        let dojo_prompt_open = self.modal.dojo_prompt.is_some();
         let tab_context_menu_layout = if let Some(menu) = self.modal.tab_context_menu.as_ref() {
             // Chips name keys for the current tab, Lair or pane only.
             let keymap = menu.is_current().then_some(&self.input.keymap);

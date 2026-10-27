@@ -143,7 +143,7 @@ impl App {
             WindowAccessUpdate::RevokeAllCounts { counts, recounted } => {
                 let prompt = if counts_are_empty(counts) {
                     RevokeAccessUi::notice(
-                        "REVOKE ALL ACCESS",
+                        "revoke all access",
                         if recounted {
                             "Nothing is left to revoke, and nothing was revoked."
                         } else {
@@ -169,9 +169,9 @@ impl App {
                 if all || failed {
                     return self.show_access_prompt(RevokeAccessUi::notice(
                         if failed {
-                            "AGENT ACCESS NOT FULLY REVOKED"
+                            "agent access not fully revoked"
                         } else {
-                            "AGENT ACCESS REVOKED"
+                            "agent access revoked"
                         },
                         &message,
                     ));

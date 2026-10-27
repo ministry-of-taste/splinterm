@@ -577,6 +577,19 @@ a hostile program running as your account.
   the current one. A menu is as wide as its widest row, and a Window too
   short for every row closes the menu rather than hide it. The palette's
   "Rename current tab…" and "Rename current Lair…" gain their ellipsis.
+- Prompts (rename, Terminate, Restore, saved-layout preview, Revoke) are
+  the same box too, centred and at most 440 px wide: the title in the
+  frame, lowercase, and the keys in its bottom edge (`←→ choose  ↵ confirm
+  esc cancel`; a rename's `↵ save  esc cancel`). Buttons are bracketed,
+  right-aligned and centred on their labels, `[ Cancel ]` chosen first on
+  the selection fill; a chosen Terminate is on the danger fill, and an
+  unchosen one keeps its label in danger, so neither button disappears. A
+  rename is a sunken field with the current name, the accent `›` and a
+  block cursor, and no longer looks like a selected row. A saved-layout
+  preview is an aligned table of each pane's Dojo, title and directory
+  (keeping the directory's end) instead of a wrapped paragraph, and no
+  longer lists split ratios. Terminate says "Running programs are
+  stopped." A Window too small for a prompt cancels it rather than hide it.
 - Trusted dialogs (access consent, upgrade, restart) take your theme and its
   `[colors]` keys as they open, always opaque: the frame in `warning`, the
   left "no" button's edge and label in `danger` and the right "yes" button's

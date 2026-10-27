@@ -217,6 +217,14 @@ termination requires at least one live pane and a complete captured incarnation
 set, including exited panes. Rename dialogs use current authoritative names, and
 Restore/Terminate require confirmation with Cancel selected initially. Escape
 cancels a menu or dialog.
+
+Prompts sit centred over the dimmed Window, in the same box as the palette,
+with their keys in the bottom edge. A rename is a sunken field holding the
+current name: Enter saves, Escape cancels. A confirmation asks its question
+over `[ Cancel ]` and the confirming button, right-aligned; the arrows or Tab
+choose, Enter confirms, Escape cancels. A chosen Terminate is filled in the
+danger colour. A saved-layout preview lists each pane as a row of Dojo, pane
+and directory. A Window too small to show a prompt cancels it.
 Stale targets are rejected rather than redirected to the active item.
 
 Launcher-generated `terminal-<timestamp>-<pid>` names appear as compact **Lair 1**,

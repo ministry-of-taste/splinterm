@@ -1228,60 +1228,55 @@ fn collect_scoped_lair_targets(
     Ok(targets)
 }
 
+/// A saved Lair's preview for its prompts: a summary line, then one
+/// tab-separated row per Splint (its Dojo, its title, its directory), which
+/// the prompt lines up as a table, then where it came from and what a
+/// restore leaves out.
 fn saved_layout_preview(lair: &splinterm_core::Lair) -> String {
-    fn leaves(node: &LayoutNode, depth: usize, output: &mut Vec<String>) {
-        match node {
-            LayoutNode::Leaf(splint) => {
-                let recipe = if let Some(executable) = splint.command.first() {
-                    format!("Application: {executable}")
-                } else if splint.launch.shell.is_some() || splint.command.is_empty() {
-                    "Shell".to_owned()
+    /// A table cell: control characters, tabs and newlines among them,
+    /// become spaces, so a name cannot break the row.
+    fn cell(text: &str) -> String {
+        text.chars()
+            .map(|character| {
+                if character.is_control() {
+                    ' '
                 } else {
-                    "No restorable recipe".to_owned()
-                };
-                output.push(format!(
-                    "{}{} — {} — {}",
-                    "  ".repeat(depth),
-                    splint.title,
-                    recipe,
-                    splint.cwd.display()
-                ));
-            }
-            LayoutNode::Branch {
-                axis,
-                ratio,
-                first,
-                second,
-            } => {
-                output.push(format!(
-                    "{}{:?} split {}/1000",
-                    "  ".repeat(depth),
-                    axis,
-                    ratio.get()
-                ));
-                leaves(first, depth + 1, output);
-                leaves(second, depth + 1, output);
+                    character
+                }
+            })
+            .collect()
+    }
+    fn leaves(dojo: &str, node: &LayoutNode, output: &mut Vec<String>) {
+        match node {
+            LayoutNode::Leaf(splint) => output.push(format!(
+                "{}\t{}\t{}",
+                cell(dojo),
+                cell(&splint.title),
+                cell(&splint.cwd.display().to_string())
+            )),
+            LayoutNode::Branch { first, second, .. } => {
+                leaves(dojo, first, output);
+                leaves(dojo, second, output);
             }
         }
     }
+    let dojos = lair.dojos.len();
+    let retention = format!("{:?}", lair.retention).to_lowercase();
     let mut lines = vec![format!(
-        "{} — {:?} — {} Dojo(s)",
-        lair.name,
-        lair.retention,
-        lair.dojos.len()
+        "{} · {retention} · {dojos} Dojo{}",
+        cell(&lair.name),
+        if dojos == 1 { "" } else { "s" }
     )];
     for dojo in &lair.dojos {
-        lines.push(format!(
-            "{} ({} Splints)",
-            dojo.name,
-            dojo.root.splint_count()
-        ));
-        leaves(&dojo.root, 1, &mut lines);
+        leaves(&dojo.name, &dojo.root, &mut lines);
     }
     if let Some(provenance) = &lair.provenance {
         lines.push(format!("Origin: {provenance}"));
     }
-    lines.push("Not restored: terminal/scrollback bodies, process memory, shell state, environment, clipboard, images".to_owned());
+    lines.push(
+        "Not restored: scrollback, processes, shell state, environment, clipboard, images."
+            .to_owned(),
+    );
     lines.join("\n")
 }
 
@@ -4413,6 +4408,7 @@ mod tests {
         let splint = lair.dojos[0].root.find_splint_mut(splint_id).unwrap();
         splint.state = SplintState::Exited(0);
         splint.last_incarnation = Some(4);
+        splint.title = "vim\tmain".to_owned();
         let target = build_lair_prompt_target(
             revision,
             &lair,
@@ -4422,6 +4418,19 @@ mod tests {
         .unwrap();
         assert_eq!(target.targets.len(), 1);
         assert_eq!(target.targets[0].splint_id, splint_id);
+        // The preview: a summary line, one tab-separated row per Splint
+        // (Dojo, title, directory) that the prompt lines up as a table, a
+        // title's own tab made a space, and what a restore leaves out.
+        let lines = target.preview.lines().collect::<Vec<_>>();
+        assert_eq!(lines[0], "saved · saved · 1 Dojo");
+        assert_eq!(lines[1], format!("{}\tvim main\t/tmp", lair.dojos[0].name));
+        assert_eq!(
+            lines.last().copied(),
+            Some(
+                "Not restored: scrollback, processes, shell state, environment, clipboard, images."
+            )
+        );
+        assert_eq!(lines.len(), 3);
 
         for actual in [
             LairRetention::Disposable,

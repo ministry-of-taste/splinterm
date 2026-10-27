@@ -1139,7 +1139,7 @@ impl RevokeAccessUi {
                         rule_list(&entry.policy_rules)
                     );
                 }
-                ("REVOKE “ALWAYS” ACCESS", body)
+                ("revoke “always” access", body)
             }
             AccessPrompt::All { counts, recounted } => {
                 let mut body = String::new();
@@ -1152,7 +1152,7 @@ impl RevokeAccessUi {
                 body.push_str(
                     "\nEvery agent grant of every duration ends and waiting requests are cancelled. This Window keeps working.",
                 );
-                ("REVOKE ALL ACCESS", body)
+                ("revoke all access", body)
             }
             AccessPrompt::Notice { title, body } => (*title, body.clone()),
         }
@@ -1833,7 +1833,7 @@ pub(crate) mod tests {
         };
         let mut prompt = RevokeAccessUi::all(counts, false);
         let (title, body) = prompt.title_and_body();
-        assert_eq!(title, "REVOKE ALL ACCESS");
+        assert_eq!(title, "revoke all access");
         assert!(body.starts_with(
             "This removes 2 remembered grants, and ends 1 just-this-once grant, 0 while-open grants, and 1 pending request. Policy rules are not touched."
         ));
@@ -1863,7 +1863,7 @@ pub(crate) mod tests {
             revoke_all_summary(counts, true),
             "Removed 2 remembered grants, and ended 1 just-this-once grant, 0 while-open grants, and 1 pending request. Policy rules are not touched."
         );
-        let notice = RevokeAccessUi::notice("REVOKE ALL ACCESS", "Nothing to revoke.");
+        let notice = RevokeAccessUi::notice("revoke all access", "Nothing to revoke.");
         assert!(notice.is_notice());
         assert_eq!(notice.decision(), None);
         assert_eq!(notice.confirmation_label(), None);

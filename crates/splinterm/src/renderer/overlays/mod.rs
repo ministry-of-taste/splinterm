@@ -7,3 +7,4 @@ pub(super) mod history;
 pub(super) mod menu_box;
 pub(super) mod picker;
 pub(super) mod picker_box;
+pub(super) mod prompt_box;
