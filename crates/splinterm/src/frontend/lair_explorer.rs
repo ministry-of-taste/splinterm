@@ -11,10 +11,10 @@ use super::{
     topology::LairExplorerActivationTarget,
 };
 use crate::navigation_projection::{
-    EndpointFreshness, NavigationAgentStatus, NavigationAvailability, NavigationExplorerDojo,
-    NavigationExplorerLair, NavigationExplorerSplint, NavigationExplorerSplintTarget,
-    NavigationExplorerTarget, NavigationExplorerView, NavigationLifecycle, NavigationNodeId,
-    WindowAttachment,
+    EndpointFreshness, NavigationAction, NavigationAgentStatus, NavigationAvailability,
+    NavigationBlocker, NavigationExplorerDojo, NavigationExplorerLair, NavigationExplorerSplint,
+    NavigationExplorerSplintTarget, NavigationExplorerTarget, NavigationExplorerView,
+    NavigationLifecycle, NavigationNodeId, WindowAttachment,
 };
 use crate::renderer::ChromeSource;
 
@@ -128,6 +128,11 @@ pub(crate) struct LairExplorerRow {
     /// leaves out.
     pub(crate) accessible_status: String,
     pub(crate) level: usize,
+    /// A Lair row's place among every Lair of the view, counting from 0,
+    /// whatever the filter or search hides: the rail numbers a Lair whose
+    /// name has no letter or digit by it, so its mark never shifts as other
+    /// Lairs come and go from the list. 0 for Dojo and Splint rows.
+    pub(crate) ordinal: usize,
     pub(crate) expanded: Option<bool>,
     pub(crate) current: bool,
     pub(crate) enabled: bool,
@@ -137,6 +142,10 @@ pub(crate) struct LairExplorerRow {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LairExplorerDecision {
     Toggle(NavigationNodeId),
+    /// A rail row whose Lair has no Dojo that opens at once expanded the
+    /// Explorer to the tree with that Lair selected and open: the terminal
+    /// beside it narrows, and the keys stay in the Explorer.
+    ExpandRail(NavigationNodeId),
     OpenDojo(NavigationExplorerTarget),
     FocusSplint(NavigationExplorerSplintTarget),
 }
@@ -156,7 +165,7 @@ enum LairExplorerPending {
 impl LairExplorerPending {
     const fn from_decision(decision: LairExplorerDecision) -> Option<Self> {
         match decision {
-            LairExplorerDecision::Toggle(_) => None,
+            LairExplorerDecision::Toggle(_) | LairExplorerDecision::ExpandRail(_) => None,
             LairExplorerDecision::OpenDojo(target) => Some(Self::Dojo(target)),
             LairExplorerDecision::FocusSplint(target) => Some(Self::Splint(target)),
         }
@@ -950,7 +959,7 @@ impl LairExplorerUi {
         let searching = !query.is_empty();
         let mut rows = Vec::new();
         let filter = self.effective_filter();
-        for lair in &view.lairs {
+        for (ordinal, lair) in view.lairs.iter().enumerate() {
             if (filter == LairExplorerFilter::Saved && !lair.retention.is_protected())
                 || (filter == LairExplorerFilter::Live
                     && !lair.dojos.iter().any(|dojo| self.includes_dojo(dojo)))
@@ -996,13 +1005,15 @@ impl LairExplorerUi {
                 retention_brief(lair.retention),
                 mark_text(whole, part, 0).map(|text| lower_first(&text)),
             ]);
-            // A rail row switches to its Lair, so it waits while that switch
-            // is pending and is disabled with no Dojo to open.
+            // A rail row switches to its Lair, or expands the tree where
+            // nothing opens at once, so it waits only while its switch is
+            // pending. A refresh, which disables every Dojo for a moment,
+            // does not dim it.
             let rail_pending = self.collapsed
                 && self
                     .pending
                     .is_some_and(|pending| lair_node(pending.id()) == lair.id);
-            let enabled = !self.collapsed || (!rail_pending && rail_dojo(lair).is_some());
+            let enabled = !rail_pending;
             rows.push(LairExplorerRow {
                 id: lair.id,
                 kind: LairExplorerRowKind::Lair,
@@ -1020,7 +1031,9 @@ impl LairExplorerUi {
                 accessible_status,
                 status,
                 level: 1,
-                expanded: Some(lair_expanded),
+                ordinal,
+                // The rail has no disclosure.
+                expanded: (!self.collapsed).then_some(lair_expanded),
                 current: lair.current_here,
                 enabled,
                 pending: rail_pending,
@@ -1101,6 +1114,7 @@ impl LairExplorerUi {
             accessible_status,
             status,
             level: 2,
+            ordinal: 0,
             expanded: Some(dojo_expanded),
             current: dojo.active_here,
             enabled: enabled && !pending,
@@ -1157,6 +1171,7 @@ impl LairExplorerUi {
             accessible_status,
             status,
             level: 3,
+            ordinal: 0,
             expanded: None,
             current: splint.focused_here,
             enabled: enabled && !pending,
@@ -1301,9 +1316,13 @@ impl LairExplorerUi {
     }
 
     /// A rail row's switch to its Lair: opens the Lair's Dojo that
-    /// [`rail_dojo`] picks. `None` for a row not in the rail, a Lair with no
-    /// Dojo to open, or one whose switch is already pending.
-    fn rail_decision(&self, lair_id: NavigationNodeId) -> Option<LairExplorerDecision> {
+    /// [`rail_dojo`] picks. A Lair with no Dojo that opens at once, such as
+    /// one that only restores behind a confirmation, instead expands the
+    /// Explorer to the tree with that Lair selected and open, so its Dojo is
+    /// chosen there. `None` for a row not in the rail, one whose switch is
+    /// already pending, or a Lair whose Dojos wait on navigation, as while it
+    /// refreshes.
+    fn rail_decision(&mut self, lair_id: NavigationNodeId) -> Option<LairExplorerDecision> {
         if !self
             .rows()
             .iter()
@@ -1317,7 +1336,26 @@ impl LairExplorerUi {
             .lairs
             .iter()
             .find(|lair| lair.id == lair_id)?;
-        rail_dojo(lair).map(|dojo| LairExplorerDecision::OpenDojo(dojo.target))
+        if let Some(dojo) = rail_dojo(lair) {
+            return Some(LairExplorerDecision::OpenDojo(dojo.target));
+        }
+        if rail_waits(lair) {
+            return None;
+        }
+        self.expand_from_rail(lair_id);
+        Some(LairExplorerDecision::ExpandRail(lair_id))
+    }
+
+    /// Expands the rail to the tree with `lair_id` selected and open. A
+    /// query left in the tree that would hide that Lair is cleared.
+    fn expand_from_rail(&mut self, lair_id: NavigationNodeId) {
+        self.set_collapsed(false);
+        self.expanded.insert(lair_id);
+        if !self.rows().iter().any(|row| row.id == lair_id) {
+            self.query = BoundedTextEditor::new(String::new(), 256, 64, true);
+        }
+        self.selected = Some(lair_id);
+        self.ensure_selection_visible();
     }
 
     pub(crate) fn activation_decision(
@@ -1470,20 +1508,46 @@ const fn lair_node(id: NavigationNodeId) -> NavigationNodeId {
     }
 }
 
-/// The Dojo a rail row opens to switch to its Lair, among those that can be
-/// opened: the Lair's active Dojo here, else one open in a tab here, else a
-/// live one, else the first.
+/// Whether a Dojo opens at once, with no confirmation: it is activated or
+/// attached, never restored, which asks first.
+const fn opens_directly(dojo: &NavigationExplorerDojo) -> bool {
+    matches!(
+        dojo.target.capability.action,
+        NavigationAction::ActivateDojo | NavigationAction::AttachDojo
+    )
+}
+
+/// The Dojo a rail row opens to switch to its Lair, among those that open
+/// at once and can now: the Lair's active Dojo here, else one open in a tab
+/// here, else a live one, else the first.
 fn rail_dojo(lair: &NavigationExplorerLair) -> Option<&NavigationExplorerDojo> {
     let openable = || {
         lair.dojos
             .iter()
-            .filter(|dojo| dojo.target.capability.is_enabled())
+            .filter(|dojo| opens_directly(dojo) && dojo.target.capability.is_enabled())
     };
     openable()
         .find(|dojo| dojo.active_here)
         .or_else(|| openable().find(|dojo| dojo.attachment == WindowAttachment::Here))
         .or_else(|| openable().find(|dojo| is_live(dojo.lifecycle())))
         .or_else(|| openable().next())
+}
+
+/// Whether a rail row's Lair has a Dojo that would open at once but waits
+/// on navigation, as while it refreshes or reconnects: its click then does
+/// nothing yet, rather than expanding the tree.
+fn rail_waits(lair: &NavigationExplorerLair) -> bool {
+    lair.dojos.iter().any(|dojo| {
+        opens_directly(dojo)
+            && matches!(
+                dojo.target.capability.availability,
+                NavigationAvailability::Disabled(
+                    NavigationBlocker::Refreshing
+                        | NavigationBlocker::Stale
+                        | NavigationBlocker::Disconnected
+                )
+            )
+    })
 }
 
 const fn lifecycle_label(lifecycle: NavigationLifecycle) -> &'static str {
@@ -2066,6 +2130,54 @@ pub(super) mod tests {
         assert!(explorer.collapsed());
     }
 
+    /// A Lair row's ordinal is its place among every Lair of the view, so a
+    /// Lair the rail numbers keeps its number when a filter or a search
+    /// hides the Lairs before it. Dojo and Splint rows carry 0.
+    #[test]
+    fn lair_ordinals_ignore_the_filter_and_the_search() {
+        let mut view = view();
+        let mut beta = view.lairs[1].clone();
+        let beta_id = NavigationNodeId::Lair(LairId::new());
+        beta.id = beta_id;
+        beta.label = "beta".into();
+        beta.retention = LairRetention::Disposable;
+        view.lairs.insert(1, beta);
+        view.lairs[2].label = "__".into();
+        let unnamed = view.lairs[2].id;
+        let ordinal = |explorer: &LairExplorerUi, id| {
+            explorer
+                .rows()
+                .into_iter()
+                .find(|row| row.id == id)
+                .map(|row| row.ordinal)
+        };
+        let mut explorer = LairExplorerUi::default();
+        explorer.set_filter(LairExplorerFilter::All);
+        explorer.set_view(view);
+        explorer.toggle_visibility();
+        assert_eq!(ordinal(&explorer, beta_id), Some(1));
+        assert_eq!(ordinal(&explorer, unnamed), Some(2));
+        // Saved hides the disposable `beta` before it; the number stays.
+        explorer.set_filter(LairExplorerFilter::Saved);
+        assert_eq!(ordinal(&explorer, beta_id), None);
+        assert_eq!(ordinal(&explorer, unnamed), Some(2));
+        explorer.toggle_rail();
+        assert_eq!(ordinal(&explorer, unnamed), Some(2));
+        explorer.toggle_rail();
+        // A search that leaves it alone keeps it too, and the tree's other
+        // rows carry 0.
+        explorer.set_filter(LairExplorerFilter::All);
+        explorer.set_search("draft".to_owned());
+        assert_eq!(ordinal(&explorer, unnamed), Some(2));
+        assert!(
+            explorer
+                .rows()
+                .iter()
+                .filter(|row| row.kind != LairExplorerRowKind::Lair)
+                .all(|row| row.ordinal == 0)
+        );
+    }
+
     /// A rail row switches to its Lair: it opens the Lair's active Dojo,
     /// else one open here, else a live one, else the first that can open,
     /// and waits while that switch is pending. It has no disclosure.
@@ -2120,18 +2232,87 @@ pub(super) mod tests {
                 view.lairs[1].dojos[0].target
             ))
         );
-        // A Lair with nothing to open is disabled and switches nowhere.
+        // A Lair whose Dojos wait on navigation stays lit and switches
+        // nowhere yet.
         view.lairs[1].dojos[0].target.capability.availability =
             NavigationAvailability::Disabled(NavigationBlocker::Stale);
         explorer.set_view(view);
-        assert!(!explorer.rows()[1].enabled);
+        assert!(explorer.rows()[1].enabled);
         assert_eq!(explorer.decision(), None);
+        assert!(explorer.collapsed());
         // Expanded, the same row toggles its disclosure again.
         explorer.set_collapsed(false);
         assert!(matches!(
             explorer.decision(),
             Some(LairExplorerDecision::Toggle(_))
         ));
+    }
+
+    /// One rail click never asks to restore: a Lair whose Dojos only
+    /// restore, behind a confirmation, is skipped by the switch, and its
+    /// click expands the Explorer to the tree with that Lair selected and
+    /// open instead, so its Dojo is chosen there. A query that would hide
+    /// the Lair is cleared; one that shows it is kept. Rail rows have no
+    /// disclosure, and a refresh, which disables every Dojo for a moment,
+    /// neither dims them nor makes a click expand.
+    #[test]
+    fn rail_clicks_never_restore_and_stay_lit_through_a_refresh() {
+        let mut view = view();
+        let lairs = view.lairs.iter().map(|lair| lair.id).collect::<Vec<_>>();
+        // The second Lair's only Dojo restores; the first keeps a direct
+        // Dojo, so it still switches.
+        for dojo in &mut view.lairs[1].dojos {
+            dojo.target.capability.action = NavigationAction::PreviewRestoreDojo;
+            dojo.target.capability.availability = NavigationAvailability::Enabled;
+        }
+        let mut explorer = LairExplorerUi::default();
+        explorer.set_filter(LairExplorerFilter::All);
+        explorer.set_view(view.clone());
+        explorer.toggle_rail();
+        assert!(explorer.rows().iter().all(|row| row.expanded.is_none()));
+        explorer.select(lairs[0]);
+        assert!(matches!(
+            explorer.decision(),
+            Some(LairExplorerDecision::OpenDojo(_))
+        ));
+        // Through a refresh every row stays lit, and a click waits.
+        explorer.begin_refresh();
+        assert!(explorer.rows().iter().all(|row| row.enabled));
+        assert_eq!(explorer.decision(), None);
+        assert!(explorer.collapsed());
+        explorer.set_view(view.clone());
+        // A query left in the tree that would hide the Lair is cleared.
+        explorer.set_collapsed(false);
+        explorer.set_search("shell".into());
+        explorer.set_collapsed(true);
+        assert!(explorer.select(lairs[1]));
+        let decision = explorer.decision().unwrap();
+        assert_eq!(decision, LairExplorerDecision::ExpandRail(lairs[1]));
+        assert!(!decision.returns_focus_to_terminal());
+        assert!(!explorer.set_pending(decision));
+        assert!(!explorer.collapsed());
+        assert_eq!(explorer.selected(), Some(lairs[1]));
+        assert_eq!(explorer.query(), "");
+        let rows = explorer.rows();
+        let lair = rows.iter().position(|row| row.id == lairs[1]).unwrap();
+        assert_eq!(rows[lair].expanded, Some(true));
+        assert!(matches!(
+            rows.get(lair + 1).map(|row| row.id),
+            Some(NavigationNodeId::Dojo { .. })
+        ));
+        // A query that keeps the Lair in view is kept.
+        let mut explorer = LairExplorerUi::default();
+        explorer.set_filter(LairExplorerFilter::All);
+        explorer.set_view(view);
+        explorer.set_search("notes".into());
+        explorer.toggle_rail();
+        explorer.select(lairs[1]);
+        assert_eq!(
+            explorer.decision(),
+            Some(LairExplorerDecision::ExpandRail(lairs[1]))
+        );
+        assert_eq!(explorer.query(), "notes");
+        assert_eq!(explorer.selected(), Some(lairs[1]));
     }
 
     #[test]
@@ -2316,7 +2497,9 @@ pub(super) mod tests {
                 LairExplorerDecision::FocusSplint(target) => {
                     (LairExplorerActivationTarget::Splint(target), target.dojo_id)
                 }
-                LairExplorerDecision::Toggle(_) => panic!("expected activation"),
+                LairExplorerDecision::Toggle(_) | LairExplorerDecision::ExpandRail(_) => {
+                    panic!("expected activation")
+                }
             };
             assert!(explorer.set_pending(decision));
             let pending = explorer.pending;

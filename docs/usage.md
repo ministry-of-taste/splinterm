@@ -143,27 +143,33 @@ terminal panes only. `[explorer] full-height=no` in `config.ini` puts it below a
 full-width tab strip instead. In a Window too narrow to dock it, the Explorer
 opens over the terminal, below the tab strip.
 
-The docked Explorer can collapse to a rail about four cells wide. Click `«` at
-the right end of the Explorer's header to collapse it and `»` at the top of the
-rail to expand it again, or choose **Toggle Lair explorer rail** in the command
-palette, which also shows a hidden Explorer as its rail. There is no default
-shortcut, and clicking `«` or `»` leaves the keyboard where it was. The rail
-has one row per Lair under the chosen filter: the Lair's initial (its place in
-the list when its name has no letter or digit) and, while any Splint reports
+The Explorer can collapse to a rail about four cells wide; it widens with
+larger chrome text. Click `«` at the right end of the Explorer's header to
+collapse it and `»` at the top of the rail to expand it again, or choose
+**Toggle Lair explorer rail** in the command palette, which also shows a hidden
+Explorer as its rail. There is no default shortcut, and clicking `«` or `»`
+leaves the keyboard where it was. The rail has one row per Lair under the
+chosen filter: the Lair's initial (when its name has no letter or digit, its
+place among all Lairs, which no filter changes) and, while any Splint reports
 agent status, the Lair's most urgent status glyph. An accent bar marks the
-current Lair. Clicking a rail row switches to that Lair: it opens the Lair's
-active Dojo, else one open in a tab here, else a live one, else the first that
-can be opened. Like any row click, it gives the Explorer the keys, which return
-to the terminal once the switch completes. Right-click a rail row for the
+current Lair. A `!` left of the `»` means navigation has a notice or is
+loading; expand the Explorer to read it. A muted `s` or `a` right of the `»`
+names the Saved or All filter, so a short rail is not mistaken for every
+Lair; under Live, the default, there is no mark. Clicking a rail row switches to that Lair: it opens the Lair's active Dojo,
+else one open in a tab here, else a live one, else the first that opens without
+asking. It never restores a Dojo: a Lair whose Dojos only restore expands the
+Explorer instead, with that Lair selected and open, so you choose the Dojo to
+restore there. Like any row click, it gives the Explorer the keys, which return
+to the terminal once a switch completes. Right-click a rail row for the
 Lair's menu. With the rail focused, Up/Down, `j`/`k`, PageUp/PageDown and
 Home/End move between Lairs, Enter switches, `f` cycles the filter, `r` selects
-the current Lair, and Escape returns to the terminal. The rail has no search;
-a query left in the full Explorer waits there until it expands. The terminal
-widens as the Explorer collapses, and the tab strip beside a full-height
-Explorer moves with it. A Window too narrow to dock the full Explorer still
-docks the rail; when even the rail does not fit, the Explorer opens over the
-terminal and shows no `«`. A hidden Explorer is shown again collapsed or
-expanded as it was, for as long as the Window is open.
+the current Lair, and Escape returns to the terminal; unfocused, the wheel
+scrolls the rail. The rail has no search; a query left in the full Explorer
+waits there until it expands. The terminal widens as the Explorer collapses,
+and the tab strip beside a full-height Explorer moves with it. A Window too
+narrow to dock the full Explorer still docks the rail; when even the rail does
+not fit, the rail opens over the terminal's left edge. A hidden Explorer is
+shown again collapsed or expanded as it was, for as long as the Window is open.
 `[explorer] collapsed=yes` makes new Windows show the rail first.
 
 Right-click a row for actions on that exact item, without selecting or opening it.

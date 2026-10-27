@@ -158,7 +158,8 @@ impl NavigationAccessibility {
                 self.announced_status(navigation_status(explorer, limited, items.len(), &focus))
             }),
             items,
-            query: if visible {
+            // The rail has no search: the tree's query waits for it unseen.
+            query: if visible && !explorer.collapsed() {
                 explorer.query().to_owned()
             } else {
                 String::new()
@@ -272,6 +273,18 @@ impl NavigationAccessibility {
             return None;
         }
         let target = |id| self.targets.get(&id).copied();
+        // The rail has no search field and no disclosure, so neither may
+        // clobber the tree's query or expansion behind it.
+        if explorer.collapsed()
+            && matches!(
+                request.action,
+                SemanticAction::Focus(SEARCH_NODE_ID)
+                    | SemanticAction::SetSearch(_)
+                    | SemanticAction::SetExpanded { .. }
+            )
+        {
+            return None;
+        }
         match request.action {
             SemanticAction::Focus(TERMINAL_NODE_ID) => Some(NavigationAccessAction::Terminal),
             SemanticAction::Focus(SEARCH_NODE_ID) => Some(NavigationAccessAction::SearchFocus),
@@ -771,6 +784,80 @@ mod tests {
                 .is_none()
         );
         assert!(explorer.decision().is_none());
+    }
+
+    /// While the Explorer is collapsed to its rail, its rows offer no
+    /// disclosure, the published query is empty, and search and expansion
+    /// requests are refused, so the tree's query and expansion behind the
+    /// rail are never changed unseen. Focusing and activating a Lair still
+    /// work.
+    #[test]
+    fn navigation_accessibility_rail_never_touches_the_hidden_search_or_tree() {
+        use crate::frontend::LairExplorerFilter;
+
+        let mut explorer = explorer();
+        explorer.set_search("work".into());
+        explorer.focus_tree();
+        assert!(explorer.set_collapsed(true));
+        let mut accessibility = NavigationAccessibility::default();
+        let snapshot = accessibility.refresh(&explorer, context());
+        assert!(!snapshot.items.is_empty());
+        assert!(snapshot.items.iter().all(|item| item.level == 1));
+        assert!(snapshot.items.iter().all(|item| item.expanded.is_none()));
+        assert_eq!(snapshot.query, "");
+        let lair = snapshot.items[0].id;
+        for action in [
+            SemanticAction::Focus(SEARCH_NODE_ID),
+            SemanticAction::SetSearch("notes".into()),
+            SemanticAction::SetExpanded {
+                node: lair,
+                expanded: true,
+            },
+        ] {
+            assert_eq!(
+                accessibility.resolve(request(&snapshot, action.clone()), &explorer, context()),
+                None,
+                "{action:?}"
+            );
+        }
+        assert!(
+            accessibility
+                .resolve(
+                    request(&snapshot, SemanticAction::Focus(lair)),
+                    &explorer,
+                    context()
+                )
+                .is_some()
+        );
+        assert!(
+            accessibility
+                .resolve(
+                    request(&snapshot, SemanticAction::Activate(lair)),
+                    &explorer,
+                    context()
+                )
+                .is_some()
+        );
+        assert_eq!(explorer.query(), "work");
+        // The rail lists the chosen filter's Lairs whatever query waits in
+        // the tree, and its status names that filter.
+        for filter in LairExplorerFilter::ALL {
+            explorer.set_filter(filter);
+            let snapshot = accessibility.refresh(&explorer, context());
+            assert!(
+                snapshot
+                    .status
+                    .as_deref()
+                    .unwrap()
+                    .starts_with(&format!("{} filter ·", filter.label())),
+                "{filter:?}: {:?}",
+                snapshot.status
+            );
+        }
+        // Expanded again, the query is published as before.
+        explorer.set_collapsed(false);
+        let snapshot = accessibility.refresh(&explorer, context());
+        assert_eq!(snapshot.query, "work");
     }
 
     #[test]

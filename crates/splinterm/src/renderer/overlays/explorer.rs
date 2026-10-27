@@ -89,10 +89,56 @@ const HEADER_TEXT: &str = "lairs";
 /// Painted between neighbouring header filters.
 const FILTER_SEPARATOR: &str = "·";
 
-/// The collapsed rail's width in logical px: about four chrome cells, room
-/// for a Lair's initial and its agent glyph beside the current-Lair accent
-/// bar.
+/// The collapsed rail's narrowest width in logical px. It widens with the
+/// chrome text: see [`lair_explorer_rail_width`].
 const RAIL_WIDTH: u32 = 40;
+/// The current-Lair accent bar and the divider beside a rail row's text, in
+/// borders: the bar is three borders wide.
+const RAIL_BAR_AND_BORDER: u32 = 4;
+/// Chrome cells a rail row's text has: a Lair's initial, a blank cell, and
+/// its agent glyph.
+const RAIL_CELLS: u32 = 4;
+
+/// The collapsed rail's width in logical px for a regular chrome cell
+/// `chrome_cell` buffer px wide at `scale_120`: room for [`RAIL_CELLS`]
+/// whole cells beside the accent bar and the divider as they are painted,
+/// so an initial and its glyph keep a blank cell between them, and never
+/// under `RAIL_WIDTH`. At a fractional scale it is one logical px wider,
+/// for a panel edge that rounds away a buffer px.
+#[must_use]
+pub(crate) fn lair_explorer_rail_width(chrome_cell: u32, scale_120: u32) -> u32 {
+    let scale_120 = scale_120.max(1);
+    let border = scale_120.div_ceil(120).max(1);
+    let buffer = chrome_cell
+        .saturating_mul(RAIL_CELLS)
+        .saturating_add(border.saturating_mul(RAIL_BAR_AND_BORDER));
+    let slack = u32::from(scale_120 % 120 != 0);
+    RAIL_WIDTH.max(
+        buffer
+            .saturating_mul(120)
+            .div_ceil(scale_120)
+            .saturating_add(slack),
+    )
+}
+
+/// One regular chrome cell's width in buffer px at `scale_120`, as the
+/// Explorer's text is drawn with `context`.
+///
+/// # Errors
+/// Returns an error when the chrome font cannot be loaded.
+pub(crate) fn lair_explorer_chrome_cell_width(
+    context: &RenderContext,
+    scale_120: u32,
+) -> Result<u32> {
+    let text = super::super::ChromeText::load_source_styled_with_context(
+        &ChromeSource::from(" "),
+        scale_120,
+        ChromeTextStyle::Regular,
+        context,
+    )?;
+    Ok(text.frame.cell_width.max(1))
+}
+
 /// The `«` target at the right end of the expanded header line, which the
 /// filters give up. It reaches the divider.
 const TOGGLE_WIDTH: u32 = 24;
@@ -100,6 +146,8 @@ const TOGGLE_WIDTH: u32 = 24;
 const COLLAPSE_TEXT: &str = "«";
 /// Expands the rail to the full Explorer.
 const EXPAND_TEXT: &str = "»";
+/// Marks a navigation notice or load state on the rail's header.
+const RAIL_NOTICE_TEXT: &str = "!";
 
 /// The footer's context line when no search or notice takes it: who owns
 /// keyboard input and how to move.
@@ -214,21 +262,21 @@ pub(crate) struct LairExplorerLayout {
     pub(crate) visible_start: usize,
     pub(crate) visible_capacity: usize,
     pub(crate) mode: LairExplorerPresentationMode,
-    /// Whether this is the collapsed rail: one row per Lair, always docked,
-    /// with no filters and no footer.
+    /// Whether this is the collapsed rail: one row per Lair, with no filters
+    /// and no footer, docked, or a drawer over the terminal in a Window too
+    /// narrow to dock even the rail.
     pub(crate) rail: bool,
     /// The `«` (expanded) or `»` (rail) target on the header line. `None`
-    /// when the rail could not dock beside the terminal, or the header line
-    /// is cut short.
+    /// when the header line is cut short.
     pub(crate) toggle: Option<Rect>,
 }
 
-/// Whether a rail docked in `content` leaves the terminal at least
-/// `minimum_terminal_width` logical px.
-fn rail_docks(content: Rect, minimum_terminal_width: u32) -> bool {
+/// Whether a rail `rail_width` logical px wide docked in `content` leaves
+/// the terminal at least `minimum_terminal_width` logical px.
+fn rail_docks(content: Rect, minimum_terminal_width: u32, rail_width: u32) -> bool {
     content
         .width
-        .checked_sub(RAIL_WIDTH)
+        .checked_sub(rail_width)
         .is_some_and(|rest| rest >= minimum_terminal_width)
 }
 
@@ -275,67 +323,64 @@ fn row_slots(
 }
 
 /// The shown Explorer's layout with a header line `header` logical px
-/// tall, or row-high for `None`: the rail when `collapsed` and it docks
-/// beside the terminal, else the expanded panel, docked or a drawer. A
-/// Window too narrow for even the rail keeps the drawer, which overlays the
-/// terminal instead of squeezing it.
+/// tall, or row-high for `None`: the rail, `rail_width` logical px wide,
+/// when `collapsed`, else the expanded panel. Either one docks beside the
+/// terminal when that leaves it `minimum_terminal_width` logical px, and is
+/// otherwise a drawer over the terminal instead of squeezing it.
 #[must_use]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn lair_explorer_shown_layout(
     content: Rect,
     header: Option<u32>,
     minimum_terminal_width: u32,
+    rail_width: u32,
     rows: &[LairExplorerRow],
     selected: Option<NavigationNodeId>,
     requested_start: usize,
     collapsed: bool,
 ) -> Option<LairExplorerLayout> {
     let header = header.unwrap_or(HEADER_HEIGHT);
-    collapsed
-        .then(|| {
-            lair_explorer_rail_layout(
-                content,
-                header,
-                minimum_terminal_width,
-                rows,
-                selected,
-                requested_start,
-            )
-        })
-        .flatten()
-        .or_else(|| {
-            lair_explorer_layout_with_header(
-                content,
-                header,
-                minimum_terminal_width,
-                rows,
-                selected,
-                requested_start,
-            )
-        })
+    if collapsed {
+        lair_explorer_rail_layout(
+            content,
+            header,
+            minimum_terminal_width,
+            rail_width,
+            rows,
+            selected,
+            requested_start,
+        )
+    } else {
+        lair_explorer_layout_with_header(
+            content,
+            header,
+            minimum_terminal_width,
+            rows,
+            selected,
+            requested_start,
+        )
+    }
 }
 
-/// The collapsed rail, `RAIL_WIDTH` logical px wide and always docked: the
-/// `»` header line, a spacer, then one row per Lair to the panel's bottom.
-/// `None` when the rail would leave the terminal narrower than
-/// `minimum_terminal_width`.
-#[must_use]
-pub(crate) fn lair_explorer_rail_layout(
+/// The collapsed rail, `rail_width` logical px wide: the `»` header line, a
+/// spacer, then one row per Lair to the panel's bottom. It docks when that
+/// leaves the terminal `minimum_terminal_width` logical px, and is otherwise
+/// a drawer over the terminal's left edge.
+fn lair_explorer_rail_layout(
     content: Rect,
     header: u32,
     minimum_terminal_width: u32,
+    rail_width: u32,
     rows: &[LairExplorerRow],
     selected: Option<NavigationNodeId>,
     requested_start: usize,
 ) -> Option<LairExplorerLayout> {
-    if content.width == 0
-        || content.height == 0
-        || header == 0
-        || !rail_docks(content, minimum_terminal_width)
-    {
+    if content.width == 0 || content.height == 0 || header == 0 {
         return None;
     }
+    let docked = rail_docks(content, minimum_terminal_width, rail_width);
     let panel = Rect {
-        width: RAIL_WIDTH,
+        width: rail_width.min(content.width),
         ..content
     };
     let header_height = header.min(panel.height);
@@ -356,10 +401,14 @@ pub(crate) fn lair_explorer_rail_layout(
     };
     Some(LairExplorerLayout {
         panel,
-        terminal: Rect {
-            x: content.x.saturating_add(RAIL_WIDTH),
-            width: content.width - RAIL_WIDTH,
-            ..content
+        terminal: if docked {
+            Rect {
+                x: content.x.saturating_add(panel.width),
+                width: content.width - panel.width,
+                ..content
+            }
+        } else {
+            content
         },
         header: header_rect,
         header_text_cell_cap: u32::MAX,
@@ -372,7 +421,11 @@ pub(crate) fn lair_explorer_rail_layout(
         rows: row_layouts,
         visible_start: start,
         visible_capacity: capacity,
-        mode: LairExplorerPresentationMode::Docked,
+        mode: if docked {
+            LairExplorerPresentationMode::Docked
+        } else {
+            LairExplorerPresentationMode::Drawer
+        },
         rail: true,
         toggle: (header_height == header).then_some(header_rect),
     })
@@ -400,8 +453,7 @@ pub(crate) fn lair_explorer_layout(
 
 /// The Explorer's layout with a header line `header` logical px tall, such
 /// as the tab strip's height for a docked Explorer that runs beside it.
-#[must_use]
-pub(crate) fn lair_explorer_layout_with_header(
+fn lair_explorer_layout_with_header(
     content: Rect,
     header: u32,
     minimum_terminal_width: u32,
@@ -445,18 +497,17 @@ pub(crate) fn lair_explorer_layout_with_header(
         selected,
         requested_start,
     );
-    // The `«` takes the header line's right end whenever collapsing would
-    // dock a rail, also from a drawer.
-    let toggle =
-        (header_height == header && rail_docks(content, minimum_terminal_width)).then(|| {
-            let width = TOGGLE_WIDTH.min(panel.width / 3);
-            Rect {
-                x: panel.x.saturating_add(panel.width - width),
-                y: panel.y,
-                width,
-                height: header_height,
-            }
-        });
+    // The `«` takes the header line's right end: every Window can collapse
+    // to the rail, which is a drawer where it cannot dock.
+    let toggle = (header_height == header).then(|| {
+        let width = TOGGLE_WIDTH.min(panel.width / 3);
+        Rect {
+            x: panel.x.saturating_add(panel.width - width),
+            y: panel.y,
+            width,
+            height: header_height,
+        }
+    });
     Some(LairExplorerLayout {
         panel,
         terminal,
@@ -1015,7 +1066,7 @@ pub(crate) fn paint_lair_explorer(
             palette,
             rows,
             selected,
-            focused,
+            (focused, status_message.is_some(), filter),
             (cell_width, border, right),
         )?;
         cache.finish_frame(used);
@@ -1124,24 +1175,18 @@ pub(crate) fn paint_lair_explorer(
             header_text_cap,
         )?;
     }
-    if let Some(toggle) = layout.toggle {
-        paint_picker_source_within(
-            cache,
-            context,
-            &mut used,
-            canvas,
-            canvas_width,
-            canvas_height,
-            &ChromeSource::from(COLLAPSE_TEXT),
-            ChromeTextStyle::Regular,
-            scale_120,
-            renderer_generation,
-            toggle_clip(toggle, scale_120, right),
-            PickerTextAlignment::Center,
-            palette.secondary,
-            header_text_cap,
-        )?;
-    }
+    paint_header_toggle(
+        cache,
+        context,
+        &mut used,
+        canvas,
+        (canvas_width, canvas_height),
+        scale_120,
+        renderer_generation,
+        layout,
+        palette,
+        right,
+    )?;
 
     let icons = chrome_icons_available();
     let columns = ExplorerColumns::of(rows);
@@ -1323,34 +1368,222 @@ fn toggle_clip(toggle: Rect, scale_120: u32, right: u32) -> Rect {
     }
 }
 
-/// A Lair's mark on the rail: the first letter or digit of its name, upper
-/// case, else its place in the list counting from 1.
+/// Where the rail's notice `!` goes in buffer px: one chrome cell at the
+/// left of its `header`, past the accent bar's width and short of the
+/// divider at `right`.
+fn rail_notice_clip(header: Rect, border: u32, cell_width: u32, right: u32) -> Rect {
+    let left = header.x.saturating_add(border.saturating_mul(3));
+    Rect {
+        x: left,
+        width: cell_width.min(right.saturating_sub(left)),
+        ..header
+    }
+}
+
+/// The rail header's filter mark: none for the default Live filter, else
+/// the chosen filter's initial, so a rail under Saved or All never reads as
+/// every Lair there is.
+fn rail_filter_mark(filter: LairExplorerFilter) -> Option<&'static str> {
+    match filter {
+        LairExplorerFilter::Live => None,
+        LairExplorerFilter::Saved => Some("s"),
+        LairExplorerFilter::All => Some("a"),
+    }
+}
+
+/// Where the rail's filter mark goes in buffer px: the last chrome cell of
+/// its `header` before the divider at `right`, clear of the centred `»`.
+fn rail_filter_clip(header: Rect, cell_width: u32, right: u32) -> Rect {
+    let left = right.saturating_sub(cell_width).max(header.x);
+    Rect {
+        x: left,
+        width: right.saturating_sub(left),
+        ..header
+    }
+}
+
+/// A rail row's buffer `rect` short of the divider at `right`.
+fn rail_row_inner(rect: Rect, right: u32) -> Rect {
+    Rect {
+        width: rect.width.min(right.saturating_sub(rect.x)),
+        ..rect
+    }
+}
+
+/// Where a rail row's text goes: its `inner` rect right of the accent bar,
+/// three borders wide.
+fn rail_row_text(inner: Rect, border: u32) -> Rect {
+    let bar = border.saturating_mul(3).min(inner.width);
+    Rect {
+        x: inner.x.saturating_add(bar),
+        width: inner.width - bar,
+        ..inner
+    }
+}
+
+/// The header's `«`, or `»` on the rail, muted and centred in its target.
+#[allow(clippy::too_many_arguments)]
+fn paint_header_toggle(
+    cache: &mut SessionPickerTextCache,
+    context: &RenderContext,
+    used: &mut HashSet<SessionPickerTextKey>,
+    canvas: &mut [u8],
+    (canvas_width, canvas_height): (u32, u32),
+    scale_120: u32,
+    renderer_generation: u64,
+    layout: &LairExplorerLayout,
+    palette: SessionPickerPalette,
+    right: u32,
+) -> Result<()> {
+    let Some(toggle) = layout.toggle else {
+        return Ok(());
+    };
+    paint_picker_source_within(
+        cache,
+        context,
+        used,
+        canvas,
+        canvas_width,
+        canvas_height,
+        &ChromeSource::from(if layout.rail {
+            EXPAND_TEXT
+        } else {
+            COLLAPSE_TEXT
+        }),
+        ChromeTextStyle::Regular,
+        scale_120,
+        renderer_generation,
+        toggle_clip(toggle, scale_120, right),
+        PickerTextAlignment::Center,
+        palette.secondary,
+        layout.header_text_cell_cap,
+    )
+}
+
+/// A Lair's mark on the rail: the first letter or digit of its name that
+/// takes a cell, as one upper-case character, else its `position` among
+/// every Lair counting from 1, which no filter changes.
 fn rail_initial(label: &str, position: usize) -> String {
     label
         .chars()
+        .filter(|character| character.width().unwrap_or(0) > 0)
         .find(|character| character.is_alphanumeric())
+        .and_then(|character| character.to_uppercase().next())
         .map_or_else(
             || position.saturating_add(1).to_string(),
-            |character| character.to_uppercase().collect(),
+            |character| character.to_string(),
         )
 }
 
-/// A rail row's text: the Lair's initial, or `…` while its switch is
-/// pending, then its agent glyph slot when any Lair reports, a blank cell
-/// apart when `cells` leaves room for one.
+/// The longest start of `text` that fits `cells` cells.
+fn leading_cells(text: &str, cells: usize) -> String {
+    let mut used = 0;
+    text.chars()
+        .take_while(|character| {
+            used += character.width().unwrap_or(0);
+            used <= cells
+        })
+        .collect()
+}
+
+/// A rail row's text, fitted to `cells` cells so the painter never cuts
+/// it: the Lair's initial, or `…` while its switch is pending, then its
+/// agent glyph slot, a blank cell apart where that fits. An all-blank slot,
+/// which keeps the initials lined up while other Lairs report, is left out
+/// where it does not fit beside the whole initial. When the initial and a
+/// glyph do not both fit, the glyph stays and the initial gives up cells,
+/// down to none; a glyph wider than the row gives way to the initial.
 fn rail_row_source(row: &LairExplorerRow, position: usize, cells: usize) -> ChromeSource {
-    let mut source = ChromeSource::from(if row.pending {
+    let initial = if row.pending {
         "…".to_owned()
     } else {
         rail_initial(&row.label, position)
-    });
-    if let Some(glyph) = &row.rail_glyph {
-        if source.cells() + 1 + glyph.cells() <= cells {
-            source.push_str(" ");
-        }
-        source.push_source(glyph);
+    };
+    let initial_cells = text_cells(&initial);
+    let Some(glyph) = row.rail_glyph.as_ref().filter(|glyph| {
+        glyph.cells() <= cells && (!glyph.is_blank() || initial_cells + glyph.cells() <= cells)
+    }) else {
+        return ChromeSource::from(leading_cells(&initial, cells));
+    };
+    let room = cells - glyph.cells();
+    let mut source = ChromeSource::from(leading_cells(&initial, room));
+    if initial_cells < room && !source.is_empty() {
+        source.push_str(" ");
     }
+    source.push_source(glyph);
     source
+}
+
+/// The rail's header: its `»`, the `!` while navigation has a notice, and
+/// the filter mark under a filter other than Live.
+#[allow(clippy::too_many_arguments)]
+fn paint_rail_header(
+    cache: &mut SessionPickerTextCache,
+    context: &RenderContext,
+    used: &mut HashSet<SessionPickerTextKey>,
+    canvas: &mut [u8],
+    (canvas_width, canvas_height): (u32, u32),
+    (scale_120, renderer_generation): (u32, u64),
+    layout: &LairExplorerLayout,
+    palette: SessionPickerPalette,
+    (notice, filter): (bool, LairExplorerFilter),
+    (cell_width, border, right): (u32, u32, u32),
+) -> Result<()> {
+    paint_header_toggle(
+        cache,
+        context,
+        used,
+        canvas,
+        (canvas_width, canvas_height),
+        scale_120,
+        renderer_generation,
+        layout,
+        palette,
+        right,
+    )?;
+    // The rail has no footer for a navigation notice or a load state: a
+    // `!` in the accent colour at the header's left marks one, and screen
+    // readers get the message itself. A filter other than Live is named by
+    // its muted initial at the header's right, so a short rail never reads
+    // as every Lair there is.
+    let header = buffer_rect(layout.header, scale_120);
+    let marks = [
+        notice.then(|| {
+            (
+                RAIL_NOTICE_TEXT,
+                ChromeTextStyle::Bold,
+                rail_notice_clip(header, border, cell_width, right),
+                palette.selected_rail,
+            )
+        }),
+        rail_filter_mark(filter).map(|mark| {
+            (
+                mark,
+                ChromeTextStyle::Regular,
+                rail_filter_clip(header, cell_width, right),
+                palette.secondary,
+            )
+        }),
+    ];
+    for (text, style, clip, color) in marks.into_iter().flatten() {
+        paint_picker_source_within(
+            cache,
+            context,
+            used,
+            canvas,
+            canvas_width,
+            canvas_height,
+            &ChromeSource::from(text),
+            style,
+            scale_120,
+            renderer_generation,
+            clip,
+            PickerTextAlignment::Center,
+            color,
+            layout.header_text_cell_cap,
+        )?;
+    }
+    Ok(())
 }
 
 /// The collapsed rail below its `»`: one row per Lair, its initial and
@@ -1371,38 +1604,28 @@ fn paint_rail(
     palette: SessionPickerPalette,
     rows: &[LairExplorerRow],
     selected: Option<NavigationNodeId>,
-    focused: bool,
+    (focused, notice, filter): (bool, bool, LairExplorerFilter),
     (cell_width, border, right): (u32, u32, u32),
 ) -> Result<()> {
-    if let Some(toggle) = layout.toggle {
-        paint_picker_source_within(
-            cache,
-            context,
-            used,
-            canvas,
-            canvas_width,
-            canvas_height,
-            &ChromeSource::from(EXPAND_TEXT),
-            ChromeTextStyle::Regular,
-            scale_120,
-            renderer_generation,
-            toggle_clip(toggle, scale_120, right),
-            PickerTextAlignment::Center,
-            palette.secondary,
-            layout.header_text_cell_cap,
-        )?;
-    }
-    for (slot, (layout_row, row)) in layout
+    paint_rail_header(
+        cache,
+        context,
+        used,
+        canvas,
+        (canvas_width, canvas_height),
+        (scale_120, renderer_generation),
+        layout,
+        palette,
+        (notice, filter),
+        (cell_width, border, right),
+    )?;
+    for (layout_row, row) in layout
         .rows
         .iter()
         .zip(rows.iter().skip(layout.visible_start))
-        .enumerate()
     {
         let rect = buffer_rect(layout_row.rect, scale_120);
-        let inner = Rect {
-            width: rect.width.min(right.saturating_sub(rect.x)),
-            ..rect
-        };
+        let inner = rail_row_inner(rect, right);
         let is_selected = focused && selected == Some(row.id);
         if is_selected {
             fill_rect(
@@ -1428,11 +1651,7 @@ fn paint_rail(
                 rgba(palette.selected_rail),
             );
         }
-        let text = Rect {
-            x: inner.x.saturating_add(bar),
-            width: inner.width - bar,
-            ..inner
-        };
+        let text = rail_row_text(inner, border);
         let cells = usize::try_from(text.width / cell_width.max(1)).unwrap_or(0);
         let color = match (is_selected, row.enabled) {
             (true, true) => palette.selected_primary,
@@ -1447,7 +1666,7 @@ fn paint_rail(
             canvas,
             canvas_width,
             canvas_height,
-            &rail_row_source(row, layout.visible_start.saturating_add(slot), cells),
+            &rail_row_source(row, row.ordinal, cells),
             ChromeTextStyle::Regular,
             scale_120,
             renderer_generation,
@@ -1480,6 +1699,7 @@ mod tests {
             status: "stopped · saved".into(),
             accessible_status: "Stopped · Saved".into(),
             level: 1,
+            ordinal: 0,
             expanded: Some(false),
             current: false,
             enabled: true,
@@ -1547,8 +1767,17 @@ mod tests {
             width: 1000,
             height: 600,
         };
-        let rail = lair_explorer_shown_layout(content, None, 640, &rows, Some(rows[2].id), 0, true)
-            .unwrap();
+        let rail = lair_explorer_shown_layout(
+            content,
+            None,
+            640,
+            RAIL_WIDTH,
+            &rows,
+            Some(rows[2].id),
+            0,
+            true,
+        )
+        .unwrap();
         assert!(rail.rail);
         assert_eq!(rail.mode, LairExplorerPresentationMode::Docked);
         assert_eq!(
@@ -1588,9 +1817,11 @@ mod tests {
         }
         // With no footer the rail fits more rows than the expanded panel.
         let many = lair_rows(40);
-        let rail = lair_explorer_shown_layout(content, None, 640, &many, None, 0, true).unwrap();
+        let rail = lair_explorer_shown_layout(content, None, 640, RAIL_WIDTH, &many, None, 0, true)
+            .unwrap();
         let expanded =
-            lair_explorer_shown_layout(content, None, 640, &many, None, 0, false).unwrap();
+            lair_explorer_shown_layout(content, None, 640, RAIL_WIDTH, &many, None, 0, false)
+                .unwrap();
         assert!(!expanded.rail);
         assert_eq!(
             rail.visible_capacity,
@@ -1600,7 +1831,8 @@ mod tests {
         // The selected Lair stays in view.
         let last = many.last().unwrap().id;
         let rail =
-            lair_explorer_shown_layout(content, None, 640, &many, Some(last), 0, true).unwrap();
+            lair_explorer_shown_layout(content, None, 640, RAIL_WIDTH, &many, Some(last), 0, true)
+                .unwrap();
         assert_eq!(rail.rows.last().unwrap().id, last);
     }
 
@@ -1617,7 +1849,8 @@ mod tests {
             width: 1000,
             height: 400,
         };
-        let rail = lair_explorer_shown_layout(content, None, 640, &rows, None, 0, true).unwrap();
+        let rail = lair_explorer_shown_layout(content, None, 640, RAIL_WIDTH, &rows, None, 0, true)
+            .unwrap();
         for (laid, entry) in rail.rows.iter().zip(&rows) {
             let top = f64::from(laid.rect.y);
             let bottom = f64::from(laid.rect.y + laid.rect.height) - 0.5;
@@ -1640,7 +1873,8 @@ mod tests {
         assert_eq!(lair_explorer_hit_test(&rail, beside), None);
 
         let expanded =
-            lair_explorer_shown_layout(content, None, 640, &rows, None, 0, false).unwrap();
+            lair_explorer_shown_layout(content, None, 640, RAIL_WIDTH, &rows, None, 0, false)
+                .unwrap();
         let toggle = expanded.toggle.unwrap();
         assert_eq!(
             toggle.x + toggle.width,
@@ -1665,25 +1899,16 @@ mod tests {
             assert!(!contains(toggle, corner));
             assert!(!lair_explorer_toggle_hit_test(&expanded, corner));
         }
-        // A drawer whose rail would dock keeps the `«`; one too narrow for
-        // even the rail has none.
-        let drawer = Rect {
-            width: 700,
-            ..content
-        };
-        let layout = lair_explorer_shown_layout(drawer, None, 640, &rows, None, 0, false).unwrap();
-        assert_eq!(layout.mode, LairExplorerPresentationMode::Drawer);
-        assert!(layout.toggle.is_some());
-        let docked = lair_explorer_shown_layout(drawer, None, 640, &rows, None, 0, true).unwrap();
-        assert!(docked.rail);
-        let tiny = Rect {
-            width: 650,
-            ..content
-        };
-        let layout = lair_explorer_shown_layout(tiny, None, 640, &rows, None, 0, true).unwrap();
-        assert!(!layout.rail);
-        assert_eq!(layout.toggle, None);
-        assert!(!lair_explorer_toggle_hit_test(&layout, (640.0, 5.0)));
+        // Every expanded panel can collapse, a drawer too: the rail docks
+        // where it fits and is a drawer itself where it does not.
+        for width in [700, 650] {
+            let drawer = Rect { width, ..content };
+            let layout =
+                lair_explorer_shown_layout(drawer, None, 640, RAIL_WIDTH, &rows, None, 0, false)
+                    .unwrap();
+            assert_eq!(layout.mode, LairExplorerPresentationMode::Drawer);
+            assert!(layout.toggle.is_some());
+        }
         // A header cut short by a tiny Window shows no toggle.
         let short = Rect {
             height: HEADER_HEIGHT - 1,
@@ -1691,7 +1916,8 @@ mod tests {
         };
         for collapsed in [false, true] {
             let layout =
-                lair_explorer_shown_layout(short, None, 640, &rows, None, 0, collapsed).unwrap();
+                lair_explorer_shown_layout(short, None, 640, RAIL_WIDTH, &rows, None, 0, collapsed)
+                    .unwrap();
             assert_eq!(layout.toggle, None, "collapsed={collapsed}");
         }
     }
@@ -1729,6 +1955,360 @@ mod tests {
         lair.pending = false;
         lair.rail_glyph = Some(ChromeSource::from("  "));
         assert_eq!(rail_row_source(&lair, 0, 4).text(), "W   ");
+        // Zero-width marks never stand in for the initial, and one upper-case
+        // character stands for a letter that upper-cases to more.
+        lair.rail_glyph = None;
+        lair.label = "\u{200b}\u{301}straße".into();
+        assert_eq!(rail_row_source(&lair, 0, 4).text(), "S");
+        lair.label = "ßeta".into();
+        assert_eq!(rail_row_source(&lair, 0, 4).text(), "S");
+    }
+
+    /// A rail row's text always fits its cells, so the painter never cuts it
+    /// to `W…`: a wide initial (a two-digit place, a CJK letter) and the
+    /// glyph share the row, the initial giving up cells first; an all-blank
+    /// slot is dropped where the whole initial would not fit beside it; and
+    /// a glyph wider than the row gives way to the initial.
+    #[test]
+    fn rail_row_text_fits_its_cells_and_keeps_the_glyph() {
+        let mut lair = row(NavigationNodeId::Lair(LairId::new()));
+        let mut glyph = ChromeSource::default();
+        glyph.push_icon(ChromeIcon::MessageQuestion);
+        let glyph_cells = glyph.cells();
+        let blank = ChromeSource::from(" ".repeat(glyph_cells).as_str());
+        for label in ["work", "··", "語り", "ßeta"] {
+            for position in [0, 9, 99, 999] {
+                for slot in [None, Some(glyph.clone()), Some(blank.clone())] {
+                    for cells in 0..=6 {
+                        lair.label = label.into();
+                        lair.rail_glyph.clone_from(&slot);
+                        let source = rail_row_source(&lair, position, cells);
+                        let case = format!("{label:?} #{position} {slot:?} in {cells}");
+                        assert!(source.cells() <= cells, "{case}: {source:?}");
+                        assert!(!source.text().contains('…'), "{case}");
+                        if slot.as_ref() == Some(&glyph) && glyph_cells <= cells {
+                            assert!(
+                                source.describe().ends_with("[message-question]"),
+                                "{case}: the glyph stays"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // Two-digit places and wide letters next to the glyph in four cells.
+        lair.rail_glyph = Some(glyph.clone());
+        lair.label = "··".into();
+        assert_eq!(
+            rail_row_source(&lair, 11, 4).describe(),
+            "12[message-question]"
+        );
+        assert_eq!(
+            rail_row_source(&lair, 11, 3).describe(),
+            "1[message-question]"
+        );
+        lair.label = "語り".into();
+        assert_eq!(
+            rail_row_source(&lair, 0, 4).describe(),
+            "語[message-question]"
+        );
+        assert_eq!(
+            rail_row_source(&lair, 0, 3).describe(),
+            "[message-question]"
+        );
+        // The blank slot gives way to a wide initial.
+        lair.rail_glyph = Some(blank);
+        assert_eq!(rail_row_source(&lair, 11, 2).text(), "語");
+        // A glyph wider than the row gives way to the initial.
+        lair.rail_glyph = Some(glyph);
+        lair.label = "work".into();
+        assert_eq!(rail_row_source(&lair, 0, 1).text(), "W");
+    }
+
+    /// The rail widens with the chrome text so four cells always fit beside
+    /// The rail widens with the chrome text so four whole cells always fit
+    /// beside the accent bar and the divider as they are painted, at every
+    /// scale and wherever the panel starts, so an initial and a two-cell
+    /// glyph keep a blank cell between them. It is never narrower than
+    /// `RAIL_WIDTH`.
+    #[test]
+    fn rail_width_follows_the_chrome_cell() {
+        assert_eq!(lair_explorer_rail_width(0, 120), RAIL_WIDTH);
+        assert_eq!(lair_explorer_rail_width(9, 120), RAIL_WIDTH);
+        assert_eq!(lair_explorer_rail_width(14, 120), 14 * RAIL_CELLS + 4);
+        assert_eq!(lair_explorer_rail_width(28, 240), 14 * RAIL_CELLS + 4);
+        let mut lair = row(NavigationNodeId::Lair(LairId::new()));
+        let mut glyph = ChromeSource::default();
+        glyph.push_icon(ChromeIcon::MessageQuestion);
+        lair.rail_glyph = Some(glyph);
+        for scale in [120, 144, 150, 180, 210, 240, 300] {
+            let border = u32::div_ceil(scale, 120);
+            for cell in 6..=48 {
+                let width = lair_explorer_rail_width(cell, scale);
+                for x in [0, 1, 3, 7] {
+                    let panel = buffer_rect(
+                        Rect {
+                            x,
+                            y: 0,
+                            width,
+                            height: ROW_HEIGHT,
+                        },
+                        scale,
+                    );
+                    let right = panel.x + panel.width - border;
+                    let text = rail_row_text(rail_row_inner(panel, right), border);
+                    let what = format!("cell {cell} at scale {scale} from x {x}");
+                    assert!(text.width / cell >= RAIL_CELLS, "{what}");
+                    let cells = usize::try_from(text.width / cell).unwrap();
+                    assert_eq!(
+                        rail_row_source(&lair, 0, cells).describe(),
+                        "W [message-question]",
+                        "{what}"
+                    );
+                }
+            }
+        }
+        let content = Rect {
+            x: 0,
+            y: 0,
+            width: 1000,
+            height: 300,
+        };
+        let rows = lair_rows(2);
+        let wide = lair_explorer_rail_width(14, 120);
+        let rail =
+            lair_explorer_shown_layout(content, None, 640, wide, &rows, None, 0, true).unwrap();
+        assert_eq!(rail.panel.width, wide);
+        assert_eq!(rail.terminal.x, wide);
+        assert_eq!(rail.terminal.width, 1000 - wide);
+        assert_eq!(rail.toggle.map(|toggle| toggle.width), Some(wide));
+        for laid in &rail.rows {
+            assert_eq!(laid.rect.width, wide);
+            let inside = (f64::from(wide) - 0.5, f64::from(laid.rect.y));
+            assert_eq!(lair_explorer_hit_test(&rail, inside), Some(laid.id));
+            assert_eq!(
+                lair_explorer_hit_test(&rail, (f64::from(wide), f64::from(laid.rect.y))),
+                None
+            );
+        }
+        // The wider rail's own width decides whether it docks.
+        let edge = Rect {
+            width: 640 + wide,
+            ..content
+        };
+        let docked =
+            lair_explorer_shown_layout(edge, None, 640, wide, &rows, None, 0, true).unwrap();
+        assert_eq!(docked.mode, LairExplorerPresentationMode::Docked);
+        let narrower = Rect {
+            width: 640 + wide - 1,
+            ..content
+        };
+        let drawer =
+            lair_explorer_shown_layout(narrower, None, 640, wide, &rows, None, 0, true).unwrap();
+        assert_eq!(drawer.mode, LairExplorerPresentationMode::Drawer);
+    }
+
+    /// A Window too narrow to dock even the rail shows the rail itself as a
+    /// drawer over the terminal's left edge, with its `»` and one row per
+    /// Lair, so the collapsed state and what is drawn always agree. The
+    /// terminal keeps the whole width under it.
+    #[test]
+    fn a_rail_that_cannot_dock_is_a_drawer_over_the_terminal() {
+        let rows = lair_rows(3);
+        let content = Rect {
+            x: 0,
+            y: 30,
+            width: 600,
+            height: 300,
+        };
+        let rail = lair_explorer_shown_layout(content, None, 640, RAIL_WIDTH, &rows, None, 0, true)
+            .unwrap();
+        assert!(rail.rail);
+        assert_eq!(rail.mode, LairExplorerPresentationMode::Drawer);
+        assert_eq!(rail.terminal, content);
+        assert_eq!(
+            rail.panel,
+            Rect {
+                width: RAIL_WIDTH,
+                ..content
+            }
+        );
+        assert_eq!(rail.toggle, Some(rail.header));
+        assert!(rail.filters.is_empty());
+        assert_eq!(
+            rail.rows.iter().map(|laid| laid.id).collect::<Vec<_>>(),
+            rows.iter().map(|row| row.id).collect::<Vec<_>>()
+        );
+        for laid in &rail.rows {
+            assert_eq!(
+                lair_explorer_disclosure_hit_test(&rail, &rows, (5.0, f64::from(laid.rect.y))),
+                None
+            );
+        }
+        // A Window narrower than the rail gets a rail as wide as it is.
+        let sliver = Rect {
+            width: 30,
+            ..content
+        };
+        let rail = lair_explorer_shown_layout(sliver, None, 640, RAIL_WIDTH, &rows, None, 0, true)
+            .unwrap();
+        assert!(rail.rail);
+        assert_eq!(rail.panel.width, 30);
+    }
+
+    /// The rail has no footer, so a navigation notice or load state is
+    /// marked by an accent `!` at its header's left, apart from the `»`;
+    /// nothing else changes.
+    #[test]
+    fn rail_header_marks_a_notice() {
+        use super::super::picker::session_picker_palette;
+
+        let rows = lair_rows(2);
+        let palette = session_picker_palette(ResolvedTheme::default());
+        let content = Rect {
+            x: 0,
+            y: 0,
+            width: 1000,
+            height: 200,
+        };
+        let layout =
+            lair_explorer_shown_layout(content, None, 640, RAIL_WIDTH, &rows, None, 0, true)
+                .unwrap();
+        let render = RenderContext::new(u16::MAX);
+        for scale in [120, 240] {
+            let width = 1000 * scale / 120;
+            let height = 200 * scale / 120 + 1;
+            let draw = |notice: Option<&str>| {
+                let mut canvas = vec![0; (width * height * 4) as usize];
+                paint_lair_explorer(
+                    &mut SessionPickerTextCache::default(),
+                    &render,
+                    &mut canvas,
+                    width,
+                    height,
+                    scale,
+                    1,
+                    &layout,
+                    palette,
+                    &rows,
+                    None,
+                    "",
+                    notice,
+                    false,
+                    LairExplorerFilter::Live,
+                    false,
+                )
+                .unwrap();
+                canvas
+            };
+            let plain = draw(None);
+            let noticed = draw(Some("Navigation is stale · R retry"));
+            let header = buffer_rect(layout.header, scale);
+            let toggle_left = header.x + header.width / 2 - header.width / 5;
+            let mut marked = 0;
+            for (index, (a, b)) in noticed
+                .chunks_exact(4)
+                .zip(plain.chunks_exact(4))
+                .enumerate()
+            {
+                if a == b {
+                    continue;
+                }
+                let x = u32::try_from(index).unwrap() % width;
+                let y = u32::try_from(index).unwrap() / width;
+                assert!(y < header.y + header.height, "scale {scale}: mark at y {y}");
+                assert!(
+                    x < toggle_left,
+                    "scale {scale}: mark at x {x} reaches the `»`"
+                );
+                marked += 1;
+            }
+            assert!(marked > 0, "scale {scale}");
+        }
+    }
+
+    /// Under a filter other than Live the rail header names it by a muted
+    /// initial at its right, `s` for Saved and `a` for All, apart from the
+    /// `»` and the notice `!`, so a short rail never reads as every Lair
+    /// there is. Live, the default, adds no mark.
+    #[test]
+    fn rail_header_marks_a_filter_other_than_live() {
+        use super::super::picker::session_picker_palette;
+
+        assert_eq!(rail_filter_mark(LairExplorerFilter::Live), None);
+        assert_eq!(rail_filter_mark(LairExplorerFilter::Saved), Some("s"));
+        assert_eq!(rail_filter_mark(LairExplorerFilter::All), Some("a"));
+        let rows = lair_rows(2);
+        let palette = session_picker_palette(ResolvedTheme::default());
+        let content = Rect {
+            x: 0,
+            y: 0,
+            width: 1000,
+            height: 200,
+        };
+        let layout =
+            lair_explorer_shown_layout(content, None, 640, RAIL_WIDTH, &rows, None, 0, true)
+                .unwrap();
+        let render = RenderContext::new(u16::MAX);
+        for scale in [120, 240] {
+            let width = 1000 * scale / 120;
+            let height = 200 * scale / 120 + 1;
+            let draw = |filter| {
+                let mut canvas = vec![0; (width * height * 4) as usize];
+                paint(
+                    &render,
+                    &mut canvas,
+                    width,
+                    height,
+                    scale,
+                    &layout,
+                    palette,
+                    &rows,
+                    None,
+                    false,
+                    filter,
+                );
+                canvas
+            };
+            let live = draw(LairExplorerFilter::Live);
+            let header = buffer_rect(layout.header, scale);
+            let toggle_right = header.x + header.width / 2 + header.width / 5;
+            let mut marks = Vec::new();
+            for filter in [LairExplorerFilter::Saved, LairExplorerFilter::All] {
+                let marked = draw(filter);
+                let mut changed = 0;
+                for (index, (a, b)) in marked.chunks_exact(4).zip(live.chunks_exact(4)).enumerate()
+                {
+                    if a == b {
+                        continue;
+                    }
+                    let x = u32::try_from(index).unwrap() % width;
+                    let y = u32::try_from(index).unwrap() / width;
+                    let what = format!("{filter:?} at scale {scale}: mark at ({x}, {y})");
+                    assert!(y < header.y + header.height, "{what}");
+                    assert!(x > toggle_right, "{what} reaches the `»`");
+                    assert!(x < header.x + header.width, "{what} passes the divider");
+                    changed += 1;
+                }
+                assert!(changed > 0, "{filter:?} at scale {scale}");
+                marks.push(marked);
+            }
+            assert_ne!(marks[0], marks[1], "scale {scale}");
+        }
+        // The mark's cell never meets the notice's.
+        for (cell, border) in [(9, 1), (14, 2), (24, 2)] {
+            let header = Rect {
+                x: 0,
+                y: 0,
+                width: cell * RAIL_CELLS + border * RAIL_BAR_AND_BORDER,
+                height: HEADER_HEIGHT,
+            };
+            let right = header.width - border;
+            let notice = rail_notice_clip(header, border, cell, right);
+            let filter = rail_filter_clip(header, cell, right);
+            assert!(notice.x + notice.width <= filter.x, "cell {cell}");
+            assert_eq!(filter.x + filter.width, right);
+        }
     }
 
     /// The current Lair carries the accent bar the expanded panel gives its
@@ -1750,9 +2330,17 @@ mod tests {
             width: 1000,
             height: 200,
         };
-        let layout =
-            lair_explorer_shown_layout(content, None, 640, &rows, Some(rows[2].id), 0, true)
-                .unwrap();
+        let layout = lair_explorer_shown_layout(
+            content,
+            None,
+            640,
+            RAIL_WIDTH,
+            &rows,
+            Some(rows[2].id),
+            0,
+            true,
+        )
+        .unwrap();
         for scale in [120, 150, 240] {
             for focused in [false, true] {
                 let width = 1000 * scale / 120;
