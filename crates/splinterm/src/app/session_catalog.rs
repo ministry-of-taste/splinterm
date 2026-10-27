@@ -291,10 +291,18 @@ pub(in crate::app) fn remember_dojo(factory: &ConnectionFactory, dojo_id: DojoId
     }
 }
 
+/// A Recent Dojos row, as the inline picker shows it: the Dojo's name, and
+/// the `Lair / Dojo` breadcrumb that gives its Lair as the location. A Dojo
+/// named as its Lair is one level, its Lair's label alone.
 pub(in crate::app) fn session_picker_item(entry: &SessionEntry) -> SessionPickerItem {
+    let breadcrumb = entry.display_title();
     SessionPickerItem {
-        display_title: entry.display_title(),
-        breadcrumb: entry.display_title(),
+        display_title: if entry.lair_name == entry.dojo_name {
+            breadcrumb.clone()
+        } else {
+            entry.dojo_display_title()
+        },
+        breadcrumb,
         working_directory: entry.working_directory(),
         pane_count: entry.pane_count,
         running_pane_count: entry.running_panes,
@@ -306,6 +314,36 @@ pub(in crate::app) fn session_picker_item(entry: &SessionEntry) -> SessionPicker
 mod tests {
     use super::*;
     use splinterm_core::Dojo;
+
+    /// The standalone `splinterm dojos` row has the inline row's columns:
+    /// the Dojo's name, then its Lair and directory, then the status (the
+    /// row itself is pinned in the picker's tests).
+    #[test]
+    fn recent_dojo_rows_name_the_dojo_and_place_it_in_its_lair() {
+        let entry = SessionEntry {
+            lair_id: splinterm_core::LairId::new(),
+            dojo_id: splinterm_core::DojoId::new(),
+            lair_name: "lair-1".to_owned(),
+            dojo_name: "dojo-1".to_owned(),
+            lair_label: "Lair 1".to_owned(),
+            dojo_label: "Dojo 1".to_owned(),
+            cwd: PathBuf::from("/home/user/Projects/splinterm"),
+            pane_count: 1,
+            running_panes: 1,
+            exited_panes: 0,
+        };
+        let item = session_picker_item(&entry);
+        assert_eq!(item.display_title, "Dojo 1");
+        assert_eq!(item.breadcrumb, "Lair 1 / Dojo 1");
+        assert_eq!(item.working_directory, "/home/user/Projects/splinterm");
+        let one_level = SessionEntry {
+            dojo_name: "lair-1".to_owned(),
+            ..entry
+        };
+        let item = session_picker_item(&one_level);
+        assert_eq!(item.display_title, "Lair 1");
+        assert_eq!(item.breadcrumb, "Lair 1");
+    }
 
     #[test]
     fn graphical_lifetime_selection_is_narrow_and_backward_compatible() {

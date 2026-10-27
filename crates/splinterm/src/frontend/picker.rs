@@ -1151,6 +1151,36 @@ mod tests {
             .collect()
     }
 
+    /// A Recent Dojos row in the standalone host: the marker, the Dojo's
+    /// name in its column, the Lair and directory, and the running panes at
+    /// the row's end, as the inline row lays them out.
+    #[test]
+    fn the_standalone_row_names_the_dojo_then_its_lair() {
+        let (decision, _receiver) = std_mpsc::channel();
+        let mut picker = SessionPickerUi::new(
+            vec![SessionPickerItem {
+                display_title: "Dojo 1".to_owned(),
+                breadcrumb: "Lair 1 / Dojo 1".to_owned(),
+                working_directory: "/home/user/Projects/splinterm".to_owned(),
+                pane_count: 1,
+                running_pane_count: 1,
+                agent: None,
+            }],
+            decision,
+        );
+        let lines = snapshot_lines(&picker.snapshot());
+        let row = &lines[SESSION_PICKER_LIST_ROW + 1];
+        assert_eq!(
+            *row,
+            format!(
+                "› Dojo 1{}Lair 1 · /home/user/Projects/splinterm{}1/1",
+                " ".repeat(9),
+                " ".repeat(14)
+            )
+        );
+        assert_eq!(text_cells(row), STANDALONE_COLUMNS);
+    }
+
     #[test]
     fn the_standalone_picker_reads_like_the_inline_one() {
         let (decision, _receiver) = std_mpsc::channel();
