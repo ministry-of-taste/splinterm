@@ -455,20 +455,6 @@ impl ChromeSurface {
     }
 }
 
-/// Mixes two colours in encoded sRGB, the space the compositor blends in.
-#[cfg(test)]
-fn mix_encoded(first: u32, second: u32, second_weight: f64) -> u32 {
-    let first = rgb_channels(first);
-    let second = rgb_channels(second);
-    packed_channels(std::array::from_fn(|index| {
-        let mixed = f64::from(first[index]) * (1.0 - second_weight)
-            + f64::from(second[index]) * second_weight;
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let mixed = mixed.round().clamp(0.0, 255.0) as u8;
-        mixed
-    }))
-}
-
 /// Alpha, out of 255, of the translucent highlight blended over a hovered row.
 pub(crate) const ROW_HOVER_ALPHA: u8 = 64;
 /// Alpha, out of 255, of the translucent highlight blended over a pressed row.
@@ -2025,6 +2011,7 @@ pub(crate) fn paint_session_picker_overlay(
 mod tests {
     use super::super::super::pixel_index;
     use super::*;
+    use crate::color::mix_encoded;
     use crate::theme::ChromeRoles;
 
     #[test]
@@ -3006,21 +2993,21 @@ mod tests {
         (
             "builtin",
             [
-                0x4b_4c_4d, 0xeb_eb_eb, 0xc0_bb_b5, 0x35_4a_60, 0xeb_eb_eb, 0xf4_a8_a4, 0xf5_a0_9b,
+                0x20_23_27, 0xeb_eb_eb, 0x95_87_78, 0x35_4a_60, 0xeb_eb_eb, 0xfb_49_34, 0xf5_a0_9b,
                 0x03_04_05,
             ],
         ),
         (
             "json",
             [
-                0x48_4b_4f, 0xe0_e4_ea, 0xb5_bb_c1, 0x2a_3a_4a, 0xe0_e4_ea, 0xe8_aa_b2, 0xeb_83_8d,
+                0x21_28_30, 0xe0_e4_ea, 0x8a_91_98, 0x2a_3a_4a, 0xe0_e4_ea, 0xee_5c_6b, 0xeb_83_8d,
                 0x03_06_0a,
             ],
         ),
         (
             "json-explicit",
             [
-                0x48_4b_4f, 0xe0_e4_ea, 0xb1_bb_c6, 0x2a_3a_4a, 0xe0_e4_ea, 0xe8_aa_b2, 0xeb_83_8d,
+                0x21_28_30, 0xe0_e4_ea, 0x88_99_aa, 0x2a_3a_4a, 0xe0_e4_ea, 0xee_5c_6b, 0xeb_83_8d,
                 0x03_06_0a,
             ],
         ),
@@ -3055,7 +3042,7 @@ mod tests {
         (
             "alacritty-kanagawa",
             [
-                0x4b_49_45, 0xdc_d7_ba, 0xbd_b8_a0, 0x2d_4f_67, 0xdc_d7_ba, 0xe1_ac_94, 0xe0_b1_99,
+                0x2e_2e_34, 0xdc_d7_ba, 0xbc_b8_a0, 0x2d_4f_67, 0xdc_d7_ba, 0xe5_7464, 0xe0_b1_99,
                 0x09_09_0e,
             ],
         ),

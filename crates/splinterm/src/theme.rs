@@ -18,7 +18,9 @@
 //!    `[colors]` keys without a new theme read.
 //!
 //! Every chrome color the Window paints comes from a role or from a
-//! component derived from roles, mixed in linear light ([`crate::color`]).
+//! component derived from roles, mixed in linear light ([`crate::color`]),
+//! except the raised surface's fallback, a step taken in encoded sRGB as
+//! theme authors take their own.
 
 #![allow(
     clippy::unreadable_literal,
@@ -31,7 +33,7 @@ use anyhow::Result;
 
 use crate::color::{
     NON_TEXT_MIN_CONTRAST, TEXT_MIN_CONTRAST, contrast_corrected, contrast_corrected_toward,
-    contrast_floor_toward, contrast_ratio, mix_linear, strongest_contrast_endpoint,
+    contrast_floor_toward, contrast_ratio, mix_encoded, mix_linear, strongest_contrast_endpoint,
 };
 use crate::config::OmarchyShellSettings;
 
@@ -48,8 +50,9 @@ pub struct ChromeRoles {
     /// The chrome background: the tab strip and the Explorer. Today the
     /// terminal background.
     pub surface: u32,
-    /// A surface raised above `surface`: menus, pickers, popups and the
-    /// selected tab. Omarchy `lighter_background`.
+    /// A surface raised above `surface`: menus, pickers and popups, and the
+    /// selected tab when the theme names one.
+    /// Omarchy `lighter_background`.
     pub surface_raised: u32,
     /// A surface sunk below `surface`. Omarchy `dark_background`.
     pub surface_sunken: u32,
@@ -654,6 +657,9 @@ pub fn derive(input: &ThemeInput) -> ChromeRoles {
 ///   `selection` is the theme's, else the terminal selection. Overriding
 ///   `surface` or `text` recolors chrome only: the terminal grid keeps its
 ///   palette.
+/// - `surface_raised` is the theme's, else `text` mixed 8% over the
+///   surface in encoded sRGB: a step like Omarchy's own
+///   `lighter_background` (tokyo-night 1a1b26 to 24283b).
 /// - `accent` is the theme's accent, else ANSI 4; `focus_ring` is the
 ///   theme's, else the accent.
 /// - `divider` is the theme's, else ANSI 8. The Omarchy provider always
@@ -732,7 +738,7 @@ pub fn derive_with(input: &ThemeInput, overrides: &RoleOverrides) -> ChromeRoles
         surface,
         surface_raised: given(Role::SurfaceRaised)
             .or(hints.surface_raised)
-            .unwrap_or_else(|| mix_linear(surface, text, 0.08)),
+            .unwrap_or_else(|| mix_encoded(surface, text, 0.08)),
         surface_sunken: given(Role::SurfaceSunken)
             .or(hints.surface_sunken)
             .unwrap_or_else(|| mix_linear(surface, 0, 0.06)),

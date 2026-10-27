@@ -796,7 +796,7 @@ come before their legacy aliases, in `omarchy-theme-color`'s order:
 
 | Role | Used for | Keys, in order | Without one |
 | --- | --- | --- | --- |
-| surface-raised | menus, pickers, popups, selected Dojo tab body | `lighter_background`, `lighter_bg` | the foreground mixed 8% over the background |
+| surface-raised | menus, pickers, popups, selected Dojo tab body | `lighter_background`, `lighter_bg` | the foreground mixed 8% over the background in encoded sRGB; for the selected tab, Foot `bright0` |
 | surface-sunken | (not yet painted) | `dark_background`, `dark_bg` | the background mixed 6% toward black |
 | selection | the selected row's fill | `selection_background`, `selection` | Foot `selection-background` |
 | divider | pane borders, frames | `border`, `muted`, `color8` | Foot `bright0` |
@@ -822,11 +822,12 @@ white text contrasts more with the background.
 
 Omarchy itself falls back from `lighter_background` to `color0`, which is the
 terminal background. That would make the selected tab and the popups
-invisible, so Splinterm mixes the foreground 8% over the background instead.
-The selected-tab body never borrows the terminal selection background. Its
-label and close affordance use whichever effective Foot background or
-foreground has higher WCAG contrast against that resolved tab body, preferring
-the foreground on an exact tie.
+invisible, so Splinterm uses Foot `bright0` for the selected tab instead, and
+for popups the foreground mixed 8% over the background in encoded sRGB, a step
+like a theme's own `lighter_background`. The selected-tab body never borrows
+the terminal selection background. Its label and close affordance use
+whichever effective Foot background or foreground has higher WCAG contrast
+against that resolved tab body, preferring the foreground on an exact tie.
 
 Inactive tab labels and close affordances are muted. Splinterm starts from the
 resolved text-muted hint and keeps it when it has at
@@ -905,7 +906,7 @@ accent=#8c6c3e
 | Key | Painted today | Without the key |
 | --- | --- | --- |
 | `surface` | the tab strip and the Explorer panel; darkened 80% toward black, the scrim behind a modal picker | the terminal background |
-| `surface-raised` | menus, pickers, the command palette, the tab menu, the Dojo prompt, the history overlay and other popups, and the selected Dojo tab body | the theme's ([role table](#native-omarchy-theme-integration)), else `text` mixed 8% over `surface` |
+| `surface-raised` | menus, pickers, the command palette, the tab menu, the Dojo prompt, the history overlay and other popups, and the selected Dojo tab body | the theme's ([role table](#native-omarchy-theme-integration)), else `text` mixed 8% over `surface` in encoded sRGB; for the selected tab, Foot `bright0` when the theme names none |
 | `surface-sunken` | nothing yet | the theme's |
 | `selection` | the selected row of menus, pickers and the Explorer | the theme's |
 | `divider` | pane borders and frames, menu and picker frames, the tab strip border | the theme's |
@@ -1020,8 +1021,7 @@ portable or isolated use. The strict JSON schema retains optional
 `selection_foreground`, `active_tab_background`, `active_tab_foreground`,
 `inactive_tab_foreground`, `pane_border`, and `pane_border_active` overrides.
 `selection_foreground` falls back to the normal foreground and
-`active_tab_background` falls back to the raised surface, the foreground mixed
-8% over the background, for older JSON themes. A
+`active_tab_background` falls back to ANSI color 8 for older JSON themes. A
 missing `active_tab_foreground` uses the same contrast algorithm against the
 JSON palette's resolved `background` and `foreground`. A missing
 `inactive_tab_foreground` applies the inactive-tab rule above to ANSI color 8;

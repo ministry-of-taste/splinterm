@@ -1655,9 +1655,9 @@ pub struct ResolvedTheme {
     pub ansi: [u32; 16],
     /// The semantic chrome colors.
     pub roles: ChromeRoles,
-    /// The selected Dojo tab's body: a JSON theme's own color, else the
-    /// `surface_raised` role, the same as the popups (Omarchy
-    /// `lighter_background`). `[colors] active-tab-background` replaces it.
+    /// The selected Dojo tab's body: a JSON theme's own color, the
+    /// `surface_raised` role a theme names (Omarchy `lighter_background`),
+    /// else ANSI 8. `[colors] active-tab-background` replaces it.
     pub active_tab_background: u32,
     /// The selected Dojo tab's label: a JSON theme's own color, else the
     /// surface or text role, whichever contrasts more with the body.
@@ -1786,15 +1786,20 @@ impl ResolvedTheme {
     pub fn from_input_with(input: &ThemeInput, overrides: &RoleOverrides) -> Self {
         let terminal = input.terminal;
         let roles = derive_with(input, overrides);
-        // The selected tab's body is the raised surface, as the popups are,
-        // unless a JSON theme names its own; an overridden raised surface
-        // wins over that, and the label is then chosen for contrast.
+        // An overridden raised surface is the selected tab's body, over a
+        // JSON theme's own; the label is then chosen for contrast.
         let raised_override = overrides.color(Role::SurfaceRaised, &terminal.ansi);
-        let active_tab_background = input
-            .components
-            .active_tab_background
-            .filter(|_| raised_override.is_none())
-            .unwrap_or(roles.surface_raised);
+        let active_tab_background = raised_override
+            .or(input.components.active_tab_background)
+            .unwrap_or(
+                // Without a theme's raised surface, the selected tab keeps the
+                // Foot `bright0` ramp rather than the derived `surface_raised`.
+                if input.hints.surface_raised.is_some() {
+                    roles.surface_raised
+                } else {
+                    terminal.ansi[8]
+                },
+            );
         let active_tab_foreground = input
             .components
             .active_tab_foreground
@@ -3649,10 +3654,7 @@ pub(crate) mod tests {
         let resolved = resolve_omarchy_theme("cursor=\"#000006\"", &foot).unwrap();
         assert_eq!(resolved.background, 2);
         assert_eq!(resolved.selection_foreground, resolved.foreground);
-        assert_eq!(
-            resolved.active_tab_background,
-            resolved.roles.surface_raised
-        );
+        assert_eq!(resolved.active_tab_background, resolved.ansi[8]);
         assert!(
             resolve_omarchy_theme("accent=\"#000006\"", "[colors-dark]\nbackground=000001")
                 .unwrap_err()
@@ -3769,13 +3771,11 @@ pub(crate) mod tests {
                 Some(0x665c54),
                 0x282828,
             ),
-            // No lighter_background or lighter_bg: the text mixed 8% over the
-            // background, as its popups are (Foot bright0, 727169, before
-            // Plan 0064 milestone 5). No muted or dark_foreground: the
-            // inactive tab mixes the text.
+            // No lighter_background or lighter_bg: Foot bright0 (color8). No
+            // muted or dark_foreground: the inactive tab mixes the text.
             (
                 "alacritty-kanagawa",
-                0x4b4945,
+                0x727169,
                 0x7e9cd8,
                 0x7e9cd8,
                 None,
@@ -3996,7 +3996,7 @@ pub(crate) mod tests {
 
         let legacy = resolve_omarchy_theme("", &foot).unwrap();
         assert_eq!(legacy.selection, 0xf0_e0_d0);
-        assert_eq!(legacy.active_tab_background, legacy.roles.surface_raised);
+        assert_eq!(legacy.active_tab_background, legacy.ansi[8]);
         assert_ne!(legacy.active_tab_background, legacy.selection);
     }
 
@@ -4115,11 +4115,8 @@ pub(crate) mod tests {
         let resolved = theme.resolve().unwrap();
         assert_eq!(resolved.background, 1);
         assert_eq!(resolved.selection_foreground, 3);
-        assert_eq!(
-            resolved.active_tab_background,
-            resolved.roles.surface_raised
-        );
-        assert_eq!(resolved.active_tab_foreground, resolved.foreground);
+        assert_eq!(resolved.active_tab_background, resolved.ansi[8]);
+        assert_eq!(resolved.active_tab_foreground, resolved.background);
         assert_ne!(resolved.active_tab_background, resolved.selection);
         assert_eq!(resolved.ui_accent(), 6);
         // A JSON theme without pane_border draws its ANSI 8.
@@ -4192,10 +4189,7 @@ pub(crate) mod tests {
             .unwrap()
             .resolve()
             .unwrap();
-        assert_eq!(
-            resolved.active_tab_background,
-            resolved.roles.surface_raised
-        );
+        assert_eq!(resolved.active_tab_background, resolved.ansi[8]);
         assert_eq!(resolved.active_tab_foreground, resolved.foreground);
 
         let different_selection =
@@ -4204,10 +4198,7 @@ pub(crate) mod tests {
             .unwrap()
             .resolve()
             .unwrap();
-        assert_eq!(
-            resolved.active_tab_background,
-            resolved.roles.surface_raised
-        );
+        assert_eq!(resolved.active_tab_background, resolved.ansi[8]);
         assert_eq!(resolved.active_tab_foreground, resolved.foreground);
     }
 
@@ -4994,10 +4985,7 @@ pub(crate) mod tests {
     /// which names no `muted` or `dark_foreground` and now mixes its text;
     /// `last-horizon`'s active pane border (b59790), now its
     /// `active_border_color`; and `semantic-keys`' pane border (6a6488),
-    /// now its `border`. Milestone 5 then changed, on purpose: the selected
-    /// tab of a theme that names no raised surface, now the text mixed 8%
-    /// over the background as its popups are (`builtin` 928374 with label
-    /// 0e1216, `json` 56606a, `alacritty-kanagawa` 727169); a JSON theme's
+    /// now its `border`. Milestone 5 then changed, on purpose: a JSON theme's
     /// default pane border, now ANSI 8 (`json` 787e85); and each inactive
     /// tab label ramped toward the text, now in linear light (`json`
     /// 79818a, `tokyo-night` 8f97bb, `flexoki-light` 64625e,
@@ -5008,7 +4996,7 @@ pub(crate) mod tests {
         (
             "builtin",
             [
-                0x0e1216, 0xebebeb, 0xebebeb, 0x354a60, 0xebebeb, 0x78beff, 0x4b4c4d, 0xebebeb,
+                0x0e1216, 0xebebeb, 0xebebeb, 0x354a60, 0xebebeb, 0x78beff, 0x928374, 0x0e1216,
                 0x928374, 0x78d2ff, 0x7c7e80, 0x78d2ff,
             ],
             u16::MAX,
@@ -5017,7 +5005,7 @@ pub(crate) mod tests {
         (
             "json",
             [
-                0x101820, 0xe0e4ea, 0xf0f0f0, 0x2a3a4a, 0xe0e4ea, 0x5599ff, 0x484b4f, 0xe0e4ea,
+                0x101820, 0xe0e4ea, 0xf0f0f0, 0x2a3a4a, 0xe0e4ea, 0x5599ff, 0x56606a, 0xe0e4ea,
                 0x8a9198, 0x33bbee, 0x56606a, 0x33bbee,
             ],
             u16::MAX,
@@ -5071,7 +5059,7 @@ pub(crate) mod tests {
         (
             "alacritty-kanagawa",
             [
-                0x1f1f28, 0xdcd7ba, 0xdcd7ba, 0x2d4f67, 0xdcd7ba, 0x7e9cd8, 0x4b4945, 0xdcd7ba,
+                0x1f1f28, 0xdcd7ba, 0xdcd7ba, 0x2d4f67, 0xdcd7ba, 0x7e9cd8, 0x727169, 0xdcd7ba,
                 0xbcb8a0, 0x7e9cd8, 0x727169, 0x7e9cd8,
             ],
             u16::MAX,

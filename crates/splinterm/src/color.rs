@@ -62,6 +62,22 @@ pub fn mix_linear(left: u32, right: u32, right_weight: f64) -> u32 {
     }))
 }
 
+/// Mixes `right` into `left` in gamma-encoded sRGB, the space the
+/// compositor blends in and theme authors step their surfaces in: weight 0
+/// keeps `left` and 1 gives `right`, each channel rounded.
+#[must_use]
+pub fn mix_encoded(left: u32, right: u32, right_weight: f64) -> u32 {
+    let left = rgb_channels(left);
+    let right = rgb_channels(right);
+    let weight = right_weight.clamp(0.0, 1.0);
+    packed_channels(std::array::from_fn(|index| {
+        let mixed = f64::from(left[index]) * (1.0 - weight) + f64::from(right[index]) * weight;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let mixed = mixed.round().clamp(0.0, 255.0) as u8;
+        mixed
+    }))
+}
+
 /// WCAG relative luminance.
 #[must_use]
 pub fn relative_luminance(color: u32) -> f64 {
