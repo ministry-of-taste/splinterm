@@ -228,6 +228,24 @@ impl AgentGlyphs {
         });
     }
 
+    /// The glyph slot alone for one state, padded to its fixed cells, or
+    /// blank cells without one. A stale working status holds the spinner's
+    /// first frame; the stale marker is left out.
+    fn slot(self, state: Option<(AgentState, bool)>, spinner: AgentSpinner) -> ChromeSource {
+        let mut slot = ChromeSource::default();
+        if let Some((state, is_stale)) = state {
+            let spinner = if is_stale {
+                AgentSpinner::STATIC
+            } else {
+                spinner
+            };
+            self.push_glyph(&mut slot, state, spinner);
+        }
+        let padding = self.glyph_cells().saturating_sub(slot.cells());
+        slot.push_str(&" ".repeat(padding));
+        slot
+    }
+
     /// The fixed-width column for one state, or blank cells without one. A
     /// stale working status holds the spinner's first frame.
     fn column(self, state: Option<(AgentState, bool)>, spinner: AgentSpinner) -> ChromeSource {
@@ -390,6 +408,16 @@ impl AgentAggregate {
     /// Explorer glyph column for a Dojo or Lair row: the most urgent state.
     pub(crate) fn glyph_column(&self, glyphs: AgentGlyphs, spinner: AgentSpinner) -> ChromeSource {
         glyphs.column(
+            self.top().map(|(state, is_stale, _)| (state, is_stale)),
+            spinner,
+        )
+    }
+
+    /// The collapsed Explorer rail's glyph for a Lair: the most urgent
+    /// state's glyph in its fixed slot, without the stale slot the rail has
+    /// no room for; blank cells when no Splint reports.
+    pub(crate) fn glyph_slot(&self, glyphs: AgentGlyphs, spinner: AgentSpinner) -> ChromeSource {
+        glyphs.slot(
             self.top().map(|(state, is_stale, _)| (state, is_stale)),
             spinner,
         )

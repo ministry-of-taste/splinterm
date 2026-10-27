@@ -393,6 +393,15 @@ a hostile program running as your account.
 - The Lair Explorer opens on **Live**, and its filters read Live, Saved, All
   (`f` cycles them in that order). Search looks through every Lair whatever the
   filter, so a saved or stopped Lair is found from Live too.
+- The docked Lair Explorer can collapse to a narrow rail with one row per
+  Lair: its initial and its most urgent agent glyph, with the current Lair
+  marked by the accent bar. Click `«` at the right end of the Explorer's
+  header to collapse it and `»` at the top of the rail to expand it, or
+  choose **Toggle Lair explorer rail** in the command palette; there is no
+  default shortcut. Clicking a rail row switches to that Lair. The terminal
+  and the tab strip beside the Explorer widen and narrow with it. A
+  Window too narrow to dock the full Explorer still docks the rail.
+  `explorer.collapsed=yes` shows the rail first in new Windows.
 - A thin line now runs the full width of the Window along the bottom of the tab
   strip, in the colour and thickness of a `line` Splint divider; the active
   tab's accent underline stays thicker and sits on top. Turn it off with

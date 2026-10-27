@@ -540,6 +540,8 @@ pub struct WindowOptions {
     /// `[explorer] full-height`: a docked Explorer runs the Window's full
     /// height and the tab strip begins at its right edge.
     pub explorer_full_height: bool,
+    /// `[explorer] collapsed`: the docked Explorer first shows as its rail.
+    pub explorer_collapsed: bool,
     /// Whether the Window binds the text-input (IME) protocol. The remote
     /// connection status Window turns it off so an input method never sees or
     /// draws a typed password as composing text.
@@ -614,6 +616,7 @@ impl Default for WindowOptions {
             agent_status_style: crate::config::AgentStatusStyle::default(),
             tab_strip_border: true,
             explorer_full_height: true,
+            explorer_collapsed: false,
             input_method: true,
             mapped: None,
             handoff_status: None,

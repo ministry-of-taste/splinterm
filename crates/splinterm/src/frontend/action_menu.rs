@@ -1198,6 +1198,7 @@ pub(crate) enum BuiltInCommandId {
     ReturnToLive,
     ToggleTabStrip,
     ToggleLairExplorer,
+    ToggleLairExplorerRail,
     FocusLairExplorer,
     ReturnFocusToTerminal,
     ZoomIn,
@@ -1260,6 +1261,7 @@ impl BuiltInCommandId {
         Self::ReturnToLive,
         Self::ToggleTabStrip,
         Self::ToggleLairExplorer,
+        Self::ToggleLairExplorerRail,
         Self::FocusLairExplorer,
         Self::ReturnFocusToTerminal,
         Self::ZoomIn,
@@ -1417,6 +1419,9 @@ pub(crate) enum BuiltInCommandDispatch {
     Zoom(CommandZoomAction),
     ToggleTabStrip,
     ToggleLairExplorer,
+    /// Collapses the shown Explorer to its rail or expands it; shows a
+    /// hidden one as its rail.
+    ToggleLairExplorerRail,
     FocusLairExplorer,
     ReturnFocusToTerminal,
     History {
@@ -1832,6 +1837,15 @@ pub(crate) const BUILT_IN_COMMANDS: [BuiltInCommandDescriptor; BuiltInCommandId:
         shortcut_action: None,
     },
     BuiltInCommandDescriptor {
+        id: BuiltInCommandId::ToggleLairExplorerRail,
+        category: CommandCategory::View,
+        title: "Toggle Lair explorer rail",
+        keywords: &[
+            "toggle", "collapse", "expand", "rail", "narrow", "lair", "explorer", "view",
+        ],
+        shortcut_action: None,
+    },
+    BuiltInCommandDescriptor {
         id: BuiltInCommandId::FocusLairExplorer,
         category: CommandCategory::View,
         title: "Focus Lair explorer",
@@ -2007,6 +2021,7 @@ pub(crate) const fn command_paused_during_handoff(id: BuiltInCommandId) -> bool 
         | BuiltInCommandId::ReturnToLive
         | BuiltInCommandId::ToggleTabStrip
         | BuiltInCommandId::ToggleLairExplorer
+        | BuiltInCommandId::ToggleLairExplorerRail
         | BuiltInCommandId::FocusLairExplorer
         | BuiltInCommandId::ReturnFocusToTerminal
         | BuiltInCommandId::ZoomIn
@@ -2082,6 +2097,7 @@ pub(crate) fn command_enabled(id: BuiltInCommandId, context: &CommandPaletteCont
         | BuiltInCommandId::PageDown
         | BuiltInCommandId::ToggleTabStrip
         | BuiltInCommandId::ToggleLairExplorer
+        | BuiltInCommandId::ToggleLairExplorerRail
         | BuiltInCommandId::FocusLairExplorer
         | BuiltInCommandId::ReturnFocusToTerminal
         | BuiltInCommandId::ZoomIn
@@ -2529,6 +2545,7 @@ pub(crate) fn command_dispatch(
         },
         BuiltInCommandId::ToggleTabStrip => BuiltInCommandDispatch::ToggleTabStrip,
         BuiltInCommandId::ToggleLairExplorer => BuiltInCommandDispatch::ToggleLairExplorer,
+        BuiltInCommandId::ToggleLairExplorerRail => BuiltInCommandDispatch::ToggleLairExplorerRail,
         BuiltInCommandId::FocusLairExplorer => BuiltInCommandDispatch::FocusLairExplorer,
         BuiltInCommandId::ReturnFocusToTerminal => BuiltInCommandDispatch::ReturnFocusToTerminal,
         BuiltInCommandId::ZoomIn => BuiltInCommandDispatch::Zoom(CommandZoomAction::Increase),
@@ -3041,6 +3058,7 @@ mod tests {
             vec![
                 BuiltInCommandId::ToggleTabStrip,
                 BuiltInCommandId::ToggleLairExplorer,
+                BuiltInCommandId::ToggleLairExplorerRail,
                 BuiltInCommandId::FocusLairExplorer,
                 BuiltInCommandId::ReturnFocusToTerminal,
                 BuiltInCommandId::ZoomIn,
@@ -3048,6 +3066,13 @@ mod tests {
                 BuiltInCommandId::ResetZoom,
                 BuiltInCommandId::DetachWindow
             ]
+        );
+        // The rail is found by what it does.
+        while palette.backspace() {}
+        assert!(palette.append_text("collapse"));
+        assert_eq!(
+            palette.filtered,
+            vec![BuiltInCommandId::ToggleLairExplorerRail]
         );
     }
 
@@ -3608,6 +3633,11 @@ mod tests {
             (
                 BuiltInCommandId::ToggleLairExplorer,
                 BuiltInCommandDispatch::ToggleLairExplorer,
+            ),
+            // The rail toggle is palette-only too: no default chord.
+            (
+                BuiltInCommandId::ToggleLairExplorerRail,
+                BuiltInCommandDispatch::ToggleLairExplorerRail,
             ),
             (
                 BuiltInCommandId::FocusLairExplorer,

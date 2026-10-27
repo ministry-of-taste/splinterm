@@ -89,6 +89,8 @@ pub(crate) use overlays::actions::{
     command_palette_row_hit_test, dojo_prompt_hit_test, dojo_prompt_layout, paint_command_palette,
     paint_dojo_prompt, paint_tab_context_menu, tab_context_menu_hit_test, tab_context_menu_layout,
 };
+#[cfg(test)]
+pub(crate) use overlays::explorer::lair_explorer_layout;
 #[allow(
     unused_imports,
     reason = "preserve the crate-local renderer facade for the inferred layout return type"
@@ -96,8 +98,8 @@ pub(crate) use overlays::actions::{
 pub(crate) use overlays::explorer::{
     LairExplorerLayout, LairExplorerPresentationMode, explorer_minimum_docked_terminal_width,
     lair_explorer_disclosure_hit_test, lair_explorer_filter_hit_test, lair_explorer_hit_test,
-    lair_explorer_layout, lair_explorer_layout_with_header, lair_explorer_palette,
-    lair_explorer_shows_working, paint_lair_explorer,
+    lair_explorer_layout_with_header, lair_explorer_palette, lair_explorer_shown_layout,
+    lair_explorer_shows_working, lair_explorer_toggle_hit_test, paint_lair_explorer,
 };
 pub(crate) use overlays::handoff::paint_handoff_banner;
 pub(crate) use overlays::history::{
