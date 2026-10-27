@@ -1235,7 +1235,7 @@ fn assemble_app(
             pending_remote_splits: HashMap::new(),
             dirty_inactive_panes: HashSet::new(),
         },
-        explorer: LairExplorerUi::new(options.explorer_collapsed),
+        explorer: LairExplorerUi::new(options.explorer_collapsed, options.explorer_two_line_rows),
         accessibility: navigation_accessibility::WindowAccessibility::new(update_waker.clone()),
         access: agent_access::WindowAccess::default(),
         handoff: HandoffFrontend::new(options.handoff_status.take(), update_waker),
@@ -4311,9 +4311,10 @@ impl App {
     }
 
     /// What the Explorer's layout sizes from its chrome text: the rail's
-    /// width and the footer's action targets.
+    /// width and the footer's action targets; and how tall its rows are.
     fn explorer_metrics(&self) -> LairExplorerMetrics {
         LairExplorerMetrics::measured(self.explorer_chrome_cell(), self.surface.scale_120)
+            .with_two_line_rows(self.explorer.two_line_rows())
     }
 
     /// One regular chrome cell's width in buffer px, or 0 when the chrome
@@ -6749,6 +6750,16 @@ impl App {
                         self.relayout_tab_strip();
                         self.relayout_panes();
                     }
+                }
+                if self
+                    .explorer
+                    .set_two_line_rows(loaded.config.explorer_two_line_rows)
+                {
+                    // Rows change height, not the panel's width: the
+                    // layout is taken again so a click hit-tests the new
+                    // rows at once.
+                    self.presentation.explorer_layout = self.take_explorer_layout();
+                    self.presentation.full_redraw = true;
                 }
                 self.presentation.ui_font_size = loaded.config.ui_font_size;
                 self.reconcile_chrome_font_size();

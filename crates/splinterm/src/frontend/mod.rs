@@ -51,8 +51,8 @@ pub use dialog_text::{DialogIdentity, DialogLine, DialogLineRole, DialogText};
 #[cfg(test)]
 pub(crate) use lair_explorer::LairExplorerRowKind;
 pub(crate) use lair_explorer::{
-    LairExplorerAccess, LairExplorerAgentRow, LairExplorerDecision, LairExplorerFilter,
-    LairExplorerRow, LairExplorerUi,
+    LairExplorerAccess, LairExplorerAgentRow, LairExplorerDecision, LairExplorerDetail,
+    LairExplorerFilter, LairExplorerRow, LairExplorerUi,
 };
 pub use message::{
     AuthorityStatus, FontUpdate, PerfTraceCorrelation, ThemeUpdate, WindowCommand,

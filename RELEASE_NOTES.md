@@ -410,6 +410,12 @@ a hostile program running as your account.
   focuses the Splint and right-click opens its menu, as in the tree. Down
   from the tree's last row moves into the section. It is hidden on the rail,
   with `agent-status=no`, and when nothing reports.
+- `[explorer] row-lines=2` makes the expanded Lair Explorer's rows two lines
+  tall. A Splint row, in the tree and in the agents section, shows the agent's
+  detail muted under its name, or its working directory (`~` for home, the
+  middle elided to keep the last components) when no detail is reported. Lair
+  and Dojo rows centre their one line and the rail is unchanged. The default
+  stays `1`, and a reload applies a change at once.
 - The Lair Explorer can collapse to a narrow rail with one row per Lair: its
   initial and its most urgent agent glyph, with the current Lair marked by
   the accent bar and a muted `s` or `a` in its header under the Saved or All
