@@ -221,10 +221,13 @@ The footer has two lines. The first is an action line, `new · menu · «`:
 **new** makes a new Lair from the focused Splint's directory, as **New
 terminal** does; **menu** opens the selected row's menu, the one a
 right-click opens, or the command palette when no row is selected or the row
-has no menu; and **«** collapses the Explorer to its rail. A token runs when
-the press and the release both land on it, and clicking one leaves the
-keyboard where it was. The tokens have no default shortcut. In a narrow panel
-`menu` goes first, then `new`; `«` stays longest.
+has nothing on its menu, and does nothing while the row's menu is unavailable
+during a refresh or a disconnect; and **«** collapses the Explorer to its
+rail. A token runs when the press and the release both land on it. Clicking
+one, or anywhere else on the footer, leaves the keyboard where it was (a menu
+that `menu` opens has the keys until it closes). The tokens have no default
+shortcut, and their width follows the UI font. In a narrow panel `menu` goes
+first, then `new`; `«` stays longest.
 
 The footer's second line shows, in this order, the search field while you
 search, a navigation notice such as *Refreshing navigation…* when there is

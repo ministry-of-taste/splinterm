@@ -380,13 +380,16 @@ a hostile program running as your account.
   whether the row is live (a filled or hollow dot), and whether a Lair is saved
   or pinned. The footer's first line is an action line, `new · menu · «`:
   **new** makes a new Lair, **menu** opens the selected row's menu (the
-  command palette when there is none), and **«** collapses the Explorer to
-  its rail. Clicking one leaves the keyboard where it was, and none has a
-  default shortcut; a narrow panel drops `menu`, then `new`. The second
-  line gives the selected row one short status that says only what the row
-  does not already show, a waiting access request and agents needing input
-  or in error first, for example *1 needs input · 2 working · saved*. It
-  drops the name, a running row's "Running", a disposable Lair's
+  command palette when no row is selected or the row has nothing on its
+  menu, and nothing while the menu is unavailable during a refresh), and
+  **«** collapses the Explorer to its rail. Clicking one, or anywhere else
+  on the footer, leaves the keyboard where it was (a menu that `menu` opens
+  has the keys until it closes), and none has a default shortcut; the words
+  are sized from the UI font, and a narrow panel drops `menu`, then `new`.
+  The second line gives the selected row one short status that says only
+  what the row does not already show, a waiting access request and agents
+  needing input or in error first, for example *1 needs input · 2 working ·
+  saved*. It drops the name, a running row's "Running", a disposable Lair's
   "Disposable", and the current Dojo's "Current". A status too long for the
   panel ends in an ellipsis after its last whole word instead of wrapping.
   Assistive technology still reads the full words for every row. The search

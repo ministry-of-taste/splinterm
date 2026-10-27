@@ -53,8 +53,9 @@ const FOOTER_LINE_HEIGHT: u32 = 24;
 /// The footer's first line holds the actions; the second, the context.
 const FOOTER_ACTION_LINE: usize = 0;
 const FOOTER_CONTEXT_LINE: usize = 1;
+const FOOTER_LINES: u32 = 2;
 const FOOTER_PADDING: u32 = 4;
-const FOOTER_HEIGHT: u32 = FOOTER_LINE_HEIGHT * 2 + FOOTER_PADDING;
+const FOOTER_HEIGHT: u32 = FOOTER_LINE_HEIGHT * FOOTER_LINES + FOOTER_PADDING;
 const ROW_HEIGHT: u32 = 26;
 /// Logical pixels each tree level indents a row's name.
 const LEVEL_INDENT: u32 = 12;
@@ -140,7 +141,7 @@ pub(crate) fn lair_explorer_chrome_cell_width(
     Ok(text.frame.cell_width.max(1))
 }
 
-/// The `«` target on the footer's action line.
+/// The `«` target's narrowest width on the footer's action line.
 const TOGGLE_WIDTH: u32 = 24;
 /// Collapses the expanded Explorer to its rail.
 const COLLAPSE_TEXT: &str = "«";
@@ -150,13 +151,87 @@ const EXPAND_TEXT: &str = "»";
 const RAIL_NOTICE_TEXT: &str = "!";
 /// Painted between neighbouring footer actions.
 const ACTION_SEPARATOR: &str = "·";
-/// Logical px per cell of an action word's target: wider than a chrome
-/// cell at the chrome line cap (24 px lines), so the word is never cut.
+/// Logical px per cell of an action word's target, and the gap between two
+/// targets, while the chrome font cannot be measured.
 const ACTION_CELL_WIDTH: u32 = 14;
 /// Logical px each side of an action word inside its target.
 const ACTION_PADDING: u32 = 4;
-/// The dead space between two action targets, where the `·` sits.
-const ACTION_SEPARATOR_WIDTH: u32 = ACTION_CELL_WIDTH;
+
+/// What the Explorer's layout sizes from the chrome text as it is drawn:
+/// the collapsed rail's width and the footer's action targets.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LairExplorerMetrics {
+    /// The collapsed rail's width in logical px.
+    pub(crate) rail_width: u32,
+    /// One regular chrome cell's width in buffer px, or 0 when the chrome
+    /// font could not be measured.
+    chrome_cell: u32,
+    scale_120: u32,
+}
+
+impl LairExplorerMetrics {
+    /// The sizes for an unmeasured chrome font: the rail at its narrowest
+    /// and action targets of [`ACTION_CELL_WIDTH`] per cell.
+    #[cfg(test)]
+    pub(crate) const UNMEASURED: Self = Self {
+        rail_width: RAIL_WIDTH,
+        chrome_cell: 0,
+        scale_120: 120,
+    };
+
+    /// The sizes for a regular chrome cell `chrome_cell` buffer px wide at
+    /// `scale_120`, as [`lair_explorer_chrome_cell_width`] measures it.
+    #[must_use]
+    pub(crate) fn measured(chrome_cell: u32, scale_120: u32) -> Self {
+        Self {
+            rail_width: lair_explorer_rail_width(chrome_cell, scale_120),
+            chrome_cell,
+            scale_120: scale_120.max(1),
+        }
+    }
+
+    /// `buffer` px in logical px, rounded up, and one px more at a
+    /// fractional scale for an edge that rounds away a buffer px.
+    fn logical(self, buffer: u32) -> u32 {
+        buffer
+            .saturating_mul(120)
+            .div_ceil(self.scale_120)
+            .saturating_add(u32::from(self.scale_120 % 120 != 0))
+    }
+
+    /// An action target's width in logical px: its word in measured chrome
+    /// cells with [`ACTION_PADDING`] each side, so the word is never cut;
+    /// `«` is never narrower than [`TOGGLE_WIDTH`].
+    fn action_width(self, action: LairExplorerAction) -> u32 {
+        let cells = u32::try_from(text_cells(action.text())).unwrap_or(u32::MAX);
+        let width = if self.chrome_cell == 0 {
+            cells
+                .saturating_mul(ACTION_CELL_WIDTH)
+                .saturating_add(ACTION_PADDING * 2)
+        } else {
+            let padding = ACTION_PADDING.saturating_mul(self.scale_120).div_ceil(120);
+            self.logical(
+                cells
+                    .saturating_mul(self.chrome_cell)
+                    .saturating_add(padding.saturating_mul(2)),
+            )
+        };
+        match action {
+            LairExplorerAction::Toggle => width.max(TOGGLE_WIDTH),
+            _ => width,
+        }
+    }
+
+    /// The gap between two action targets, where the `·` sits: one chrome
+    /// cell.
+    fn separator_width(self) -> u32 {
+        if self.chrome_cell == 0 {
+            ACTION_CELL_WIDTH
+        } else {
+            self.logical(self.chrome_cell)
+        }
+    }
+}
 
 /// A click target of the Explorer's own chrome: the footer's action line or
 /// the rail's header. A press on one leaves keyboard input where it is.
@@ -165,7 +240,8 @@ pub(crate) enum LairExplorerAction {
     /// `new`: a new Lair, as **New terminal** makes one.
     New,
     /// `menu`: the selected row's menu, as a right-click opens it, or the
-    /// command palette when no row with a menu is selected.
+    /// command palette when no row is selected or the row has nothing on its
+    /// menu; nothing while the row's menu is unavailable for now.
     Menu,
     /// `«` on the expanded footer collapses to the rail; `»` on the rail's
     /// header expands it.
@@ -173,23 +249,12 @@ pub(crate) enum LairExplorerAction {
 }
 
 impl LairExplorerAction {
-    const fn text(self, rail: bool) -> &'static str {
+    /// The word on the footer's action line.
+    const fn text(self) -> &'static str {
         match self {
             Self::New => "new",
             Self::Menu => "menu",
-            Self::Toggle if rail => EXPAND_TEXT,
             Self::Toggle => COLLAPSE_TEXT,
-        }
-    }
-
-    /// The target's width in logical px.
-    fn width(self) -> u32 {
-        match self {
-            Self::Toggle => TOGGLE_WIDTH,
-            action => u32::try_from(text_cells(action.text(false)))
-                .unwrap_or(u32::MAX)
-                .saturating_mul(ACTION_CELL_WIDTH)
-                .saturating_add(ACTION_PADDING * 2),
         }
     }
 }
@@ -384,7 +449,7 @@ fn row_slots(
 }
 
 /// The shown Explorer's layout with a header line `header` logical px
-/// tall, or row-high for `None`: the rail, `rail_width` logical px wide,
+/// tall, or row-high for `None`: the rail, as wide as `metrics` say,
 /// when `collapsed`, else the expanded panel. Either one docks beside the
 /// terminal when that leaves it `minimum_terminal_width` logical px, and is
 /// otherwise a drawer over the terminal instead of squeezing it.
@@ -394,7 +459,7 @@ pub(crate) fn lair_explorer_shown_layout(
     content: Rect,
     header: Option<u32>,
     minimum_terminal_width: u32,
-    rail_width: u32,
+    metrics: LairExplorerMetrics,
     rows: &[LairExplorerRow],
     selected: Option<NavigationNodeId>,
     requested_start: usize,
@@ -406,7 +471,7 @@ pub(crate) fn lair_explorer_shown_layout(
             content,
             header,
             minimum_terminal_width,
-            rail_width,
+            metrics.rail_width,
             rows,
             selected,
             requested_start,
@@ -416,6 +481,7 @@ pub(crate) fn lair_explorer_shown_layout(
             content,
             header,
             minimum_terminal_width,
+            metrics,
             rows,
             selected,
             requested_start,
@@ -510,6 +576,7 @@ pub(crate) fn lair_explorer_layout(
         content,
         HEADER_HEIGHT,
         minimum_terminal_width,
+        LairExplorerMetrics::UNMEASURED,
         rows,
         selected,
         requested_start,
@@ -522,6 +589,7 @@ fn lair_explorer_layout_with_header(
     content: Rect,
     header: u32,
     minimum_terminal_width: u32,
+    metrics: LairExplorerMetrics,
     rows: &[LairExplorerRow],
     selected: Option<NavigationNodeId>,
     requested_start: usize,
@@ -593,15 +661,20 @@ fn lair_explorer_layout_with_header(
         rail: false,
         // Every Window can collapse: the rail is a drawer where it cannot
         // dock.
-        actions: footer_action_rects(footer),
+        actions: footer_action_rects(footer, metrics),
     })
 }
 
 /// The footer action line's targets, left to right with a `·` between
-/// neighbours: `new`, `menu`, and `«`. A line too narrow for all of them
-/// drops `menu`, then `new`, so `«` stays longest; none overlaps another or
-/// reaches the divider. A footer cut short by a tiny Window has none.
-fn footer_action_rects(footer: Rect) -> Vec<(LairExplorerAction, Rect)> {
+/// neighbours: `new`, `menu`, and `«`, each as wide as its word in the
+/// measured chrome cells of `metrics`. The first word starts at the context
+/// line's inset. A line too narrow for all of them drops `menu`, then
+/// `new`, so `«` stays longest; none overlaps another or reaches the
+/// divider. A footer cut short by a tiny Window has none.
+fn footer_action_rects(
+    footer: Rect,
+    metrics: LairExplorerMetrics,
+) -> Vec<(LairExplorerAction, Rect)> {
     use LairExplorerAction::{Menu, New, Toggle};
 
     if footer.height < FOOTER_HEIGHT {
@@ -613,15 +686,15 @@ fn footer_action_rects(footer: Rect) -> Vec<(LairExplorerAction, Rect)> {
     let right = footer
         .x
         .saturating_add(footer.width.saturating_sub(FOOTER_PADDING));
+    let separator = metrics.separator_width();
     let choices: [&[LairExplorerAction]; 3] = [&[New, Menu, Toggle], &[New, Toggle], &[Toggle]];
     for shown in choices {
         let width = shown
             .iter()
-            .map(|action| action.width())
+            .map(|&action| metrics.action_width(action))
             .sum::<u32>()
             .saturating_add(
-                ACTION_SEPARATOR_WIDTH
-                    .saturating_mul(u32::try_from(shown.len().saturating_sub(1)).unwrap_or(0)),
+                separator.saturating_mul(u32::try_from(shown.len().saturating_sub(1)).unwrap_or(0)),
             );
         if left.saturating_add(width) > right {
             continue;
@@ -633,12 +706,10 @@ fn footer_action_rects(footer: Rect) -> Vec<(LairExplorerAction, Rect)> {
                 let rect = Rect {
                     x,
                     y: footer.y.saturating_add(FOOTER_PADDING),
-                    width: action.width(),
+                    width: metrics.action_width(action),
                     height: FOOTER_LINE_HEIGHT,
                 };
-                x = x
-                    .saturating_add(rect.width)
-                    .saturating_add(ACTION_SEPARATOR_WIDTH);
+                x = x.saturating_add(rect.width).saturating_add(separator);
                 (action, rect)
             })
             .collect();
@@ -700,6 +771,21 @@ pub(crate) fn lair_explorer_action_hit_test(
             && position.1 < f64::from(rect.y.saturating_add(rect.height)))
         .then_some(*action)
     })
+}
+
+/// Whether `position` is anywhere on the expanded footer, both lines and
+/// their padding: a press there that misses a target is not a row press.
+/// The rail has no footer.
+#[must_use]
+pub(crate) fn lair_explorer_footer_hit_test(
+    layout: &LairExplorerLayout,
+    position: (f64, f64),
+) -> bool {
+    let footer = layout.footer;
+    position.0 >= f64::from(footer.x)
+        && position.0 < f64::from(footer.x.saturating_add(footer.width))
+        && position.1 >= f64::from(footer.y)
+        && position.1 < f64::from(footer.y.saturating_add(footer.height))
 }
 
 #[must_use]
@@ -982,7 +1068,7 @@ fn footer_lines(footer: Rect, scale_120: u32, inset: u32) -> Vec<Rect> {
         .y
         .saturating_add(FOOTER_PADDING.saturating_mul(scale_120).div_ceil(120));
     let bottom = footer.y.saturating_add(footer.height);
-    (0..=u32::try_from(FOOTER_CONTEXT_LINE).unwrap_or(0))
+    (0..FOOTER_LINES)
         .map(|index| {
             let y = top.saturating_add(line.saturating_mul(index)).min(bottom);
             Rect {
@@ -1410,16 +1496,17 @@ pub(crate) fn paint_lair_explorer(
     } else {
         status_message
     };
-    // The action words are muted tokens, centred in their targets, with a
-    // `·` centred in the dead space between neighbours.
+    // The action words are muted tokens, each left-aligned in its target
+    // past the padding, so the first starts where the context line does,
+    // with a `·` centred in the gap between neighbours.
     let action_line = lines[FOOTER_ACTION_LINE];
+    let padding = ACTION_PADDING.saturating_mul(scale_120).div_ceil(120);
     let mut previous_end = None;
     for (action, rect) in &layout.actions {
-        let target = toggle_clip(*rect, scale_120, right);
         let target = Rect {
             y: action_line.y,
             height: action_line.height,
-            ..target
+            ..action_clip(*rect, scale_120, right)
         };
         if let Some(previous_end) = previous_end {
             paint_picker_text(
@@ -1450,12 +1537,12 @@ pub(crate) fn paint_lair_explorer(
             canvas,
             canvas_width,
             canvas_height,
-            action.text(false),
+            action.text(),
             ChromeTextStyle::Regular,
             scale_120,
             renderer_generation,
-            target,
-            PickerTextAlignment::Center,
+            action_text_clip(target, padding),
+            PickerTextAlignment::Left,
             palette.secondary,
         )?;
     }
@@ -1496,13 +1583,23 @@ pub(crate) fn paint_lair_explorer(
     Ok(())
 }
 
-/// An action target's text clip in buffer px: its target, never past the
-/// divider at `right`.
-fn toggle_clip(toggle: Rect, scale_120: u32, right: u32) -> Rect {
-    let clip = buffer_rect(toggle, scale_120);
+/// An action target in buffer px, never past the divider at `right`.
+fn action_clip(target: Rect, scale_120: u32, right: u32) -> Rect {
+    let clip = buffer_rect(target, scale_120);
     Rect {
         width: clip.width.min(right.saturating_sub(clip.x)),
         ..clip
+    }
+}
+
+/// Where an action word goes inside its buffer `target`: past `padding`
+/// buffer px on each side.
+fn action_text_clip(target: Rect, padding: u32) -> Rect {
+    let padding = padding.min(target.width / 2);
+    Rect {
+        x: target.x.saturating_add(padding),
+        width: target.width - padding * 2,
+        ..target
     }
 }
 
@@ -1561,7 +1658,7 @@ fn rail_row_text(inner: Rect, border: u32) -> Rect {
 
 /// The rail header's `»`, muted and centred in its target.
 #[allow(clippy::too_many_arguments)]
-fn paint_header_toggle(
+fn paint_rail_toggle(
     cache: &mut SessionPickerTextCache,
     context: &RenderContext,
     used: &mut HashSet<SessionPickerTextKey>,
@@ -1583,11 +1680,11 @@ fn paint_header_toggle(
         canvas,
         canvas_width,
         canvas_height,
-        &ChromeSource::from(LairExplorerAction::Toggle.text(layout.rail)),
+        &ChromeSource::from(EXPAND_TEXT),
         ChromeTextStyle::Regular,
         scale_120,
         renderer_generation,
-        toggle_clip(toggle, scale_120, right),
+        action_clip(toggle, scale_120, right),
         PickerTextAlignment::Center,
         palette.secondary,
         layout.header_text_cell_cap,
@@ -1663,7 +1760,7 @@ fn paint_rail_header(
     (notice, filter): (bool, LairExplorerFilter),
     (cell_width, border, right): (u32, u32, u32),
 ) -> Result<()> {
-    paint_header_toggle(
+    paint_rail_toggle(
         cache,
         context,
         used,
@@ -1821,6 +1918,8 @@ mod tests {
     use super::*;
     use crate::frontend::LairExplorerRowKind;
 
+    const UNMEASURED: LairExplorerMetrics = LairExplorerMetrics::UNMEASURED;
+
     fn row(id: NavigationNodeId) -> LairExplorerRow {
         LairExplorerRow {
             id,
@@ -1900,7 +1999,7 @@ mod tests {
             content,
             None,
             640,
-            RAIL_WIDTH,
+            UNMEASURED,
             &rows,
             Some(rows[2].id),
             0,
@@ -1946,10 +2045,10 @@ mod tests {
         }
         // With no footer the rail fits more rows than the expanded panel.
         let many = lair_rows(40);
-        let rail = lair_explorer_shown_layout(content, None, 640, RAIL_WIDTH, &many, None, 0, true)
+        let rail = lair_explorer_shown_layout(content, None, 640, UNMEASURED, &many, None, 0, true)
             .unwrap();
         let expanded =
-            lair_explorer_shown_layout(content, None, 640, RAIL_WIDTH, &many, None, 0, false)
+            lair_explorer_shown_layout(content, None, 640, UNMEASURED, &many, None, 0, false)
                 .unwrap();
         assert!(!expanded.rail);
         assert_eq!(
@@ -1960,7 +2059,7 @@ mod tests {
         // The selected Lair stays in view.
         let last = many.last().unwrap().id;
         let rail =
-            lair_explorer_shown_layout(content, None, 640, RAIL_WIDTH, &many, Some(last), 0, true)
+            lair_explorer_shown_layout(content, None, 640, UNMEASURED, &many, Some(last), 0, true)
                 .unwrap();
         assert_eq!(rail.rows.last().unwrap().id, last);
     }
@@ -1976,7 +2075,7 @@ mod tests {
             width: 1000,
             height: 400,
         };
-        let rail = lair_explorer_shown_layout(content, None, 640, RAIL_WIDTH, &rows, None, 0, true)
+        let rail = lair_explorer_shown_layout(content, None, 640, UNMEASURED, &rows, None, 0, true)
             .unwrap();
         assert_eq!(
             rail.actions,
@@ -2012,7 +2111,7 @@ mod tests {
         };
         for collapsed in [false, true] {
             let layout =
-                lair_explorer_shown_layout(short, None, 640, RAIL_WIDTH, &rows, None, 0, collapsed)
+                lair_explorer_shown_layout(short, None, 640, UNMEASURED, &rows, None, 0, collapsed)
                     .unwrap();
             assert!(layout.actions.is_empty(), "collapsed={collapsed}");
         }
@@ -2036,14 +2135,14 @@ mod tests {
             height: 400,
         };
         let layout =
-            lair_explorer_shown_layout(content, None, 640, RAIL_WIDTH, &rows, None, 0, false)
+            lair_explorer_shown_layout(content, None, 640, UNMEASURED, &rows, None, 0, false)
                 .unwrap();
         let shown: Vec<_> = layout.actions.iter().map(|(action, _)| *action).collect();
         assert_eq!(shown, [New, Menu, Toggle]);
         let line_y = layout.footer.y + FOOTER_PADDING;
         for pair in layout.actions.windows(2) {
             let (left, right) = (pair[0].1, pair[1].1);
-            assert_eq!(left.x + left.width + ACTION_SEPARATOR_WIDTH, right.x);
+            assert_eq!(left.x + left.width + UNMEASURED.separator_width(), right.x);
         }
         for (action, rect) in &layout.actions {
             assert_eq!((rect.y, rect.height), (line_y, FOOTER_LINE_HEIGHT));
@@ -2064,30 +2163,41 @@ mod tests {
             let gap = (f64::from(rect.x + rect.width) + 1.0, f64::from(line_y + 2));
             assert_eq!(lair_explorer_action_hit_test(&layout, gap), None);
         }
-        // The word itself fits its target with room to spare even at the
-        // widest chrome cell, which the chrome line cap bounds.
-        let render = RenderContext::new(u16::MAX).at_maximum_chrome_font_size();
-        for scale in [120, 180, 240] {
-            let cell = lair_explorer_chrome_cell_width(&render, scale).unwrap();
-            assert!(
-                cell * 120 <= ACTION_CELL_WIDTH * scale,
-                "a {cell} px chrome cell at scale {scale}"
-            );
-        }
-        for action in [New, Menu] {
-            let cells = u32::try_from(text_cells(action.text(false))).unwrap();
-            assert_eq!(
-                action.width(),
-                cells * ACTION_CELL_WIDTH + ACTION_PADDING * 2
-            );
-        }
         assert_eq!(layout.toggle().map(|rect| rect.width), Some(TOGGLE_WIDTH));
-        // Nothing on the header or the context line is an action.
+        // The first word starts at the context line's inset.
+        assert_eq!(
+            layout.actions[0].1.x + ACTION_PADDING,
+            layout.panel.x + LEVEL_INDENT
+        );
+        // Nothing on the header or the context line is an action, but the
+        // whole footer, both lines and the gaps between targets, is footer
+        // rather than rows; the rows and the header are not.
         assert_eq!(lair_explorer_action_hit_test(&layout, (280.0, 5.0)), None);
+        assert!(!lair_explorer_footer_hit_test(&layout, (280.0, 5.0)));
         let context_y = f64::from(line_y + FOOTER_LINE_HEIGHT + 2);
         for x in [20.0, 60.0, 120.0] {
             assert_eq!(lair_explorer_action_hit_test(&layout, (x, context_y)), None);
+            assert!(lair_explorer_footer_hit_test(&layout, (x, context_y)));
         }
+        for (_, rect) in &layout.actions {
+            let gap = (f64::from(rect.x + rect.width) + 1.0, f64::from(line_y + 2));
+            assert!(lair_explorer_footer_hit_test(&layout, gap));
+        }
+        for x in [0.0, f64::from(layout.panel.width) - 1.0] {
+            let padding = (x, f64::from(layout.footer.y));
+            assert!(lair_explorer_footer_hit_test(&layout, padding));
+            let bottom = (x, f64::from(layout.footer.y + layout.footer.height) - 0.5);
+            assert!(lair_explorer_footer_hit_test(&layout, bottom));
+        }
+        for laid in &layout.rows {
+            let row = (20.0, f64::from(laid.rect.y + 1));
+            assert!(!lair_explorer_footer_hit_test(&layout, row));
+        }
+        let past = (
+            f64::from(layout.panel.x + layout.panel.width),
+            f64::from(layout.footer.y + 2),
+        );
+        assert!(!lair_explorer_footer_hit_test(&layout, past));
         // The filters take back the header's right end: they run to the
         // panel's inset.
         let (_, last_filter) = layout.filters[2];
@@ -2104,7 +2214,7 @@ mod tests {
         for width in [700, 650] {
             let drawer = Rect { width, ..content };
             let layout =
-                lair_explorer_shown_layout(drawer, None, 640, RAIL_WIDTH, &rows, None, 0, false)
+                lair_explorer_shown_layout(drawer, None, 640, UNMEASURED, &rows, None, 0, false)
                     .unwrap();
             assert_eq!(layout.mode, LairExplorerPresentationMode::Drawer);
             let shown: Vec<_> = layout.actions.iter().map(|(action, _)| *action).collect();
@@ -2116,58 +2226,67 @@ mod tests {
             ..content
         };
         let layout =
-            lair_explorer_shown_layout(short, None, 640, RAIL_WIDTH, &rows, None, 0, false)
+            lair_explorer_shown_layout(short, None, 640, UNMEASURED, &rows, None, 0, false)
                 .unwrap();
         assert!(layout.footer.height < FOOTER_HEIGHT);
         assert!(layout.actions.is_empty());
     }
-
     /// A narrow footer drops `menu` first, then `new`, keeping `«` longest;
     /// a footer too narrow for even `«` shows none. No two targets ever
-    /// overlap, and none reaches the divider.
+    /// overlap, and none reaches the divider, whatever the chrome cell.
     #[test]
     fn narrow_footers_drop_menu_then_new_and_keep_the_collapse() {
         use LairExplorerAction::{Menu, New, Toggle};
 
-        let left = LEVEL_INDENT - ACTION_PADDING;
-        let full = left
-            + New.width()
-            + Menu.width()
-            + Toggle.width()
-            + ACTION_SEPARATOR_WIDTH * 2
-            + FOOTER_PADDING;
-        let without_menu =
-            left + New.width() + Toggle.width() + ACTION_SEPARATOR_WIDTH + FOOTER_PADDING;
-        let only_toggle = left + Toggle.width() + FOOTER_PADDING;
         let footer = |width| Rect {
             x: 10,
             y: 100,
             width,
             height: FOOTER_HEIGHT,
         };
-        let shown = |width| -> Vec<LairExplorerAction> {
-            footer_action_rects(footer(width))
-                .into_iter()
-                .map(|(action, _)| action)
-                .collect()
-        };
-        assert_eq!(shown(full), [New, Menu, Toggle]);
-        assert_eq!(shown(full - 1), [New, Toggle]);
-        assert_eq!(shown(without_menu), [New, Toggle]);
-        assert_eq!(shown(without_menu - 1), [Toggle]);
-        assert_eq!(shown(only_toggle), [Toggle]);
-        assert!(shown(only_toggle - 1).is_empty());
-        // The expanded panel's own width keeps every action.
-        assert!(full <= PREFERRED_WIDTH);
-        for width in 0..=PREFERRED_WIDTH {
-            let rects = footer_action_rects(footer(width));
-            for (index, (_, rect)) in rects.iter().enumerate() {
-                assert!(
-                    rect.x + rect.width <= 10 + width - FOOTER_PADDING,
-                    "{width}"
-                );
-                for (_, other) in &rects[index + 1..] {
-                    assert!(rect.x + rect.width < other.x, "{width}: overlap");
+        for metrics in [
+            UNMEASURED,
+            LairExplorerMetrics::measured(8, 120),
+            LairExplorerMetrics::measured(14, 120),
+            LairExplorerMetrics::measured(17, 150),
+            LairExplorerMetrics::measured(21, 180),
+            LairExplorerMetrics::measured(29, 240),
+        ] {
+            let width = |action| metrics.action_width(action);
+            let separator = metrics.separator_width();
+            let left = LEVEL_INDENT - ACTION_PADDING;
+            let full =
+                left + width(New) + width(Menu) + width(Toggle) + separator * 2 + FOOTER_PADDING;
+            let without_menu = left + width(New) + width(Toggle) + separator + FOOTER_PADDING;
+            let only_toggle = left + width(Toggle) + FOOTER_PADDING;
+            let shown = |width| -> Vec<LairExplorerAction> {
+                footer_action_rects(footer(width), metrics)
+                    .into_iter()
+                    .map(|(action, _)| action)
+                    .collect()
+            };
+            assert_eq!(shown(full), [New, Menu, Toggle], "{metrics:?}");
+            assert_eq!(shown(full - 1), [New, Toggle], "{metrics:?}");
+            assert_eq!(shown(without_menu), [New, Toggle], "{metrics:?}");
+            assert_eq!(shown(without_menu - 1), [Toggle], "{metrics:?}");
+            assert_eq!(shown(only_toggle), [Toggle], "{metrics:?}");
+            assert!(shown(only_toggle - 1).is_empty(), "{metrics:?}");
+            // The expanded panel's own width keeps every action.
+            assert!(full <= PREFERRED_WIDTH, "{metrics:?}");
+            for width in 0..=PREFERRED_WIDTH {
+                let rects = footer_action_rects(footer(width), metrics);
+                for (index, (_, rect)) in rects.iter().enumerate() {
+                    assert!(
+                        rect.x + rect.width <= 10 + width - FOOTER_PADDING,
+                        "{metrics:?} {width}"
+                    );
+                    if let Some((_, next)) = rects.get(index + 1) {
+                        assert_eq!(
+                            rect.x + rect.width + separator,
+                            next.x,
+                            "{metrics:?} {width}"
+                        );
+                    }
                 }
             }
         }
@@ -2367,9 +2486,10 @@ mod tests {
             height: 300,
         };
         let rows = lair_rows(2);
-        let wide = lair_explorer_rail_width(14, 120);
+        let metrics = LairExplorerMetrics::measured(14, 120);
+        let wide = metrics.rail_width;
         let rail =
-            lair_explorer_shown_layout(content, None, 640, wide, &rows, None, 0, true).unwrap();
+            lair_explorer_shown_layout(content, None, 640, metrics, &rows, None, 0, true).unwrap();
         assert_eq!(rail.panel.width, wide);
         assert_eq!(rail.terminal.x, wide);
         assert_eq!(rail.terminal.width, 1000 - wide);
@@ -2389,14 +2509,14 @@ mod tests {
             ..content
         };
         let docked =
-            lair_explorer_shown_layout(edge, None, 640, wide, &rows, None, 0, true).unwrap();
+            lair_explorer_shown_layout(edge, None, 640, metrics, &rows, None, 0, true).unwrap();
         assert_eq!(docked.mode, LairExplorerPresentationMode::Docked);
         let narrower = Rect {
             width: 640 + wide - 1,
             ..content
         };
         let drawer =
-            lair_explorer_shown_layout(narrower, None, 640, wide, &rows, None, 0, true).unwrap();
+            lair_explorer_shown_layout(narrower, None, 640, metrics, &rows, None, 0, true).unwrap();
         assert_eq!(drawer.mode, LairExplorerPresentationMode::Drawer);
     }
 
@@ -2413,7 +2533,7 @@ mod tests {
             width: 600,
             height: 300,
         };
-        let rail = lair_explorer_shown_layout(content, None, 640, RAIL_WIDTH, &rows, None, 0, true)
+        let rail = lair_explorer_shown_layout(content, None, 640, UNMEASURED, &rows, None, 0, true)
             .unwrap();
         assert!(rail.rail);
         assert_eq!(rail.mode, LairExplorerPresentationMode::Drawer);
@@ -2442,7 +2562,7 @@ mod tests {
             width: 30,
             ..content
         };
-        let rail = lair_explorer_shown_layout(sliver, None, 640, RAIL_WIDTH, &rows, None, 0, true)
+        let rail = lair_explorer_shown_layout(sliver, None, 640, UNMEASURED, &rows, None, 0, true)
             .unwrap();
         assert!(rail.rail);
         assert_eq!(rail.panel.width, 30);
@@ -2464,7 +2584,7 @@ mod tests {
             height: 200,
         };
         let layout =
-            lair_explorer_shown_layout(content, None, 640, RAIL_WIDTH, &rows, None, 0, true)
+            lair_explorer_shown_layout(content, None, 640, UNMEASURED, &rows, None, 0, true)
                 .unwrap();
         let render = RenderContext::new(u16::MAX);
         for scale in [120, 240] {
@@ -2539,7 +2659,7 @@ mod tests {
             height: 200,
         };
         let layout =
-            lair_explorer_shown_layout(content, None, 640, RAIL_WIDTH, &rows, None, 0, true)
+            lair_explorer_shown_layout(content, None, 640, UNMEASURED, &rows, None, 0, true)
                 .unwrap();
         let render = RenderContext::new(u16::MAX);
         for scale in [120, 240] {
@@ -2626,7 +2746,7 @@ mod tests {
             content,
             None,
             640,
-            RAIL_WIDTH,
+            UNMEASURED,
             &rows,
             Some(rows[2].id),
             0,
@@ -3457,7 +3577,8 @@ mod tests {
     /// VM case E6, for the one-line layout: at every Omarchy text size from
     /// 9 to 20 px and at the largest UI size, at 1x, 1.25x, 1.5x, and 2x,
     /// every Explorer line still holds a whole chrome glyph, a long name is
-    /// ellipsized before the icon columns, and the columns fit the row.
+    /// ellipsized before the icon columns, the columns fit the row, and the
+    /// footer's action words and their `·`s fit their targets and gaps.
     #[test]
     fn every_ui_text_size_fits_every_explorer_line_and_ellipsizes_long_names() {
         use super::super::super::{ChromeText, text::chrome_maximum_cell_height};
@@ -3547,7 +3668,43 @@ mod tests {
                 assert!(fitted.ends_with('…'));
                 let fitted = ChromeText::load_with_context(&fitted, scale, &context).unwrap();
                 assert!(fitted.pixel_width() <= name_clip.width);
+                assert_action_words_fit(&context, scale, &layout);
             }
+        }
+    }
+
+    /// Sized from `context`'s measured chrome cell at `scale`, every action
+    /// word on `layout`'s footer fits its target whole past the padding, and
+    /// each `·` fits the gap before its word.
+    fn assert_action_words_fit(context: &RenderContext, scale: u32, layout: &LairExplorerLayout) {
+        use super::super::super::ChromeText;
+
+        let cell = lair_explorer_chrome_cell_width(context, scale).unwrap();
+        let metrics = LairExplorerMetrics::measured(cell, scale);
+        let panel = buffer_rect(layout.panel, scale);
+        let right = panel.x + panel.width - scale.div_ceil(120);
+        let padding = ACTION_PADDING.saturating_mul(scale).div_ceil(120);
+        let actions = footer_action_rects(layout.footer, metrics);
+        assert_eq!(actions.len(), 3, "scale {scale}, cell {cell}");
+        let dot = ChromeText::load_with_context(ACTION_SEPARATOR, scale, context).unwrap();
+        let mut previous_end = None;
+        for (action, rect) in &actions {
+            let target = action_clip(*rect, scale, right);
+            let clip = action_text_clip(target, padding);
+            let word = ChromeText::load_with_context(action.text(), scale, context).unwrap();
+            assert!(
+                word.pixel_width() <= clip.width,
+                "{action:?} at scale {scale}, cell {cell}: {} > {}",
+                word.pixel_width(),
+                clip.width
+            );
+            if let Some(end) = previous_end {
+                assert!(
+                    dot.pixel_width() <= target.x - end,
+                    "`·` before {action:?} at scale {scale}, cell {cell}"
+                );
+            }
+            previous_end = Some(target.x + target.width);
         }
     }
 
@@ -3981,6 +4138,90 @@ mod tests {
                     "scale {scale}: {:?}",
                     rows[0].status
                 );
+            }
+        }
+    }
+
+    /// Everything the action line paints, its words and their `·`s, stays
+    /// on the action line's rows, between the first target's left edge and
+    /// the last one's right edge, and left of the divider, at every scale
+    /// and at the largest chrome font, with the targets sized from the
+    /// measured chrome cell.
+    #[test]
+    fn action_line_paints_inside_its_targets_and_gaps() {
+        use super::super::picker::session_picker_palette;
+        use crate::config::ResolvedTheme;
+
+        let rows = lair_rows(2);
+        let surface = Rect {
+            x: 0,
+            y: 0,
+            width: 1000,
+            height: HEADER_HEIGHT + HEADER_SPACER + FOOTER_HEIGHT + ROW_HEIGHT * 2,
+        };
+        let palette = session_picker_palette(ResolvedTheme::default());
+        for context in [
+            RenderContext::new(u16::MAX),
+            RenderContext::new(u16::MAX).at_maximum_chrome_font_size(),
+        ] {
+            for scale in [120, 150, 180, 240] {
+                let metrics = LairExplorerMetrics::measured(
+                    lair_explorer_chrome_cell_width(&context, scale).unwrap(),
+                    scale,
+                );
+                let layout =
+                    lair_explorer_shown_layout(surface, None, 640, metrics, &rows, None, 0, false)
+                        .unwrap();
+                assert_eq!(layout.actions.len(), 3, "scale {scale}");
+                let without = LairExplorerLayout {
+                    actions: Vec::new(),
+                    ..layout.clone()
+                };
+                let canvas_width = surface.width * scale / 120 + 1;
+                let canvas_height = surface.height * scale / 120 + 1;
+                let draw = |layout: &LairExplorerLayout| {
+                    let mut canvas = vec![0; (canvas_width * canvas_height * 4) as usize];
+                    paint(
+                        &context,
+                        &mut canvas,
+                        canvas_width,
+                        canvas_height,
+                        scale,
+                        layout,
+                        palette,
+                        &rows,
+                        None,
+                        true,
+                        LairExplorerFilter::All,
+                    );
+                    canvas
+                };
+                let (with, bare) = (draw(&layout), draw(&without));
+                let inset = LEVEL_INDENT.saturating_mul(scale).div_ceil(120);
+                let line = footer_lines(buffer_rect(layout.footer, scale), scale, inset)
+                    [FOOTER_ACTION_LINE];
+                let panel = buffer_rect(layout.panel, scale);
+                let right = panel.x + panel.width - scale.div_ceil(120);
+                let first = buffer_rect(layout.actions[0].1, scale);
+                let last = action_clip(layout.actions[2].1, scale, right);
+                let mut painted = 0_usize;
+                for (index, (a, b)) in with.chunks_exact(4).zip(bare.chunks_exact(4)).enumerate() {
+                    if a == b {
+                        continue;
+                    }
+                    let x = u32::try_from(index).unwrap() % canvas_width;
+                    let y = u32::try_from(index).unwrap() / canvas_width;
+                    assert!(
+                        (line.y..line.y + line.height).contains(&y),
+                        "scale {scale}: action ink off its line at {x},{y}"
+                    );
+                    assert!(
+                        (first.x..last.x + last.width).contains(&x) && x < right,
+                        "scale {scale}: action ink outside its targets at {x},{y}"
+                    );
+                    painted += 1;
+                }
+                assert!(painted > 0, "scale {scale}");
             }
         }
     }
