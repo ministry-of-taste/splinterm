@@ -430,10 +430,11 @@ impl ChromeSurface {
     /// unselected row under the translucent hover highlight, the press
     /// highlight, or both. Panels draw primary and secondary text and the
     /// danger label of a destructive action, such as Terminate, there; the
-    /// accent rail only marks rows. The action palette, the session picker
-    /// and the tab context menu blend those highlights before painting row
-    /// text; selected rows sit on the opaque selected fill.
-    fn panel_text_layers(palette: &SessionPickerPalette) -> Vec<PanelTextLayer> {
+    /// accent rail only marks rows. Popups also draw the accent as text: the
+    /// Dojo prompt's unselected Restore or Revoke. The action palette, the
+    /// session picker and the tab context menu blend those highlights before
+    /// painting row text; selected rows sit on the opaque selected fill.
+    fn panel_text_layers(self, palette: &SessionPickerPalette) -> Vec<PanelTextLayer> {
         let row_text = vec![
             palette.highlight_primary,
             palette.highlight_secondary,
@@ -441,7 +442,15 @@ impl ChromeSurface {
         ];
         let mut layers = vec![PanelTextLayer {
             overlays: Vec::new(),
-            text: vec![palette.primary, palette.secondary, palette.danger],
+            text: match self {
+                Self::Menu => vec![palette.primary, palette.secondary, palette.danger],
+                Self::Popup => vec![
+                    palette.primary,
+                    palette.secondary,
+                    palette.danger,
+                    palette.selected_rail,
+                ],
+            },
         }];
         layers.extend(
             highlight_overlays(palette)
@@ -626,9 +635,13 @@ pub(crate) struct SessionPickerPalette {
     /// highlight, corrected to 4.5:1 against every opaque highlight state.
     pub(crate) highlight_primary: u32,
     pub(crate) highlight_secondary: u32,
-    /// A destructive action's label, such as Terminate: the danger role
-    /// raised to 4.5:1 against the panel, the selected fill, and every
-    /// highlight state, by mixing toward the text.
+    /// A destructive action's label, such as Terminate, from the danger role
+    /// or ANSI 9, whichever reads better on the panel. `danger` and
+    /// `selected_danger` are mixed toward the text until they keep 4.5:1 on
+    /// the panel and the selected fill; `highlight_danger` is corrected
+    /// toward black or white until it keeps 4.5:1 under every highlight. On
+    /// a translucent panel `danger` and `highlight_danger` are also mixed
+    /// toward the text until they read at the primary text's coverage.
     pub(crate) danger: u32,
     pub(crate) selected_danger: u32,
     pub(crate) highlight_danger: u32,
@@ -837,7 +850,7 @@ pub(crate) fn chrome_panel_palette_on(
         palette.panel,
         shell_alpha,
         theme.background_alpha,
-        &ChromeSurface::panel_text_layers(&palette),
+        &surface.panel_text_layers(&palette),
     );
     palette
 }
@@ -2852,7 +2865,7 @@ mod tests {
         assert!(alpha < u8::MAX, "{alpha}");
         let text = [palette.primary, palette.secondary];
         let coverage = |alpha: u8| f64::from(alpha) / 255.0;
-        let layers = ChromeSurface::panel_text_layers(&palette);
+        let layers = ChromeSurface::Menu.panel_text_layers(&palette);
         assert!(panel_layers_readable(
             palette.panel,
             coverage(alpha),
@@ -2889,6 +2902,8 @@ mod tests {
         floored.roles.surface = 0xf5_f1_e8;
         floored.roles.surface_raised = 0xf5_f1_e8;
         floored.roles.text = 0x22_24_28;
+        // A readable accent: popups also draw it as text.
+        floored.roles.accent = 0x2a_4a_8a;
         let opaque = session_picker_palette(floored);
         assert!(contrast_ratio(opaque.secondary, opaque.panel) < 4.6);
         let floored = chrome_panel_palette(floored, ChromeSurface::Popup);
@@ -2905,6 +2920,29 @@ mod tests {
             chrome_panel_fill(0x77_77_77, 0, 0, &[0x78_78_78])[3],
             u8::MAX
         );
+    }
+
+    #[test]
+    fn popup_accent_text_on_the_panel_joins_the_coverage_floor() {
+        // The Dojo prompt paints its unselected Restore or Revoke label in
+        // the accent (selected_rail) straight onto the popup's panel fill.
+        let mut theme = glassy_theme(0.0, 0.0);
+        let coverage = |fill: [u8; 4]| f64::from(fill[3]) / 255.0;
+        let menu = chrome_panel_palette(theme, ChromeSurface::Menu);
+        let popup = chrome_panel_palette(theme, ChromeSurface::Popup);
+        assert!(panel_text_readable(
+            popup.panel,
+            coverage(popup.panel_fill),
+            &[popup.primary, popup.secondary, popup.selected_rail],
+        ));
+        assert!(popup.panel_fill[3] >= menu.panel_fill[3]);
+        // An accent too dim to read even on the opaque panel keeps popups
+        // opaque, while menus, which draw no accent text, stay translucent.
+        theme.roles.accent = 0x20_22_30;
+        let menu = chrome_panel_palette(theme, ChromeSurface::Menu);
+        let popup = chrome_panel_palette(theme, ChromeSurface::Popup);
+        assert!(menu.panel_fill[3] < u8::MAX);
+        assert_eq!(popup.panel_fill[3], u8::MAX);
     }
 
     #[test]
@@ -3102,6 +3140,22 @@ mod tests {
                     contrast_ratio(text, under) >= TEXT_MIN_CONTRAST,
                     "{name}: {text:06x} on {under:06x}"
                 );
+            }
+            // Hovered and pressed rows, over the full selection fill.
+            let hover = (palette.selected_fill, ROW_HOVER_ALPHA);
+            let press = (palette.selected_rail, ROW_PRESS_ALPHA);
+            for overlays in [vec![hover], vec![press], vec![hover, press]] {
+                let under = visible_panel_color(palette.panel, 1.0, &overlays, 0);
+                for text in [
+                    palette.highlight_primary,
+                    palette.highlight_secondary,
+                    palette.highlight_danger,
+                ] {
+                    assert!(
+                        contrast_ratio(text, under) >= TEXT_MIN_CONTRAST,
+                        "{name}: {text:06x} under {overlays:x?}"
+                    );
+                }
             }
             // Text that already keeps its floor is the role itself.
             for (role, painted) in [

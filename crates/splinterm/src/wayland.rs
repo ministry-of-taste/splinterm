@@ -197,7 +197,7 @@ mod terminal_state;
 use chrome::divider_junction;
 use chrome::{
     TrustedConsentColors, frame_title_maximum_cells, paint_pane_chrome,
-    paint_trusted_consent_chrome, sanitize_frame_title,
+    paint_trusted_consent_chrome, sanitize_frame_title, trusted_dialog_theme,
 };
 pub use clipboard::encode_bracketed_paste;
 use clipboard::{
@@ -690,6 +690,11 @@ struct PreparedWindow {
 /// The part of [`run`] before the compositor: input activation, snapshot
 /// validation and theming, font and frame loading, and the initial size.
 fn prepare_window(options: &mut WindowOptions) -> Result<PreparedWindow> {
+    if options.trusted_consent.is_some() {
+        // A trusted dialog draws in its own floored colors from its first
+        // frame, even one shown before its text is fitted.
+        options.theme = trusted_dialog_theme(options.theme);
+    }
     let managed_tabs = options.initial_dojo.is_some();
     let render_context = RenderContext::new(options.theme.background_alpha)
         .with_font_size_override(followed_font_size(options.theme))
@@ -12610,6 +12615,9 @@ impl App {
                 &self.panes.pane.scrollback_viewport,
                 self.panes.pane.snapshot.as_ref(),
             ) {
+                // The digits are text on the raised surface.
+                let roles = self.presentation.theme.roles;
+                let digits = crate::color::contrast_corrected(roles.accent, roles.surface_raised);
                 paint_history_overlay(
                     canvas,
                     width,
@@ -12618,12 +12626,12 @@ impl App {
                     self.surface.scale_120,
                     status,
                     chrome_panel_fill(
-                        self.presentation.theme.roles.surface_raised,
+                        roles.surface_raised,
                         ChromeSurface::Popup.shell_alpha(self.presentation.theme.shell),
                         self.presentation.theme.background_alpha,
-                        &[self.presentation.theme.roles.accent],
+                        &[digits],
                     ),
-                    self.presentation.theme.roles.accent,
+                    digits,
                 );
             }
             if let Some(button_top) = trusted_action_top {
@@ -16083,6 +16091,37 @@ mod tests {
             ..WindowOptions::default()
         };
         assert_eq!(prepare_window(&mut plain).unwrap().fixed_size, None);
+    }
+
+    /// A trusted dialog draws in its floored colors from its first frame,
+    /// even one shown before its text is fitted: preparing its Window
+    /// writes them into its theme and its first snapshot.
+    #[test]
+    fn trusted_dialogs_draw_their_floored_colors_from_the_first_frame() {
+        let (decision, _receiver) = std::sync::mpsc::channel();
+        let mut theme = ResolvedTheme {
+            background: 0x00_70_70_70,
+            ..ResolvedTheme::default()
+        };
+        theme.roles.text = 0x00_76_76_76;
+        let mut dialog = WindowOptions {
+            theme,
+            ..TrustedConsentUi::restart(decision)
+                .with_text(crate::frontend::DialogText {
+                    lines: vec![crate::frontend::DialogLine::new("question")],
+                    minimum_rows: 1,
+                })
+                .into_window_options()
+        };
+        prepare_window(&mut dialog).unwrap();
+        let colors = TrustedConsentColors::from_theme(theme);
+        assert_eq!(dialog.theme, trusted_dialog_theme(theme));
+        let snapshot = dialog.snapshot.as_ref().unwrap();
+        assert_eq!(
+            snapshot.default_colors[..2],
+            [colors.text, colors.background]
+        );
+        assert!(crate::color::contrast_ratio(colors.text, colors.background) >= 4.5);
     }
 
     #[test]

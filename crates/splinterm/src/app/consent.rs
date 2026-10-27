@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail};
 use splinterd::dialog_shortcut::{BackgroundRegistration, DialogShortcut};
 use splinterm::{
     DialogIdentity, DialogLine, DialogText, TrustedConsentUi, WindowOptions,
-    config::{AppConfig, ResolvedTheme},
+    config::{AppConfig, OmarchyShellSettings, ResolvedTheme},
     run_window,
 };
 use splinterm_protocol::{
@@ -409,16 +409,24 @@ fn global_dialog_shortcut() -> bool {
 /// draws with the explicit startup fallback font alone, ignoring
 /// `main.font` and Fontconfig's `monospace`, and fails where that font is
 /// not installed. It returns the theme the dialog draws with: the person's
-/// theme as of opening, with its `[colors]` keys, always opaque, so nothing
-/// behind the dialog shows through it.
+/// theme as of opening, with its `[colors]` keys ([`dialog_theme`]).
 pub(in crate::app) fn configure_dialog_renderer(config: &AppConfig) -> Result<ResolvedTheme> {
-    let theme = ResolvedTheme {
-        background_alpha: u16::MAX,
-        background_blur: false,
-        ..super::theme_watch::load_dialog_theme(config)
-    };
+    let theme = dialog_theme(super::theme_watch::load_dialog_theme(config));
     super::sessions::configure_picker_renderer(config, theme)?;
     Ok(theme)
+}
+
+/// What a trusted dialog keeps of the person's theme: its colors only. It is
+/// always opaque, so nothing behind it shows through, and it keeps
+/// Omarchy's default shell settings, so its text size is the configured
+/// font's and never follows the shell's text size.
+fn dialog_theme(theme: ResolvedTheme) -> ResolvedTheme {
+    ResolvedTheme {
+        background_alpha: u16::MAX,
+        background_blur: false,
+        shell: OmarchyShellSettings::default(),
+        ..theme
+    }
 }
 
 /// The consent dialog's Window at the natural size of its text, answering on
@@ -947,5 +955,28 @@ mod tests {
         assert_eq!(decoded, [1, 2, 3]);
         assert!(read_private_frame_bounded::<Vec<u8>>(&mut buffer.as_slice(), 4).is_err());
         assert!(write_private_frame_bounded(&mut Vec::new(), &"x".repeat(64), 16).is_err());
+    }
+
+    /// A trusted dialog takes the theme's colours only: it is opaque and
+    /// keeps the default shell settings, so Omarchy's `[font] base-size`
+    /// never changes its text size.
+    #[test]
+    fn dialogs_take_the_theme_colors_but_not_its_shell_settings() {
+        use splinterm::config::{OmarchyShellSettings, ResolvedTheme};
+        let mut theme = ResolvedTheme {
+            background: 0x10_20_30,
+            background_alpha: 1_000,
+            background_blur: true,
+            ..ResolvedTheme::default()
+        };
+        theme.shell.text_size_px = Some(22);
+        theme.shell.ui_text_size_px = Some(19);
+        theme.shell.menu_alpha = 7;
+        let dialog = super::dialog_theme(theme);
+        assert_eq!(dialog.shell, OmarchyShellSettings::default());
+        assert_eq!(dialog.background_alpha, u16::MAX);
+        assert!(!dialog.background_blur);
+        assert_eq!(dialog.background, 0x10_20_30);
+        assert_eq!(dialog.roles, theme.roles);
     }
 }

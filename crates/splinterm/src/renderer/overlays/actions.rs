@@ -1102,11 +1102,13 @@ pub(crate) fn paint_command_palette(
                 scale_120,
                 renderer_generation,
                 buffer_rect(row.title, scale_120),
-                if enabled && row.command.destructive() {
-                    palette.row_danger(is_selected, highlighted)
-                } else {
-                    primary
-                },
+                row_label_color(
+                    &palette,
+                    enabled && row.command.destructive(),
+                    is_selected,
+                    highlighted,
+                    primary,
+                ),
                 false,
             )?;
             if !layout.compact {
@@ -1401,11 +1403,13 @@ pub(crate) fn paint_tab_context_menu(
             palette.secondary
         };
         // Terminate Lair and Terminate Dojo end running terminals.
-        let label_color = if enabled && row.action.destructive() {
-            palette.row_danger(selected, highlighted)
-        } else {
-            primary
-        };
+        let label_color = row_label_color(
+            &palette,
+            enabled && row.action.destructive(),
+            selected,
+            highlighted,
+            primary,
+        );
         if selected {
             let inset = 3_u32
                 .saturating_mul(scale_120)
@@ -1601,6 +1605,42 @@ pub(crate) fn dojo_prompt_hit_test(
         Some(TerminationDecision::Terminate)
     } else {
         None
+    }
+}
+
+/// A menu row's label: a destructive action that can run, such as
+/// Terminate, in danger; any other row in `primary`.
+fn row_label_color(
+    palette: &SessionPickerPalette,
+    destructive: bool,
+    selected: bool,
+    highlighted: bool,
+    primary: u32,
+) -> u32 {
+    if destructive {
+        palette.row_danger(selected, highlighted)
+    } else {
+        primary
+    }
+}
+
+/// A Dojo prompt choice's label. The confirming choice of a prompt that
+/// ends running terminals, Terminate a Dojo or a Lair, is drawn in danger,
+/// selected or not; another prompt's, Restore or Revoke, in the accent
+/// until it is selected, as before.
+fn dojo_prompt_choice_color(
+    palette: &SessionPickerPalette,
+    state: &DojoPromptUi,
+    decision: TerminationDecision,
+    selected: bool,
+) -> u32 {
+    let confirming = decision == TerminationDecision::Terminate;
+    match (confirming && state.confirmation_destructive(), selected) {
+        (true, true) => palette.selected_danger,
+        (true, false) => palette.danger,
+        (false, true) => palette.selected_primary,
+        (false, false) if confirming => palette.selected_rail,
+        (false, false) => palette.primary,
     }
 }
 
@@ -1835,13 +1875,7 @@ pub(crate) fn paint_dojo_prompt(
                 scale_120,
                 renderer_generation,
                 rect,
-                // Terminate is drawn in danger, selected or not.
-                match (decision == TerminationDecision::Terminate, selected) {
-                    (true, true) => palette.selected_danger,
-                    (true, false) => palette.danger,
-                    (false, true) => palette.selected_primary,
-                    (false, false) => palette.primary,
-                },
+                dojo_prompt_choice_color(&palette, state, decision, selected),
                 false,
             )?;
         }
@@ -2909,5 +2943,103 @@ mod tests {
         }
         assert!(filled * 2 > total, "{filled} of {total} panel pixels");
         assert!(text > 0, "fully covered glyph pixels stay opaque text");
+    }
+
+    /// Terminate is drawn in danger in the command palette, the tab menu and
+    /// the Dojo prompt; every other row and choice keeps its colour, and
+    /// Restore and Revoke confirm in the accent, as before.
+    #[test]
+    fn only_terminate_rows_and_choices_are_drawn_in_danger() {
+        let palette = session_picker_palette(ResolvedTheme::default());
+        assert_ne!(palette.danger, palette.primary);
+        for command in BuiltInCommandId::ALL.iter().copied() {
+            let destructive = matches!(
+                command,
+                BuiltInCommandId::TerminateCurrentDojo | BuiltInCommandId::TerminateCurrentLair
+            );
+            assert_eq!(command.destructive(), destructive, "{command:?}");
+            for (selected, highlighted) in [(false, false), (false, true), (true, false)] {
+                let painted = row_label_color(
+                    &palette,
+                    command.destructive(),
+                    selected,
+                    highlighted,
+                    palette.primary,
+                );
+                let expected = if destructive {
+                    palette.row_danger(selected, highlighted)
+                } else {
+                    palette.primary
+                };
+                assert_eq!(painted, expected, "{command:?}");
+            }
+        }
+        for action in [
+            TabMenuActionId::TerminateLair,
+            TabMenuActionId::TerminateDojo,
+            TabMenuActionId::CloseTab,
+            TabMenuActionId::Restore,
+            TabMenuActionId::RenameTab,
+        ] {
+            let destructive = matches!(
+                action,
+                TabMenuActionId::TerminateLair | TabMenuActionId::TerminateDojo
+            );
+            assert_eq!(action.destructive(), destructive, "{action:?}");
+        }
+        // A disabled Terminate row is not drawn in danger.
+        assert_eq!(
+            row_label_color(&palette, false, false, false, palette.secondary),
+            palette.secondary
+        );
+
+        let terminate = DojoPromptUi::terminate(
+            DojoId::new(),
+            "captured".to_owned(),
+            1,
+            vec![(SplintId::new(), 1)],
+        );
+        let target = crate::frontend::LairPromptTarget {
+            topology_revision: splinterm_core::TopologyRevision::new(9),
+            lair_id: LairId::new(),
+            dojo_id: None,
+            name: "saved".to_owned(),
+            retention: splinterm_core::LairRetention::Saved,
+            preview: "Lair: saved".to_owned(),
+            targets: Vec::new(),
+        };
+        let terminate_lair = DojoPromptUi::terminate_lair(target.clone());
+        let restore = DojoPromptUi::restore_lair(target);
+        let confirm = TerminationDecision::Terminate;
+        let cancel = TerminationDecision::Cancel;
+        for prompt in [&terminate, &terminate_lair] {
+            assert!(prompt.confirmation_destructive());
+            assert_eq!(
+                dojo_prompt_choice_color(&palette, prompt, confirm, false),
+                palette.danger
+            );
+            assert_eq!(
+                dojo_prompt_choice_color(&palette, prompt, confirm, true),
+                palette.selected_danger
+            );
+            assert_eq!(
+                dojo_prompt_choice_color(&palette, prompt, cancel, false),
+                palette.primary
+            );
+        }
+        assert!(!restore.confirmation_destructive());
+        assert_eq!(restore.confirmation_label(), Some("Restore"));
+        assert_eq!(
+            dojo_prompt_choice_color(&palette, &restore, confirm, false),
+            palette.selected_rail
+        );
+        assert_eq!(
+            dojo_prompt_choice_color(&palette, &restore, confirm, true),
+            palette.selected_primary
+        );
+        assert_eq!(
+            dojo_prompt_choice_color(&palette, &restore, cancel, true),
+            palette.selected_primary
+        );
     }
 }

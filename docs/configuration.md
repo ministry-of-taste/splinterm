@@ -948,14 +948,17 @@ and Terminate labels to 4.5:1 against their own panel and selected row, so a
 `text`, `text-muted` or `danger` override too faint for a panel is raised
 there; on a translucent panel, muted text and Terminate labels move toward
 the text as far as they need to read over any backdrop. Trusted dialogs
-(access consent, upgrade, restart), which take the theme as they open,
-with its `[colors]` keys, and are always opaque, raise their text to 4.5:1
-and their frame and answer areas to 3:1 against their background. Their
-text tells you to click the red area to say no and the green one to
-say yes, so a `danger` that is not red or a `success` that is not green,
-whether the theme's or set here, gives way to Splinterm's own red or green
-there. Everywhere else the role is never mixed toward readable text or
-raised to a contrast floor, and a status role that follows it is drawn the
+(access consent, upgrade, restart), which take the theme as they open, with
+its `[colors]` keys, and are always opaque, raise their text to 4.5:1 and
+their frame and answer areas to 3:1 against their background. Their text
+tells you to click the red area to say no and the green one to say yes,
+so a `danger` that is not red or a `success` that is not green, whether the
+theme's or set here, gives way to Splinterm's own red or green there; areas
+too close to each other, or a frame too close to either, give way as well,
+and a dialog whose colours still cannot be kept apart takes Splinterm's own
+palette. Dialogs take only colours from the theme: their text size is the
+configured font's. Everywhere else the role is never mixed toward readable text
+or raised to a contrast floor, and a status role that follows it is drawn the
 same way. When it falls below its floor against `surface`, 4.5:1 for `text`,
 `text-muted`, `text-faint`, `remote-marker` and `warning` (which also paints
 the ASCII `A?` marker as text) and 3:1 for the other hue and status roles,

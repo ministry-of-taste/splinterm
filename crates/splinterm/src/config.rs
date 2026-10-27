@@ -998,11 +998,44 @@ fn resolve_bar_size(
     px
 }
 
+/// The most a theme file (`colors.toml`, `foot.ini`, `shell.toml`, a JSON
+/// theme) may hold. Real ones are a few KiB.
+const MAX_THEME_FILE_BYTES: u64 = 256 * 1024;
+
+/// Reads a theme file: a regular file of at most [`MAX_THEME_FILE_BYTES`].
+/// It is opened without blocking, so a FIFO or device in its place is
+/// refused instead of waited on; trusted dialogs read their theme from an
+/// environment their caller chose.
+fn read_theme_file(path: &Path) -> std::io::Result<String> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    let mut text = String::new();
+    file.take(MAX_THEME_FILE_BYTES + 1)
+        .read_to_string(&mut text)?;
+    if text.len() as u64 > MAX_THEME_FILE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "larger than 256 KiB",
+        ));
+    }
+    Ok(text)
+}
+
 fn read_omarchy_shell_layer(
     path: &Path,
     diagnostics: &mut Vec<(OmarchyShellConcern, String)>,
 ) -> Option<String> {
-    match fs::read_to_string(path) {
+    match read_theme_file(path) {
         Ok(contents) => Some(contents),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => {
@@ -2389,11 +2422,11 @@ fn load_omarchy_input_with_status(
         });
     }
     after_identity();
-    let colors = fs::read_to_string(&colors_path)
-        .with_context(|| format!("read {}", colors_path.display()))?;
+    let colors =
+        read_theme_file(&colors_path).with_context(|| format!("read {}", colors_path.display()))?;
     between_reads();
     let foot =
-        fs::read_to_string(&foot_path).with_context(|| format!("read {}", foot_path.display()))?;
+        read_theme_file(&foot_path).with_context(|| format!("read {}", foot_path.display()))?;
     anyhow::ensure!(
         omarchy_theme_identity(theme_dir) == before,
         "active Omarchy theme changed while its palette was loading"
@@ -2494,8 +2527,8 @@ impl ThemeProvider for JsonThemeProvider<'_> {
         if !self.path.exists() {
             return BuiltinThemeProvider.load();
         }
-        let raw = fs::read_to_string(self.path)
-            .with_context(|| format!("read {}", self.path.display()))?;
+        let raw =
+            read_theme_file(self.path).with_context(|| format!("read {}", self.path.display()))?;
         serde_json::from_str::<ThemePalette>(&raw)
             .context("parse explicit Splinterm theme JSON")?
             .input()
@@ -5421,5 +5454,42 @@ pub(crate) mod tests {
             load_provider_theme(&BuiltinThemeProvider).unwrap(),
             ResolvedTheme::default()
         );
+    }
+
+    /// Theme files are read only when they are regular files of a bounded
+    /// size, and a FIFO in their place is refused without blocking.
+    #[test]
+    fn theme_files_must_be_bounded_regular_files() {
+        let root = std::env::temp_dir().join(format!(
+            "splinterm-theme-file-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let regular = root.join("colors.toml");
+        fs::write(&regular, "accent = \"#123456\"\n").unwrap();
+        assert_eq!(read_theme_file(&regular).unwrap(), "accent = \"#123456\"\n");
+        let missing = read_theme_file(&root.join("absent.toml")).unwrap_err();
+        assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
+        let fifo = root.join("foot.ini");
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            &fifo,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        )
+        .unwrap();
+        let refused = read_theme_file(&fifo).unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::InvalidInput);
+        let large = root.join("shell.toml");
+        let limit = usize::try_from(MAX_THEME_FILE_BYTES).unwrap();
+        fs::write(&large, "#".repeat(limit)).unwrap();
+        assert_eq!(read_theme_file(&large).unwrap().len(), limit);
+        fs::write(&large, "#".repeat(limit + 1)).unwrap();
+        let refused = read_theme_file(&large).unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::InvalidData);
+        fs::remove_dir_all(root).unwrap();
     }
 }
