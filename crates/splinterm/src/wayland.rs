@@ -152,8 +152,6 @@ use crate::pane::{
     FocusDirection, LayoutFit, PaneChrome, PaneLayout, PaneResizeMetrics, PaneSplit,
     directional_resize_ratio, split_fits, split_ratio_at, split_ratio_mut,
 };
-#[cfg(test)]
-use crate::renderer::paint_box_drawing_cell;
 use crate::renderer::{
     ChromeSource, ChromeSurface, ChromeText, ChromeTextStyle, CommandPaletteLayout,
     CommandPaletteTextCache, CursorPresentation, DojoPromptLayout, HistoryOverlayStatus,
@@ -163,8 +161,9 @@ use crate::renderer::{
     background_bgra, chrome_panel_fill, chrome_panel_palette, clear_snapshot_caches,
     command_palette_hit_test, command_palette_layout, dojo_prompt_hit_test, dojo_prompt_layout,
     explorer_minimum_docked_terminal_width, fill_rect, history_overlay_layout,
-    lair_explorer_disclosure_hit_test, lair_explorer_filter_hit_test, lair_explorer_hit_test,
-    lair_explorer_layout, lair_explorer_layout_with_header, paint, paint_command_palette,
+    lair_explorer_chrome_cell_width, lair_explorer_disclosure_hit_test,
+    lair_explorer_filter_hit_test, lair_explorer_hit_test, lair_explorer_rail_width,
+    lair_explorer_shown_layout, lair_explorer_toggle_hit_test, paint, paint_command_palette,
     paint_dojo_prompt, paint_handoff_banner, paint_history_overlay, paint_lair_explorer,
     paint_search_overlay, paint_session_picker_overlay, paint_snapshot_overlays,
     paint_snapshot_presented, paint_snapshot_region_presented, paint_snapshot_rows_presented,
@@ -172,6 +171,8 @@ use crate::renderer::{
     session_picker_hit_test, session_picker_overlay_layout, snapshot_row_rect,
     tab_context_menu_hit_test, tab_context_menu_layout, write_ppm,
 };
+#[cfg(test)]
+use crate::renderer::{lair_explorer_layout, paint_box_drawing_cell};
 use crate::{
     keymap::{ActionId, KeymapPress, PrefixState, ResolvedKeymap},
     tab::{DojoTab, WindowTabSet, sanitized_tab_label},
@@ -1104,6 +1105,8 @@ fn assemble_app(
             cursor_blink: options.cursor_blink,
             tab_strip_border: options.tab_strip_border,
             explorer_full_height: options.explorer_full_height,
+            explorer_collapsed: options.explorer_collapsed,
+            explorer_chrome_cell: std::cell::Cell::new(None),
             title: TitleSettings {
                 text: options.title,
                 controller_label: options.controller_title,
@@ -1223,7 +1226,7 @@ fn assemble_app(
             pending_remote_splits: HashMap::new(),
             dirty_inactive_panes: HashSet::new(),
         },
-        explorer: LairExplorerUi::default(),
+        explorer: LairExplorerUi::new(options.explorer_collapsed),
         accessibility: navigation_accessibility::WindowAccessibility::new(update_waker.clone()),
         access: agent_access::WindowAccess::default(),
         handoff: HandoffFrontend::new(options.handoff_status.take(), update_waker),
@@ -2395,6 +2398,14 @@ struct PresentationState {
     tab_strip_border: bool,
     /// `[explorer] full-height`, which configuration reload replaces.
     explorer_full_height: bool,
+    /// `[explorer] collapsed` as last loaded. A reload that changes it
+    /// collapses or expands the Explorer; one that keeps it leaves the
+    /// Window's own toggles alone.
+    explorer_collapsed: bool,
+    /// One regular chrome cell's width in buffer px, keyed by the renderer
+    /// generation and scale it was measured at: the collapsed rail's width
+    /// follows it.
+    explorer_chrome_cell: std::cell::Cell<Option<((u64, u32), u32)>>,
     title: TitleSettings,
     theme: ResolvedTheme,
     pane_divider_style: PaneDividerStyle,
@@ -3234,6 +3245,8 @@ fn explorer_pointer_returns_to_terminal(
 enum ExplorerPointerPress {
     Row(NavigationNodeId, bool),
     Filter(LairExplorerFilter),
+    /// The header's `«` or `»`, which never takes keyboard focus.
+    Toggle,
 }
 
 fn explorer_released_filter(
@@ -3244,6 +3257,45 @@ fn explorer_released_filter(
         Some(ExplorerPointerPress::Filter(filter)) if Some(filter) == target => Some(filter),
         _ => None,
     }
+}
+
+/// What a left press in the Explorer panel starts, and whether it gives the
+/// Explorer the keys. The header's `«` / `»` leaves keyboard focus where it
+/// is; every other press in the panel, a row of the tree or of the rail
+/// alike, gives the Explorer the keys, as a row click always has.
+fn explorer_left_press(
+    on_toggle: bool,
+    filter: Option<LairExplorerFilter>,
+    target: Option<NavigationNodeId>,
+    disclosure: Option<NavigationNodeId>,
+) -> (Option<ExplorerPointerPress>, bool) {
+    if on_toggle {
+        return (Some(ExplorerPointerPress::Toggle), false);
+    }
+    let pressed = filter.map(ExplorerPointerPress::Filter).or_else(|| {
+        target.map(|target| ExplorerPointerPress::Row(target, disclosure == Some(target)))
+    });
+    (pressed, true)
+}
+
+/// Whether a left release completes a press on the header's `«` / `»`: both
+/// on the toggle.
+fn explorer_released_toggle(pressed: Option<ExplorerPointerPress>, on_toggle: bool) -> bool {
+    on_toggle && pressed == Some(ExplorerPointerPress::Toggle)
+}
+
+/// The rail's first row in view after a wheel step of `delta` rows from
+/// `start`, with `capacity` of its `count` rows in view: never before the
+/// first row or past the last screenful.
+fn explorer_rail_scrolled_start(
+    start: usize,
+    capacity: usize,
+    count: usize,
+    delta: isize,
+) -> usize {
+    start
+        .saturating_add_signed(delta)
+        .min(count.saturating_sub(capacity))
 }
 
 fn explorer_filter_key(key: Keysym, modifiers: Modifiers, searching: bool) -> bool {
@@ -3999,40 +4051,38 @@ fn explorer_beside_tabs(
 /// strip `strip` logical px tall. Beside a shown strip its header takes the
 /// strip's height and sizes its text as the tab labels are at `scale_120`,
 /// so the header and the labels share one baseline; with no strip it keeps
-/// the row-high header. `None` when the Explorer would be a drawer.
+/// the row-high header. A `collapsed` Explorer is the rail, `rail_width`
+/// logical px wide, when it docks beside `minimum_terminal_width` px of
+/// terminal. `None` when the Explorer would be a drawer.
+#[allow(clippy::too_many_arguments)]
 fn full_height_explorer_layout(
     full: Rect,
     strip: u32,
     scale_120: u32,
-    minimum_terminal_width: u32,
+    (minimum_terminal_width, rail_width): (u32, u32),
     rows: &[LairExplorerRow],
     selected: Option<NavigationNodeId>,
     requested_start: usize,
+    collapsed: bool,
 ) -> Option<LairExplorerLayout> {
-    let layout = if strip == 0 {
-        lair_explorer_layout(
-            full,
-            minimum_terminal_width,
-            rows,
-            selected,
-            requested_start,
-        )
-    } else {
-        lair_explorer_layout_with_header(
-            full,
-            strip,
-            minimum_terminal_width,
-            rows,
-            selected,
-            requested_start,
-        )
-        .map(|mut layout| {
+    lair_explorer_shown_layout(
+        full,
+        (strip != 0).then_some(strip),
+        minimum_terminal_width,
+        rail_width,
+        rows,
+        selected,
+        requested_start,
+        collapsed,
+    )
+    .map(|mut layout| {
+        if strip != 0 {
             layout.header_text_cell_cap =
                 tab_text_maximum_cell_height(strip, scale_120).unwrap_or(u32::MAX);
-            layout
-        })
-    };
-    layout.and_then(|layout| explorer_beside_tabs(layout, strip))
+        }
+        layout
+    })
+    .and_then(|layout| explorer_beside_tabs(layout, strip))
 }
 
 /// Where a tab strip beside a full-height Explorer begins: the docked
@@ -4077,8 +4127,16 @@ impl App {
             .unwrap_or(1);
         let minimum_terminal_width =
             explorer_minimum_docked_terminal_width(cell_width, self.presentation.initial_columns);
+        let rail_width = self.explorer_rail_width();
         let rows = self.explorer.rows();
         let below_tabs = self.base_content_rect();
+        // The rail shows its selection only while it has the keys, so only
+        // then does the selection hold the list in place; otherwise the
+        // wheel scrolls the rail freely.
+        let selected = self
+            .explorer
+            .selected()
+            .filter(|_| !self.explorer.collapsed() || self.explorer.focused());
         if self.presentation.explorer_full_height {
             let full = Rect {
                 x: 0,
@@ -4090,21 +4148,49 @@ impl App {
                 full,
                 below_tabs.y,
                 self.surface.scale_120,
-                minimum_terminal_width,
+                (minimum_terminal_width, rail_width),
                 &rows,
-                self.explorer.selected(),
+                selected,
                 self.presentation.explorer_visible_start,
+                self.explorer.collapsed(),
             ) {
                 return Some(layout);
             }
         }
-        lair_explorer_layout(
+        lair_explorer_shown_layout(
             below_tabs,
+            None,
             minimum_terminal_width,
+            rail_width,
             &rows,
-            self.explorer.selected(),
+            selected,
             self.presentation.explorer_visible_start,
+            self.explorer.collapsed(),
         )
+    }
+
+    /// The collapsed rail's width in logical px: four chrome cells beside
+    /// its accent bar, measured once per chrome text generation and scale.
+    fn explorer_rail_width(&self) -> u32 {
+        let key = (
+            self.presentation.renderer_generation,
+            self.surface.scale_120,
+        );
+        let cell = match self.presentation.explorer_chrome_cell.get() {
+            Some((cached, cell)) if cached == key => cell,
+            _ => {
+                let cell = lair_explorer_chrome_cell_width(
+                    &self.presentation.render_context,
+                    self.surface.scale_120,
+                )
+                .unwrap_or(0);
+                self.presentation
+                    .explorer_chrome_cell
+                    .set(Some((key, cell)));
+                cell
+            }
+        };
+        lair_explorer_rail_width(cell, self.surface.scale_120)
     }
 
     /// Where the tab strip begins: at a full-height docked Explorer's right
@@ -6501,6 +6587,18 @@ impl App {
                     self.relayout_tab_strip();
                     self.relayout_panes();
                 }
+                if self.presentation.explorer_collapsed != loaded.config.explorer_collapsed {
+                    self.presentation.explorer_collapsed = loaded.config.explorer_collapsed;
+                    if self
+                        .explorer
+                        .set_collapsed(loaded.config.explorer_collapsed)
+                    {
+                        // The terminal area changes width with the Explorer.
+                        self.presentation.explorer_layout = None;
+                        self.relayout_tab_strip();
+                        self.relayout_panes();
+                    }
+                }
                 self.presentation.ui_font_size = loaded.config.ui_font_size;
                 self.reconcile_chrome_font_size();
                 self.apply_pane_chrome(
@@ -6640,6 +6738,32 @@ impl App {
         self.presentation.full_redraw = true;
     }
 
+    /// Collapses the Explorer to its rail or expands it; whether that
+    /// changed. Keyboard focus stays where it is.
+    fn set_explorer_collapsed(&mut self, collapsed: bool) -> Result<bool> {
+        if !self.explorer.set_collapsed(collapsed) {
+            return Ok(false);
+        }
+        self.apply_explorer_width_change()?;
+        Ok(true)
+    }
+
+    /// The Explorer was shown, hidden, collapsed, or expanded, so the
+    /// terminal beside it changes width: the layout is taken again, the tab
+    /// strip beside a full-height Explorer moves with it, and every pane is
+    /// resized.
+    fn apply_explorer_width_change(&mut self) -> Result<()> {
+        // Taken now, not at the next draw, so a quick second click hit-tests
+        // the new layout.
+        self.presentation.explorer_layout = self.current_explorer_layout();
+        self.presentation.full_redraw = true;
+        self.relayout_tab_strip();
+        if self.surface.configured {
+            self.emit_resize()?;
+        }
+        Ok(())
+    }
+
     fn refresh_lair_explorer(&mut self) -> Result<()> {
         self.explorer.begin_refresh();
         if let Err(error) = self.send_topology_command(WindowTopologyCommand::RequestLairExplorer {
@@ -6666,6 +6790,13 @@ impl App {
         let returns_focus = decision.returns_focus_to_terminal();
         let command = match decision {
             LairExplorerDecision::Toggle(_) => return true,
+            LairExplorerDecision::ExpandRail(_) => {
+                // The rail expanded to the tree, so the terminal narrows.
+                if let Err(error) = self.apply_explorer_width_change() {
+                    eprintln!("splinterm Explorer resize failed: {error:#}");
+                }
+                return true;
+            }
             LairExplorerDecision::OpenDojo(target) => {
                 let target = SessionPickerTarget {
                     topology_revision: target.topology_revision,
@@ -6865,12 +6996,13 @@ impl App {
                 if visible {
                     self.refresh_lair_explorer()?;
                 }
-                self.presentation.explorer_layout = None;
-                self.presentation.full_redraw = true;
-                // Beside a full-height Explorer the tab strip moves with it.
-                self.relayout_tab_strip();
-                if self.surface.configured {
-                    self.emit_resize()?;
+                self.apply_explorer_width_change()
+            })(),
+            BuiltInCommandDispatch::ToggleLairExplorerRail => (|| -> Result<()> {
+                let was_hidden = self.explorer.toggle_rail();
+                self.apply_explorer_width_change()?;
+                if was_hidden {
+                    self.refresh_lair_explorer()?;
                 }
                 Ok(())
             })(),
@@ -7887,7 +8019,8 @@ impl App {
     /// Applies the chrome text size the configured `[main] ui-font-pixelsize`
     /// and the theme's Omarchy text size resolve to. Chrome text never
     /// shares the terminal's size, so only cached chrome text is dropped:
-    /// terminal frames, cell metrics and the PTY size stay as they are.
+    /// terminal frames and cell metrics stay as they are, and the PTY size
+    /// too unless a shown rail, sized in chrome cells, changes width.
     /// Returns whether the size changed.
     fn reconcile_chrome_font_size(&mut self) -> bool {
         let size = chrome_font_size(self.presentation.ui_font_size, self.presentation.theme);
@@ -7897,6 +8030,12 @@ impl App {
             .replace_chrome_font_size(size);
         if changed {
             self.invalidate_chrome_text();
+            // The rail is four chrome cells wide, so the terminal and the
+            // tab strip beside it move with the chrome text.
+            if self.explorer.visible() && self.explorer.collapsed() {
+                self.relayout_tab_strip();
+                self.relayout_panes();
+            }
         }
         changed
     }
@@ -8673,6 +8812,8 @@ impl App {
         };
         let target = lair_explorer_hit_test(layout, event.position);
         let filter = lair_explorer_filter_hit_test(layout, event.position);
+        let toggle = lair_explorer_toggle_hit_test(layout, event.position);
+        let rail = layout.rail;
         let disclosure =
             lair_explorer_disclosure_hit_test(layout, &self.explorer.rows(), event.position);
         let mut changed = false;
@@ -8698,28 +8839,26 @@ impl App {
             }
             PointerEventKind::Press { button, .. } if button == BTN_LEFT => {
                 self.explorer.cancel_context_press();
-                self.set_explorer_focus(true, queue_handle);
-                self.presentation.explorer_pressed =
-                    filter.map(ExplorerPointerPress::Filter).or_else(|| {
-                        target.map(|target| {
-                            ExplorerPointerPress::Row(target, disclosure == Some(target))
-                        })
-                    });
+                let (pressed, takes_focus) =
+                    explorer_left_press(toggle, filter, target, disclosure);
+                if takes_focus {
+                    self.set_explorer_focus(true, queue_handle);
+                }
+                self.presentation.explorer_pressed = pressed;
                 if let Some(target) = target {
                     changed |= self.explorer.select(target);
                 }
             }
             PointerEventKind::Release { button, .. } if button == BTN_LEFT => {
-                changed |= self.release_lair_explorer_pointer(target, disclosure, filter);
+                changed |= if explorer_released_toggle(self.presentation.explorer_pressed, toggle) {
+                    self.release_explorer_toggle()
+                } else {
+                    self.release_lair_explorer_pointer(target, disclosure, filter)
+                };
             }
             PointerEventKind::Axis { vertical, .. } if !vertical.is_none() => {
-                let delta =
-                    if vertical.discrete < 0 || vertical.value120 < 0 || vertical.absolute < 0.0 {
-                        -1
-                    } else {
-                        1
-                    };
-                changed |= self.explorer.move_selection(delta);
+                let up = vertical.discrete < 0 || vertical.value120 < 0 || vertical.absolute < 0.0;
+                changed |= self.explorer_wheel(rail, if up { -1 } else { 1 });
             }
             PointerEventKind::Leave { .. } => {
                 self.explorer.cancel_context_press();
@@ -8731,6 +8870,43 @@ impl App {
             self.presentation.full_redraw = true;
         }
         true
+    }
+
+    /// A wheel step over the Explorer: it moves the selection, except over
+    /// an unfocused rail, which shows no selection, where it scrolls the
+    /// rail's rows instead.
+    fn explorer_wheel(&mut self, rail: bool, delta: isize) -> bool {
+        if !rail || self.explorer.focused() {
+            return self.explorer.move_selection(delta);
+        }
+        let Some(layout) = self.presentation.explorer_layout.as_ref() else {
+            return false;
+        };
+        let start = explorer_rail_scrolled_start(
+            layout.visible_start,
+            layout.visible_capacity,
+            self.explorer.rows().len(),
+            delta,
+        );
+        if start == layout.visible_start {
+            return false;
+        }
+        self.presentation.explorer_visible_start = start;
+        self.presentation.explorer_layout = self.current_explorer_layout();
+        true
+    }
+
+    /// Completes a click on the header's `«` / `»`: the Explorer collapses
+    /// to its rail or expands, and keyboard focus stays where it is.
+    fn release_explorer_toggle(&mut self) -> bool {
+        self.presentation.explorer_pressed = None;
+        match self.set_explorer_collapsed(!self.explorer.collapsed()) {
+            Ok(toggled) => toggled,
+            Err(error) => {
+                eprintln!("splinterm Explorer resize failed: {error:#}");
+                true
+            }
+        }
     }
 
     fn release_lair_explorer_pointer(
@@ -9567,7 +9743,9 @@ impl App {
                     }
                 }
                 Keysym::BackSpace => changed = self.explorer.backspace_search(),
-                Keysym::Escape if self.explorer.query().is_empty() => {
+                // The rail shows no search: Escape always returns to the
+                // terminal there.
+                Keysym::Escape if self.explorer.query().is_empty() || self.explorer.collapsed() => {
                     self.set_explorer_focus(false, queue_handle);
                     changed = true;
                 }
@@ -12953,6 +13131,49 @@ fn write_selection_payload(write_pipe: WritePipe, payload: Arc<[u8]>) {
 
 #[cfg(test)]
 mod tests {
+    /// The header's `«` / `»` never takes keyboard focus; a press on a row,
+    /// of the tree or of the rail, or on a filter gives the Explorer the keys
+    /// as before. A toggle runs only when its press and release both land on
+    /// it.
+    #[test]
+    fn explorer_toggle_press_keeps_focus_and_needs_a_matching_release() {
+        use super::{
+            ExplorerPointerPress, LairExplorerFilter, explorer_left_press, explorer_released_toggle,
+        };
+        use crate::navigation_projection::NavigationNodeId;
+
+        let lair = NavigationNodeId::Lair(splinterm_core::LairId::new());
+        assert_eq!(
+            explorer_left_press(true, None, None, None),
+            (Some(ExplorerPointerPress::Toggle), false)
+        );
+        assert_eq!(
+            explorer_left_press(false, None, Some(lair), None),
+            (Some(ExplorerPointerPress::Row(lair, false)), true)
+        );
+        assert_eq!(
+            explorer_left_press(false, None, Some(lair), Some(lair)),
+            (Some(ExplorerPointerPress::Row(lair, true)), true)
+        );
+        assert_eq!(
+            explorer_left_press(false, Some(LairExplorerFilter::Saved), None, None),
+            (
+                Some(ExplorerPointerPress::Filter(LairExplorerFilter::Saved)),
+                true
+            )
+        );
+        // Empty panel space still gives the Explorer the keys.
+        assert_eq!(explorer_left_press(false, None, None, None), (None, true));
+        let toggle = Some(ExplorerPointerPress::Toggle);
+        assert!(explorer_released_toggle(toggle, true));
+        assert!(!explorer_released_toggle(toggle, false));
+        assert!(!explorer_released_toggle(None, true));
+        assert!(!explorer_released_toggle(
+            Some(ExplorerPointerPress::Row(lair, false)),
+            true
+        ));
+    }
+
     #[test]
     fn explorer_filter_gestures_require_matching_release_and_tree_key_ownership() {
         use super::{
@@ -17768,8 +17989,17 @@ mod tests {
         for strip in [20, 26, 34, 48] {
             for scale in [120, 150, 180, 240] {
                 let case = format!("strip={strip} scale={scale}");
-                let layout =
-                    full_height_explorer_layout(window, strip, scale, 160, &[], None, 0).unwrap();
+                let layout = full_height_explorer_layout(
+                    window,
+                    strip,
+                    scale,
+                    (160, lair_explorer_rail_width(0, 120)),
+                    &[],
+                    None,
+                    0,
+                    false,
+                )
+                .unwrap();
                 assert_eq!(
                     (layout.header.y, layout.header.height),
                     (0, strip),
@@ -17790,7 +18020,17 @@ mod tests {
         }
         // With the strip hidden the header keeps the row-high line and the
         // chrome text cap.
-        let hidden = full_height_explorer_layout(window, 0, 120, 160, &[], None, 0).unwrap();
+        let hidden = full_height_explorer_layout(
+            window,
+            0,
+            120,
+            (160, lair_explorer_rail_width(0, 120)),
+            &[],
+            None,
+            0,
+            false,
+        )
+        .unwrap();
         let default = lair_explorer_layout(window, 160, &[], None, 0).unwrap();
         assert_eq!(hidden.header, default.header);
         assert_eq!(hidden.header_text_cell_cap, u32::MAX);
@@ -17799,7 +18039,163 @@ mod tests {
             width: 400,
             ..window
         };
-        assert!(full_height_explorer_layout(narrow, 26, 120, 160, &[], None, 0).is_none());
+        assert!(
+            full_height_explorer_layout(
+                narrow,
+                26,
+                120,
+                (160, lair_explorer_rail_width(0, 120)),
+                &[],
+                None,
+                0,
+                false
+            )
+            .is_none()
+        );
+    }
+
+    /// Collapsing the full-height Explorer to its rail widens the terminal
+    /// beside it by the panels' difference and moves the tab strip to the
+    /// rail's edge; the rail's `»` keeps the strip-high header. A Window too
+    /// narrow to dock the expanded panel still docks the rail, and one too
+    /// narrow for even the rail shows the rail as a drawer over the terminal.
+    #[test]
+    fn collapsing_the_explorer_widens_the_terminal_and_moves_the_tab_strip() {
+        let window = Rect {
+            x: 0,
+            y: 0,
+            width: 900,
+            height: 400,
+        };
+        let strip = 26;
+        let shown = |content, collapsed| {
+            full_height_explorer_layout(
+                content,
+                strip,
+                120,
+                (160, lair_explorer_rail_width(0, 120)),
+                &[],
+                None,
+                0,
+                collapsed,
+            )
+        };
+        let expanded = shown(window, false).unwrap();
+        let rail = shown(window, true).unwrap();
+        assert!(!expanded.rail && rail.rail);
+        assert_eq!(rail.mode, LairExplorerPresentationMode::Docked);
+        assert!(rail.panel.width * 4 < expanded.panel.width);
+        assert_eq!(
+            rail.terminal.width - expanded.terminal.width,
+            expanded.panel.width - rail.panel.width
+        );
+        assert_eq!(rail.terminal.x, rail.panel.width);
+        assert_eq!(
+            (rail.terminal.y, rail.terminal.height),
+            (expanded.terminal.y, expanded.terminal.height)
+        );
+        assert_eq!(rail.panel.height, window.height);
+        assert_eq!(tab_strip_left_of(Some(&rail)), rail.panel.width);
+        assert_eq!(tab_strip_left_of(Some(&expanded)), expanded.panel.width);
+        assert_eq!((rail.header.y, rail.header.height), (0, strip));
+        assert_eq!(rail.toggle, Some(rail.header));
+        assert_eq!(
+            rail.header_text_cell_cap,
+            tab_text_maximum_cell_height(strip, 120).unwrap()
+        );
+        // Below a full-width strip the rail docks the same way.
+        let below = Rect {
+            y: strip,
+            height: window.height - strip,
+            ..window
+        };
+        let below_rail = lair_explorer_shown_layout(
+            below,
+            None,
+            160,
+            lair_explorer_rail_width(0, 120),
+            &[],
+            None,
+            0,
+            true,
+        )
+        .unwrap();
+        assert!(below_rail.rail);
+        assert_eq!(below_rail.terminal.width, rail.terminal.width);
+        // Too narrow to dock the expanded panel: the rail still docks.
+        let narrow = Rect {
+            width: 400,
+            ..window
+        };
+        assert!(shown(narrow, false).is_none());
+        let narrow_rail = shown(narrow, true).unwrap();
+        assert!(narrow_rail.rail);
+        assert_eq!(narrow_rail.terminal.width, 400 - narrow_rail.panel.width);
+        // Too narrow for even the rail: the rail is a drawer over the
+        // terminal, which keeps its whole width and the strip its place. In
+        // full-height mode that drawer falls back below the strip.
+        let tiny = Rect {
+            width: 190,
+            ..below
+        };
+        let drawer = lair_explorer_shown_layout(
+            tiny,
+            None,
+            160,
+            lair_explorer_rail_width(0, 120),
+            &[],
+            None,
+            0,
+            true,
+        )
+        .unwrap();
+        assert!(drawer.rail);
+        assert_eq!(drawer.mode, LairExplorerPresentationMode::Drawer);
+        assert_eq!(drawer.terminal, tiny);
+        assert_eq!(drawer.toggle, Some(drawer.header));
+        assert_eq!(tab_strip_left_of(Some(&drawer)), 0);
+        assert!(
+            shown(
+                Rect {
+                    width: 190,
+                    ..window
+                },
+                true
+            )
+            .is_none()
+        );
+    }
+
+    /// A rail widened for larger chrome text takes its width from the
+    /// terminal, and the tab strip beside it moves to its edge.
+    #[test]
+    fn a_wider_rail_narrows_the_terminal_and_moves_the_tab_strip() {
+        let window = Rect {
+            x: 0,
+            y: 0,
+            width: 900,
+            height: 400,
+        };
+        let wide = lair_explorer_rail_width(14, 120);
+        assert!(wide > lair_explorer_rail_width(0, 120));
+        let wide_rail =
+            full_height_explorer_layout(window, 26, 120, (160, wide), &[], None, 0, true).unwrap();
+        assert_eq!(wide_rail.panel.width, wide);
+        assert_eq!(wide_rail.terminal.width, 900 - wide);
+        assert_eq!(tab_strip_left_of(Some(&wide_rail)), wide);
+    }
+
+    /// Over an unfocused rail, which shows no selection, the wheel scrolls
+    /// the rows, never before the first or past the last screenful.
+    #[test]
+    fn unfocused_rail_wheel_scrolls_its_rows() {
+        use super::explorer_rail_scrolled_start;
+
+        assert_eq!(explorer_rail_scrolled_start(0, 5, 12, 1), 1);
+        assert_eq!(explorer_rail_scrolled_start(0, 5, 12, -1), 0);
+        assert_eq!(explorer_rail_scrolled_start(7, 5, 12, 1), 7);
+        assert_eq!(explorer_rail_scrolled_start(9, 5, 12, -1), 7);
+        assert_eq!(explorer_rail_scrolled_start(0, 20, 12, 1), 0);
     }
 
     #[test]

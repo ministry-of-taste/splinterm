@@ -137,6 +137,7 @@ substitution, but do not sandbox hostile processes running as your own user.
 | `multiplexer.pane-gap` | empty space between adjacent Splint panes and around the pane area at the Window's edges, in logical px scaled by the output scale (see below); shrinks, down to none, where the Splints cannot fit it; configuration reload applies it | 0–64; 0 |
 | `multiplexer.frame-title` | top-frame title source: `splint` or `none`; inert outside frame style | splint |
 | `explorer.full-height` | a docked Lair Explorer runs the Window's full height and the tab strip begins at its right edge, above the terminal only; `no` puts the Explorer below a full-width tab strip. An Explorer too wide to dock opens over the terminal below the tab strip either way; configuration reload applies it | strict boolean; yes |
+| `explorer.collapsed` | a new Window's Lair Explorer shows as its collapsed rail, one row per Lair, instead of the full tree; `«`, `»` and **Toggle Lair explorer rail** still switch it while the Window is open ([Lair Explorer](usage.md#lair-explorer)). A reload that changes the value collapses or expands the Explorer at once; one that keeps it leaves the Window's own choice alone | strict boolean; no |
 | `explorer.agent-status` | show explicitly reported agent status in the Explorer, on Dojo tabs, and in navigation accessibility; `no` hides it all; configuration reload applies it | yes |
 | `explorer.status-colors` | colour agent status glyphs in the Explorer and on Dojo tabs by state, and the access "Asking" marker; see [Status colours](#status-colours). `no` draws them in the colour of the text around them; the remote host tag is not a status and keeps its colour. Configuration reload applies it | strict boolean; yes |
 | `explorer.status-glyphs` | `icons` draws two-cell icons; `dots` draws one-cell shapes: ◆ needs input, ▲ error, ■ done, □ idle, the Braille spinner for working, and `~` after a stale status. Every state keeps its own shape in both, so colour is never the only signal; configuration reload applies it | icons |
@@ -179,10 +180,11 @@ file, and `prefix-timeout-ms`), `clipboard.image-directory` (an in-flight save
 is cancelled), `main.ui-font-pixelsize` and `multiplexer.tab-strip-border`
 (chrome is drawn again at once),
 `explorer.agent-status`, `explorer.status-colors`, `explorer.status-glyphs`,
-`explorer.full-height`, `multiplexer.divider-style`,
+`explorer.full-height`, `explorer.collapsed`, `multiplexer.divider-style`,
 `multiplexer.frame-title`, `multiplexer.pane-gap`, `multiplexer.close-unused`,
 `multiplexer.persist-on-tab-organization`, `multiplexer.new-dojo-directory`,
 and `multiplexer.new-splint-directory`. A changed `explorer.full-height`,
+`explorer.collapsed`,
 `multiplexer.divider-style`, `multiplexer.frame-title`, or
 `multiplexer.pane-gap` lays the Splints out again
 at once and resizes each one's PTY; a gap they

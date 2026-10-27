@@ -132,6 +132,10 @@ pub struct AppConfig {
     /// tab strip beginning at its right edge, instead of sitting below a
     /// full-width tab strip (`[explorer] full-height`, default on).
     pub explorer_full_height: bool,
+    /// Whether a new Window's Explorer first shows collapsed to its rail,
+    /// one row per Lair, instead of the full tree (`[explorer] collapsed`,
+    /// default off).
+    pub explorer_collapsed: bool,
     /// Whether a graphical client under Omarchy may show the one-time hint
     /// that recommends `splinterm integration omarchy enable`
     /// (`[main] omarchy-integration-hint`).
@@ -297,6 +301,7 @@ impl Default for AppConfig {
             explorer_status_style: AgentStatusStyle::default(),
             tab_strip_border: true,
             explorer_full_height: true,
+            explorer_collapsed: false,
             omarchy_integration_hint: true,
             dialog_shortcut: Some(DialogShortcut::default()),
         }
@@ -1336,6 +1341,10 @@ fn parse_with_base(text: &str, config_dir: &Path) -> Result<ConfigLoad> {
             }
             "explorer.full-height" => {
                 config.explorer_full_height = parse_bool(value, index)?;
+                false
+            }
+            "explorer.collapsed" => {
+                config.explorer_collapsed = parse_bool(value, index)?;
                 false
             }
             "main.omarchy-integration-hint" | "omarchy-integration-hint" => {
@@ -3096,6 +3105,25 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.starts_with("line 2:"), "{error}");
+    }
+
+    #[test]
+    fn explorer_collapsed_defaults_off_and_starts_the_rail() {
+        assert!(!AppConfig::default().explorer_collapsed);
+        assert!(!parse("[explorer]\n").unwrap().config.explorer_collapsed);
+        for (value, expected) in [("yes", true), ("on", true), ("no", false), ("0", false)] {
+            let loaded = parse(&format!("[explorer]\ncollapsed={value}\n")).unwrap();
+            assert_eq!(loaded.config.explorer_collapsed, expected, "{value}");
+            assert!(loaded.diagnostics.is_empty());
+        }
+        let error = parse("[explorer]\ncollapsed=rail\n")
+            .unwrap_err()
+            .to_string();
+        assert!(error.starts_with("line 2:"), "{error}");
+        // The key belongs to [explorer]; elsewhere it is an unknown key.
+        let misplaced = parse("[main]\ncollapsed=yes\n").unwrap();
+        assert!(!misplaced.config.explorer_collapsed);
+        assert!(!misplaced.diagnostics.is_empty());
     }
 
     #[test]
