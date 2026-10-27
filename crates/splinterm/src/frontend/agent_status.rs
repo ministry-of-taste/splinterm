@@ -239,7 +239,7 @@ impl AgentGlyphs {
             } else {
                 spinner
             };
-            self.push_glyph(&mut slot, state, spinner);
+            self.push_glyph(&mut slot, state, is_stale, spinner);
         }
         let padding = self.glyph_cells().saturating_sub(slot.cells());
         slot.push_str(&" ".repeat(padding));

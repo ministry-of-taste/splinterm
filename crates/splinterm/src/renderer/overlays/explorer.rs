@@ -34,8 +34,8 @@ use super::{
     picker::{
         ChromeSurface, PickerTextAlignment, SessionPickerPalette, SessionPickerTextCache,
         SessionPickerTextKey, chrome_panel_palette, editable_text, paint_picker_source,
-        paint_picker_source_tinted,
-        paint_picker_source_within, paint_picker_text, picker_cell_width, truncate_picker_text,
+        paint_picker_source_tinted, paint_picker_source_within, paint_picker_text,
+        picker_cell_width, truncate_picker_text,
     },
 };
 
@@ -1659,7 +1659,7 @@ fn paint_rail(
             (false, true) => palette.primary,
             (false, false) => palette.secondary,
         };
-        paint_picker_source(
+        paint_picker_source_tinted(
             cache,
             context,
             used,
@@ -1673,6 +1673,8 @@ fn paint_rail(
             text,
             PickerTextAlignment::Center,
             color,
+            palette.row_tints(is_selected),
+            u32::MAX,
         )?;
     }
     Ok(())
