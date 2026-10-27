@@ -7529,6 +7529,9 @@ impl App {
                     if !self.begin_lair_explorer_action(decision) {
                         return;
                     }
+                    // The selection and the footer's status follow the row
+                    // the menu acted on, as a click or Enter on it does.
+                    self.explorer.select_activated(target.node);
                     navigates = true;
                     if let WindowTopologyCommand::OpenDojo {
                         target,

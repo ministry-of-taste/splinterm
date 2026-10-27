@@ -1323,6 +1323,23 @@ impl LairExplorerUi {
         changed
     }
 
+    /// Moves the selection to `id` as its menu activates it, so the
+    /// selection and the footer's status follow the row acted on: to its
+    /// agents row while the selection is in the agents section or the tree
+    /// does not show it, else to its tree row.
+    pub(crate) fn select_activated(&mut self, id: NavigationNodeId) -> bool {
+        let in_tree = self.rows().iter().any(|row| row.id == id);
+        if (self.agents_selected || !in_tree)
+            && self
+                .shown_agent_rows()
+                .iter()
+                .any(|agent| agent.row.id == id)
+        {
+            return self.select_agent(id);
+        }
+        self.select(id)
+    }
+
     /// The order the keys move through: the tree's rows, then the shown
     /// agents section's, each with whether it is an agent row.
     fn navigation_order(&self) -> Vec<(NavigationNodeId, bool)> {
@@ -3791,6 +3808,56 @@ pub(super) mod tests {
         assert!(explorer.select_agent(scribe));
         assert!(explorer.set_agents_shown(false));
         assert_eq!(explorer.tree_selected(), Some(lair_node(scribe)));
+    }
+
+    /// A menu's Focus on a row not selected moves the selection, and with it
+    /// the footer's status, to that row: to its agents row while the
+    /// selection is in the agents section or the tree does not show the
+    /// Splint, else to its tree row.
+    #[test]
+    fn menu_activation_moves_the_selection_to_the_row_acted_on() {
+        use splinterm_protocol::AgentState;
+        let mut explorer = LairExplorerUi::default();
+        explorer.set_view(agents_view(
+            [
+                Some(agent(AgentState::Working, false)),
+                Some(agent(AgentState::Idle, false)),
+            ],
+            Some(agent(AgentState::NeedsInput, false)),
+        ));
+        let rows = expanded_rows(&mut explorer);
+        let id = |label: &str| {
+            explorer
+                .agent_rows()
+                .iter()
+                .find(|agent| agent.row.label == label)
+                .unwrap()
+                .row
+                .id
+        };
+        let (scribe, shell, second) = (id("scribe"), id("shell"), id("agent"));
+        // As the menu does: decide, start the activation, then select.
+        let activate = |explorer: &mut LairExplorerUi, id| {
+            let decision = explorer.activation_decision(id).unwrap();
+            assert!(explorer.set_pending(decision));
+            let changed = explorer.select_activated(id);
+            assert!(explorer.clear_pending());
+            changed
+        };
+        // From one agents row to another, though the tree shows both.
+        assert!(explorer.select_agent(shell));
+        assert!(rows.iter().any(|row| row.id == second));
+        assert!(activate(&mut explorer, second));
+        assert_eq!(explorer.agent_selected(), Some(second));
+        assert!(!activate(&mut explorer, second), "already selected");
+        assert_eq!(explorer.agent_selected(), Some(second));
+        // From the tree: a Splint the tree shows keeps the selection there.
+        assert!(explorer.select(rows[0].id));
+        assert!(activate(&mut explorer, shell));
+        assert_eq!(explorer.tree_selected(), Some(shell));
+        // One the tree does not show is selected in the agents section.
+        assert!(activate(&mut explorer, scribe));
+        assert_eq!(explorer.agent_selected(), Some(scribe));
     }
 
     /// With no position in the list, as when a search leaves the tree
