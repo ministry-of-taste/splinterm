@@ -4,5 +4,6 @@ pub(super) mod chrome_rows;
 pub(super) mod explorer;
 pub(super) mod handoff;
 pub(super) mod history;
+pub(super) mod menu_box;
 pub(super) mod picker;
 pub(super) mod picker_box;

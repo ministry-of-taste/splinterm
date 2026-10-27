@@ -19,7 +19,7 @@ pub(crate) use action_menu::{
     CommandPaletteContext, CommandPaletteUi, CommandTabMoveAvailability, CommandZoomAction,
     DojoPromptUi, TabContextMenuUi, TabMenuActionDescriptor, TabMenuActionId, TabMenuContext,
     TabMenuDispatch, TabMenuRightPress, TerminationDecision, close_other_tabs_command,
-    command_descriptor, lair_lifecycle_command, tab_menu_right_press,
+    command_descriptor, lair_lifecycle_command, tab_menu_right_press, tab_menu_starts_group,
 };
 #[cfg(test)]
 pub(crate) use action_menu::{TAB_MENU_ACTIONS, tab_menu_descriptor};
