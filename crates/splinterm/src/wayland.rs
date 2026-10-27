@@ -155,15 +155,15 @@ use crate::pane::{
 use crate::renderer::{
     ChromeSource, ChromeSurface, ChromeText, ChromeTextStyle, CommandPaletteLayout,
     CommandPaletteTextCache, CursorPresentation, DojoPromptLayout, HistoryOverlayStatus,
-    LairExplorerLayout, LairExplorerPresentationMode, PaletteBody, PickerHitTarget, RenderContext,
-    SessionPickerOverlayLayout, SessionPickerPurpose, SessionPickerTextCache,
-    SessionPickerTextItem, SnapshotFrame, SnapshotOverlays, TabContextMenuLayout, TextRow,
-    background_bgra, chrome_panel_fill, chrome_panel_palette, clear_snapshot_caches,
-    command_palette_hit_test, command_palette_layout, dojo_prompt_hit_test, dojo_prompt_layout,
-    explorer_minimum_docked_terminal_width, fill_rect, history_overlay_layout,
-    lair_explorer_chrome_cell_width, lair_explorer_disclosure_hit_test,
-    lair_explorer_filter_hit_test, lair_explorer_hit_test, lair_explorer_rail_width,
-    lair_explorer_shown_layout, lair_explorer_toggle_hit_test, paint, paint_command_palette,
+    LairExplorerAction, LairExplorerLayout, LairExplorerPresentationMode, PaletteBody,
+    PickerHitTarget, RenderContext, SessionPickerOverlayLayout, SessionPickerPurpose,
+    SessionPickerTextCache, SessionPickerTextItem, SnapshotFrame, SnapshotOverlays,
+    TabContextMenuLayout, TextRow, background_bgra, chrome_panel_fill, chrome_panel_palette,
+    clear_snapshot_caches, command_palette_hit_test, command_palette_layout, dojo_prompt_hit_test,
+    dojo_prompt_layout, explorer_minimum_docked_terminal_width, fill_rect, history_overlay_layout,
+    lair_explorer_action_hit_test, lair_explorer_chrome_cell_width,
+    lair_explorer_disclosure_hit_test, lair_explorer_filter_hit_test, lair_explorer_hit_test,
+    lair_explorer_rail_width, lair_explorer_shown_layout, paint, paint_command_palette,
     paint_dojo_prompt, paint_handoff_banner, paint_history_overlay, paint_lair_explorer,
     paint_search_overlay, paint_session_picker_overlay, paint_snapshot_overlays,
     paint_snapshot_presented, paint_snapshot_region_presented, paint_snapshot_rows_presented,
@@ -3245,8 +3245,9 @@ fn explorer_pointer_returns_to_terminal(
 enum ExplorerPointerPress {
     Row(NavigationNodeId, bool),
     Filter(LairExplorerFilter),
-    /// The header's `«` or `»`, which never takes keyboard focus.
-    Toggle,
+    /// A footer action token, or the rail header's `»`, which never takes
+    /// keyboard focus.
+    Action(LairExplorerAction),
 }
 
 fn explorer_released_filter(
@@ -3260,17 +3261,18 @@ fn explorer_released_filter(
 }
 
 /// What a left press in the Explorer panel starts, and whether it gives the
-/// Explorer the keys. The header's `«` / `»` leaves keyboard focus where it
-/// is; every other press in the panel, a row of the tree or of the rail
-/// alike, gives the Explorer the keys, as a row click always has.
+/// Explorer the keys. A footer action token (`new`, `menu`, `«`) and the
+/// rail header's `»` leave keyboard focus where it is; every other press in
+/// the panel, a row of the tree or of the rail alike, gives the Explorer the
+/// keys, as a row click always has.
 fn explorer_left_press(
-    on_toggle: bool,
+    action: Option<LairExplorerAction>,
     filter: Option<LairExplorerFilter>,
     target: Option<NavigationNodeId>,
     disclosure: Option<NavigationNodeId>,
 ) -> (Option<ExplorerPointerPress>, bool) {
-    if on_toggle {
-        return (Some(ExplorerPointerPress::Toggle), false);
+    if let Some(action) = action {
+        return (Some(ExplorerPointerPress::Action(action)), false);
     }
     let pressed = filter.map(ExplorerPointerPress::Filter).or_else(|| {
         target.map(|target| ExplorerPointerPress::Row(target, disclosure == Some(target)))
@@ -3278,10 +3280,41 @@ fn explorer_left_press(
     (pressed, true)
 }
 
-/// Whether a left release completes a press on the header's `«` / `»`: both
-/// on the toggle.
-fn explorer_released_toggle(pressed: Option<ExplorerPointerPress>, on_toggle: bool) -> bool {
-    on_toggle && pressed == Some(ExplorerPointerPress::Toggle)
+/// The action a left release completes: one only when the press and the
+/// release both land on the same token.
+fn explorer_released_action(
+    pressed: Option<ExplorerPointerPress>,
+    on: Option<LairExplorerAction>,
+) -> Option<LairExplorerAction> {
+    match (pressed, on) {
+        (Some(ExplorerPointerPress::Action(pressed)), Some(on)) if pressed == on => Some(on),
+        _ => None,
+    }
+}
+
+/// What a completed footer action does. `menu` opens the selected row's own
+/// menu, the one a right-click opens, when that row has one, and the command
+/// palette (the Window's action menu) otherwise.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExplorerActionCommand {
+    Toggle,
+    NewLair,
+    RowMenu(NavigationNodeId),
+    Palette,
+}
+
+fn explorer_action_command(
+    action: LairExplorerAction,
+    menu_row: Option<NavigationNodeId>,
+) -> ExplorerActionCommand {
+    match action {
+        LairExplorerAction::Toggle => ExplorerActionCommand::Toggle,
+        LairExplorerAction::New => ExplorerActionCommand::NewLair,
+        LairExplorerAction::Menu => menu_row.map_or(
+            ExplorerActionCommand::Palette,
+            ExplorerActionCommand::RowMenu,
+        ),
+    }
 }
 
 /// The rail's first row in view after a wheel step of `delta` rows from
@@ -8812,7 +8845,7 @@ impl App {
         };
         let target = lair_explorer_hit_test(layout, event.position);
         let filter = lair_explorer_filter_hit_test(layout, event.position);
-        let toggle = lair_explorer_toggle_hit_test(layout, event.position);
+        let action = lair_explorer_action_hit_test(layout, event.position);
         let rail = layout.rail;
         let disclosure =
             lair_explorer_disclosure_hit_test(layout, &self.explorer.rows(), event.position);
@@ -8840,7 +8873,7 @@ impl App {
             PointerEventKind::Press { button, .. } if button == BTN_LEFT => {
                 self.explorer.cancel_context_press();
                 let (pressed, takes_focus) =
-                    explorer_left_press(toggle, filter, target, disclosure);
+                    explorer_left_press(action, filter, target, disclosure);
                 if takes_focus {
                     self.set_explorer_focus(true, queue_handle);
                 }
@@ -8850,11 +8883,11 @@ impl App {
                 }
             }
             PointerEventKind::Release { button, .. } if button == BTN_LEFT => {
-                changed |= if explorer_released_toggle(self.presentation.explorer_pressed, toggle) {
-                    self.release_explorer_toggle()
-                } else {
-                    self.release_lair_explorer_pointer(target, disclosure, filter)
-                };
+                changed |=
+                    match explorer_released_action(self.presentation.explorer_pressed, action) {
+                        Some(action) => self.release_explorer_action(action, event.position),
+                        None => self.release_lair_explorer_pointer(target, disclosure, filter),
+                    };
             }
             PointerEventKind::Axis { vertical, .. } if !vertical.is_none() => {
                 let up = vertical.discrete < 0 || vertical.value120 < 0 || vertical.absolute < 0.0;
@@ -8896,10 +8929,66 @@ impl App {
         true
     }
 
-    /// Completes a click on the header's `«` / `»`: the Explorer collapses
-    /// to its rail or expands, and keyboard focus stays where it is.
-    fn release_explorer_toggle(&mut self) -> bool {
+    /// Completes a click on a footer action token or the rail header's `»`.
+    /// None of them takes keyboard focus; `menu` opens a menu, which, like
+    /// a right-click's, takes the keys while it is open.
+    fn release_explorer_action(&mut self, action: LairExplorerAction, at: (f64, f64)) -> bool {
         self.presentation.explorer_pressed = None;
+        let menu_row = self
+            .explorer
+            .selected()
+            .filter(|&node| self.explorer_context_menu(node).is_some());
+        match explorer_action_command(action, menu_row) {
+            ExplorerActionCommand::Toggle => self.release_explorer_toggle(),
+            ExplorerActionCommand::NewLair => {
+                self.explorer_new_lair();
+                false
+            }
+            ExplorerActionCommand::RowMenu(node) => {
+                if self.show_explorer_context_menu(node, at).is_err() {
+                    eprintln!("splinterm Explorer menu is unavailable");
+                }
+                true
+            }
+            ExplorerActionCommand::Palette => {
+                if self.show_command_palette().is_err() {
+                    eprintln!("splinterm command palette unavailable");
+                }
+                true
+            }
+        }
+    }
+
+    /// The footer's `new`: a new Lair, as the `lair.new` action makes one,
+    /// from the focused Splint's directory.
+    fn explorer_new_lair(&mut self) {
+        if !tab_action_dispatch_allowed([
+            self.modal.session_picker.is_some(),
+            self.modal.trusted_consent.is_some(),
+            self.modal.session_picker_requested,
+            self.tab_state.session_switch_pending,
+            self.modal.session_picker_reconcile_pending,
+        ]) {
+            return;
+        }
+        let source_splint_id = match self.focused_cwd_source() {
+            Ok(source_splint_id) => source_splint_id,
+            Err(error) => {
+                eprintln!("splinterm new Lair is unavailable: {error:#}");
+                return;
+            }
+        };
+        if let Err(error) =
+            self.send_topology_command(WindowTopologyCommand::NewLair { source_splint_id })
+        {
+            self.scheduling.fail(error);
+        }
+    }
+
+    /// Completes a click on the footer's `«` or the rail header's `»`: the
+    /// Explorer collapses to its rail or expands, and keyboard focus stays
+    /// where it is.
+    fn release_explorer_toggle(&mut self) -> bool {
         match self.set_explorer_collapsed(!self.explorer.collapsed()) {
             Ok(toggled) => toggled,
             Err(error) => {
@@ -13131,47 +13220,104 @@ fn write_selection_payload(write_pipe: WritePipe, payload: Arc<[u8]>) {
 
 #[cfg(test)]
 mod tests {
-    /// The header's `«` / `»` never takes keyboard focus; a press on a row,
-    /// of the tree or of the rail, or on a filter gives the Explorer the keys
-    /// as before. A toggle runs only when its press and release both land on
-    /// it.
+    /// A footer action token (`new`, `menu`, `«`) and the rail header's `»`
+    /// never take keyboard focus; a press on a row, of the tree or of the
+    /// rail, or on a filter gives the Explorer the keys as before. A token
+    /// runs only when its press and release both land on it.
     #[test]
-    fn explorer_toggle_press_keeps_focus_and_needs_a_matching_release() {
+    fn explorer_action_press_keeps_focus_and_needs_a_matching_release() {
         use super::{
-            ExplorerPointerPress, LairExplorerFilter, explorer_left_press, explorer_released_toggle,
+            ExplorerPointerPress, LairExplorerAction, LairExplorerFilter, explorer_left_press,
+            explorer_released_action,
         };
         use crate::navigation_projection::NavigationNodeId;
 
         let lair = NavigationNodeId::Lair(splinterm_core::LairId::new());
+        for action in [
+            LairExplorerAction::New,
+            LairExplorerAction::Menu,
+            LairExplorerAction::Toggle,
+        ] {
+            // A token press wins over whatever else is under it, and leaves
+            // the keys where they are.
+            assert_eq!(
+                explorer_left_press(
+                    Some(action),
+                    Some(LairExplorerFilter::Saved),
+                    Some(lair),
+                    None
+                ),
+                (Some(ExplorerPointerPress::Action(action)), false)
+            );
+            let pressed = Some(ExplorerPointerPress::Action(action));
+            assert_eq!(
+                explorer_released_action(pressed, Some(action)),
+                Some(action)
+            );
+            assert_eq!(explorer_released_action(pressed, None), None);
+            assert_eq!(explorer_released_action(None, Some(action)), None);
+            assert_eq!(
+                explorer_released_action(
+                    Some(ExplorerPointerPress::Row(lair, false)),
+                    Some(action)
+                ),
+                None
+            );
+        }
+        // A press on one token and a release on another runs neither.
         assert_eq!(
-            explorer_left_press(true, None, None, None),
-            (Some(ExplorerPointerPress::Toggle), false)
+            explorer_released_action(
+                Some(ExplorerPointerPress::Action(LairExplorerAction::New)),
+                Some(LairExplorerAction::Menu)
+            ),
+            None
         );
         assert_eq!(
-            explorer_left_press(false, None, Some(lair), None),
+            explorer_left_press(None, None, Some(lair), None),
             (Some(ExplorerPointerPress::Row(lair, false)), true)
         );
         assert_eq!(
-            explorer_left_press(false, None, Some(lair), Some(lair)),
+            explorer_left_press(None, None, Some(lair), Some(lair)),
             (Some(ExplorerPointerPress::Row(lair, true)), true)
         );
         assert_eq!(
-            explorer_left_press(false, Some(LairExplorerFilter::Saved), None, None),
+            explorer_left_press(None, Some(LairExplorerFilter::Saved), None, None),
             (
                 Some(ExplorerPointerPress::Filter(LairExplorerFilter::Saved)),
                 true
             )
         );
         // Empty panel space still gives the Explorer the keys.
-        assert_eq!(explorer_left_press(false, None, None, None), (None, true));
-        let toggle = Some(ExplorerPointerPress::Toggle);
-        assert!(explorer_released_toggle(toggle, true));
-        assert!(!explorer_released_toggle(toggle, false));
-        assert!(!explorer_released_toggle(None, true));
-        assert!(!explorer_released_toggle(
-            Some(ExplorerPointerPress::Row(lair, false)),
-            true
-        ));
+        assert_eq!(explorer_left_press(None, None, None, None), (None, true));
+    }
+
+    /// `new` makes a Lair, `«` / `»` toggles the rail, and `menu` opens the
+    /// selected row's own menu when it has one and the action menu (the
+    /// command palette) otherwise.
+    #[test]
+    fn explorer_actions_dispatch_their_commands() {
+        use super::{ExplorerActionCommand, LairExplorerAction, explorer_action_command};
+        use crate::navigation_projection::NavigationNodeId;
+
+        let lair = NavigationNodeId::Lair(splinterm_core::LairId::new());
+        for row in [None, Some(lair)] {
+            assert_eq!(
+                explorer_action_command(LairExplorerAction::New, row),
+                ExplorerActionCommand::NewLair
+            );
+            assert_eq!(
+                explorer_action_command(LairExplorerAction::Toggle, row),
+                ExplorerActionCommand::Toggle
+            );
+        }
+        assert_eq!(
+            explorer_action_command(LairExplorerAction::Menu, Some(lair)),
+            ExplorerActionCommand::RowMenu(lair)
+        );
+        assert_eq!(
+            explorer_action_command(LairExplorerAction::Menu, None),
+            ExplorerActionCommand::Palette
+        );
     }
 
     #[test]
@@ -18098,7 +18244,7 @@ mod tests {
         assert_eq!(tab_strip_left_of(Some(&rail)), rail.panel.width);
         assert_eq!(tab_strip_left_of(Some(&expanded)), expanded.panel.width);
         assert_eq!((rail.header.y, rail.header.height), (0, strip));
-        assert_eq!(rail.toggle, Some(rail.header));
+        assert_eq!(rail.toggle(), Some(rail.header));
         assert_eq!(
             rail.header_text_cell_cap,
             tab_text_maximum_cell_height(strip, 120).unwrap()
@@ -18152,7 +18298,7 @@ mod tests {
         assert!(drawer.rail);
         assert_eq!(drawer.mode, LairExplorerPresentationMode::Drawer);
         assert_eq!(drawer.terminal, tiny);
-        assert_eq!(drawer.toggle, Some(drawer.header));
+        assert_eq!(drawer.toggle(), Some(drawer.header));
         assert_eq!(tab_strip_left_of(Some(&drawer)), 0);
         assert!(
             shown(

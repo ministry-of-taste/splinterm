@@ -184,15 +184,14 @@ is cancelled), `main.ui-font-pixelsize` and `multiplexer.tab-strip-border`
 `multiplexer.frame-title`, `multiplexer.pane-gap`, `multiplexer.close-unused`,
 `multiplexer.persist-on-tab-organization`, `multiplexer.new-dojo-directory`,
 and `multiplexer.new-splint-directory`. A changed `explorer.full-height`,
-`explorer.collapsed`,
-`multiplexer.divider-style`, `multiplexer.frame-title`, or
-`multiplexer.pane-gap` lays the Splints out again
-at once and resizes each one's PTY; a gap they
-cannot fit shrinks for that layout, as described above, rather than being
-refused. The other four multiplexer settings take effect at the Window's next
-close, tab organization, or Dojo, Lair, or Splint creation; one already under
-way keeps the value it started with. A file with errors is rejected and changes
-nothing. Every other setting keeps the value the Window started with.
+`explorer.collapsed`, `multiplexer.divider-style`, `multiplexer.frame-title`,
+or `multiplexer.pane-gap` lays the Splints out again at once and resizes each
+one's PTY; a gap they cannot fit shrinks for that layout, as described above,
+rather than being refused. The other four multiplexer settings take effect at
+the Window's next close, tab organization, or Dojo, Lair, or Splint creation;
+one already under way keeps the value it started with. A file with errors is
+rejected and changes nothing. Every other setting keeps the value the Window
+started with.
 
 Malformed supported values fail startup. Unknown sections and keys print
 line-numbered diagnostics. When `main.font` is unset, each graphical client

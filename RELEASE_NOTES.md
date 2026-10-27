@@ -378,26 +378,32 @@ a hostile program running as your account.
 - The Lair Explorer shows one line per row: the disclosure chevron and the
   name, then fixed icon columns on the right for agent access, agent status,
   whether the row is live (a filled or hollow dot), and whether a Lair is saved
-  or pinned. The footer gives the selected row one short status line that
-  says only what the row does not already show, a waiting access request and
-  agents needing input or in error first, for example *1 needs input ·
-  2 working · saved*. It drops the name, a running row's "Running", a
-  disposable Lair's "Disposable", and the current Dojo's "Current", and a
-  plain running row leaves it blank. A line too long for the panel ends in an
-  ellipsis after its last whole word instead of wrapping. Assistive
-  technology still reads the full words for every row. While the terminal has
-  the keyboard, the footer's hint says so, *Terminal has keys · click to
-  move*; it used to read as if a click left typing in the terminal, but a
-  click on a row gives the Explorer the keys. The breadcrumb line is
-  gone; the title and the filters share one header line.
+  or pinned. The footer's first line is an action line, `new · menu · «`:
+  **new** makes a new Lair, **menu** opens the selected row's menu (the
+  command palette when there is none), and **«** collapses the Explorer to
+  its rail. Clicking one leaves the keyboard where it was, and none has a
+  default shortcut; a narrow panel drops `menu`, then `new`. The second
+  line gives the selected row one short status that says only what the row
+  does not already show, a waiting access request and agents needing input
+  or in error first, for example *1 needs input · 2 working · saved*. It
+  drops the name, a running row's "Running", a disposable Lair's
+  "Disposable", and the current Dojo's "Current". A status too long for the
+  panel ends in an ellipsis after its last whole word instead of wrapping.
+  Assistive technology still reads the full words for every row. The search
+  field, a navigation notice, or a search left behind takes the line first,
+  and a row with no status shows who has the keyboard; while the terminal
+  does, *Terminal has keys · click to move*. It used to read as if a click
+  left typing in the terminal, but a click on a row gives the Explorer the
+  keys. The breadcrumb line is gone; the title and the filters share one
+  header line.
 - The Lair Explorer opens on **Live**, and its filters read Live, Saved, All
   (`f` cycles them in that order). Search looks through every Lair whatever the
   filter, so a saved or stopped Lair is found from Live too.
 - The Lair Explorer can collapse to a narrow rail with one row per Lair: its
   initial and its most urgent agent glyph, with the current Lair marked by
   the accent bar and a muted `s` or `a` in its header under the Saved or All
-  filter. Click `«` at the right end of the Explorer's header to
-  collapse it and `»` at the top of the rail to expand it, or choose
+  filter. Click `«` on the footer's action line to collapse it and `»` at
+  the top of the rail to expand it, or choose
   **Toggle Lair explorer rail** in the command palette; there is no default
   shortcut. Clicking a rail row switches to that Lair, never restoring one: a
   Lair whose Dojos only restore expands the Explorer to it instead. The

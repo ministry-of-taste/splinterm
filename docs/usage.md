@@ -144,7 +144,7 @@ full-width tab strip instead. In a Window too narrow to dock it, the Explorer
 opens over the terminal, below the tab strip.
 
 The Explorer can collapse to a rail about four cells wide; it widens with
-larger chrome text. Click `«` at the right end of the Explorer's header to
+larger chrome text. Click `«` on the Explorer's footer action line to
 collapse it and `»` at the top of the rail to expand it again, or choose
 **Toggle Lair explorer rail** in the command palette, which also shows a hidden
 Explorer as its rail. There is no default shortcut, and clicking `«` or `»`
@@ -155,11 +155,12 @@ agent status, the Lair's most urgent status glyph. An accent bar marks the
 current Lair. A `!` left of the `»` means navigation has a notice or is
 loading; expand the Explorer to read it. A muted `s` or `a` right of the `»`
 names the Saved or All filter, so a short rail is not mistaken for every
-Lair; under Live, the default, there is no mark. Clicking a rail row switches to that Lair: it opens the Lair's active Dojo,
-else one open in a tab here, else a live one, else the first that opens without
-asking. It never restores a Dojo: a Lair whose Dojos only restore expands the
-Explorer instead, with that Lair selected and open, so you choose the Dojo to
-restore there. Like any row click, it gives the Explorer the keys, which return
+Lair; under Live, the default, there is no mark. Clicking a rail row switches
+to that Lair: it opens the Lair's active Dojo, else one open in a tab here,
+else a live one, else the first that opens without asking. It never restores a
+Dojo: a Lair whose Dojos only restore expands the Explorer instead, with that
+Lair selected and open, so you choose the Dojo to restore there. Like any row
+click, it gives the Explorer the keys, which return
 to the terminal once a switch completes. Right-click a rail row for the
 Lair's menu. With the rail focused, Up/Down, `j`/`k`, PageUp/PageDown and
 Home/End move between Lairs, Enter switches, `f` cycles the filter, `r` selects
@@ -214,8 +215,24 @@ every row:
 
 A column appears only while some row in the Explorer uses it, except the live
 dot, which is always there. A long name is ellipsized before the first icon in
-its row; it never runs under one. The footer's first line is a short status
-for the selected row that says only what the row does not already show, in
+its row; it never runs under one.
+
+The footer has two lines. The first is an action line, `new · menu · «`:
+**new** makes a new Lair from the focused Splint's directory, as **New
+terminal** does; **menu** opens the selected row's menu, the one a
+right-click opens, or the command palette when no row is selected or the row
+has no menu; and **«** collapses the Explorer to its rail. A token runs when
+the press and the release both land on it, and clicking one leaves the
+keyboard where it was. The tokens have no default shortcut. In a narrow panel
+`menu` goes first, then `new`; `«` stays longest.
+
+The footer's second line shows, in this order, the search field while you
+search, a navigation notice such as *Refreshing navigation…* when there is
+one, a search query left behind (*Search: …*, which still narrows the rows),
+the selected row's short status, and otherwise who has the keyboard: *↑↓ move
+· F filter · Esc terminal* while the Explorer has focus, *Terminal has keys ·
+click to move* while the terminal does. Clicking a row gives the Explorer the
+keys. The short status says only what the row does not already show, in
 this order: a waiting access request (*asking for access*), agent states
 (needs input, then error, working, done, idle), a lifecycle out of the
 ordinary, the retention or *open here*, why the row cannot be opened, and
@@ -223,17 +240,12 @@ which agents can reach it, for example
 *1 needs input · 2 working · saved · agent connected*. It never repeats the
 name, which is highlighted just above, and it leaves out the ordinary: a
 running row's lifecycle, a disposable Lair's retention (every new Lair starts
-disposable), and the current Dojo's attachment. A plain running row leaves the
-line blank. The line never wraps; what does not fit ends in an ellipsis after
-the last whole word that fits, so an agent's detail keeps its first words, for
-example *needs input · waiting for…*. Assistive technology still reads the
-full words for every row, ordinary states included, for example *Agent
-connected · Running · Saved · 1 working*. The footer's second line shows the
-search field
-while you search, a navigation notice such as *Refreshing navigation…* when
-there is one, and otherwise who has the keyboard: *↑↓ move · F filter · Esc
-terminal* while the Explorer has focus, *Terminal has keys · click to move*
-while the terminal does. Clicking a row gives the Explorer the keys.
+disposable), and the current Dojo's attachment, so a plain running row shows
+the keyboard hint instead. The status never wraps; what does not fit ends in
+an ellipsis after the last whole word that fits, so an agent's detail keeps
+its first words, for example *needs input · waiting for…*. Assistive
+technology still reads the full words for every row, ordinary states
+included, for example *Agent connected · Running · Saved · 1 working*.
 
 Parent rows summarize runtime state independently of retention and window
 attachment. A saved Lair can still be running, and a Dojo not open in this
