@@ -161,16 +161,16 @@ use crate::renderer::{
     TabContextMenuLayout, TextRow, background_bgra, chrome_panel_fill, chrome_panel_palette,
     clear_snapshot_caches, command_palette_hit_test, command_palette_layout, dojo_prompt_hit_test,
     dojo_prompt_layout, explorer_minimum_docked_terminal_width, fill_rect, history_overlay_layout,
-    lair_explorer_action_hit_test, lair_explorer_chrome_cell_width,
+    lair_explorer_action_hit_test, lair_explorer_agent_hit_test, lair_explorer_chrome_cell_width,
     lair_explorer_disclosure_hit_test, lair_explorer_filter_hit_test,
-    lair_explorer_footer_hit_test, lair_explorer_hit_test, lair_explorer_shown_layout, paint,
-    paint_command_palette, paint_dojo_prompt, paint_handoff_banner, paint_history_overlay,
-    paint_lair_explorer, paint_search_overlay, paint_session_picker_overlay,
-    paint_snapshot_overlays, paint_snapshot_presented, paint_snapshot_region_presented,
-    paint_snapshot_rows_presented, paint_tab_context_menu, premultiplied_theme_rgba,
-    scroll_snapshot_pixels, search_overlay_panel, session_picker_hit_test,
-    session_picker_overlay_layout, snapshot_row_rect, tab_context_menu_hit_test,
-    tab_context_menu_layout, write_ppm,
+    lair_explorer_footer_hit_test, lair_explorer_hit_test, lair_explorer_shown_layout,
+    lair_explorer_with_agents, paint, paint_command_palette, paint_dojo_prompt,
+    paint_handoff_banner, paint_history_overlay, paint_lair_explorer, paint_search_overlay,
+    paint_session_picker_overlay, paint_snapshot_overlays, paint_snapshot_presented,
+    paint_snapshot_region_presented, paint_snapshot_rows_presented, paint_tab_context_menu,
+    premultiplied_theme_rgba, scroll_snapshot_pixels, search_overlay_panel,
+    session_picker_hit_test, session_picker_overlay_layout, snapshot_row_rect,
+    tab_context_menu_hit_test, tab_context_menu_layout, write_ppm,
 };
 #[cfg(test)]
 use crate::renderer::{lair_explorer_layout, paint_box_drawing_cell};
@@ -1135,6 +1135,7 @@ fn assemble_app(
             search_text_cache: SessionPickerTextCache::default(),
             painted_search_panel: None,
             explorer_visible_start: 0,
+            explorer_agents_start: 0,
             explorer_pressed: None,
             full_redraw: true,
         },
@@ -2440,6 +2441,8 @@ struct PresentationState {
     /// buffer pixels; the next frame damages it if the field closes or moves.
     painted_search_panel: Option<Rect>,
     explorer_visible_start: usize,
+    /// The agents section's first row in view, kept as the tree's start is.
+    explorer_agents_start: usize,
     explorer_pressed: Option<ExplorerPointerPress>,
     full_redraw: bool,
 }
@@ -3254,6 +3257,8 @@ fn explorer_pointer_returns_to_terminal(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ExplorerPointerPress {
     Row(NavigationNodeId, bool),
+    /// A row of the agents section, for its Splint.
+    Agent(NavigationNodeId),
     Filter(LairExplorerFilter),
     /// A footer action token, or the rail header's `»`, which never takes
     /// keyboard focus.
@@ -3270,19 +3275,32 @@ fn explorer_released_filter(
     }
 }
 
+/// The agents row a left release completes: one only when the press and the
+/// release both land on the same row of the agents section.
+fn explorer_released_agent(
+    pressed: Option<ExplorerPointerPress>,
+    agent: Option<NavigationNodeId>,
+) -> Option<NavigationNodeId> {
+    match pressed {
+        Some(ExplorerPointerPress::Agent(pressed)) if Some(pressed) == agent => Some(pressed),
+        _ => None,
+    }
+}
+
 /// What a left press in the Explorer panel starts, and whether it gives the
 /// Explorer the keys. A footer action token (`new`, `menu`, `«`) and the
 /// rail header's `»` leave keyboard focus where it is, and so does a press
 /// anywhere else `on_footer`, between the tokens or on the context line: the
-/// footer is not rows. Every other press in the panel, a row of the tree or
-/// of the rail alike, gives the Explorer the keys, as a row click always
-/// has.
+/// footer is not rows. Every other press in the panel, a row of the tree,
+/// of the agents section, or of the rail alike, gives the Explorer the
+/// keys, as a row click always has. `row` is the tree row pressed and the
+/// row whose disclosure is under the press; `agent`, the agents row.
 fn explorer_left_press(
     action: Option<LairExplorerAction>,
     on_footer: bool,
     filter: Option<LairExplorerFilter>,
-    target: Option<NavigationNodeId>,
-    disclosure: Option<NavigationNodeId>,
+    (target, disclosure): (Option<NavigationNodeId>, Option<NavigationNodeId>),
+    agent: Option<NavigationNodeId>,
 ) -> (Option<ExplorerPointerPress>, bool) {
     if let Some(action) = action {
         return (Some(ExplorerPointerPress::Action(action)), false);
@@ -3290,9 +3308,12 @@ fn explorer_left_press(
     if on_footer {
         return (None, false);
     }
-    let pressed = filter.map(ExplorerPointerPress::Filter).or_else(|| {
-        target.map(|target| ExplorerPointerPress::Row(target, disclosure == Some(target)))
-    });
+    let pressed = filter
+        .map(ExplorerPointerPress::Filter)
+        .or_else(|| {
+            target.map(|target| ExplorerPointerPress::Row(target, disclosure == Some(target)))
+        })
+        .or_else(|| agent.map(ExplorerPointerPress::Agent));
     (pressed, true)
 }
 
@@ -4215,38 +4236,51 @@ impl App {
         // wheel scrolls the rail freely.
         let selected = self
             .explorer
-            .selected()
+            .tree_selected()
             .filter(|_| !self.explorer.collapsed() || self.explorer.focused());
-        if self.presentation.explorer_full_height {
-            let full = Rect {
-                x: 0,
-                y: 0,
-                width: self.surface.logical_width,
-                height: self.surface.logical_height,
-            };
-            if let Some(layout) = full_height_explorer_layout(
-                full,
-                below_tabs.y,
-                self.surface.scale_120,
-                (minimum_terminal_width, metrics),
+        let full_height = self
+            .presentation
+            .explorer_full_height
+            .then(|| {
+                let full = Rect {
+                    x: 0,
+                    y: 0,
+                    width: self.surface.logical_width,
+                    height: self.surface.logical_height,
+                };
+                full_height_explorer_layout(
+                    full,
+                    below_tabs.y,
+                    self.surface.scale_120,
+                    (minimum_terminal_width, metrics),
+                    &rows,
+                    selected,
+                    self.presentation.explorer_visible_start,
+                    self.explorer.collapsed(),
+                )
+            })
+            .flatten();
+        let layout = full_height.or_else(|| {
+            lair_explorer_shown_layout(
+                below_tabs,
+                None,
+                minimum_terminal_width,
+                metrics,
                 &rows,
                 selected,
                 self.presentation.explorer_visible_start,
                 self.explorer.collapsed(),
-            ) {
-                return Some(layout);
-            }
-        }
-        lair_explorer_shown_layout(
-            below_tabs,
-            None,
-            minimum_terminal_width,
-            metrics,
+            )
+        })?;
+        // The agents section splits off the list's bottom, above the footer.
+        Some(lair_explorer_with_agents(
+            layout,
             &rows,
             selected,
-            self.presentation.explorer_visible_start,
-            self.explorer.collapsed(),
-        )
+            &self.explorer.agent_rows(),
+            self.explorer.agent_selected(),
+            self.presentation.explorer_agents_start,
+        ))
     }
 
     /// What the Explorer's layout sizes from its chrome text: the rail's
@@ -8904,6 +8938,7 @@ impl App {
         let filter = lair_explorer_filter_hit_test(layout, event.position);
         let action = lair_explorer_action_hit_test(layout, event.position);
         let on_footer = lair_explorer_footer_hit_test(layout, event.position);
+        let agent = lair_explorer_agent_hit_test(layout, event.position);
         let rail = layout.rail;
         let disclosure =
             lair_explorer_disclosure_hit_test(layout, &self.explorer.rows(), event.position);
@@ -8913,12 +8948,12 @@ impl App {
                 button: BTN_RIGHT, ..
             } => {
                 self.presentation.explorer_pressed = None;
-                self.explorer.context_press(target);
+                self.explorer.context_press(target.or(agent));
             }
             PointerEventKind::Release {
                 button: BTN_RIGHT, ..
             } => {
-                if let Some(node) = self.explorer.context_release(target) {
+                if let Some(node) = self.explorer.context_release(target.or(agent)) {
                     if self
                         .show_explorer_context_menu(node, event.position)
                         .is_err()
@@ -8931,20 +8966,24 @@ impl App {
             PointerEventKind::Press { button, .. } if button == BTN_LEFT => {
                 self.explorer.cancel_context_press();
                 let (pressed, takes_focus) =
-                    explorer_left_press(action, on_footer, filter, target, disclosure);
+                    explorer_left_press(action, on_footer, filter, (target, disclosure), agent);
                 if takes_focus {
                     self.set_explorer_focus(true, queue_handle);
                 }
                 self.presentation.explorer_pressed = pressed;
                 if let Some(target) = target {
                     changed |= self.explorer.select(target);
+                } else if let Some(agent) = agent {
+                    changed |= self.explorer.select_agent(agent);
                 }
             }
             PointerEventKind::Release { button, .. } if button == BTN_LEFT => {
                 changed |=
                     match explorer_released_action(self.presentation.explorer_pressed, action) {
                         Some(action) => self.release_explorer_action(action, event.position),
-                        None => self.release_lair_explorer_pointer(target, disclosure, filter),
+                        None => {
+                            self.release_lair_explorer_pointer(target, disclosure, filter, agent)
+                        }
                     };
             }
             PointerEventKind::Axis { vertical, .. } if !vertical.is_none() => {
@@ -9079,12 +9118,27 @@ impl App {
         target: Option<NavigationNodeId>,
         disclosure: Option<NavigationNodeId>,
         filter: Option<LairExplorerFilter>,
+        agent: Option<NavigationNodeId>,
     ) -> bool {
         let pressed = self.presentation.explorer_pressed.take();
         if let Some(filter) = explorer_released_filter(pressed, filter) {
             let changed = self.explorer.search_active();
             self.explorer.focus_tree();
             return self.explorer.set_filter(filter) || changed;
+        }
+        // An agents row activates its Splint as the tree's row does.
+        if matches!(pressed, Some(ExplorerPointerPress::Agent(_))) {
+            let Some(pressed) = explorer_released_agent(pressed, agent) else {
+                return false;
+            };
+            let mut changed = self.explorer.select_agent(pressed);
+            if self.explorer.agent_selected() != Some(pressed) {
+                return changed;
+            }
+            if let Some(decision) = self.explorer.decision() {
+                changed |= self.execute_lair_explorer_decision(decision);
+            }
+            return changed;
         }
         let Some(ExplorerPointerPress::Row(pressed, was_disclosure)) = pressed else {
             return false;
@@ -9834,12 +9888,24 @@ impl App {
             let mut changed = false;
             match event.keysym {
                 key if explorer_context_menu_key(key, self.input.modifiers) => {
+                    let agents = self.explorer.agent_selected().is_some();
                     if let Some(node) = self.explorer.selected()
-                        && let Some(row) = self
-                            .presentation
-                            .explorer_layout
-                            .as_ref()
-                            .and_then(|layout| layout.rows.iter().find(|row| row.id == node))
+                        && let Some(row) =
+                            self.presentation
+                                .explorer_layout
+                                .as_ref()
+                                .and_then(|layout| {
+                                    if agents {
+                                        layout
+                                            .agents
+                                            .as_ref()?
+                                            .rows
+                                            .iter()
+                                            .find(|row| row.id == node)
+                                    } else {
+                                        layout.rows.iter().find(|row| row.id == node)
+                                    }
+                                })
                     {
                         let anchor = (f64::from(row.rect.x), f64::from(row.rect.y));
                         if let Err(error) = self.show_explorer_context_menu(node, anchor) {
@@ -12298,6 +12364,9 @@ impl App {
         let explorer_layout = self.current_explorer_layout();
         if let Some(layout) = &explorer_layout {
             self.presentation.explorer_visible_start = layout.visible_start;
+            if let Some(agents) = &layout.agents {
+                self.presentation.explorer_agents_start = agents.visible_start;
+            }
         }
         self.presentation
             .explorer_layout
@@ -12845,8 +12914,9 @@ impl App {
         self.tab_state.agent.explorer_working = false;
         if let Some(layout) = explorer_layout.as_ref() {
             let rows = self.explorer.rows();
+            let agents = self.explorer.agent_rows();
             self.tab_state.agent.explorer_working =
-                crate::renderer::lair_explorer_shows_working(layout, &rows);
+                crate::renderer::lair_explorer_shows_working(layout, &rows, &agents);
             let status_message = self.explorer.status_message();
             paint_lair_explorer(
                 &mut self.presentation.explorer_text_cache,
@@ -12862,7 +12932,8 @@ impl App {
                     self.tab_state.agent.colors(),
                 ),
                 &rows,
-                self.explorer.selected(),
+                self.explorer.tree_selected(),
+                (&agents, self.explorer.agent_selected()),
                 self.explorer.query(),
                 status_message,
                 self.explorer.focused(),
@@ -13326,9 +13397,10 @@ fn write_selection_payload(write_pipe: WritePipe, payload: Arc<[u8]>) {
 #[cfg(test)]
 mod tests {
     /// A footer action token (`new`, `menu`, `«`) and the rail header's `»`
-    /// never take keyboard focus; a press on a row, of the tree or of the
-    /// rail, or on a filter gives the Explorer the keys as before. A token
-    /// runs only when its press and release both land on it.
+    /// never take keyboard focus; a press on a row, of the tree, of the
+    /// agents section, or of the rail, or on a filter gives the Explorer the
+    /// keys as before. A token runs only when its press and release both
+    /// land on it.
     #[test]
     fn explorer_action_press_keeps_focus_and_needs_a_matching_release() {
         use super::{
@@ -13338,6 +13410,11 @@ mod tests {
         use crate::navigation_projection::NavigationNodeId;
 
         let lair = NavigationNodeId::Lair(splinterm_core::LairId::new());
+        let splint = NavigationNodeId::Splint {
+            lair_id: splinterm_core::LairId::new(),
+            dojo_id: splinterm_core::DojoId::new(),
+            splint_id: splinterm_core::SplintId::new(),
+        };
         for action in [
             LairExplorerAction::New,
             LairExplorerAction::Menu,
@@ -13350,8 +13427,8 @@ mod tests {
                     Some(action),
                     true,
                     Some(LairExplorerFilter::Saved),
-                    Some(lair),
-                    None
+                    (Some(lair), None),
+                    Some(splint)
                 ),
                 (Some(ExplorerPointerPress::Action(action)), false)
             );
@@ -13379,30 +13456,77 @@ mod tests {
             None
         );
         assert_eq!(
-            explorer_left_press(None, false, None, Some(lair), None),
+            explorer_left_press(None, false, None, (Some(lair), None), Some(splint)),
             (Some(ExplorerPointerPress::Row(lair, false)), true)
         );
         assert_eq!(
-            explorer_left_press(None, false, None, Some(lair), Some(lair)),
+            explorer_left_press(None, false, None, (Some(lair), Some(lair)), None),
             (Some(ExplorerPointerPress::Row(lair, true)), true)
         );
         assert_eq!(
-            explorer_left_press(None, false, Some(LairExplorerFilter::Saved), None, None),
+            explorer_left_press(
+                None,
+                false,
+                Some(LairExplorerFilter::Saved),
+                (None, None),
+                Some(splint)
+            ),
             (
                 Some(ExplorerPointerPress::Filter(LairExplorerFilter::Saved)),
                 true
             )
         );
+        // An agents row takes the keys as a tree row does.
+        assert_eq!(
+            explorer_left_press(None, false, None, (None, None), Some(splint)),
+            (Some(ExplorerPointerPress::Agent(splint)), true)
+        );
         // Empty panel space still gives the Explorer the keys.
         assert_eq!(
-            explorer_left_press(None, false, None, None, None),
+            explorer_left_press(None, false, None, (None, None), None),
             (None, true)
         );
         // A near miss on the footer, between the tokens or on the context
         // line, leaves the keys where they are too: the footer is not rows.
         assert_eq!(
-            explorer_left_press(None, true, None, None, None),
+            explorer_left_press(None, true, None, (None, None), None),
             (None, false)
+        );
+    }
+
+    /// A click on an agents row completes only when the press and the
+    /// release land on the same row; a press there never completes a tree
+    /// row, a filter, or an action, nor does a press elsewhere complete it.
+    #[test]
+    fn agents_row_click_needs_a_matching_release() {
+        use super::{
+            ExplorerPointerPress, LairExplorerAction, LairExplorerFilter, explorer_released_action,
+            explorer_released_agent, explorer_released_filter,
+        };
+        use crate::navigation_projection::NavigationNodeId;
+
+        let splint = |_| NavigationNodeId::Splint {
+            lair_id: splinterm_core::LairId::new(),
+            dojo_id: splinterm_core::DojoId::new(),
+            splint_id: splinterm_core::SplintId::new(),
+        };
+        let (agent, other) = (splint(0), splint(1));
+        let pressed = Some(ExplorerPointerPress::Agent(agent));
+        assert_eq!(explorer_released_agent(pressed, Some(agent)), Some(agent));
+        assert_eq!(explorer_released_agent(pressed, Some(other)), None);
+        assert_eq!(explorer_released_agent(pressed, None), None);
+        assert_eq!(explorer_released_agent(None, Some(agent)), None);
+        assert_eq!(
+            explorer_released_agent(Some(ExplorerPointerPress::Row(agent, false)), Some(agent)),
+            None
+        );
+        assert_eq!(
+            explorer_released_filter(pressed, Some(LairExplorerFilter::Live)),
+            None
+        );
+        assert_eq!(
+            explorer_released_action(pressed, Some(LairExplorerAction::New)),
+            None
         );
     }
 

@@ -85,6 +85,19 @@ impl App {
                                 self.execute_lair_explorer_decision(decision);
                             }
                         }
+                        NavigationAccessAction::AgentItem(id) => {
+                            self.explorer.focus_tree();
+                            self.explorer.select_agent(id);
+                        }
+                        NavigationAccessAction::ActivateAgent(id) => {
+                            self.explorer.focus_tree();
+                            self.explorer.select_agent(id);
+                            if self.explorer.agent_selected() == Some(id)
+                                && let Some(decision) = self.explorer.decision()
+                            {
+                                self.execute_lair_explorer_decision(decision);
+                            }
+                        }
                         NavigationAccessAction::Terminal => unreachable!(),
                     }
                 }

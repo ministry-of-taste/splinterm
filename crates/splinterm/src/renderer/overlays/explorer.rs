@@ -7,6 +7,10 @@
 //! is, then one line for the search field, else a navigation notice, else
 //! the selected row's short status, else who owns keyboard input.
 //!
+//! Below the tree, above the footer, the expanded Explorer lists every
+//! Splint reporting an agent status in an agents section of a fixed share of
+//! the list (see [`lair_explorer_with_agents`]).
+//!
 //! The docked Explorer can also collapse to a rail about four cells wide:
 //! one row per Lair, its initial and agent glyph, the current Lair marked by
 //! the accent bar. The footer's `«` collapses the panel and the rail's `»`
@@ -19,7 +23,7 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::{
     config::ResolvedTheme,
-    frontend::{LairExplorerAccess, LairExplorerFilter, LairExplorerRow},
+    frontend::{LairExplorerAccess, LairExplorerAgentRow, LairExplorerFilter, LairExplorerRow},
     geometry::Rect,
     navigation_projection::NavigationNodeId,
     theme::ChromeTint,
@@ -385,6 +389,21 @@ pub(crate) struct LairExplorerLayout {
     /// `»` on the rail. Narrow panels drop `menu`, then `new`, then `«`,
     /// and a line cut short has none.
     pub(crate) actions: Vec<(LairExplorerAction, Rect)>,
+    /// The expanded Explorer's agents section, when it is shown.
+    pub(crate) agents: Option<LairExplorerAgentsLayout>,
+}
+
+/// The agents section at the bottom of the expanded Explorer's list, above
+/// the footer: a rule, the `agents` label line, then its rows.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LairExplorerAgentsLayout {
+    /// The label line, with the rule along its top.
+    pub(crate) label: Rect,
+    pub(crate) rows: Vec<LairExplorerRowLayout>,
+    pub(crate) visible_start: usize,
+    pub(crate) visible_capacity: usize,
+    /// How many reporting Splints are not in view, for the label's `+k more`.
+    pub(crate) hidden: usize,
 }
 
 impl LairExplorerLayout {
@@ -559,6 +578,7 @@ fn lair_explorer_rail_layout(
         } else {
             Vec::new()
         },
+        agents: None,
     })
 }
 
@@ -662,7 +682,131 @@ fn lair_explorer_layout_with_header(
         // Every Window can collapse: the rail is a drawer where it cannot
         // dock.
         actions: footer_action_rects(footer, metrics),
+        agents: None,
     })
+}
+
+/// The most rows the agents section shows at once.
+const AGENTS_MAXIMUM_ROWS: u32 = 5;
+/// Names the agents section on its label line.
+const AGENTS_TEXT: &str = "agents";
+/// The fewest cells a row's location is shown in, ellipsized; with less
+/// room the row shows its name alone.
+const AGENT_LOCATION_MINIMUM_CELLS: usize = 6;
+
+/// How many agent rows the section shows in a list `capacity` rows tall,
+/// for `count` reporting Splints: up to [`AGENTS_MAXIMUM_ROWS`] and a third
+/// of the list, but at least one, below its label line, leaving the tree at
+/// least one row. `None` when nothing reports or the list has fewer than
+/// three rows.
+fn agents_section_rows(capacity: u32, count: usize) -> Option<u32> {
+    let count = u32::try_from(count).unwrap_or(u32::MAX);
+    if count == 0 || capacity < 3 {
+        return None;
+    }
+    Some(
+        count
+            .min(AGENTS_MAXIMUM_ROWS)
+            .min((capacity / 3).max(1))
+            .min(capacity - 2),
+    )
+}
+
+/// The expanded `layout` with the agents section split off the bottom of
+/// its list, above the footer, for the reporting Splints `agents`, most
+/// urgent first. The split is fixed by [`agents_section_rows`]; the tree
+/// scrolls in the rows left above it, keeping `selected` in view, and the
+/// section scrolls from `agent_start`, keeping `agent_selected` in view.
+/// The rail, and a list with nothing reporting or too short for the
+/// section, are returned as they are.
+#[must_use]
+pub(crate) fn lair_explorer_with_agents(
+    mut layout: LairExplorerLayout,
+    rows: &[LairExplorerRow],
+    selected: Option<NavigationNodeId>,
+    agents: &[LairExplorerAgentRow],
+    agent_selected: Option<NavigationNodeId>,
+    agent_start: usize,
+) -> LairExplorerLayout {
+    if layout.rail {
+        return layout;
+    }
+    let panel = layout.panel;
+    let list_bottom = layout.footer.y.saturating_sub(panel.y);
+    let list_top = layout
+        .header
+        .height
+        .saturating_add(HEADER_SPACER)
+        .min(list_bottom);
+    let list_height = list_bottom - list_top;
+    let Some(shown) = agents_section_rows(list_height / ROW_HEIGHT, agents.len()) else {
+        return layout;
+    };
+    let section_height = ROW_HEIGHT.saturating_mul(shown.saturating_add(1));
+    let section_top = list_bottom.saturating_sub(section_height);
+    let (start, capacity, tree_rows) = row_slots(
+        panel,
+        list_top,
+        section_top.saturating_sub(list_top),
+        rows,
+        selected,
+        layout.visible_start,
+    );
+    layout.visible_start = start;
+    layout.visible_capacity = capacity;
+    layout.rows = tree_rows;
+    let agent_rows: Vec<_> = agents.iter().map(|agent| agent.row.clone()).collect();
+    let (agent_visible_start, agent_capacity, agent_layouts) = row_slots(
+        panel,
+        section_top.saturating_add(ROW_HEIGHT),
+        ROW_HEIGHT.saturating_mul(shown),
+        &agent_rows,
+        agent_selected,
+        agent_start,
+    );
+    layout.agents = Some(LairExplorerAgentsLayout {
+        label: Rect {
+            x: panel.x,
+            y: panel.y.saturating_add(section_top),
+            width: panel.width,
+            height: ROW_HEIGHT,
+        },
+        hidden: agents.len().saturating_sub(agent_layouts.len()),
+        rows: agent_layouts,
+        visible_start: agent_visible_start,
+        visible_capacity: agent_capacity,
+    });
+    layout
+}
+
+/// The agents section's row at `position`, if any.
+#[must_use]
+pub(crate) fn lair_explorer_agent_hit_test(
+    layout: &LairExplorerLayout,
+    position: (f64, f64),
+) -> Option<NavigationNodeId> {
+    layout.agents.as_ref()?.rows.iter().find_map(|row| {
+        (position.0 >= f64::from(row.rect.x)
+            && position.0 < f64::from(row.rect.x.saturating_add(row.rect.width))
+            && position.1 >= f64::from(row.rect.y)
+            && position.1 < f64::from(row.rect.y.saturating_add(row.rect.height)))
+        .then_some(row.id)
+    })
+}
+
+/// An agent row's name and location for `cells` cells after its glyph: both
+/// when they fit with two cells between, else the name whole with the
+/// location ellipsized into what is left when that is at least
+/// [`AGENT_LOCATION_MINIMUM_CELLS`], else the name alone, ellipsized.
+fn agent_row_text(label: &str, location: &str, cells: usize) -> (String, Option<String>) {
+    let name = text_cells(label);
+    let room = cells.saturating_sub(name.saturating_add(2));
+    if name.saturating_add(2) >= cells
+        || room < AGENT_LOCATION_MINIMUM_CELLS.min(text_cells(location))
+    {
+        return (truncate_picker_text(label, cells), None);
+    }
+    (label.to_owned(), Some(truncate_picker_text(location, room)))
 }
 
 /// The footer action line's targets, left to right with a `·` between
@@ -804,17 +948,26 @@ pub(crate) fn lair_explorer_hit_test(
     })
 }
 
-/// Whether a row in view shows a fresh working status, whose spinner moves.
-/// Rows scrolled out of view do not count.
+/// Whether a row in view, of the tree or of the agents section, shows a
+/// fresh working status, whose spinner moves. Rows scrolled out of view do
+/// not count.
 #[must_use]
 pub(crate) fn lair_explorer_shows_working(
     layout: &LairExplorerLayout,
     rows: &[LairExplorerRow],
+    agents: &[LairExplorerAgentRow],
 ) -> bool {
     rows.iter()
         .skip(layout.visible_start)
         .take(layout.rows.len())
         .any(|row| row.agent_working)
+        || layout.agents.as_ref().is_some_and(|section| {
+            agents
+                .iter()
+                .skip(section.visible_start)
+                .take(section.rows.len())
+                .any(|agent| agent.row.agent_working)
+        })
 }
 
 /// The logical width from a row's left edge that toggles its disclosure: the
@@ -1203,6 +1356,7 @@ pub(crate) fn paint_lair_explorer(
     palette: SessionPickerPalette,
     rows: &[LairExplorerRow],
     selected: Option<NavigationNodeId>,
+    agents: (&[LairExplorerAgentRow], Option<NavigationNodeId>),
     query: &str,
     status_message: Option<&str>,
     focused: bool,
@@ -1378,30 +1532,12 @@ pub(crate) fn paint_lair_explorer(
         let rect = buffer_rect(layout_row.rect, scale_120);
         let is_selected = selected == Some(row.id);
         if is_selected {
-            // Row hit areas span the panel, but selection paint must not cover
-            // its right-hand divider, including at fractional buffer scales.
-            let highlight = Rect {
-                width: rect.width.min(right.saturating_sub(rect.x)),
-                ..rect
-            };
-            fill_rect(
+            paint_row_highlight(
                 canvas,
-                canvas_width,
-                canvas_height,
-                tuple(highlight),
-                glass_rgba(palette.selected_fill, palette.panel_fill),
-            );
-            fill_rect(
-                canvas,
-                canvas_width,
-                canvas_height,
-                (
-                    i32::try_from(rect.x).unwrap_or(i32::MAX),
-                    i32::try_from(rect.y).unwrap_or(i32::MAX),
-                    border.saturating_mul(3).min(highlight.width),
-                    rect.height,
-                ),
-                rgba(palette.selected_rail),
+                (canvas_width, canvas_height),
+                rect,
+                (border, right),
+                palette,
             );
         }
         let (columns_source, first_mark) = row_columns_source(row, columns, icons);
@@ -1413,17 +1549,7 @@ pub(crate) fn paint_lair_explorer(
             columns_source.cells(),
             first_mark,
         );
-        let primary = if is_selected {
-            if row.enabled {
-                palette.selected_primary
-            } else {
-                palette.selected_secondary
-            }
-        } else if row.enabled {
-            palette.primary
-        } else {
-            palette.secondary
-        };
+        let primary = row_primary(palette, is_selected, row.enabled);
         paint_picker_source(
             cache,
             context,
@@ -1455,6 +1581,21 @@ pub(crate) fn paint_lair_explorer(
             primary,
             palette.row_tints(is_selected),
             u32::MAX,
+        )?;
+    }
+
+    if let Some(section) = &layout.agents {
+        paint_agents_section(
+            cache,
+            context,
+            &mut used,
+            canvas,
+            (canvas_width, canvas_height),
+            (scale_120, renderer_generation),
+            section,
+            palette,
+            agents,
+            (cell_width, border, right, inset),
         )?;
     }
 
@@ -1556,6 +1697,15 @@ pub(crate) fn paint_lair_explorer(
         notice,
         selected
             .and_then(|id| rows.iter().find(|row| row.id == id))
+            .or_else(|| {
+                agents.1.and_then(|id| {
+                    agents
+                        .0
+                        .iter()
+                        .map(|agent| &agent.row)
+                        .find(|row| row.id == id)
+                })
+            })
             .map(|row| row.status.as_str()),
         line_cells(&context_line),
     );
@@ -1579,6 +1729,252 @@ pub(crate) fn paint_lair_explorer(
         },
     )?;
     cache.finish_frame(used);
+    Ok(())
+}
+
+/// A row's text colour: brighter on the selection, muted while disabled.
+const fn row_primary(palette: SessionPickerPalette, is_selected: bool, enabled: bool) -> u32 {
+    match (is_selected, enabled) {
+        (true, true) => palette.selected_primary,
+        (true, false) => palette.selected_secondary,
+        (false, true) => palette.primary,
+        (false, false) => palette.secondary,
+    }
+}
+
+/// The selected row's fill and accent bar in buffer px. Row hit areas span
+/// the panel, but selection paint must not cover its right-hand divider at
+/// `right`, including at fractional buffer scales.
+fn paint_row_highlight(
+    canvas: &mut [u8],
+    (canvas_width, canvas_height): (u32, u32),
+    rect: Rect,
+    (border, right): (u32, u32),
+    palette: SessionPickerPalette,
+) {
+    let highlight = Rect {
+        width: rect.width.min(right.saturating_sub(rect.x)),
+        ..rect
+    };
+    fill_rect(
+        canvas,
+        canvas_width,
+        canvas_height,
+        tuple(highlight),
+        glass_rgba(palette.selected_fill, palette.panel_fill),
+    );
+    fill_rect(
+        canvas,
+        canvas_width,
+        canvas_height,
+        (
+            i32::try_from(rect.x).unwrap_or(i32::MAX),
+            i32::try_from(rect.y).unwrap_or(i32::MAX),
+            border.saturating_mul(3).min(highlight.width),
+            rect.height,
+        ),
+        rgba(palette.selected_rail),
+    );
+}
+
+/// One line of the agents section in buffer px: `rect` between the row's
+/// `inset` and the same inset short of the divider at `right`.
+fn agents_text_line(rect: Rect, inset: u32, right: u32) -> Rect {
+    let left = rect.x.saturating_add(inset).min(right);
+    Rect {
+        x: left,
+        width: right.saturating_sub(inset).saturating_sub(left),
+        ..rect
+    }
+}
+
+/// The agents section: a rule along the top of its label line, the muted
+/// bold `agents` label with a muted `+k more` at its right while reporting
+/// Splints are out of view, then one row per Splint in view, the selected
+/// one highlighted as in the tree.
+#[allow(clippy::too_many_arguments)]
+fn paint_agents_section(
+    cache: &mut SessionPickerTextCache,
+    context: &RenderContext,
+    used: &mut HashSet<SessionPickerTextKey>,
+    canvas: &mut [u8],
+    (canvas_width, canvas_height): (u32, u32),
+    (scale_120, renderer_generation): (u32, u64),
+    section: &LairExplorerAgentsLayout,
+    palette: SessionPickerPalette,
+    (agents, selected): (&[LairExplorerAgentRow], Option<NavigationNodeId>),
+    (cell_width, border, right, inset): (u32, u32, u32, u32),
+) -> Result<()> {
+    let label = buffer_rect(section.label, scale_120);
+    fill_rect(
+        canvas,
+        canvas_width,
+        canvas_height,
+        (
+            i32::try_from(label.x).unwrap_or(i32::MAX),
+            i32::try_from(label.y).unwrap_or(i32::MAX),
+            right.saturating_sub(label.x),
+            border,
+        ),
+        rgba(palette.frame),
+    );
+    let label_line = agents_text_line(label, inset, right);
+    let half = label_line.width / 2;
+    paint_picker_source(
+        cache,
+        context,
+        used,
+        canvas,
+        canvas_width,
+        canvas_height,
+        &ChromeSource::from(AGENTS_TEXT),
+        ChromeTextStyle::Bold,
+        scale_120,
+        renderer_generation,
+        Rect {
+            width: half,
+            ..label_line
+        },
+        PickerTextAlignment::Left,
+        palette.secondary,
+    )?;
+    if section.hidden > 0 {
+        paint_picker_text(
+            cache,
+            context,
+            used,
+            canvas,
+            canvas_width,
+            canvas_height,
+            &format!("+{} more", section.hidden),
+            ChromeTextStyle::Regular,
+            scale_120,
+            renderer_generation,
+            Rect {
+                x: label_line.x.saturating_add(half),
+                width: label_line.width - half,
+                ..label_line
+            },
+            PickerTextAlignment::Right,
+            palette.secondary,
+        )?;
+    }
+    for (layout_row, agent) in section
+        .rows
+        .iter()
+        .zip(agents.iter().skip(section.visible_start))
+    {
+        let rect = buffer_rect(layout_row.rect, scale_120);
+        let is_selected = selected == Some(agent.row.id);
+        if is_selected {
+            paint_row_highlight(
+                canvas,
+                (canvas_width, canvas_height),
+                rect,
+                (border, right),
+                palette,
+            );
+        }
+        paint_agent_row(
+            cache,
+            context,
+            used,
+            canvas,
+            (canvas_width, canvas_height),
+            (scale_120, renderer_generation),
+            agents_text_line(rect, inset, right),
+            agent,
+            palette,
+            (is_selected, cell_width),
+        )?;
+    }
+    Ok(())
+}
+
+/// One agents row's text on its `line`: the Splint's glyph column at the
+/// left, then its name, and its muted location at the right when it fits.
+#[allow(clippy::too_many_arguments)]
+fn paint_agent_row(
+    cache: &mut SessionPickerTextCache,
+    context: &RenderContext,
+    used: &mut HashSet<SessionPickerTextKey>,
+    canvas: &mut [u8],
+    (canvas_width, canvas_height): (u32, u32),
+    (scale_120, renderer_generation): (u32, u64),
+    line: Rect,
+    agent: &LairExplorerAgentRow,
+    palette: SessionPickerPalette,
+    (is_selected, cell_width): (bool, u32),
+) -> Result<()> {
+    let row = &agent.row;
+    let primary = row_primary(palette, is_selected, row.enabled);
+    let glyph_width = row.agent_column.as_ref().map_or(0, |column| {
+        cell_width.saturating_mul(u32::try_from(column.cells()).unwrap_or(u32::MAX))
+    });
+    if let Some(column) = &row.agent_column {
+        paint_picker_source(
+            cache,
+            context,
+            used,
+            canvas,
+            canvas_width,
+            canvas_height,
+            column,
+            ChromeTextStyle::Regular,
+            scale_120,
+            renderer_generation,
+            Rect {
+                width: glyph_width.min(line.width),
+                ..line
+            },
+            PickerTextAlignment::Left,
+            primary,
+        )?;
+    }
+    let gap = glyph_width.saturating_add(cell_width).min(line.width);
+    let text = Rect {
+        x: line.x.saturating_add(gap),
+        width: line.width - gap,
+        ..line
+    };
+    let cells = usize::try_from(text.width / cell_width.max(1)).unwrap_or(0);
+    let (name, location) = agent_row_text(&row.label, &agent.location, cells);
+    paint_picker_text(
+        cache,
+        context,
+        used,
+        canvas,
+        canvas_width,
+        canvas_height,
+        &name,
+        ChromeTextStyle::Regular,
+        scale_120,
+        renderer_generation,
+        text,
+        PickerTextAlignment::Left,
+        primary,
+    )?;
+    if let Some(location) = location {
+        paint_picker_text(
+            cache,
+            context,
+            used,
+            canvas,
+            canvas_width,
+            canvas_height,
+            &location,
+            ChromeTextStyle::Regular,
+            scale_120,
+            renderer_generation,
+            text,
+            PickerTextAlignment::Right,
+            if is_selected {
+                palette.selected_secondary
+            } else {
+                palette.secondary
+            },
+        )?;
+    }
     Ok(())
 }
 
@@ -1967,6 +2363,7 @@ mod tests {
             palette,
             rows,
             selected,
+            (&[], None),
             "",
             None,
             focused,
@@ -2603,6 +3000,7 @@ mod tests {
                     palette,
                     &rows,
                     None,
+                    (&[], None),
                     "",
                     notice,
                     false,
@@ -4241,9 +4639,9 @@ mod tests {
         };
         let top = lair_explorer_layout(content(400), 640, &rows, Some(rows[0].id), 0).unwrap();
         assert_eq!(top.visible_start, 0);
-        assert!(!lair_explorer_shows_working(&top, &rows));
+        assert!(!lair_explorer_shows_working(&top, &rows, &[]));
         let bottom = lair_explorer_layout(content(400), 640, &rows, Some(rows[29].id), 0).unwrap();
-        assert!(lair_explorer_shows_working(&bottom, &rows));
+        assert!(lair_explorer_shows_working(&bottom, &rows, &[]));
         let no_room = lair_explorer_layout(
             content(HEADER_HEIGHT + HEADER_SPACER + FOOTER_HEIGHT),
             640,
@@ -4253,7 +4651,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(no_room.visible_capacity, 0);
-        assert!(!lair_explorer_shows_working(&no_room, &rows));
+        assert!(!lair_explorer_shows_working(&no_room, &rows, &[]));
     }
 
     /// A navigation notice is never lost: with no rows it takes the list's
@@ -4298,6 +4696,7 @@ mod tests {
                     palette,
                     rows,
                     None,
+                    (&[], None),
                     "",
                     notice,
                     true,
@@ -4639,6 +5038,399 @@ mod tests {
                     );
                     assert_ne!(off, tinted, "{what}");
                 }
+            }
+        }
+    }
+
+    /// `count` reporting Splints for the agents section, named `agent-0`
+    /// on, each with a glyph column.
+    fn agent_rows(count: usize) -> Vec<LairExplorerAgentRow> {
+        (0..count)
+            .map(|index| {
+                let id = NavigationNodeId::Splint {
+                    lair_id: LairId::new(),
+                    dojo_id: splinterm_core::DojoId::new(),
+                    splint_id: splinterm_core::SplintId::new(),
+                };
+                let mut agent = row(id);
+                agent.kind = LairExplorerRowKind::Splint;
+                agent.label = format!("agent-{index}");
+                agent.expanded = None;
+                agent.agent_column = Some(ChromeSource::from("! "));
+                LairExplorerAgentRow {
+                    row: agent,
+                    location: "work / editor".into(),
+                }
+            })
+            .collect()
+    }
+
+    /// The expanded layout of `content` with `rows` and the agents section
+    /// for `agents`.
+    fn agents_layout(
+        content: Rect,
+        rows: &[LairExplorerRow],
+        agents: &[LairExplorerAgentRow],
+        agent_selected: Option<NavigationNodeId>,
+    ) -> LairExplorerLayout {
+        lair_explorer_with_agents(
+            lair_explorer_layout(content, 640, rows, None, 0).unwrap(),
+            rows,
+            None,
+            agents,
+            agent_selected,
+            0,
+        )
+    }
+
+    /// The fixed split: up to five agent rows and a third of the list, at
+    /// least one, under the label line, always leaving the tree a row; no
+    /// section in a list under three rows or with nothing reporting.
+    #[test]
+    fn agents_section_takes_a_fixed_share_of_the_list() {
+        for capacity in 0..3 {
+            assert_eq!(agents_section_rows(capacity, 4), None, "{capacity}");
+        }
+        assert_eq!(agents_section_rows(20, 0), None);
+        for (capacity, count, shown) in [
+            (3, 4, 1),
+            (5, 4, 1),
+            (6, 4, 2),
+            (9, 4, 3),
+            (12, 4, 4),
+            (15, 4, 4),
+            (15, 9, 5),
+            (40, 9, 5),
+            (40, 2, 2),
+            (4, 1, 1),
+        ] {
+            assert_eq!(
+                agents_section_rows(capacity, count),
+                Some(shown),
+                "{capacity} rows, {count} reporting"
+            );
+        }
+        for capacity in 3..60 {
+            for count in 1..12 {
+                let shown = agents_section_rows(capacity, count).unwrap();
+                assert!((1..=AGENTS_MAXIMUM_ROWS).contains(&shown));
+                assert!(shown + 2 <= capacity, "the label and one tree row fit");
+            }
+        }
+    }
+
+    /// At several Window heights the section sits right above the footer:
+    /// its label line, then its rows, back to back, with the tree's rows all
+    /// above the label. The tree keeps scrolling in what is left, the
+    /// section counts the Splints it cannot show, and the rail, a list with
+    /// nothing reporting, or one too short is laid out as before.
+    #[test]
+    fn agents_section_splits_off_the_bottom_of_the_list_at_every_height() {
+        let rows = lair_rows(30);
+        let agents = agent_rows(7);
+        for height in [180, 240, 400, 600, 900] {
+            let content = Rect {
+                x: 0,
+                y: 34,
+                width: 1000,
+                height,
+            };
+            let plain = lair_explorer_layout(content, 640, &rows, None, 0).unwrap();
+            let layout = agents_layout(content, &rows, &agents, None);
+            let section = layout.agents.as_ref().expect("a section");
+            let capacity = u32::try_from(plain.visible_capacity).unwrap();
+            let shown = agents_section_rows(capacity, agents.len()).unwrap();
+            assert_eq!(section.rows.len(), shown as usize, "height {height}");
+            assert_eq!(section.hidden, agents.len() - shown as usize);
+            assert_eq!(
+                section.label.y + ROW_HEIGHT * (shown + 1),
+                layout.footer.y,
+                "height {height}"
+            );
+            assert_eq!(section.label.height, ROW_HEIGHT);
+            for (index, laid) in section.rows.iter().enumerate() {
+                let index = u32::try_from(index).unwrap();
+                assert_eq!(laid.rect.y, section.label.y + ROW_HEIGHT * (index + 1));
+                assert_eq!(laid.id, agents[index as usize].row.id);
+                assert_eq!((laid.rect.x, laid.rect.width), (0, layout.panel.width));
+            }
+            for laid in &layout.rows {
+                assert!(laid.rect.y + laid.rect.height <= section.label.y);
+            }
+            assert_eq!(
+                layout.rows.first().map(|laid| laid.rect.y),
+                plain.rows.first().map(|laid| laid.rect.y)
+            );
+            assert!(layout.visible_capacity >= 1);
+            assert!(layout.visible_capacity < plain.visible_capacity);
+        }
+        // Nothing reporting, or no room: the layout is as it was.
+        let content = Rect {
+            x: 0,
+            y: 0,
+            width: 1000,
+            height: 400,
+        };
+        let plain = lair_explorer_layout(content, 640, &rows, None, 0).unwrap();
+        assert_eq!(agents_layout(content, &rows, &[], None), plain);
+        let short = Rect {
+            height: HEADER_HEIGHT + HEADER_SPACER + FOOTER_HEIGHT + ROW_HEIGHT * 2,
+            ..content
+        };
+        let plain_short = lair_explorer_layout(short, 640, &rows, None, 0).unwrap();
+        assert_eq!(plain_short.visible_capacity, 2);
+        assert_eq!(agents_layout(short, &rows, &agents, None), plain_short);
+        // The rail never has the section.
+        let rail = lair_explorer_shown_layout(content, None, 640, UNMEASURED, &rows, None, 0, true)
+            .unwrap();
+        assert_eq!(
+            lair_explorer_with_agents(rail.clone(), &rows, None, &agents, None, 0),
+            rail
+        );
+        // The tree keeps its selection in view in the rows left to it.
+        let last = rows[29].id;
+        let layout = lair_explorer_with_agents(
+            lair_explorer_layout(content, 640, &rows, Some(last), 0).unwrap(),
+            &rows,
+            Some(last),
+            &agents,
+            None,
+            0,
+        );
+        assert_eq!(layout.rows.last().map(|laid| laid.id), Some(last));
+    }
+
+    /// The section scrolls to keep its selected row in view, from the start
+    /// it was left at, and its label counts the rows out of view.
+    #[test]
+    fn agents_section_scrolls_to_its_selection() {
+        let rows = lair_rows(3);
+        let agents = agent_rows(9);
+        let content = Rect {
+            x: 0,
+            y: 0,
+            width: 1000,
+            height: 900,
+        };
+        let layout = agents_layout(content, &rows, &agents, Some(agents[8].row.id));
+        let section = layout.agents.unwrap();
+        assert_eq!(section.visible_capacity, 5);
+        assert_eq!(section.visible_start, 4);
+        assert_eq!(
+            section.rows.last().map(|laid| laid.id),
+            Some(agents[8].row.id)
+        );
+        assert_eq!(section.hidden, 4);
+        let back = lair_explorer_with_agents(
+            lair_explorer_layout(content, 640, &rows, None, 0).unwrap(),
+            &rows,
+            None,
+            &agents,
+            Some(agents[2].row.id),
+            4,
+        )
+        .agents
+        .unwrap();
+        assert_eq!(back.visible_start, 2);
+    }
+
+    /// An agents row hit-tests to its Splint, apart from the tree: neither
+    /// the label line nor a tree row is an agents row, and no agents row is
+    /// a tree row or the footer.
+    #[test]
+    fn agents_rows_hit_test_apart_from_the_tree_and_the_label() {
+        let rows = lair_rows(4);
+        let agents = agent_rows(3);
+        let content = Rect {
+            x: 0,
+            y: 0,
+            width: 1000,
+            height: 600,
+        };
+        let layout = agents_layout(content, &rows, &agents, None);
+        let section = layout.agents.as_ref().unwrap();
+        for laid in &section.rows {
+            for point in [
+                (0.0, f64::from(laid.rect.y)),
+                (
+                    f64::from(laid.rect.width) - 0.5,
+                    f64::from(laid.rect.y + laid.rect.height) - 0.5,
+                ),
+            ] {
+                assert_eq!(lair_explorer_agent_hit_test(&layout, point), Some(laid.id));
+                assert_eq!(lair_explorer_hit_test(&layout, point), None);
+                assert!(!lair_explorer_footer_hit_test(&layout, point));
+                assert_eq!(lair_explorer_action_hit_test(&layout, point), None);
+            }
+        }
+        let label = (20.0, f64::from(section.label.y + 2));
+        assert_eq!(lair_explorer_agent_hit_test(&layout, label), None);
+        assert_eq!(lair_explorer_hit_test(&layout, label), None);
+        for laid in &layout.rows {
+            let point = (20.0, f64::from(laid.rect.y + 2));
+            assert_eq!(lair_explorer_agent_hit_test(&layout, point), None);
+            assert_eq!(lair_explorer_hit_test(&layout, point), Some(laid.id));
+        }
+        let past = (
+            f64::from(layout.panel.width),
+            f64::from(section.rows[0].rect.y + 2),
+        );
+        assert_eq!(lair_explorer_agent_hit_test(&layout, past), None);
+        let plain = lair_explorer_layout(content, 640, &rows, None, 0).unwrap();
+        assert_eq!(lair_explorer_agent_hit_test(&plain, (20.0, 300.0)), None);
+    }
+
+    /// A row's name and location: both with two cells between when they
+    /// fit, else the whole name and the location ellipsized into at least
+    /// six cells, else the name alone, ellipsized.
+    #[test]
+    fn agent_rows_fit_the_name_first_then_the_location() {
+        let location = "work / editor";
+        assert_eq!(
+            agent_row_text("shell", location, 40),
+            ("shell".to_owned(), Some(location.to_owned()))
+        );
+        assert_eq!(
+            agent_row_text("shell", location, 20),
+            ("shell".to_owned(), Some(location.to_owned()))
+        );
+        let (name, shown) = agent_row_text("shell", location, 15);
+        assert_eq!(name, "shell");
+        let shown = shown.unwrap();
+        assert!(shown.ends_with('…'));
+        assert_eq!(text_cells(&shown), 8);
+        assert_eq!(
+            agent_row_text("shell", location, 12),
+            ("shell".to_owned(), None)
+        );
+        let (name, shown) = agent_row_text("a-very-long-agent-name", location, 10);
+        assert_eq!(text_cells(&name), 10);
+        assert!(name.ends_with('…'));
+        assert_eq!(shown, None);
+        // A location shorter than six cells shows whenever it fits whole.
+        assert_eq!(
+            agent_row_text("shell", "a / b", 12),
+            ("shell".to_owned(), Some("a / b".to_owned()))
+        );
+    }
+
+    /// The spinner keeps moving for a working Splint in the agents section's
+    /// view, even when its tree row is out of view or collapsed.
+    #[test]
+    fn working_agents_rows_in_view_keep_the_spinner_moving() {
+        let rows = lair_rows(2);
+        let mut agents = agent_rows(7);
+        let content = Rect {
+            x: 0,
+            y: 0,
+            width: 1000,
+            height: 600,
+        };
+        let layout = agents_layout(content, &rows, &agents, None);
+        assert!(!lair_explorer_shows_working(&layout, &rows, &agents));
+        agents[0].row.agent_working = true;
+        assert!(lair_explorer_shows_working(&layout, &rows, &agents));
+        agents[0].row.agent_working = false;
+        agents[6].row.agent_working = true;
+        assert!(
+            !lair_explorer_shows_working(&layout, &rows, &agents),
+            "out of the section's view"
+        );
+    }
+
+    /// Everything the section paints stays between its rule and the footer
+    /// and left of the divider; the rule spans the panel, the label and each
+    /// row paint, `+k more` appears only while rows are out of view, and the
+    /// selected row is highlighted with the tree's accent bar.
+    #[test]
+    fn agents_section_paints_inside_its_rows() {
+        use super::super::picker::session_picker_palette;
+        use crate::config::ResolvedTheme;
+
+        let context = RenderContext::new(u16::MAX);
+        let rows = lair_rows(2);
+        let palette = session_picker_palette(ResolvedTheme::default());
+        let surface = Rect {
+            x: 0,
+            y: 0,
+            width: 1000,
+            height: 600,
+        };
+        for scale in [120, 150, 240] {
+            let canvas_width = surface.width * scale / 120 + 1;
+            let canvas_height = surface.height * scale / 120 + 1;
+            let draw = |layout: &LairExplorerLayout,
+                        agents: &[LairExplorerAgentRow],
+                        selected: Option<NavigationNodeId>| {
+                let mut canvas = vec![0; (canvas_width * canvas_height * 4) as usize];
+                paint_lair_explorer(
+                    &mut SessionPickerTextCache::default(),
+                    &context,
+                    &mut canvas,
+                    canvas_width,
+                    canvas_height,
+                    scale,
+                    1,
+                    layout,
+                    palette,
+                    &rows,
+                    None,
+                    (agents, selected),
+                    "",
+                    None,
+                    true,
+                    LairExplorerFilter::All,
+                    false,
+                )
+                .unwrap();
+                canvas
+            };
+            for count in [3, 7] {
+                let agents = agent_rows(count);
+                let layout = agents_layout(surface, &rows, &agents, None);
+                let section = layout.agents.clone().unwrap();
+                let plain = LairExplorerLayout {
+                    agents: None,
+                    ..layout.clone()
+                };
+                let with = draw(&layout, &agents, None);
+                let bare = draw(&plain, &agents, None);
+                let label = buffer_rect(section.label, scale);
+                let footer = buffer_rect(layout.footer, scale);
+                let panel = buffer_rect(layout.panel, scale);
+                let right = panel.x + panel.width - scale.div_ceil(120);
+                let mut lines = HashSet::new();
+                for (index, (a, b)) in with.chunks_exact(4).zip(bare.chunks_exact(4)).enumerate() {
+                    if a == b {
+                        continue;
+                    }
+                    let x = u32::try_from(index).unwrap() % canvas_width;
+                    let y = u32::try_from(index).unwrap() / canvas_width;
+                    assert!(
+                        (label.y..footer.y).contains(&y) && x < right,
+                        "scale {scale}: section ink at {x},{y}"
+                    );
+                    lines.insert((y - label.y) * 120 / (ROW_HEIGHT * scale));
+                }
+                let shown = u32::try_from(section.rows.len()).unwrap();
+                assert_eq!(lines.len(), (shown + 1) as usize, "scale {scale}");
+                // `+k more` takes the label line's right half.
+                let more = |canvas: &[u8]| {
+                    (label.y + scale.div_ceil(120)..label.y + label.height).any(|y| {
+                        (panel.x + panel.width / 2..right).any(|x| {
+                            let at = ((y * canvas_width + x) * 4) as usize;
+                            canvas[at..at + 4] != bare[at..at + 4]
+                        })
+                    })
+                };
+                assert_eq!(more(&with), section.hidden > 0, "scale {scale}, {count}");
+                // The selected row is highlighted from its left edge, as in the
+                // tree.
+                let chosen = section.rows[0].id;
+                let selected = draw(&layout, &agents, Some(chosen));
+                let row = buffer_rect(section.rows[0].rect, scale);
+                let at = (((row.y + row.height / 2) * canvas_width + row.x) * 4) as usize;
+                assert_ne!(with[at..at + 4], selected[at..at + 4]);
             }
         }
     }

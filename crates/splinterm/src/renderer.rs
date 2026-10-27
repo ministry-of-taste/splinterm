@@ -98,9 +98,10 @@ pub(crate) use overlays::explorer::lair_explorer_layout;
 pub(crate) use overlays::explorer::{
     LairExplorerAction, LairExplorerLayout, LairExplorerMetrics, LairExplorerPresentationMode,
     explorer_minimum_docked_terminal_width, lair_explorer_action_hit_test,
-    lair_explorer_chrome_cell_width, lair_explorer_disclosure_hit_test,
-    lair_explorer_filter_hit_test, lair_explorer_footer_hit_test, lair_explorer_hit_test,
-    lair_explorer_palette, lair_explorer_shown_layout, lair_explorer_shows_working,
+    lair_explorer_agent_hit_test, lair_explorer_chrome_cell_width,
+    lair_explorer_disclosure_hit_test, lair_explorer_filter_hit_test,
+    lair_explorer_footer_hit_test, lair_explorer_hit_test, lair_explorer_palette,
+    lair_explorer_shown_layout, lair_explorer_shows_working, lair_explorer_with_agents,
     paint_lair_explorer,
 };
 pub(crate) use overlays::handoff::paint_handoff_banner;

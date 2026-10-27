@@ -402,6 +402,14 @@ a hostile program running as your account.
 - The Lair Explorer opens on **Live**, and its filters read Live, Saved, All
   (`f` cycles them in that order). Search looks through every Lair whatever the
   filter, so a saved or stopped Lair is found from Live too.
+- The expanded Lair Explorer lists every Splint that reports an agent status
+  in an *agents* section under the tree, most urgent first, whatever the
+  filter or the search: each row shows its status icon, its name, and its Lair
+  and Dojo when they fit. The section takes up to five rows and a third of
+  the list, and says *+k more* when more report than it shows. A click
+  focuses the Splint and right-click opens its menu, as in the tree. Down
+  from the tree's last row moves into the section. It is hidden on the rail,
+  with `agent-status=no`, and when nothing reports.
 - The Lair Explorer can collapse to a narrow rail with one row per Lair: its
   initial and its most urgent agent glyph, with the current Lair marked by
   the accent bar and a muted `s` or `a` in its header under the Saved or All
