@@ -155,21 +155,22 @@ use crate::pane::{
 use crate::renderer::{
     ChromeSource, ChromeSurface, ChromeText, ChromeTextStyle, CommandPaletteLayout,
     CommandPaletteTextCache, CursorPresentation, DojoPromptLayout, HistoryOverlayStatus,
-    LairExplorerLayout, LairExplorerPresentationMode, PaletteBody, PickerHitTarget, RenderContext,
-    SessionPickerOverlayLayout, SessionPickerPurpose, SessionPickerTextCache,
-    SessionPickerTextItem, SnapshotFrame, SnapshotOverlays, TabContextMenuLayout, TextRow,
-    background_bgra, chrome_panel_fill, chrome_panel_palette, clear_snapshot_caches,
-    command_palette_hit_test, command_palette_layout, dojo_prompt_hit_test, dojo_prompt_layout,
-    explorer_minimum_docked_terminal_width, fill_rect, history_overlay_layout,
-    lair_explorer_chrome_cell_width, lair_explorer_disclosure_hit_test,
-    lair_explorer_filter_hit_test, lair_explorer_hit_test, lair_explorer_rail_width,
-    lair_explorer_shown_layout, lair_explorer_toggle_hit_test, paint, paint_command_palette,
-    paint_dojo_prompt, paint_handoff_banner, paint_history_overlay, paint_lair_explorer,
-    paint_search_overlay, paint_session_picker_overlay, paint_snapshot_overlays,
-    paint_snapshot_presented, paint_snapshot_region_presented, paint_snapshot_rows_presented,
-    paint_tab_context_menu, premultiplied_theme_rgba, scroll_snapshot_pixels, search_overlay_panel,
-    session_picker_hit_test, session_picker_overlay_layout, snapshot_row_rect,
-    tab_context_menu_hit_test, tab_context_menu_layout, write_ppm,
+    LairExplorerAction, LairExplorerLayout, LairExplorerMetrics, LairExplorerPresentationMode,
+    PaletteBody, PickerHitTarget, RenderContext, SessionPickerOverlayLayout, SessionPickerPurpose,
+    SessionPickerTextCache, SessionPickerTextItem, SnapshotFrame, SnapshotOverlays,
+    TabContextMenuLayout, TextRow, background_bgra, chrome_panel_fill, chrome_panel_palette,
+    clear_snapshot_caches, command_palette_hit_test, command_palette_layout, dojo_prompt_hit_test,
+    dojo_prompt_layout, explorer_minimum_docked_terminal_width, fill_rect, history_overlay_layout,
+    lair_explorer_action_hit_test, lair_explorer_chrome_cell_width,
+    lair_explorer_disclosure_hit_test, lair_explorer_filter_hit_test,
+    lair_explorer_footer_hit_test, lair_explorer_hit_test, lair_explorer_shown_layout, paint,
+    paint_command_palette, paint_dojo_prompt, paint_handoff_banner, paint_history_overlay,
+    paint_lair_explorer, paint_search_overlay, paint_session_picker_overlay,
+    paint_snapshot_overlays, paint_snapshot_presented, paint_snapshot_region_presented,
+    paint_snapshot_rows_presented, paint_tab_context_menu, premultiplied_theme_rgba,
+    scroll_snapshot_pixels, search_overlay_panel, session_picker_hit_test,
+    session_picker_overlay_layout, snapshot_row_rect, tab_context_menu_hit_test,
+    tab_context_menu_layout, write_ppm,
 };
 #[cfg(test)]
 use crate::renderer::{lair_explorer_layout, paint_box_drawing_cell};
@@ -3249,8 +3250,9 @@ fn explorer_pointer_returns_to_terminal(
 enum ExplorerPointerPress {
     Row(NavigationNodeId, bool),
     Filter(LairExplorerFilter),
-    /// The header's `«` or `»`, which never takes keyboard focus.
-    Toggle,
+    /// A footer action token, or the rail header's `»`, which never takes
+    /// keyboard focus.
+    Action(LairExplorerAction),
 }
 
 fn explorer_released_filter(
@@ -3264,17 +3266,24 @@ fn explorer_released_filter(
 }
 
 /// What a left press in the Explorer panel starts, and whether it gives the
-/// Explorer the keys. The header's `«` / `»` leaves keyboard focus where it
-/// is; every other press in the panel, a row of the tree or of the rail
-/// alike, gives the Explorer the keys, as a row click always has.
+/// Explorer the keys. A footer action token (`new`, `menu`, `«`) and the
+/// rail header's `»` leave keyboard focus where it is, and so does a press
+/// anywhere else `on_footer`, between the tokens or on the context line: the
+/// footer is not rows. Every other press in the panel, a row of the tree or
+/// of the rail alike, gives the Explorer the keys, as a row click always
+/// has.
 fn explorer_left_press(
-    on_toggle: bool,
+    action: Option<LairExplorerAction>,
+    on_footer: bool,
     filter: Option<LairExplorerFilter>,
     target: Option<NavigationNodeId>,
     disclosure: Option<NavigationNodeId>,
 ) -> (Option<ExplorerPointerPress>, bool) {
-    if on_toggle {
-        return (Some(ExplorerPointerPress::Toggle), false);
+    if let Some(action) = action {
+        return (Some(ExplorerPointerPress::Action(action)), false);
+    }
+    if on_footer {
+        return (None, false);
     }
     let pressed = filter.map(ExplorerPointerPress::Filter).or_else(|| {
         target.map(|target| ExplorerPointerPress::Row(target, disclosure == Some(target)))
@@ -3282,10 +3291,60 @@ fn explorer_left_press(
     (pressed, true)
 }
 
-/// Whether a left release completes a press on the header's `«` / `»`: both
-/// on the toggle.
-fn explorer_released_toggle(pressed: Option<ExplorerPointerPress>, on_toggle: bool) -> bool {
-    on_toggle && pressed == Some(ExplorerPointerPress::Toggle)
+/// The action a left release completes: one only when the press and the
+/// release both land on the same token.
+fn explorer_released_action(
+    pressed: Option<ExplorerPointerPress>,
+    on: Option<LairExplorerAction>,
+) -> Option<LairExplorerAction> {
+    match (pressed, on) {
+        (Some(ExplorerPointerPress::Action(pressed)), Some(on)) if pressed == on => Some(on),
+        _ => None,
+    }
+}
+
+/// What a completed footer action does. `menu` opens the selected row's own
+/// menu, the one a right-click opens; with no row selected, or a row with
+/// no menu, it opens the command palette (the Window's action menu). A
+/// selected row whose menu is only unavailable for now, while the
+/// navigation view refreshes, is stale, or is disconnected, leaves `menu`
+/// doing nothing rather than opening something else.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExplorerActionCommand {
+    Toggle,
+    NewLair,
+    RowMenu,
+    Palette,
+    Nothing,
+}
+
+/// Where `menu` stands for the selected row.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExplorerRowMenu {
+    /// No row is selected.
+    NoSelection,
+    /// The selected row has its menu.
+    Ready,
+    /// The selected row has nothing on its menu.
+    Empty,
+    /// The selected row's menu cannot be built until the view is current.
+    Unavailable,
+}
+
+/// `row_menu` is asked only for `menu`.
+fn explorer_action_command(
+    action: LairExplorerAction,
+    row_menu: impl FnOnce() -> ExplorerRowMenu,
+) -> ExplorerActionCommand {
+    match action {
+        LairExplorerAction::Toggle => ExplorerActionCommand::Toggle,
+        LairExplorerAction::New => ExplorerActionCommand::NewLair,
+        LairExplorerAction::Menu => match row_menu() {
+            ExplorerRowMenu::Ready => ExplorerActionCommand::RowMenu,
+            ExplorerRowMenu::NoSelection | ExplorerRowMenu::Empty => ExplorerActionCommand::Palette,
+            ExplorerRowMenu::Unavailable => ExplorerActionCommand::Nothing,
+        },
+    }
 }
 
 /// The rail's first row in view after a wheel step of `delta` rows from
@@ -4067,15 +4126,15 @@ fn explorer_beside_tabs(
 /// strip `strip` logical px tall. Beside a shown strip its header takes the
 /// strip's height and sizes its text as the tab labels are at `scale_120`,
 /// so the header and the labels share one baseline; with no strip it keeps
-/// the row-high header. A `collapsed` Explorer is the rail, `rail_width`
-/// logical px wide, when it docks beside `minimum_terminal_width` px of
+/// the row-high header. A `collapsed` Explorer is the rail, as wide as
+/// `metrics` say, when it docks beside `minimum_terminal_width` px of
 /// terminal. `None` when the Explorer would be a drawer.
 #[allow(clippy::too_many_arguments)]
 fn full_height_explorer_layout(
     full: Rect,
     strip: u32,
     scale_120: u32,
-    (minimum_terminal_width, rail_width): (u32, u32),
+    (minimum_terminal_width, metrics): (u32, LairExplorerMetrics),
     rows: &[LairExplorerRow],
     selected: Option<NavigationNodeId>,
     requested_start: usize,
@@ -4085,7 +4144,7 @@ fn full_height_explorer_layout(
         full,
         (strip != 0).then_some(strip),
         minimum_terminal_width,
-        rail_width,
+        metrics,
         rows,
         selected,
         requested_start,
@@ -4143,7 +4202,7 @@ impl App {
             .unwrap_or(1);
         let minimum_terminal_width =
             explorer_minimum_docked_terminal_width(cell_width, self.presentation.initial_columns);
-        let rail_width = self.explorer_rail_width();
+        let metrics = self.explorer_metrics();
         let rows = self.explorer.rows();
         let below_tabs = self.base_content_rect();
         // The rail shows its selection only while it has the keys, so only
@@ -4164,7 +4223,7 @@ impl App {
                 full,
                 below_tabs.y,
                 self.surface.scale_120,
-                (minimum_terminal_width, rail_width),
+                (minimum_terminal_width, metrics),
                 &rows,
                 selected,
                 self.presentation.explorer_visible_start,
@@ -4177,7 +4236,7 @@ impl App {
             below_tabs,
             None,
             minimum_terminal_width,
-            rail_width,
+            metrics,
             &rows,
             selected,
             self.presentation.explorer_visible_start,
@@ -4185,14 +4244,21 @@ impl App {
         )
     }
 
-    /// The collapsed rail's width in logical px: four chrome cells beside
-    /// its accent bar, measured once per chrome text generation and scale.
-    fn explorer_rail_width(&self) -> u32 {
+    /// What the Explorer's layout sizes from its chrome text: the rail's
+    /// width and the footer's action targets.
+    fn explorer_metrics(&self) -> LairExplorerMetrics {
+        LairExplorerMetrics::measured(self.explorer_chrome_cell(), self.surface.scale_120)
+    }
+
+    /// One regular chrome cell's width in buffer px, or 0 when the chrome
+    /// font cannot be loaded, measured once per chrome text generation and
+    /// scale.
+    fn explorer_chrome_cell(&self) -> u32 {
         let key = (
             self.presentation.renderer_generation,
             self.surface.scale_120,
         );
-        let cell = match self.presentation.explorer_chrome_cell.get() {
+        match self.presentation.explorer_chrome_cell.get() {
             Some((cached, cell)) if cached == key => cell,
             _ => {
                 let cell = lair_explorer_chrome_cell_width(
@@ -4205,8 +4271,7 @@ impl App {
                     .set(Some((key, cell)));
                 cell
             }
-        };
-        lair_explorer_rail_width(cell, self.surface.scale_120)
+        }
     }
 
     /// Where the tab strip begins: at a full-height docked Explorer's right
@@ -8832,7 +8897,8 @@ impl App {
         };
         let target = lair_explorer_hit_test(layout, event.position);
         let filter = lair_explorer_filter_hit_test(layout, event.position);
-        let toggle = lair_explorer_toggle_hit_test(layout, event.position);
+        let action = lair_explorer_action_hit_test(layout, event.position);
+        let on_footer = lair_explorer_footer_hit_test(layout, event.position);
         let rail = layout.rail;
         let disclosure =
             lair_explorer_disclosure_hit_test(layout, &self.explorer.rows(), event.position);
@@ -8860,7 +8926,7 @@ impl App {
             PointerEventKind::Press { button, .. } if button == BTN_LEFT => {
                 self.explorer.cancel_context_press();
                 let (pressed, takes_focus) =
-                    explorer_left_press(toggle, filter, target, disclosure);
+                    explorer_left_press(action, on_footer, filter, target, disclosure);
                 if takes_focus {
                     self.set_explorer_focus(true, queue_handle);
                 }
@@ -8870,11 +8936,11 @@ impl App {
                 }
             }
             PointerEventKind::Release { button, .. } if button == BTN_LEFT => {
-                changed |= if explorer_released_toggle(self.presentation.explorer_pressed, toggle) {
-                    self.release_explorer_toggle()
-                } else {
-                    self.release_lair_explorer_pointer(target, disclosure, filter)
-                };
+                changed |=
+                    match explorer_released_action(self.presentation.explorer_pressed, action) {
+                        Some(action) => self.release_explorer_action(action, event.position),
+                        None => self.release_lair_explorer_pointer(target, disclosure, filter),
+                    };
             }
             PointerEventKind::Axis { vertical, .. } if !vertical.is_none() => {
                 let up = vertical.discrete < 0 || vertical.value120 < 0 || vertical.absolute < 0.0;
@@ -8916,10 +8982,84 @@ impl App {
         true
     }
 
-    /// Completes a click on the header's `«` / `»`: the Explorer collapses
-    /// to its rail or expands, and keyboard focus stays where it is.
-    fn release_explorer_toggle(&mut self) -> bool {
+    /// Completes a click on a footer action token or the rail header's `»`.
+    /// None of them takes keyboard focus; `menu` opens a menu, which, like
+    /// a right-click's, takes the keys while it is open.
+    fn release_explorer_action(&mut self, action: LairExplorerAction, at: (f64, f64)) -> bool {
         self.presentation.explorer_pressed = None;
+        let mut menu = None;
+        let command = explorer_action_command(action, || {
+            let Some(node) = self.explorer.selected() else {
+                return ExplorerRowMenu::NoSelection;
+            };
+            if let Some(ready) = self.explorer_context_menu(node) {
+                menu = Some(ready);
+                ExplorerRowMenu::Ready
+            } else if self.explorer.can_context(node)
+                && self.explorer.view().is_some_and(|view| {
+                    view.freshness == crate::navigation_projection::EndpointFreshness::Current
+                })
+            {
+                ExplorerRowMenu::Empty
+            } else {
+                ExplorerRowMenu::Unavailable
+            }
+        });
+        match command {
+            ExplorerActionCommand::Toggle => self.release_explorer_toggle(),
+            ExplorerActionCommand::NewLair => {
+                self.request_new_lair();
+                false
+            }
+            ExplorerActionCommand::RowMenu => {
+                if let Some(menu) = menu
+                    && self.show_context_menu(menu, at).is_err()
+                {
+                    eprintln!("splinterm Explorer menu is unavailable");
+                }
+                true
+            }
+            ExplorerActionCommand::Palette => {
+                if self.show_command_palette().is_err() {
+                    eprintln!("splinterm command palette unavailable");
+                }
+                true
+            }
+            ExplorerActionCommand::Nothing => false,
+        }
+    }
+
+    /// A new Lair from the focused Splint's directory, for the footer's `new`
+    /// and the `lair.new` action alike. With no focused Splint to start
+    /// from it only logs: asking for a Lair never closes the Window.
+    fn request_new_lair(&mut self) {
+        if !tab_action_dispatch_allowed([
+            self.modal.session_picker.is_some(),
+            self.modal.trusted_consent.is_some(),
+            self.modal.session_picker_requested,
+            self.tab_state.session_switch_pending,
+            self.modal.session_picker_reconcile_pending,
+        ]) {
+            return;
+        }
+        let source_splint_id = match self.focused_cwd_source() {
+            Ok(source_splint_id) => source_splint_id,
+            Err(error) => {
+                eprintln!("splinterm new Lair is unavailable: {error:#}");
+                return;
+            }
+        };
+        if let Err(error) =
+            self.send_topology_command(WindowTopologyCommand::NewLair { source_splint_id })
+        {
+            self.scheduling.fail(error);
+        }
+    }
+
+    /// Completes a click on the footer's `«` or the rail header's `»`: the
+    /// Explorer collapses to its rail or expands, and keyboard focus stays
+    /// where it is.
+    fn release_explorer_toggle(&mut self) -> bool {
         match self.set_explorer_collapsed(!self.explorer.collapsed()) {
             Ok(toggled) => toggled,
             Err(error) => {
@@ -13177,47 +13317,119 @@ fn write_selection_payload(write_pipe: WritePipe, payload: Arc<[u8]>) {
 
 #[cfg(test)]
 mod tests {
-    /// The header's `«` / `»` never takes keyboard focus; a press on a row,
-    /// of the tree or of the rail, or on a filter gives the Explorer the keys
-    /// as before. A toggle runs only when its press and release both land on
-    /// it.
+    /// A footer action token (`new`, `menu`, `«`) and the rail header's `»`
+    /// never take keyboard focus; a press on a row, of the tree or of the
+    /// rail, or on a filter gives the Explorer the keys as before. A token
+    /// runs only when its press and release both land on it.
     #[test]
-    fn explorer_toggle_press_keeps_focus_and_needs_a_matching_release() {
+    fn explorer_action_press_keeps_focus_and_needs_a_matching_release() {
         use super::{
-            ExplorerPointerPress, LairExplorerFilter, explorer_left_press, explorer_released_toggle,
+            ExplorerPointerPress, LairExplorerAction, LairExplorerFilter, explorer_left_press,
+            explorer_released_action,
         };
         use crate::navigation_projection::NavigationNodeId;
 
         let lair = NavigationNodeId::Lair(splinterm_core::LairId::new());
+        for action in [
+            LairExplorerAction::New,
+            LairExplorerAction::Menu,
+            LairExplorerAction::Toggle,
+        ] {
+            // A token press wins over whatever else is under it, and leaves
+            // the keys where they are.
+            assert_eq!(
+                explorer_left_press(
+                    Some(action),
+                    true,
+                    Some(LairExplorerFilter::Saved),
+                    Some(lair),
+                    None
+                ),
+                (Some(ExplorerPointerPress::Action(action)), false)
+            );
+            let pressed = Some(ExplorerPointerPress::Action(action));
+            assert_eq!(
+                explorer_released_action(pressed, Some(action)),
+                Some(action)
+            );
+            assert_eq!(explorer_released_action(pressed, None), None);
+            assert_eq!(explorer_released_action(None, Some(action)), None);
+            assert_eq!(
+                explorer_released_action(
+                    Some(ExplorerPointerPress::Row(lair, false)),
+                    Some(action)
+                ),
+                None
+            );
+        }
+        // A press on one token and a release on another runs neither.
         assert_eq!(
-            explorer_left_press(true, None, None, None),
-            (Some(ExplorerPointerPress::Toggle), false)
+            explorer_released_action(
+                Some(ExplorerPointerPress::Action(LairExplorerAction::New)),
+                Some(LairExplorerAction::Menu)
+            ),
+            None
         );
         assert_eq!(
-            explorer_left_press(false, None, Some(lair), None),
+            explorer_left_press(None, false, None, Some(lair), None),
             (Some(ExplorerPointerPress::Row(lair, false)), true)
         );
         assert_eq!(
-            explorer_left_press(false, None, Some(lair), Some(lair)),
+            explorer_left_press(None, false, None, Some(lair), Some(lair)),
             (Some(ExplorerPointerPress::Row(lair, true)), true)
         );
         assert_eq!(
-            explorer_left_press(false, Some(LairExplorerFilter::Saved), None, None),
+            explorer_left_press(None, false, Some(LairExplorerFilter::Saved), None, None),
             (
                 Some(ExplorerPointerPress::Filter(LairExplorerFilter::Saved)),
                 true
             )
         );
         // Empty panel space still gives the Explorer the keys.
-        assert_eq!(explorer_left_press(false, None, None, None), (None, true));
-        let toggle = Some(ExplorerPointerPress::Toggle);
-        assert!(explorer_released_toggle(toggle, true));
-        assert!(!explorer_released_toggle(toggle, false));
-        assert!(!explorer_released_toggle(None, true));
-        assert!(!explorer_released_toggle(
-            Some(ExplorerPointerPress::Row(lair, false)),
-            true
-        ));
+        assert_eq!(
+            explorer_left_press(None, false, None, None, None),
+            (None, true)
+        );
+        // A near miss on the footer, between the tokens or on the context
+        // line, leaves the keys where they are too: the footer is not rows.
+        assert_eq!(
+            explorer_left_press(None, true, None, None, None),
+            (None, false)
+        );
+    }
+
+    /// `new` makes a Lair and `«` / `»` toggles the rail, neither asking
+    /// about the selected row's menu. `menu` opens the selected row's own
+    /// menu when it has one, the action menu (the command palette) with no
+    /// row selected or a row with nothing on its menu, and nothing at all
+    /// while the selected row's menu is unavailable for now.
+    #[test]
+    fn explorer_actions_dispatch_their_commands() {
+        use super::{
+            ExplorerActionCommand, ExplorerRowMenu, LairExplorerAction, explorer_action_command,
+        };
+
+        for (action, command) in [
+            (LairExplorerAction::New, ExplorerActionCommand::NewLair),
+            (LairExplorerAction::Toggle, ExplorerActionCommand::Toggle),
+        ] {
+            assert_eq!(
+                explorer_action_command(action, || panic!("{action:?} asked for a menu")),
+                command
+            );
+        }
+        for (row_menu, command) in [
+            (ExplorerRowMenu::Ready, ExplorerActionCommand::RowMenu),
+            (ExplorerRowMenu::NoSelection, ExplorerActionCommand::Palette),
+            (ExplorerRowMenu::Empty, ExplorerActionCommand::Palette),
+            (ExplorerRowMenu::Unavailable, ExplorerActionCommand::Nothing),
+        ] {
+            assert_eq!(
+                explorer_action_command(LairExplorerAction::Menu, || row_menu),
+                command,
+                "{row_menu:?}"
+            );
+        }
     }
 
     #[test]
@@ -18039,7 +18251,7 @@ mod tests {
                     window,
                     strip,
                     scale,
-                    (160, lair_explorer_rail_width(0, 120)),
+                    (160, LairExplorerMetrics::UNMEASURED),
                     &[],
                     None,
                     0,
@@ -18070,7 +18282,7 @@ mod tests {
             window,
             0,
             120,
-            (160, lair_explorer_rail_width(0, 120)),
+            (160, LairExplorerMetrics::UNMEASURED),
             &[],
             None,
             0,
@@ -18090,7 +18302,7 @@ mod tests {
                 narrow,
                 26,
                 120,
-                (160, lair_explorer_rail_width(0, 120)),
+                (160, LairExplorerMetrics::UNMEASURED),
                 &[],
                 None,
                 0,
@@ -18119,7 +18331,7 @@ mod tests {
                 content,
                 strip,
                 120,
-                (160, lair_explorer_rail_width(0, 120)),
+                (160, LairExplorerMetrics::UNMEASURED),
                 &[],
                 None,
                 0,
@@ -18144,7 +18356,7 @@ mod tests {
         assert_eq!(tab_strip_left_of(Some(&rail)), rail.panel.width);
         assert_eq!(tab_strip_left_of(Some(&expanded)), expanded.panel.width);
         assert_eq!((rail.header.y, rail.header.height), (0, strip));
-        assert_eq!(rail.toggle, Some(rail.header));
+        assert_eq!(rail.toggle(), Some(rail.header));
         assert_eq!(
             rail.header_text_cell_cap,
             tab_text_maximum_cell_height(strip, 120).unwrap()
@@ -18159,7 +18371,7 @@ mod tests {
             below,
             None,
             160,
-            lair_explorer_rail_width(0, 120),
+            LairExplorerMetrics::UNMEASURED,
             &[],
             None,
             0,
@@ -18188,7 +18400,7 @@ mod tests {
             tiny,
             None,
             160,
-            lair_explorer_rail_width(0, 120),
+            LairExplorerMetrics::UNMEASURED,
             &[],
             None,
             0,
@@ -18198,7 +18410,7 @@ mod tests {
         assert!(drawer.rail);
         assert_eq!(drawer.mode, LairExplorerPresentationMode::Drawer);
         assert_eq!(drawer.terminal, tiny);
-        assert_eq!(drawer.toggle, Some(drawer.header));
+        assert_eq!(drawer.toggle(), Some(drawer.header));
         assert_eq!(tab_strip_left_of(Some(&drawer)), 0);
         assert!(
             shown(
@@ -18222,10 +18434,12 @@ mod tests {
             width: 900,
             height: 400,
         };
-        let wide = lair_explorer_rail_width(14, 120);
-        assert!(wide > lair_explorer_rail_width(0, 120));
+        let metrics = LairExplorerMetrics::measured(14, 120);
+        let wide = metrics.rail_width;
+        assert!(wide > LairExplorerMetrics::UNMEASURED.rail_width);
         let wide_rail =
-            full_height_explorer_layout(window, 26, 120, (160, wide), &[], None, 0, true).unwrap();
+            full_height_explorer_layout(window, 26, 120, (160, metrics), &[], None, 0, true)
+                .unwrap();
         assert_eq!(wide_rail.panel.width, wide);
         assert_eq!(wide_rail.terminal.width, 900 - wide);
         assert_eq!(tab_strip_left_of(Some(&wide_rail)), wide);

@@ -369,13 +369,10 @@ impl KeyboardHandler for App {
                 return;
             }
             let command = match shortcut.expect("matched Lair action") {
-                ActionId::NewSession => match self.focused_cwd_source() {
-                    Ok(source_splint_id) => WindowTopologyCommand::NewLair { source_splint_id },
-                    Err(error) => {
-                        self.scheduling.fail(error);
-                        return;
-                    }
-                },
+                ActionId::NewSession => {
+                    self.request_new_lair();
+                    return;
+                }
                 ActionId::RenameCurrentLair => {
                     self.modal.session_picker_requested = true;
                     WindowTopologyCommand::RequestLairPrompt {
