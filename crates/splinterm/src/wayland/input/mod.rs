@@ -17,7 +17,7 @@ pub(in crate::wayland) use shortcuts::{
     PaneTopologyAction, SessionPickerShortcutAction, TabShortcutAction,
     binding_help_repeat_consumed, command_palette_shortcut_action, consume_detached_enter_press,
     copy_mode_desktop_action, font_zoom_action, keymap_press_consumes_key, keymap_press_for,
-    owned_field_clipboard_action, pane_focus_action, pane_topology_action,
+    owned_field_clipboard_action, pane_focus_action, pane_topology_action, picker_repeat_consumed,
     session_picker_shortcut_action, shortcut_action_for, shortcut_paused_during_handoff,
     tab_action_dispatch_allowed, tab_shortcut_action,
 };

@@ -69,8 +69,8 @@ impl SessionPickerPurpose {
     /// The line when nothing matches what is typed.
     pub(crate) const fn no_match(self) -> &'static str {
         match self {
-            Self::RecentDojos | Self::Dojos => "No matching dojos",
-            Self::Lairs => "No matching lairs",
+            Self::RecentDojos | Self::Dojos => "No matching Dojos",
+            Self::Lairs => "No matching Lairs",
             Self::Remotes => "No matching remotes",
         }
     }

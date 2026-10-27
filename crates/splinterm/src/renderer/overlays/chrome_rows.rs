@@ -11,6 +11,7 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::{
     color::{TEXT_MIN_CONTRAST, contrast_floor_toward, mix_encoded},
+    frontend::PICKER_NAME_CELLS,
     geometry::Rect,
 };
 
@@ -632,8 +633,6 @@ fn paint_row_fill(
     }
 }
 
-/// A picker row's name column, in cells, so the locations line up.
-pub(super) const PICKER_NAME_CELLS: u32 = 13;
 /// A location narrower than this many cells drops instead.
 pub(super) const PICKER_LOCATION_MIN_CELLS: u32 = 8;
 /// The agent state's dot, logical px square.

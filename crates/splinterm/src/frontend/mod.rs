@@ -64,7 +64,7 @@ pub(crate) use options::TrustedInput;
 pub use options::{
     AccessConsentRenderer, TerminalGridLimits, TrustedConsentUi, WindowOptions, WindowPaneOptions,
 };
-pub(crate) use picker::{PickerHitTarget, synthetic_text_snapshot};
+pub(crate) use picker::{PICKER_NAME_CELLS, PickerHitTarget, synthetic_text_snapshot};
 pub use picker::{SessionPickerDecision, SessionPickerItem, SessionPickerUi};
 pub(crate) use text_edit::BoundedTextEditor;
 pub use topology::{

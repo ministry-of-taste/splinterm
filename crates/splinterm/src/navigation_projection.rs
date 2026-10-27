@@ -2846,6 +2846,16 @@ mod tests {
             Some(expected)
         );
 
+        // A picker row carries its Dojo's most urgent state and whether it
+        // is stale, through the same aggregate as the Explorer's marks.
+        let detached = NavigationProjection::build(&snapshot, context(&[])).unwrap();
+        let lair_id = detached.lairs[0].lair_id;
+        let picker = detached.picker_view(NavigationPickerKind::ChooseDojo { lair_id }, &[], &[]);
+        assert_eq!(
+            picker.rows.first().map(|row| row.agent),
+            Some(Some((AgentState::Working, true)))
+        );
+
         // A fresh status keeps no report age, so heartbeats compare equal.
         let fresh =
             NavigationAgentStatus::from_summary(&agent_summary(AgentState::Done, false, 90_000));

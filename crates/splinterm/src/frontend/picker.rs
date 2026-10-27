@@ -60,7 +60,8 @@ impl SessionPickerItem {
     }
 
     /// The agent state when one reports, else the running panes; nothing
-    /// for a navigation row, which has no panes.
+    /// for a navigation row, which has no panes, or for a stopped Dojo,
+    /// which its `stopped` header already names.
     #[must_use]
     pub(crate) fn status(&self) -> Option<PickerStatus> {
         if let Some((state, stale)) = self.agent {
@@ -69,7 +70,7 @@ impl SessionPickerItem {
                 word: state_text(state).to_lowercase(),
             });
         }
-        (self.pane_count > 0).then(|| PickerStatus {
+        (self.running_pane_count > 0).then(|| PickerStatus {
             agent: None,
             word: format!("{}/{}", self.running_pane_count, self.pane_count),
         })
@@ -119,6 +120,8 @@ pub struct SessionPickerUi {
     hovered: Option<PickerHitTarget>,
     new_enabled: bool,
     new_blocker: Option<&'static str>,
+    /// A status picker that failed to load: R asks again.
+    retryable: bool,
     /// Standalone pickers fix their purpose; inline pickers take it from
     /// the requesting selector.
     purpose: Option<SessionPickerPurpose>,
@@ -134,8 +137,9 @@ const SESSION_PICKER_LIST_ROW: usize = 3;
 const MAX_QUERY_CHARS: usize = 64;
 /// The standalone picker's row width: its status ends here.
 const STANDALONE_COLUMNS: usize = 72;
-/// The name column, in cells, so the locations line up.
-pub(crate) const PICKER_NAME_CELLS: usize = 13;
+/// The name column, in cells, so the locations line up, here and in the
+/// inline rows.
+pub(crate) const PICKER_NAME_CELLS: u32 = 13;
 
 fn text_cells(text: &str) -> usize {
     text.chars()
@@ -176,6 +180,7 @@ impl SessionPickerUi {
             hovered: None,
             new_enabled: true,
             new_blocker: None,
+            retryable: false,
             purpose: Some(SessionPickerPurpose::RecentDojos),
             host: SessionPickerHost::Standalone {
                 revision: 0,
@@ -270,6 +275,7 @@ impl SessionPickerUi {
             hovered: None,
             new_enabled,
             new_blocker,
+            retryable: false,
             purpose: None,
             host: SessionPickerHost::Inline,
         };
@@ -333,9 +339,10 @@ impl SessionPickerUi {
     }
 
     /// The creation row is listed while nothing is typed; a query lists
-    /// only the items it matches.
+    /// only the items it matches. A status picker lists no rows: its line
+    /// says why.
     pub(crate) fn create_row_shown(&self) -> bool {
-        self.query.is_empty()
+        self.query.is_empty() && !self.shows_status()
     }
 
     /// The rows listed: the creation row while shown, then the matches.
@@ -379,15 +386,17 @@ impl SessionPickerUi {
             .collect()
     }
 
+    /// Inline Dojo pickers group; the standalone one keeps recency order.
     fn groups_rows(&self) -> bool {
-        matches!(
-            self.purpose,
-            Some(SessionPickerPurpose::RecentDojos | SessionPickerPurpose::Dojos)
-        )
+        self.is_inline()
+            && matches!(
+                self.purpose,
+                Some(SessionPickerPurpose::RecentDojos | SessionPickerPurpose::Dojos)
+            )
     }
 
-    /// Adds `text` to the query and lists what it matches, the best first,
-    /// with the first selected.
+    /// Adds `text` to the query and lists what it matches, in the
+    /// catalog's order, with the first selected.
     pub(crate) fn append_text(&mut self, text: &str) -> bool {
         let remaining = MAX_QUERY_CHARS.saturating_sub(self.query.chars().count());
         let addition = text
@@ -471,10 +480,21 @@ impl SessionPickerUi {
         }
     }
 
-    /// A status picker: nothing listed, nothing typed and no creation,
-    /// only the line that says why (loading, or R to retry).
+    /// A status picker: no items and no creation, whatever is typed,
+    /// only the line that says why (loading, or could not load).
     pub(crate) fn shows_status(&self) -> bool {
-        self.items.is_empty() && self.query.is_empty() && !self.new_enabled
+        self.items.is_empty() && !self.new_enabled
+    }
+
+    /// Whether R asks again: a status picker whose request failed, not one
+    /// still loading.
+    pub(crate) fn retryable(&self) -> bool {
+        self.retryable && self.shows_status()
+    }
+
+    /// Marks a status picker as failed, so R retries it.
+    pub(crate) fn set_retryable(&mut self) {
+        self.retryable = true;
     }
 
     pub(crate) const fn new_enabled(&self) -> bool {
@@ -605,8 +625,9 @@ impl SessionPickerUi {
     /// location, and the status at the row's end.
     fn standalone_row(selected: bool, name: &str, location: &str, status: &str) -> String {
         let marker = if selected { "› " } else { "  " };
-        let name = fitted(name, PICKER_NAME_CELLS);
-        let name_pad = PICKER_NAME_CELLS.saturating_sub(text_cells(&name));
+        let name_cells = usize::try_from(PICKER_NAME_CELLS).unwrap_or(usize::MAX);
+        let name = fitted(name, name_cells);
+        let name_pad = name_cells.saturating_sub(text_cells(&name));
         let lead = format!("{marker}{name}{}", " ".repeat(name_pad));
         let status_cells = text_cells(status);
         let room = STANDALONE_COLUMNS
@@ -644,7 +665,8 @@ impl SessionPickerUi {
             if self.query.is_empty() {
                 format!("› {}", purpose.placeholder())
             } else {
-                format!("› {}_", self.query)
+                // The space after the query is the reversed cursor cell.
+                format!("› {} ", self.query)
             },
             String::new(),
         ];
@@ -676,7 +698,9 @@ impl SessionPickerUi {
             };
             lines.push(line);
         }
-        if self.filtered_indices.is_empty() {
+        if self.shows_status() {
+            lines.push(format!("  {}", self.new_blocker.unwrap_or("")));
+        } else if self.filtered_indices.is_empty() {
             lines.push(format!(
                 "  {}",
                 if self.query.is_empty() {
@@ -702,7 +726,21 @@ impl SessionPickerUi {
             panic!("inline Dojo picker does not own a terminal snapshot");
         };
         *revision = revision.saturating_add(1).max(1);
-        picker_terminal_snapshot(*synthetic_id, *revision, lines)
+        let mut snapshot = picker_terminal_snapshot(*synthetic_id, *revision, lines);
+        if let Some(input) = snapshot.visible_rows.get_mut(1) {
+            let start = 2;
+            if self.query.is_empty() {
+                for cell in input.cells.iter_mut().skip(start) {
+                    cell.attributes.dim = true;
+                }
+            } else if let Some(cursor) = input
+                .cells
+                .get_mut(start.saturating_add(self.query.chars().count()))
+            {
+                cursor.attributes.reverse = true;
+            }
+        }
+        snapshot
     }
 }
 
@@ -1043,10 +1081,47 @@ mod tests {
         let mut filtered = picker;
         filtered.append_text("o");
         assert!(filtered.row_groups().is_empty());
-        let lairs = SessionPickerUi::inline(items, true, None, None)
+        let lairs = SessionPickerUi::inline(items.clone(), true, None, None)
             .with_purpose(SessionPickerPurpose::Lairs);
         assert!(lairs.row_groups().is_empty());
         assert_eq!(lairs.item(0).unwrap().display_title, "old");
+        // The standalone `splinterm dojos` keeps recency order, ungrouped.
+        let (decision, _receiver) = std_mpsc::channel();
+        let standalone = SessionPickerUi::new(items, decision);
+        assert!(standalone.row_groups().is_empty());
+        assert_eq!(standalone.item(0).unwrap().display_title, "old");
+        // A stopped Dojo says nothing at its end: its header says it.
+        assert_eq!(standalone.item(0).unwrap().status(), None);
+    }
+
+    #[test]
+    fn status_pickers_have_no_items_and_no_creation_whatever_is_typed() {
+        let mut loading =
+            SessionPickerUi::inline(Vec::new(), false, Some("Loading navigation…"), None);
+        assert!(loading.shows_status());
+        assert!(!loading.retryable(), "loading is not retried");
+        assert!(!loading.create_row_shown());
+        assert_eq!(loading.list_len(), 0);
+        assert!(loading.append_text("r"));
+        assert!(loading.shows_status(), "a query keeps the status line");
+        assert_eq!(loading.list_len(), 0);
+        let mut failed =
+            SessionPickerUi::inline(Vec::new(), false, Some("Could not load navigation"), None);
+        failed.set_retryable();
+        assert!(failed.retryable());
+        assert!(failed.append_text("x"));
+        assert!(failed.retryable());
+        // Items, or creation, make it a list.
+        let creation = SessionPickerUi::inline(Vec::new(), true, None, None);
+        assert!(!creation.shows_status());
+        assert!(creation.create_row_shown());
+        let mut listed =
+            SessionPickerUi::inline(vec![item("logs", "logs", 1, 1)], false, Some("Full"), None);
+        listed.set_retryable();
+        assert!(!listed.shows_status());
+        assert!(!listed.retryable());
+        // A blocked creation row stays listed among items.
+        assert!(listed.create_row_shown());
     }
 
     fn row_text(snapshot: &TerminalSnapshot, row: usize) -> String {
@@ -1083,9 +1158,14 @@ mod tests {
             vec![item("build", "build", 1, 1), item("logs", "logs", 2, 3)],
             decision,
         );
-        let lines = snapshot_lines(&picker.snapshot());
+        let snapshot = picker.snapshot();
+        let lines = snapshot_lines(&snapshot);
         assert_eq!(lines[0], "dojos");
         assert_eq!(lines[1], "› filter dojos");
+        // The placeholder is dim; the marker is not.
+        let input = &snapshot.visible_rows[1].cells;
+        assert!(!input[0].attributes.dim);
+        assert!(input[2..].iter().all(|cell| cell.attributes.dim));
         assert!(lines[SESSION_PICKER_LIST_ROW].starts_with("+ New terminal"));
         assert!(lines[SESSION_PICKER_LIST_ROW].ends_with("ctrl n"));
         let first = &lines[SESSION_PICKER_LIST_ROW + 1];
@@ -1103,8 +1183,18 @@ mod tests {
         );
         // Typing filters at once; the creation row gives way.
         assert!(picker.append_text("lo"));
-        let lines = snapshot_lines(&picker.snapshot());
-        assert_eq!(lines[1], "› lo_");
+        let snapshot = picker.snapshot();
+        let lines = snapshot_lines(&snapshot);
+        assert_eq!(lines[1], "› lo");
+        // A block cursor: the cell after the query is reversed.
+        let input = &snapshot.visible_rows[1].cells;
+        assert_eq!(input[4].content, " ");
+        assert!(input[4].attributes.reverse);
+        assert!(
+            input[..4]
+                .iter()
+                .all(|cell| !cell.attributes.reverse && !cell.attributes.dim)
+        );
         assert!(lines[SESSION_PICKER_LIST_ROW].starts_with("› logs"));
         assert_eq!(
             picker.select_row(SESSION_PICKER_LIST_ROW),
@@ -1112,7 +1202,7 @@ mod tests {
         );
         assert!(picker.append_text("x"));
         let lines = snapshot_lines(&picker.snapshot());
-        assert_eq!(lines[SESSION_PICKER_LIST_ROW], "  No matching dojos");
+        assert_eq!(lines[SESSION_PICKER_LIST_ROW], "  No matching Dojos");
         assert_eq!(picker.select_row(SESSION_PICKER_LIST_ROW), None);
     }
 

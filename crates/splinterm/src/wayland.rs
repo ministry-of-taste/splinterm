@@ -226,9 +226,9 @@ use input::{
     keymap_press_consumes_key, keymap_press_for, local_selection_owner, mouse_report,
     owned_field_clipboard_action, pane_focus_action, pane_topology_action,
     pending_selection_drag_anchor, picker_ime_reconcile, picker_release_activation,
-    pointer_axis_focus_target, reconciled_focus_report, session_picker_shortcut_action,
-    shortcut_action_for, shortcut_paused_during_handoff, tab_action_dispatch_allowed,
-    tab_shortcut_action, take_press_owner,
+    picker_repeat_consumed, pointer_axis_focus_target, reconciled_focus_report,
+    session_picker_shortcut_action, shortcut_action_for, shortcut_paused_during_handoff,
+    tab_action_dispatch_allowed, tab_shortcut_action, take_press_owner,
 };
 use selection::{
     CellPosition, CopyModeState, CopyMotion, CopyMoveOutcome, Selection, SelectionEndpoint,
@@ -1269,6 +1269,7 @@ fn assemble_app(
             session_picker_targets: Vec::new(),
             session_picker_creation_target: None,
             session_picker_layout: None,
+            session_picker_page_rows: 0,
             session_picker_pressed: None,
             session_picker_text_cache: SessionPickerTextCache::default(),
             session_picker_wheel: WheelAccumulator::default(),
@@ -2552,6 +2553,9 @@ struct ModalState {
     session_picker_targets: Vec<SessionPickerTarget>,
     session_picker_creation_target: Option<SessionPickerCreationTarget>,
     session_picker_layout: Option<CommandPaletteLayout>,
+    /// The rows the inline picker's list showed when last painted, for
+    /// paging before its next layout.
+    session_picker_page_rows: usize,
     session_picker_pressed: Option<PickerHitTarget>,
     session_picker_text_cache: SessionPickerTextCache,
     session_picker_wheel: WheelAccumulator,
@@ -4096,6 +4100,18 @@ fn session_picker_status_catalog(message: &'static str) -> SessionPickerCatalog 
         creation_target: None,
         initial_row: None,
     }
+}
+
+/// Whether a picker reply of `reply`'s kind is for the picker showing:
+/// once a navigation picker is open, a reply for the other scope, from a
+/// Tab since superseded, is stale and dropped, while the request the
+/// picker waits for stays pending.
+fn picker_reply_matches(
+    navigation_picker_open: bool,
+    showing: Option<SelectorKind>,
+    reply: Option<SelectorKind>,
+) -> bool {
+    !navigation_picker_open || showing == reply
 }
 
 const fn session_picker_title(selector_kind: Option<SelectorKind>) -> &'static str {
@@ -9349,7 +9365,7 @@ impl App {
                     .as_mut()
                     .is_some_and(SessionPickerUi::clear_query);
             }
-            Keysym::Tab | Keysym::ISO_Left_Tab if plain || modifiers.shift => {
+            Keysym::Tab | Keysym::ISO_Left_Tab if plain => {
                 self.toggle_session_picker_scope();
             }
             Keysym::r | Keysym::R
@@ -9360,7 +9376,7 @@ impl App {
                         .modal
                         .session_picker
                         .as_ref()
-                        .is_some_and(SessionPickerUi::shows_status) =>
+                        .is_some_and(SessionPickerUi::retryable) =>
             {
                 self.retry_session_picker();
             }
@@ -9399,16 +9415,44 @@ impl App {
         }
     }
 
-    /// Page Up and Page Down in a picker move by the rows its list shows;
-    /// the standalone picker, which has no list layout, by its ten rows.
+    /// Page Up and Page Down in a picker move by the rows its list last
+    /// showed, even before the next paint lays it out again; the
+    /// standalone picker, which has no list layout, by its ten rows.
     fn session_picker_page(&self) -> isize {
-        isize::try_from(
+        let rows = self
+            .modal
+            .session_picker_layout
+            .as_ref()
+            .map_or(self.modal.session_picker_page_rows, |layout| {
+                layout.rows.len()
+            });
+        isize::try_from(if rows == 0 { 10 } else { rows }).unwrap_or(1)
+    }
+
+    /// Whether a picker reply is for the picker showing.
+    fn picker_reply_expected(&self, kind: Option<SelectorKind>) -> bool {
+        picker_reply_matches(
             self.modal
-                .session_picker_layout
+                .session_picker
                 .as_ref()
-                .map_or(10, |layout| layout.rows.len().max(1)),
+                .is_some_and(SessionPickerUi::is_inline)
+                && self.modal.remote_profiles.is_none(),
+            self.modal.selector_kind,
+            kind,
         )
-        .unwrap_or(1)
+    }
+
+    /// The status picker that says a request failed: R asks again.
+    fn show_session_picker_failure(
+        &mut self,
+        message: &'static str,
+        selector_kind: Option<SelectorKind>,
+    ) -> Result<()> {
+        self.show_embedded_session_picker(session_picker_status_catalog(message), selector_kind)?;
+        if let Some(picker) = self.modal.session_picker.as_mut() {
+            picker.set_retryable();
+        }
+        Ok(())
     }
 
     /// R on a status picker: the same request again, behind "Loading".
@@ -10891,10 +10935,8 @@ impl App {
                             }
                             _ => None,
                         };
-                        self.show_embedded_session_picker(
-                            session_picker_status_catalog(
-                                "Target changed or is unavailable · R to refresh",
-                            ),
+                        self.show_session_picker_failure(
+                            "Target changed or is unavailable",
                             selector_kind,
                         )?;
                         changed = true;
@@ -10912,6 +10954,7 @@ impl App {
                 }
                 WindowTopologyUpdate::ShowSessionPicker { catalog } => {
                     if self.modal.session_picker_requested
+                        && self.picker_reply_expected(None)
                         && !self.tab_state.session_switch_pending
                         && !self.modal.session_picker_reconcile_pending
                         && !self.modal.command_palette_reconcile_pending
@@ -10959,6 +11002,7 @@ impl App {
                 }
                 WindowTopologyUpdate::ShowSelector { kind, catalog } => {
                     if self.modal.session_picker_requested
+                        && self.picker_reply_expected(Some(kind))
                         && !self.tab_state.session_switch_pending
                         && !self.modal.session_picker_reconcile_pending
                         && !self.modal.command_palette_reconcile_pending
@@ -11028,10 +11072,7 @@ impl App {
                         Some(WindowTopologyCommand::RequestSelector { kind, .. }) => Some(*kind),
                         _ => None,
                     };
-                    self.show_embedded_session_picker(
-                        session_picker_status_catalog("Could not load navigation · R to retry"),
-                        selector_kind,
-                    )?;
+                    self.show_session_picker_failure("Could not load navigation", selector_kind)?;
                     eprintln!("splinterm Dojo picker failed");
                     changed = true;
                 }
@@ -13426,6 +13467,9 @@ impl App {
             }
         }
         self.panes.dirty_inactive_panes.clear();
+        if let Some(layout) = &picker_layout {
+            self.modal.session_picker_page_rows = layout.rows.len();
+        }
         self.modal.session_picker_layout = picker_layout;
         self.complete_background_effect_draw_commit()?;
         let inject_graphical_input = self
@@ -14615,6 +14659,18 @@ mod tests {
             session_picker_scope_request(Some(SelectorKind::Lair), lair_id),
             None
         );
+        // A fast double Tab: the reply for the scope left behind is dropped
+        // while the other scope loads.
+        assert!(!picker_reply_matches(true, None, Some(SelectorKind::Dojo)));
+        assert!(!picker_reply_matches(true, Some(SelectorKind::Dojo), None));
+        assert!(picker_reply_matches(true, None, None));
+        assert!(picker_reply_matches(
+            true,
+            Some(SelectorKind::Dojo),
+            Some(SelectorKind::Dojo)
+        ));
+        // No navigation picker showing: the first reply opens one.
+        assert!(picker_reply_matches(false, None, Some(SelectorKind::Lair)));
     }
 
     #[test]

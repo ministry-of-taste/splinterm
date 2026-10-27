@@ -432,7 +432,8 @@ impl ChromeBox<'_> {
     }
 
     /// `label`'s parts and the ` · ` between them, each placed at its own
-    /// cells, when a part is marked active and the label shows them all.
+    /// cells, when a part is marked active: all of them, or the active part
+    /// alone, marked, when they do not all fit.
     fn right_parts(&self, span: FrameSpan, label: &BoxLabel) -> Option<Vec<(BoxText, bool)>> {
         let active = self.right_active?;
         let parts = self
@@ -442,7 +443,7 @@ impl ChromeBox<'_> {
             .filter(|part| !part.is_empty())
             .collect::<Vec<_>>();
         if parts.join(" · ") != label.text.text {
-            return None;
+            return Some(vec![(label.text.clone(), true)]);
         }
         let mut x = label.text.rect.x;
         let mut placed = Vec::with_capacity(parts.len() * 2);
@@ -460,8 +461,9 @@ impl ChromeBox<'_> {
 
     /// The right label's parts that fit in `room` with their padding,
     /// joined by ` · `: later parts drop first, and when even the first
-    /// alone does not fit it ends in `…`. `None` only when not one
-    /// character and its `…` fit.
+    /// alone does not fit it ends in `…`. With a part marked active, the
+    /// label is all of them or that part alone, so it never names another
+    /// one. `None` only when not one character and its `…` fit.
     fn right_label_text(&self, span: FrameSpan, room: u32) -> Option<String> {
         let parts = self
             .right_label
@@ -469,6 +471,23 @@ impl ChromeBox<'_> {
             .copied()
             .filter(|part| !part.is_empty())
             .collect::<Vec<_>>();
+        let whole = parts.join(" · ");
+        let active = self
+            .right_active
+            .and_then(|active| self.right_label.get(active).copied())
+            .filter(|part| !part.is_empty());
+        if let Some(active) = active {
+            if span.padded(cells_u32(&whole)) <= room {
+                return Some(whole);
+            }
+            if span.padded(cells_u32(active)) <= room {
+                return Some(active.to_owned());
+            }
+            let cells = (room / span.cell_width).saturating_sub(2);
+            return (cells >= 2).then(|| {
+                truncate_picker_text(active, usize::try_from(cells).unwrap_or(usize::MAX))
+            });
+        }
         let first = parts.first()?;
         for shown in (1..=parts.len()).rev() {
             let text = parts[..shown].join(" · ");
@@ -722,15 +741,21 @@ mod tests {
                         .map(|(part, _)| part.text.as_str())
                         .collect::<Vec<_>>();
                     assert_eq!(marked, [["recent", "this lair"][active]]);
-                    // Too narrow for both parts: the label drops one, and
-                    // nothing is marked.
+                    // Too narrow for both parts: the active part alone,
+                    // marked, never the other one.
+                    let active_part = ["recent", "this lair"][active];
                     let narrow = scope.layout(panel(scale, 160), scale, cell);
-                    if narrow
+                    if let Some(label) = narrow
                         .right_label
                         .as_ref()
-                        .is_some_and(|label| label.text.text != "recent · this lair")
+                        .filter(|label| label.text.text != "recent · this lair")
                     {
-                        assert!(narrow.right_parts.is_none());
+                        let shown = label.text.text.trim_end_matches('…');
+                        assert!(active_part.starts_with(shown), "{}", label.text.text);
+                        assert_eq!(
+                            narrow.right_parts.as_deref(),
+                            Some(&[(label.text.clone(), true)][..])
+                        );
                     }
                 }
             }

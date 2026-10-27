@@ -68,14 +68,26 @@ pub(crate) fn session_picker_layout(
 }
 
 /// The keys the picker answers, set into the bottom frame: while a query
-/// filters, only what Enter and Escape do.
-fn legend(purpose: SessionPickerPurpose, filtering: bool) -> Vec<(&'static str, &'static str)> {
+/// filters, no arrows; the `dojos` picker's Tab always. A status picker
+/// (`status` is whether it retries) answers R when it failed, and Escape.
+fn legend(
+    purpose: SessionPickerPurpose,
+    filtering: bool,
+    status: Option<bool>,
+) -> Vec<(&'static str, &'static str)> {
     let mut legend = Vec::with_capacity(4);
+    if let Some(retryable) = status {
+        if retryable {
+            legend.push(("r", "retry"));
+        }
+        legend.push(("esc", "close"));
+        return legend;
+    }
     if !filtering {
         legend.push(("↑↓", "move"));
     }
     legend.push(("↵", purpose.selection_verb()));
-    if !filtering && purpose.scope().is_some() {
+    if purpose.scope().is_some() {
         legend.push(("tab", "scope"));
     }
     legend.push(("esc", "close"));
@@ -121,15 +133,24 @@ pub(crate) fn paint_session_picker(
     paint_scrim(&mut painter, scrim, &palette);
     let cell = painter.box_cell()?;
     let query = picker.query();
+    let status = picker.shows_status();
     let count = match_count_label(picker.items().count(), picker.total(), query);
-    let scope = purpose.scope().filter(|_| query.is_empty());
+    let scope = purpose.scope();
     let count_part = [count.as_str()];
-    let right_label: &[&str] = if scope.is_some() {
-        &SCOPES
-    } else {
-        &count_part
+    let scoped_count = [SCOPES[0], SCOPES[1], count.as_str()];
+    // The scope stays shown while a query filters, since Tab still
+    // switches it; a status picker has nothing to count.
+    let right_label: &[&str] = match scope {
+        Some(_) if query.is_empty() || status => &SCOPES,
+        Some(_) => &scoped_count,
+        None if status => &[],
+        None => &count_part,
     };
-    let legend = legend(purpose, !query.is_empty());
+    let legend = legend(
+        purpose,
+        !query.is_empty(),
+        status.then(|| picker.retryable()),
+    );
     let chrome = ChromeBox {
         title: purpose.title(),
         right_label,
@@ -155,8 +176,8 @@ pub(crate) fn paint_session_picker(
     Ok(())
 }
 
-/// The listed rows with their group headers, or the line that says none
-/// match.
+/// The listed rows with their group headers, or the one line that says
+/// why there are none: the status (loading, could not load), or no match.
 fn paint_picker_rows(
     painter: &mut ChromePainter<'_>,
     layout: &CommandPaletteLayout,
@@ -165,7 +186,16 @@ fn paint_picker_rows(
     purpose: SessionPickerPurpose,
     pressed: Option<PickerHitTarget>,
 ) -> Result<()> {
-    if picker.list_len() == 0 && layout.list.height > 0 {
+    let line = if picker.shows_status() {
+        Some(picker.new_blocker().unwrap_or(""))
+    } else if picker.list_len() == 0 {
+        Some(purpose.no_match())
+    } else {
+        None
+    };
+    if let Some(line) = line
+        && layout.list.height > 0
+    {
         let list = painter.buffer_rect(layout.list);
         let row = Rect {
             height: painter
@@ -175,7 +205,7 @@ fn paint_picker_rows(
         };
         let clip = title_column(painter, row)?;
         painter.text(
-            purpose.no_match(),
+            line,
             ChromeTextStyle::Regular,
             clip,
             PickerTextAlignment::Left,
@@ -328,7 +358,7 @@ mod tests {
     #[test]
     fn the_legend_and_scope_follow_the_purpose_and_the_query() {
         assert_eq!(
-            legend(SessionPickerPurpose::RecentDojos, false),
+            legend(SessionPickerPurpose::RecentDojos, false, None),
             [
                 ("↑↓", "move"),
                 ("↵", "open"),
@@ -336,13 +366,26 @@ mod tests {
                 ("esc", "close")
             ]
         );
+        // Tab still switches the scope while a query filters.
         assert_eq!(
-            legend(SessionPickerPurpose::Dojos, true),
+            legend(SessionPickerPurpose::Dojos, true, None),
+            [("↵", "switch"), ("tab", "scope"), ("esc", "close")]
+        );
+        assert_eq!(
+            legend(SessionPickerPurpose::Lairs, true, None),
             [("↵", "switch"), ("esc", "close")]
         );
         assert_eq!(
-            legend(SessionPickerPurpose::Remotes, false),
+            legend(SessionPickerPurpose::Remotes, false, None),
             [("↑↓", "move"), ("↵", "connect"), ("esc", "close")]
+        );
+        assert_eq!(
+            legend(SessionPickerPurpose::Dojos, true, Some(true)),
+            [("r", "retry"), ("esc", "close")]
+        );
+        assert_eq!(
+            legend(SessionPickerPurpose::Lairs, false, Some(false)),
+            [("esc", "close")]
         );
     }
 
@@ -466,9 +509,59 @@ mod tests {
         );
         let loading = SessionPickerUi::inline(Vec::new(), false, Some("Loading navigation…"), None);
         assert!(!shows_empty_line(&loading));
-        assert_eq!(
-            session_picker_layout(CONTENT, &loading).unwrap().rows.len(),
-            1
+        assert!(
+            session_picker_layout(CONTENT, &loading)
+                .unwrap()
+                .rows
+                .is_empty(),
+            "a status picker lists no rows, not even a blocked `+` row"
         );
+    }
+
+    /// A status picker draws its line alone, typed into or not: no `+`
+    /// row, no "No matching", no count; R in its legend only once it failed.
+    #[test]
+    fn a_status_picker_shows_its_line_alone() {
+        let palette = chrome_panel_palette(ResolvedTheme::default(), ChromeSurface::Menu);
+        let (width, height) = (960, 640);
+        for (query, retryable) in [("", false), ("lo", false), ("", true), ("x", true)] {
+            let line = if retryable {
+                "Could not load navigation"
+            } else {
+                "Loading navigation…"
+            };
+            let mut picker = SessionPickerUi::inline(Vec::new(), false, Some(line), None)
+                .with_purpose(SessionPickerPurpose::Dojos);
+            if retryable {
+                picker.set_retryable();
+            }
+            picker.append_text(query);
+            let layout = session_picker_layout(CONTENT, &picker).unwrap();
+            let mut canvas = vec![0_u8; usize::try_from(width * height * 4).unwrap()];
+            let mut cache = SessionPickerTextCache::default();
+            paint_session_picker(
+                &mut cache,
+                &RenderContext::new(u16::MAX),
+                &mut canvas,
+                width,
+                height,
+                CONTENT,
+                120,
+                1,
+                &layout,
+                palette,
+                &picker,
+                SessionPickerPurpose::Dojos,
+                None,
+                true,
+            )
+            .unwrap();
+            assert!(cache.contains_source(line), "{query:?}: no status line");
+            assert!(cache.contains_source("recent"), "{query:?}: no scope");
+            for absent in ["New Dojo", "No matching Dojos", "0/0", "+", "↵"] {
+                assert!(!cache.contains_source(absent), "{query:?}: drew {absent}");
+            }
+            assert_eq!(cache.contains_source("retry"), retryable, "{query:?}");
+        }
     }
 }

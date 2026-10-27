@@ -107,7 +107,7 @@ A Window holds an ordered, client-local set of distinct Dojo tabs:
 - `Ctrl+Shift+1` … `Ctrl+Shift+9` jump to the first nine tabs;
 - `Ctrl+Shift+Q` detaches the active tab and closes the Window if it was last;
 - `Ctrl+Shift+B` toggles the Dojo tab strip without changing the tab set;
-- `Ctrl+Shift+S` opens Recent Dojos inside the same Window;
+- `Ctrl+Shift+S` opens the `dojos` picker (recent) inside the same Window;
 - choosing an already-open Dojo activates its tab rather than duplicating it;
 - choosing another running Dojo adds it without changing daemon topology; and
 - choosing New Terminal creates a fresh Lair and opens its initial Dojo.
@@ -123,14 +123,17 @@ as `recent · this lair` in its frame: **Tab** switches between them and keeps
 what you typed. Each row is one line: the name, where it is (its Lair and
 working directory), and at the end the agent's state with its coloured dot
 (`needs input`, `working`, `done`) or how many of its panes run (`1/2`).
-Running Dojos list under `running`, others under `stopped`. In a narrow
-Window the location gives way first, then the state's word; the dot stays.
+Running Dojos list under `running`, stopped ones under `stopped` without a
+count. In a narrow Window the location gives way first, then the state's
+word; the dot stays.
 
 Typing in any picker (`dojos`, `lairs`, `remotes`) filters at once; there is
 no `/` first, so `j` and `k` are letters, not moves. Arrows, Page Up and Page
 Down, Home and End move; Enter opens; `Ctrl+N` chooses the `+` row; `Ctrl+U`
 clears what you typed; Escape clears it, then closes. While you type, the `+`
 row and the headers give way to the matches, and the top match is selected.
+A picker that is loading says so alone; one that failed to load says so and
+`R` asks again. `splinterm dojos` lists Dojos most recent first, ungrouped.
 
 The trusted tab strip provides activation, a close target, and a `+` picker
 action. It is visible by default; hiding it is local to the current Window,
