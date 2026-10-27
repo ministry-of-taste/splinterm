@@ -314,10 +314,10 @@ and Escape closes. Actions without an available captured target remain visible
 but disabled. Right-clicking a visible Dojo tab opens a compact trusted menu
 targeted to that tab without activating it first, titled with its Dojo. Its six
 rows are Rename tab…, Activate tab, New Dojo, detach-only Close tab and Close
-other tabs, and Terminate Dojo…, in three groups. Rename opens a bounded prefilled editor. Termination opens a
-named confirmation showing the captured pane count with Cancel selected by
-default. Arrows navigate, Enter runs, and Escape or an outside click closes the
-active surface.
+other tabs, and Terminate Dojo…, in three groups. Rename opens a bounded
+prefilled editor. Termination opens a named confirmation showing the captured
+pane count with Cancel selected by default. Arrows navigate, Enter runs, and
+Escape or an outside click closes the active surface.
 Ctrl+Tab and Ctrl+Shift+Tab cycle Window-local Dojo tabs;
 Ctrl+Shift+1 through Ctrl+Shift+9 activate the first nine tabs in strip order,
 and a number with no tab is consumed without effect;

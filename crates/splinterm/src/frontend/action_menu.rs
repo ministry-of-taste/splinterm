@@ -652,6 +652,9 @@ enum ContextMenuTarget {
         target: ExplorerContextTarget,
         /// The row's label, which the menu's frame shows.
         title: String,
+        /// Whether the row is what the Window shows: a Lair that holds the
+        /// active Dojo, the active Dojo, or its focused Splint.
+        current: bool,
         actions: Vec<TabMenuActionDescriptor>,
         commands: Vec<WindowTopologyCommand>,
     },
@@ -736,6 +739,7 @@ impl TabContextMenuUi {
         };
         let mut entries = Vec::new();
         let mut title = lair.label.clone();
+        let mut current = lair.dojos.iter().any(|dojo| dojo.active_here);
         let live = |state| {
             matches!(
                 state,
@@ -846,6 +850,7 @@ impl TabContextMenuUi {
                     .iter()
                     .find(|dojo| dojo.target.dojo_id == dojo_id)?;
                 title.clone_from(&dojo.label);
+                current = dojo.active_here;
                 let capability = dojo.target.capability;
                 if capability.is_enabled()
                     && matches!(
@@ -919,6 +924,7 @@ impl TabContextMenuUi {
                     .iter()
                     .find(|splint| splint.target.splint_id == splint_id)?;
                 title.clone_from(&splint.label);
+                current = dojo.active_here && splint.focused_here;
                 target.live_incarnation = splint.target.live_incarnation;
                 if splint.target.capability.is_enabled()
                     && matches!(
@@ -1002,6 +1008,7 @@ impl TabContextMenuUi {
             context: ContextMenuTarget::Explorer {
                 target,
                 title,
+                current,
                 actions,
                 commands,
             },
@@ -1024,6 +1031,16 @@ impl TabContextMenuUi {
         match &self.context {
             ContextMenuTarget::Explorer { title, .. } => title,
             ContextMenuTarget::Tab(context) => &context.dojo_name,
+        }
+    }
+
+    /// Whether the menu acts on what the Window shows: the active tab, the
+    /// Lair that holds it, or its focused pane. Only then do its rows show
+    /// key chips, since a binding acts on the current Dojo, Lair or pane.
+    pub(crate) const fn is_current(&self) -> bool {
+        match &self.context {
+            ContextMenuTarget::Explorer { current, .. } => *current,
+            ContextMenuTarget::Tab(context) => context.active,
         }
     }
 
@@ -1220,7 +1237,7 @@ pub(crate) fn tab_menu_descriptor(id: TabMenuActionId) -> TabMenuActionDescripto
         },
         TabMenuActionDescriptor {
             id: TabMenuActionId::TerminateLair,
-            title: "Terminate…",
+            title: "Terminate Lair…",
         },
         TabMenuActionDescriptor {
             id: TabMenuActionId::FocusSplint,
@@ -1753,7 +1770,7 @@ pub(crate) const BUILT_IN_COMMANDS: [BuiltInCommandDescriptor; BuiltInCommandId:
     BuiltInCommandDescriptor {
         id: BuiltInCommandId::RenameCurrentTab,
         category: CommandCategory::Tabs,
-        title: "Rename current tab",
+        title: "Rename current tab…",
         keywords: &["rename", "name", "current", "dojo", "tab"],
         shortcut_action: Some(ActionId::RenameCurrentTab),
     },
@@ -1837,7 +1854,7 @@ pub(crate) const BUILT_IN_COMMANDS: [BuiltInCommandDescriptor; BuiltInCommandId:
     BuiltInCommandDescriptor {
         id: BuiltInCommandId::RenameCurrentLair,
         category: CommandCategory::Dojos,
-        title: "Rename current Lair",
+        title: "Rename current Lair…",
         keywords: &["rename", "name", "current", "lair", "workspace"],
         shortcut_action: Some(ActionId::RenameCurrentLair),
     },
@@ -3342,6 +3359,21 @@ mod tests {
         assert_eq!(menu(&view, lair).title(), "work");
         assert_eq!(menu(&view, dojo).title(), "editor");
         assert_eq!(menu(&view, splint).title(), "shell");
+        // Only a menu for what the Window shows says so, and so shows chips:
+        // the Lair holding the active Dojo, that Dojo, its focused pane.
+        assert!(menu(&view, lair).is_current());
+        assert!(menu(&view, dojo).is_current());
+        assert!(menu(&view, splint).is_current());
+        assert!(!menu(&view, view.lairs[1].id).is_current());
+        assert!(!menu(&view, view.lairs[1].dojos[0].id).is_current());
+        view.lairs[0].dojos[0].splints[0].focused_here = false;
+        assert!(!menu(&view, splint).is_current());
+        view.lairs[0].dojos[0].splints[0].focused_here = true;
+        // The Lair menu names what Terminate ends, as the Dojo menu does.
+        assert_eq!(
+            tab_menu_descriptor(TabMenuActionId::TerminateLair).title,
+            "Terminate Lair…"
+        );
         // A restorable pane among a Dojo's: Restore groups with the layout
         // actions ahead of Close, and Terminate stays last.
         view.lairs[0].dojos[0].active_here = false;
@@ -3369,6 +3401,11 @@ mod tests {
             ]
         );
         assert_eq!(dojo_menu.actions()[0].title, "Open");
+        // The Dojo is no longer the active one, so neither it, its Lair nor
+        // its focused pane is current.
+        assert!(!dojo_menu.is_current());
+        assert!(!menu(&view, lair).is_current());
+        assert!(!menu(&view, splint).is_current());
         let separators = (0..ids.len())
             .filter(|index| tab_menu_starts_group(dojo_menu.actions(), *index))
             .collect::<Vec<_>>();

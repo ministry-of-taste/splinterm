@@ -57,20 +57,22 @@ pub(crate) struct TabContextMenuLayout {
 }
 
 /// The chips of the binding that does `action` to the current Dojo, Lair
-/// or pane, or none.
-fn action_chips(action: TabMenuActionId, keymap: &ResolvedKeymap) -> Vec<String> {
-    shortcut_chips(action.shortcut(keymap))
+/// or pane, or none. A menu for anything else gets no `keymap`, so no
+/// chips: its keys would act on something the menu does not name.
+fn action_chips(action: TabMenuActionId, keymap: Option<&ResolvedKeymap>) -> Vec<String> {
+    keymap.map_or_else(Vec::new, |keymap| shortcut_chips(action.shortcut(keymap)))
 }
 
 /// The widest of `actions`' rows in logical px: the padding, the marker
 /// column, the label, and its chips at least a gap after it. A row with
 /// chips is also at least twice as wide as them, since a row gives its
-/// chips at most half its room.
+/// chips at most half its room. `keymap` is `None` for a menu that shows
+/// no chips.
 pub(crate) fn tab_menu_content_width(
     cache: &mut SessionPickerTextCache,
     context: &RenderContext,
     actions: &[TabMenuActionDescriptor],
-    keymap: &ResolvedKeymap,
+    keymap: Option<&ResolvedKeymap>,
     scale_120: u32,
     renderer_generation: u64,
 ) -> Result<u32> {
@@ -114,7 +116,7 @@ pub(crate) fn tab_context_menu_layout(
     bounds: Rect,
     anchor: (u32, u32),
     actions: &[TabMenuActionDescriptor],
-    keymap: &ResolvedKeymap,
+    keymap: Option<&ResolvedKeymap>,
     content_width: u32,
 ) -> Option<TabContextMenuLayout> {
     let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
@@ -365,62 +367,168 @@ mod tests {
         })
     }
 
-    /// Every label and its chips fit their row whole, at every scale, and
-    /// a menu is never narrower than 156.
+    /// Every label and its chips fit their row whole, at every scale and
+    /// at the largest UI text, and a menu is never narrower than 156.
     #[test]
     fn menus_fit_their_widest_row_and_are_at_least_156_wide() {
-        let context = RenderContext::new(u16::MAX);
         let keymap = ResolvedKeymap::default();
-        let mut cache = SessionPickerTextCache::default();
-        for scale in SCALES {
-            let cell = cache
-                .cell_metrics(&context, ChromeTextStyle::Regular, scale, 1)
-                .unwrap();
-            for action in every_action() {
-                let width =
-                    tab_menu_content_width(&mut cache, &context, &[action], &keymap, scale, 1)
-                        .unwrap();
-                let layout =
-                    tab_context_menu_layout(BOUNDS, (600, 390), &[action], &keymap, width).unwrap();
-                assert!(layout.panel.width >= MENU_MINIMUM_WIDTH);
-                let row = &layout.rows[0];
-                let rect = buffer_rect(row.rect, scale);
-                let chips = chips_width(&row.chips, cell, scale);
-                let columns = row_columns(
-                    rect,
-                    ROW_PADDING.saturating_mul(scale).div_ceil(120),
-                    cell.0,
-                    0,
-                    chips,
-                );
-                assert!(
-                    columns.title.width >= text_cells(row.label) * cell.0,
-                    "{} at scale {scale}",
-                    row.label
-                );
-                let placed = chip_layout(&row.chips, columns.trailing, cell, scale, true);
-                assert_eq!(placed.first, 0, "{} at scale {scale}", row.label);
-                assert!(placed.ellipsis.is_none(), "{} at scale {scale}", row.label);
+        let wide = Rect {
+            x: 0,
+            y: 0,
+            width: 2400,
+            height: 1600,
+        };
+        for context in [
+            RenderContext::new(u16::MAX),
+            RenderContext::new(u16::MAX).at_maximum_chrome_font_size(),
+        ] {
+            let mut cache = SessionPickerTextCache::default();
+            for scale in SCALES {
+                let cell = cache
+                    .cell_metrics(&context, ChromeTextStyle::Regular, scale, 1)
+                    .unwrap();
+                for action in every_action() {
+                    let width = tab_menu_content_width(
+                        &mut cache,
+                        &context,
+                        &[action],
+                        Some(&keymap),
+                        scale,
+                        1,
+                    )
+                    .unwrap();
+                    let layout =
+                        tab_context_menu_layout(wide, (600, 390), &[action], Some(&keymap), width)
+                            .unwrap();
+                    assert!(layout.panel.width >= MENU_MINIMUM_WIDTH);
+                    let row = &layout.rows[0];
+                    let rect = buffer_rect(row.rect, scale);
+                    let chips = chips_width(&row.chips, cell, scale);
+                    let columns = row_columns(
+                        rect,
+                        ROW_PADDING.saturating_mul(scale).div_ceil(120),
+                        cell.0,
+                        0,
+                        chips,
+                    );
+                    assert!(
+                        columns.title.width >= text_cells(row.label) * cell.0,
+                        "{} at scale {scale}",
+                        row.label
+                    );
+                    let placed = chip_layout(&row.chips, columns.trailing, cell, scale, true);
+                    assert_eq!(placed.first, 0, "{} at scale {scale}", row.label);
+                    assert!(placed.ellipsis.is_none(), "{} at scale {scale}", row.label);
+                }
             }
         }
+        let context = RenderContext::new(u16::MAX);
+        let mut cache = SessionPickerTextCache::default();
         // A short label with no binding keeps the minimum width.
         let focus = [tab_menu_descriptor(TabMenuActionId::FocusSplint)];
-        let width = tab_menu_content_width(&mut cache, &context, &focus, &keymap, 120, 1).unwrap();
-        let layout = tab_context_menu_layout(BOUNDS, (0, 0), &focus, &keymap, width).unwrap();
+        let width =
+            tab_menu_content_width(&mut cache, &context, &focus, Some(&keymap), 120, 1).unwrap();
+        let layout = tab_context_menu_layout(BOUNDS, (0, 0), &focus, Some(&keymap), width).unwrap();
         assert_eq!(layout.panel.width, MENU_MINIMUM_WIDTH);
         // A row with chips is wider than its label alone.
         let split = [tab_menu_descriptor(TabMenuActionId::SplitBelow)];
         assert_eq!(
-            tab_context_menu_layout(BOUNDS, (0, 0), &split, &keymap, 0)
+            tab_context_menu_layout(BOUNDS, (0, 0), &split, Some(&keymap), 0)
                 .unwrap()
                 .rows[0]
                 .chips,
             ["ctrl", "shift", "↵"]
         );
         assert!(
-            tab_menu_content_width(&mut cache, &context, &split, &keymap, 120, 1).unwrap()
+            tab_menu_content_width(&mut cache, &context, &split, Some(&keymap), 120, 1).unwrap()
                 > text_cells("Split below") * cell_width(&mut cache, &context)
         );
+    }
+
+    /// A menu for anything but the current tab, Lair or pane shows no
+    /// chips, since its keys would act on something else, and is only as
+    /// wide as its labels; the current one shows them.
+    #[test]
+    fn only_a_menu_for_the_current_target_shows_chips() {
+        let context = RenderContext::new(u16::MAX);
+        let keymap = ResolvedKeymap::default();
+        let mut cache = SessionPickerTextCache::default();
+        let mut widths = Vec::new();
+        for active in [false, true] {
+            let menu = tab_menu(active);
+            assert_eq!(menu.is_current(), active);
+            let keymap = menu.is_current().then_some(&keymap);
+            let width =
+                tab_menu_content_width(&mut cache, &context, menu.actions(), keymap, 120, 1)
+                    .unwrap();
+            let layout =
+                tab_context_menu_layout(BOUNDS, (0, 0), menu.actions(), keymap, width).unwrap();
+            let close = layout
+                .rows
+                .iter()
+                .find(|row| row.action == TabMenuActionId::CloseTab)
+                .unwrap();
+            if active {
+                assert_eq!(close.chips, ["ctrl", "shift", "q"]);
+            } else {
+                assert!(layout.rows.iter().all(|row| row.chips.is_empty()));
+            }
+            widths.push(width);
+        }
+        assert!(
+            widths[0] < widths[1],
+            "no chips, a narrower menu: {widths:?}"
+        );
+    }
+
+    /// The tab menu of the active tab: Activate tab is muted, never
+    /// selected, and the arrows step over it both ways.
+    #[test]
+    fn the_active_tabs_menu_skips_activate() {
+        let mut menu = tab_menu(true);
+        assert!(!menu.action_enabled(TabMenuActionId::ActivateTab));
+        assert_eq!(menu.selected_action(), TabMenuActionId::RenameTab);
+        assert!(menu.move_selection(1));
+        assert_eq!(menu.selected_action(), TabMenuActionId::NewDojo);
+        assert!(menu.move_selection(-1));
+        assert_eq!(menu.selected_action(), TabMenuActionId::RenameTab);
+        for _ in 0..TAB_MENU_ACTIONS.len() * 2 {
+            menu.move_selection(1);
+            assert_ne!(menu.selected_action(), TabMenuActionId::ActivateTab);
+        }
+    }
+
+    /// The tab menu needs its frame, clearances, six rows and two
+    /// separators, about 232 px: a Window one pixel shorter gets no menu,
+    /// which the Window then closes, so no hidden menu takes keys.
+    #[test]
+    fn a_window_too_short_for_every_row_gets_no_menu() {
+        let keymap = ResolvedKeymap::default();
+        let needed = BOX_EDGE * 2
+            + BOX_CLEARANCE
+            + MENU_BOTTOM_CLEARANCE
+            + ROW_HEIGHT * 6
+            + SEPARATOR_HEIGHT * 2
+            + BOX_SHADOW_OFFSET;
+        assert_eq!(needed, 232);
+        for anchor in [(0, 0), (300, 116), (639, 400)] {
+            let fits = Rect {
+                height: needed,
+                ..BOUNDS
+            };
+            let layout =
+                tab_context_menu_layout(fits, anchor, &TAB_MENU_ACTIONS, Some(&keymap), 0).unwrap();
+            assert_eq!(layout.panel.y, 0);
+            assert_eq!(layout.panel.height + BOX_SHADOW_OFFSET, needed);
+            let short = Rect {
+                height: needed - 1,
+                ..BOUNDS
+            };
+            assert!(
+                tab_context_menu_layout(short, anchor, &TAB_MENU_ACTIONS, Some(&keymap), 0)
+                    .is_none()
+            );
+        }
     }
 
     fn cell_width(cache: &mut SessionPickerTextCache, context: &RenderContext) -> u32 {
@@ -437,7 +545,8 @@ mod tests {
     fn separators_group_the_rows_and_only_rows_are_hit() {
         let keymap = ResolvedKeymap::default();
         let layout =
-            tab_context_menu_layout(BOUNDS, (200, 40), &TAB_MENU_ACTIONS, &keymap, 0).unwrap();
+            tab_context_menu_layout(BOUNDS, (200, 40), &TAB_MENU_ACTIONS, Some(&keymap), 0)
+                .unwrap();
         assert_eq!(layout.rows.len(), 6);
         assert_eq!(layout.separators.len(), 2);
         assert_eq!(
@@ -495,7 +604,8 @@ mod tests {
         let keymap = ResolvedKeymap::default();
         for anchor in [(0, 0), (639, 0), (0, 399), (639, 399)] {
             let layout =
-                tab_context_menu_layout(BOUNDS, anchor, &TAB_MENU_ACTIONS, &keymap, 0).unwrap();
+                tab_context_menu_layout(BOUNDS, anchor, &TAB_MENU_ACTIONS, Some(&keymap), 0)
+                    .unwrap();
             assert_eq!(layout.panel.width, MENU_MINIMUM_WIDTH);
             assert!(layout.panel.x + layout.panel.width + BOX_SHADOW_OFFSET <= BOUNDS.width);
             assert!(layout.panel.y + layout.panel.height + BOX_SHADOW_OFFSET <= BOUNDS.height);
@@ -509,14 +619,19 @@ mod tests {
             };
             for anchor in [(0, 0), (bounds.x + width, bounds.y + bounds.height)] {
                 let Some(layout) =
-                    tab_context_menu_layout(bounds, anchor, &TAB_MENU_ACTIONS, &keymap, 400)
+                    tab_context_menu_layout(bounds, anchor, &TAB_MENU_ACTIONS, Some(&keymap), 400)
                 else {
                     assert!(width <= BOX_EDGE * 2 + BOX_SHADOW_OFFSET, "width {width}");
                     continue;
                 };
                 assert!(layout.panel.x >= bounds.x);
+                assert!(layout.panel.y >= bounds.y);
                 assert!(
                     layout.panel.x + layout.panel.width + BOX_SHADOW_OFFSET <= bounds.x + width
+                );
+                assert!(
+                    layout.panel.y + layout.panel.height + BOX_SHADOW_OFFSET
+                        <= bounds.y + bounds.height
                 );
                 for row in &layout.rows {
                     assert!(row.rect.width > 0);
@@ -535,7 +650,9 @@ mod tests {
             height: 120,
             ..BOUNDS
         };
-        assert!(tab_context_menu_layout(short, (0, 0), &TAB_MENU_ACTIONS, &keymap, 0).is_none());
+        assert!(
+            tab_context_menu_layout(short, (0, 0), &TAB_MENU_ACTIONS, Some(&keymap), 0).is_none()
+        );
     }
 
     /// No scrim: nothing outside the menu and its shadow is painted. The
@@ -551,12 +668,19 @@ mod tests {
         let keymap = ResolvedKeymap::default();
         let palette = session_picker_palette(ResolvedTheme::default());
         let mut cache = SessionPickerTextCache::default();
-        let mut state = tab_menu(false);
+        // The active tab's menu, so its rows show their chips.
+        let mut state = tab_menu(true);
         let content_width =
-            tab_menu_content_width(&mut cache, &context, state.actions(), &keymap, 120, 1).unwrap();
-        let layout =
-            tab_context_menu_layout(BOUNDS, (240, 40), state.actions(), &keymap, content_width)
+            tab_menu_content_width(&mut cache, &context, state.actions(), Some(&keymap), 120, 1)
                 .unwrap();
+        let layout = tab_context_menu_layout(
+            BOUNDS,
+            (240, 40),
+            state.actions(),
+            Some(&keymap),
+            content_width,
+        )
+        .unwrap();
         let mut canvas = vec![0_u8; 640 * 400 * 4];
         let pixel = |canvas: &[u8], x: u32, y: u32| {
             let index = usize::try_from((y * 640 + x) * 4).unwrap();
@@ -566,6 +690,15 @@ mod tests {
             let [_, red, green, blue] = color.to_be_bytes();
             [red, green, blue]
         };
+        let close = layout.rows[3].rect;
+        assert_eq!(layout.rows[3].action, TabMenuActionId::CloseTab);
+        let terminate = layout.rows[5].rect;
+        assert_eq!(layout.rows[5].action, TabMenuActionId::TerminateDojo);
+        let paints = |canvas: &[u8], rect: Rect, color: u32| {
+            (rect.y..rect.y + rect.height)
+                .any(|y| (rect.x..rect.x + rect.width).any(|x| pixel(canvas, x, y) == rgb(color)))
+        };
+        let mut close_fills = Vec::new();
         for (hovered, pressed) in [
             (None, None),
             (Some(TabMenuActionId::CloseTab), None),
@@ -609,6 +742,10 @@ mod tests {
                 pixel(&canvas, selected.x + selected.width - 4, selected.y + 2),
                 rgb(palette.selected_fill)
             );
+            close_fills.push(pixel(&canvas, close.x + close.width - 4, close.y + 2));
+            // Terminate's label is in danger, and no other row's is.
+            assert!(paints(&canvas, terminate, palette.danger));
+            assert!(!paints(&canvas, close, palette.danger));
             let separator = layout.separators[0];
             assert_eq!(
                 pixel(&canvas, separator.x + separator.width / 2, separator.y),
@@ -620,6 +757,12 @@ mod tests {
                 rgb(palette.frame)
             );
         }
+        // Hovered differs from both the panel and the selected fill, and
+        // pressed from hovered.
+        assert_eq!(close_fills[0], rgb(palette.panel));
+        assert_ne!(close_fills[1], close_fills[0]);
+        assert_ne!(close_fills[1], rgb(palette.selected_fill));
+        assert_ne!(close_fills[2], close_fills[1]);
         // A narrow viewport paints nothing past its edge.
         for viewport_width in [27, 40, 120] {
             let narrow = Rect {
@@ -627,7 +770,8 @@ mod tests {
                 ..BOUNDS
             };
             let layout =
-                tab_context_menu_layout(narrow, (0, 0), state.actions(), &keymap, 400).unwrap();
+                tab_context_menu_layout(narrow, (0, 0), state.actions(), Some(&keymap), 400)
+                    .unwrap();
             canvas.fill(0);
             paint_tab_context_menu(
                 &mut cache,

@@ -144,11 +144,12 @@ Dojo: Rename tab…, Activate tab, New Dojo, then detach-only Close tab and Clos
 other tabs, then confirmed Terminate Dojo… last, in the danger colour. Opening
 the menu does not first activate its tab.
 
-Menus open at the pointer in the popup box, with no scrim and no key line: the
-frame names what the menu acts on, separators group its actions, and an action
-with a key binding shows it as chips (`ctrl` `shift` `q`). The chips are the
-binding for the same action on the current Dojo, Lair or pane. Arrows, Enter and
-Escape still work.
+Menus open at the pointer, in the same box as the palette and pickers but with
+no scrim and no key hints in the bottom edge: the frame names what the menu acts
+on, and separators group its actions. When the menu is for the current tab,
+Lair or pane, an action with a key binding shows it as chips (`ctrl` `shift`
+`q`); a menu for anything else shows none, since those keys act on the current
+one. Arrows, Enter and Escape still work.
 
 **Detach and terminate are different operations.** Closing tabs or Windows is
 client-local. Terminating a Dojo is a named, confirmed daemon mutation and ends
