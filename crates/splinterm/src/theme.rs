@@ -30,7 +30,7 @@ use anyhow::Result;
 
 use crate::color::{
     NON_TEXT_MIN_CONTRAST, TEXT_MIN_CONTRAST, contrast_corrected, contrast_corrected_toward,
-    contrast_floor_toward, contrast_ratio, legacy_srgb, mix_linear,
+    contrast_floor_toward, contrast_ratio, legacy_srgb, mix_linear, strongest_contrast_endpoint,
 };
 use crate::config::OmarchyShellSettings;
 
@@ -167,6 +167,38 @@ pub struct ThemeShellInput {
     pub settings: OmarchyShellSettings,
 }
 
+/// Whether a theme is dark or light.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Appearance {
+    #[default]
+    Dark,
+    Light,
+}
+
+impl Appearance {
+    /// A background's appearance: light when black text contrasts more with
+    /// it than white text does.
+    #[must_use]
+    pub fn of_background(background: u32) -> Self {
+        if strongest_contrast_endpoint(background) == 0 {
+            Self::Light
+        } else {
+            Self::Dark
+        }
+    }
+
+    /// `dark` or `light`, as Omarchy `mode` and Foot `initial-color-theme`
+    /// name them.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "dark" => Some(Self::Dark),
+            "light" => Some(Self::Light),
+            _ => None,
+        }
+    }
+}
+
 /// Everything a provider reads from one theme source.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ThemeInput {
@@ -174,6 +206,8 @@ pub struct ThemeInput {
     pub hints: RoleHints,
     pub components: ThemeComponents,
     pub shell: ThemeShellInput,
+    /// The theme's appearance: what the theme says, else its background's.
+    pub appearance: Appearance,
 }
 
 impl ThemeInput {
@@ -195,6 +229,8 @@ impl ThemeInput {
             },
             hints: RoleHints {
                 accent: Some(0x78d2ff),
+                // The built-in muted color is its ANSI 8.
+                text_muted: Some(0x928374),
                 ..RoleHints::default()
             },
             components: ThemeComponents::default(),
@@ -203,6 +239,7 @@ impl ThemeInput {
                 background_blur: false,
                 settings: OmarchyShellSettings::default(),
             },
+            appearance: Appearance::Dark,
         }
     }
 }
@@ -281,21 +318,23 @@ pub(crate) fn inactive_tab_foreground_fallback(
 /// Derives every chrome role from one theme input. Pure: the same input
 /// always gives the same roles.
 ///
-/// The roles chrome paints today keep their earlier values exactly:
-/// - `surface`, `text` and `selection` are the terminal background,
-///   foreground and selection.
+/// The roles follow Plan 0064's role table:
+/// - `surface`, `text` are the terminal background and foreground;
+///   `selection` is the theme's, else the terminal selection.
 /// - `accent` is the theme's accent, else ANSI 4; `focus_ring` is the
 ///   theme's, else the accent.
 /// - `divider` is the theme's, else the encoded-sRGB midpoint of surface and
-///   text. The Omarchy provider hints ANSI 8, so the pane border still
-///   differs per source.
-/// - `text_muted` is a JSON theme's `inactive_tab_foreground`, else the
-///   inactive-tab ramp from the theme's muted color, else from ANSI 8.
-///
-/// The roles nothing paints yet follow Plan 0064's role table: a hint, else
-/// the ANSI color for their hue, raised to their contrast floor against the
-/// surface by mixing toward readable text. The agent status roles take herdr's
-/// mapping onto them.
+///   text, a legacy kept for JSON and built-in themes. The Omarchy provider
+///   always hints one, ending at ANSI 8.
+/// - `text_muted` is a JSON theme's `inactive_tab_foreground`; else the
+///   inactive-tab ramp from the theme's muted color, which keeps every
+///   painted inactive tab label of a theme that names one (JSON and
+///   built-in themes name their ANSI 8); else text mixed 30% toward the
+///   surface, kept at 4.5:1.
+/// - `text_faint` is text mixed 55% toward the surface, kept at 4.5:1.
+/// - The hue roles are a hint, else the ANSI color for their hue, raised to
+///   3:1 against the surface by mixing toward readable text.
+/// - The agent status roles take herdr's mapping onto them.
 #[must_use]
 pub fn derive(input: &ThemeInput) -> ChromeRoles {
     let terminal = &input.terminal;
@@ -304,13 +343,20 @@ pub fn derive(input: &ThemeInput) -> ChromeRoles {
     let surface = terminal.background;
     let text = terminal.foreground;
     let accent = hints.accent.unwrap_or(ansi[4]);
-    let text_muted = input.components.inactive_tab_foreground.unwrap_or_else(|| {
-        inactive_tab_foreground_fallback(surface, text, hints.text_muted.unwrap_or(ansi[8]))
-    });
     // Floors aim at readable text, not the raw foreground: a foreground
     // below 4.5:1 would otherwise send every floored role to pure black or
     // white, louder than the text and indistinguishable from each other.
     let readable = contrast_corrected(text, surface);
+    let text_muted =
+        input
+            .components
+            .inactive_tab_foreground
+            .unwrap_or_else(|| match hints.text_muted {
+                Some(muted) => inactive_tab_foreground_fallback(surface, text, muted),
+                None => {
+                    contrast_corrected_toward(mix_linear(text, surface, 0.30), readable, surface)
+                }
+            });
     let text_faint = contrast_corrected_toward(mix_linear(text, surface, 0.55), readable, surface);
     let signal = |hint: Option<u32>, fallback: u32| {
         contrast_floor_toward(
@@ -352,6 +398,90 @@ pub fn derive(input: &ThemeInput) -> ChromeRoles {
         status_idle: success,
         status_stale: text_faint,
         remote_marker: signal(hints.remote_marker, ansi[5]),
+    }
+}
+
+/// A role that colors part of a chrome text line, such as an agent status
+/// glyph, independently of the line's own color. Sources carry the tag; the
+/// painter picks the color for the background the line actually sits on.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum ChromeTint {
+    StatusNeedsInput,
+    StatusError,
+    StatusWorking,
+    StatusDone,
+    StatusIdle,
+    StatusStale,
+    /// The access "Asking" marker.
+    Asking,
+    /// The remote host tag, which is text.
+    Remote,
+}
+
+impl ChromeTint {
+    const ALL: [Self; 8] = [
+        Self::StatusNeedsInput,
+        Self::StatusError,
+        Self::StatusWorking,
+        Self::StatusDone,
+        Self::StatusIdle,
+        Self::StatusStale,
+        Self::Asking,
+        Self::Remote,
+    ];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::StatusNeedsInput => 0,
+            Self::StatusError => 1,
+            Self::StatusWorking => 2,
+            Self::StatusDone => 3,
+            Self::StatusIdle => 4,
+            Self::StatusStale => 5,
+            Self::Asking => 6,
+            Self::Remote => 7,
+        }
+    }
+
+    const fn role(self, roles: &ChromeRoles) -> u32 {
+        match self {
+            Self::StatusNeedsInput => roles.status_needs_input,
+            Self::StatusError => roles.status_error,
+            Self::StatusWorking => roles.status_working,
+            Self::StatusDone => roles.status_done,
+            Self::StatusIdle => roles.status_idle,
+            Self::StatusStale => roles.status_stale,
+            Self::Asking => roles.warning,
+            Self::Remote => roles.remote_marker,
+        }
+    }
+
+    /// Glyphs keep the non-text floor, 3:1; the remote tag is text and
+    /// keeps 4.5:1.
+    const fn floor(self) -> f64 {
+        match self {
+            Self::Remote => TEXT_MIN_CONTRAST,
+            _ => NON_TEXT_MIN_CONTRAST,
+        }
+    }
+}
+
+/// Every [`ChromeTint`]'s color on one background, each kept at its floor
+/// against that background by mixing toward `text` corrected for it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ChromeTints([u32; 8]);
+
+impl ChromeTints {
+    #[must_use]
+    pub(crate) fn on(roles: &ChromeRoles, background: u32) -> Self {
+        let readable = contrast_corrected(roles.text, background);
+        Self(ChromeTint::ALL.map(|tint| {
+            contrast_floor_toward(tint.role(roles), readable, background, tint.floor())
+        }))
+    }
+
+    pub(crate) const fn color(&self, tint: ChromeTint) -> u32 {
+        self.0[tint.index()]
     }
 }
 
@@ -446,5 +576,47 @@ mod tests {
         for (index, signal) in signals.iter().enumerate() {
             assert!(!signals[index + 1..].contains(signal));
         }
+    }
+
+    #[test]
+    fn tints_keep_their_floors_on_the_background_they_paint_on() {
+        let roles = ChromeRoles::default();
+        // Dark, light and mid-grey bodies, and one the size of the text.
+        for background in [0x0e1216, 0xfffcf0, 0x928374, 0x777777, roles.text] {
+            let tints = ChromeTints::on(&roles, background);
+            for tint in ChromeTint::ALL {
+                let contrast = contrast_ratio(tints.color(tint), background);
+                let floor = if tint == ChromeTint::Remote {
+                    TEXT_MIN_CONTRAST
+                } else {
+                    NON_TEXT_MIN_CONTRAST
+                };
+                assert!(
+                    contrast >= floor,
+                    "{tint:?} on {background:06x}: {contrast}"
+                );
+            }
+        }
+        // A role that already clears its floor is painted as the theme gave it.
+        let tints = ChromeTints::on(&roles, roles.surface);
+        assert_eq!(tints.color(ChromeTint::StatusWorking), roles.status_working);
+        assert_eq!(tints.color(ChromeTint::StatusDone), roles.status_done);
+        assert_eq!(tints.color(ChromeTint::Asking), roles.warning);
+        assert_eq!(tints.color(ChromeTint::StatusStale), roles.status_stale);
+        // Needs input and error share danger; their glyphs tell them apart.
+        assert_eq!(
+            tints.color(ChromeTint::StatusNeedsInput),
+            tints.color(ChromeTint::StatusError)
+        );
+    }
+
+    #[test]
+    fn appearance_reads_dark_or_light() {
+        assert_eq!(Appearance::parse(" Light "), Some(Appearance::Light));
+        assert_eq!(Appearance::parse("dark"), Some(Appearance::Dark));
+        assert_eq!(Appearance::parse("dusk"), None);
+        assert_eq!(Appearance::of_background(0x0e1216), Appearance::Dark);
+        assert_eq!(Appearance::of_background(0xfffcf0), Appearance::Light);
+        assert_eq!(ThemeInput::builtin().appearance, Appearance::Dark);
     }
 }

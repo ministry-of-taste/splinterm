@@ -16,6 +16,7 @@ use crate::{
     config::{OmarchyShellSettings, ResolvedTheme},
     frontend::PickerHitTarget,
     geometry::Rect,
+    theme::ChromeTints,
 };
 
 use super::super::{
@@ -639,6 +640,10 @@ pub(crate) struct SessionPickerPalette {
     pub(crate) highlight_primary: u32,
     pub(crate) highlight_secondary: u32,
     pub(crate) shadow: [u8; 4],
+    /// Status tints on the opaque panel and on the selected fill;
+    /// `None` when `[explorer] status-colors=no`.
+    pub(crate) status_tints: Option<ChromeTints>,
+    pub(crate) selected_status_tints: Option<ChromeTints>,
 }
 
 impl SessionPickerPalette {
@@ -653,6 +658,26 @@ impl SessionPickerPalette {
         } else {
             (self.primary, self.secondary)
         }
+    }
+
+    /// The status tints for a row on the panel or the selected fill.
+    pub(crate) const fn row_tints(&self, selected: bool) -> Option<ChromeTints> {
+        if selected {
+            self.selected_status_tints
+        } else {
+            self.status_tints
+        }
+    }
+
+    /// This palette with status tints, or without them for
+    /// `[explorer] status-colors=no`.
+    #[must_use]
+    pub(crate) const fn with_status_colors(mut self, enabled: bool) -> Self {
+        if !enabled {
+            self.status_tints = None;
+            self.selected_status_tints = None;
+        }
+        self
     }
 }
 
@@ -708,6 +733,8 @@ pub(crate) fn session_picker_palette(theme: ResolvedTheme) -> SessionPickerPalet
         highlight_primary,
         highlight_secondary,
         shadow: [0, 0, 0, 89],
+        status_tints: Some(ChromeTints::on(&roles, roles.surface)),
+        selected_status_tints: Some(ChromeTints::on(&roles, selected_fill)),
     }
 }
 
@@ -1044,6 +1071,47 @@ pub(super) fn paint_picker_source_within(
     color: u32,
     maximum_cell_height: u32,
 ) -> Result<()> {
+    paint_picker_source_tinted(
+        cache,
+        context,
+        used,
+        canvas,
+        canvas_width,
+        canvas_height,
+        source,
+        style,
+        scale_120,
+        renderer_generation,
+        clip,
+        alignment,
+        color,
+        None,
+        maximum_cell_height,
+    )
+}
+
+/// Paints like [`paint_picker_source_within`], each tinted run of `source`
+/// in its color from `tints`, the tints for the background it paints on.
+/// `None` paints every glyph in `color`, as `[explorer] status-colors=no`
+/// asks.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn paint_picker_source_tinted(
+    cache: &mut SessionPickerTextCache,
+    context: &RenderContext,
+    used: &mut HashSet<SessionPickerTextKey>,
+    canvas: &mut [u8],
+    canvas_width: u32,
+    canvas_height: u32,
+    source: &ChromeSource,
+    style: ChromeTextStyle,
+    scale_120: u32,
+    renderer_generation: u64,
+    clip: Rect,
+    alignment: PickerTextAlignment,
+    color: u32,
+    tints: Option<ChromeTints>,
+    maximum_cell_height: u32,
+) -> Result<()> {
     if source.is_empty() || clip.width == 0 || clip.height == 0 {
         return Ok(());
     }
@@ -1091,7 +1159,18 @@ pub(super) fn paint_picker_source_within(
     let y = clip
         .y
         .saturating_add(clip.height.saturating_sub(text.pixel_height()) / 2);
-    text.paint(canvas, canvas_width, canvas_height, (x, y), clip, color);
+    text.paint_colored(
+        canvas,
+        canvas_width,
+        canvas_height,
+        (x, y),
+        clip,
+        |column| {
+            tints
+                .zip(source.tint_at(column))
+                .map_or(color, |(tints, tint)| tints.color(tint))
+        },
+    );
     used.insert(key);
     Ok(())
 }

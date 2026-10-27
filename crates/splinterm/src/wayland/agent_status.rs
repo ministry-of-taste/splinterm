@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 
 use super::{App, DojoId, QueueHandle, SplintId};
+use crate::config::AgentStatusStyle;
 use crate::frontend::{AgentAggregate, AgentGlyphs, AgentSpinner};
 use crate::navigation_projection::WindowAgentStatus;
 use crate::renderer::{ChromeSource, chrome_icons_available};
@@ -24,6 +25,8 @@ pub(super) struct TabAgentStatus {
     status: WindowAgentStatus,
     enabled: bool,
     glyphs: AgentGlyphs,
+    /// `[explorer] status-colors` and `status-glyphs`.
+    style: AgentStatusStyle,
     /// The working spinner's frame, shared with the Explorer.
     spinner: AgentSpinner,
     last_spinner_step: Instant,
@@ -38,11 +41,12 @@ pub(super) struct TabAgentStatus {
 }
 
 impl TabAgentStatus {
-    pub(super) fn new(enabled: bool) -> Self {
+    pub(super) fn new(enabled: bool, style: AgentStatusStyle) -> Self {
         Self {
             status: WindowAgentStatus::default(),
             enabled,
-            glyphs: AgentGlyphs::select(chrome_icons_available()),
+            glyphs: AgentGlyphs::select(chrome_icons_available(), style.glyphs),
+            style,
             spinner: AgentSpinner::STATIC,
             last_spinner_step: Instant::now(),
             animating: false,
@@ -109,8 +113,14 @@ impl TabAgentStatus {
         std::mem::take(&mut self.chrome_damage)
     }
 
-    /// Icons, or ASCII when the embedded icon face is unavailable; shared
-    /// with the Explorer at startup.
+    /// Whether status glyphs, the "Asking" marker and the remote tag take
+    /// their status colors (`[explorer] status-colors`).
+    pub(super) const fn colors(&self) -> bool {
+        self.style.colors
+    }
+
+    /// Icons, dots, or ASCII when icons are asked for but the embedded
+    /// icon face is unavailable; shared with the Explorer.
     pub(super) const fn glyphs(&self) -> AgentGlyphs {
         self.glyphs
     }
@@ -126,6 +136,19 @@ impl TabAgentStatus {
 }
 
 impl App {
+    /// Applies `[explorer] status-colors` and `status-glyphs`; returns
+    /// whether the chrome must be redrawn.
+    pub(super) fn set_agent_status_style(&mut self, style: AgentStatusStyle) -> bool {
+        let agent = &mut self.tab_state.agent;
+        if agent.style == style {
+            return false;
+        }
+        agent.style = style;
+        agent.glyphs = AgentGlyphs::select(chrome_icons_available(), style.glyphs);
+        self.explorer.set_agent_glyphs(agent.glyphs);
+        true
+    }
+
     pub(super) fn set_agent_status_presentation(&mut self, enabled: bool) -> bool {
         let explorer_changed = self.explorer.set_agent_status_enabled(enabled);
         let tabs_changed = self.tab_state.agent.enabled != enabled;
@@ -225,7 +248,7 @@ mod tests {
     #[test]
     fn tab_badges_aggregate_per_dojo_and_never_carry_detail() {
         let (first, second) = (DojoId::new(), DojoId::new());
-        let mut agent = TabAgentStatus::new(true);
+        let mut agent = TabAgentStatus::new(true, AgentStatusStyle::default());
         let blocked = SplintId::new();
         agent.status.splints = [
             (blocked, status(first, 3, AgentState::NeedsInput)),
@@ -292,7 +315,7 @@ mod tests {
     #[test]
     fn spinner_moves_on_its_own_over_simulated_time_and_damages_the_chrome() {
         let dojo = DojoId::new();
-        let mut agent = TabAgentStatus::new(true);
+        let mut agent = TabAgentStatus::new(true, AgentStatusStyle::default());
         agent.status.splints = [(SplintId::new(), status(dojo, 1, AgentState::Working))]
             .into_iter()
             .collect();
@@ -322,7 +345,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(frames, ["⠋", "⠙", "⠹", "⠸", "⠼"], "after {passes} passes");
         // The Explorer alone keeps it moving, as recorded by the last draw.
-        let mut explorer_only = TabAgentStatus::new(true);
+        let mut explorer_only = TabAgentStatus::new(true, AgentStatusStyle::default());
         explorer_only.explorer_working = true;
         let start = explorer_only.last_spinner_step;
         assert!(explorer_only.tick_spinner(start, true, false).is_none());
@@ -348,7 +371,7 @@ mod tests {
         );
         assert_eq!(agent.spinner_timeout(later), None);
         // Nothing working anywhere: no deadline either.
-        let mut idle = TabAgentStatus::new(true);
+        let mut idle = TabAgentStatus::new(true, AgentStatusStyle::default());
         assert_eq!(idle.tick_spinner(later, true, false), None);
         assert_eq!(idle.spinner_timeout(later), None);
     }
