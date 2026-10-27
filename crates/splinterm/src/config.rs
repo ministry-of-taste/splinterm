@@ -998,11 +998,44 @@ fn resolve_bar_size(
     px
 }
 
+/// The most a theme file (`colors.toml`, `foot.ini`, `shell.toml`, a JSON
+/// theme) may hold. Real ones are a few KiB.
+const MAX_THEME_FILE_BYTES: u64 = 256 * 1024;
+
+/// Reads a theme file: a regular file of at most [`MAX_THEME_FILE_BYTES`].
+/// It is opened without blocking, so a FIFO or device in its place is
+/// refused instead of waited on; trusted dialogs read their theme from an
+/// environment their caller chose.
+fn read_theme_file(path: &Path) -> std::io::Result<String> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    let mut text = String::new();
+    file.take(MAX_THEME_FILE_BYTES + 1)
+        .read_to_string(&mut text)?;
+    if text.len() as u64 > MAX_THEME_FILE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "larger than 256 KiB",
+        ));
+    }
+    Ok(text)
+}
+
 fn read_omarchy_shell_layer(
     path: &Path,
     diagnostics: &mut Vec<(OmarchyShellConcern, String)>,
 ) -> Option<String> {
-    match fs::read_to_string(path) {
+    match read_theme_file(path) {
         Ok(contents) => Some(contents),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => {
@@ -2389,11 +2422,11 @@ fn load_omarchy_input_with_status(
         });
     }
     after_identity();
-    let colors = fs::read_to_string(&colors_path)
-        .with_context(|| format!("read {}", colors_path.display()))?;
+    let colors =
+        read_theme_file(&colors_path).with_context(|| format!("read {}", colors_path.display()))?;
     between_reads();
     let foot =
-        fs::read_to_string(&foot_path).with_context(|| format!("read {}", foot_path.display()))?;
+        read_theme_file(&foot_path).with_context(|| format!("read {}", foot_path.display()))?;
     anyhow::ensure!(
         omarchy_theme_identity(theme_dir) == before,
         "active Omarchy theme changed while its palette was loading"
@@ -2494,8 +2527,8 @@ impl ThemeProvider for JsonThemeProvider<'_> {
         if !self.path.exists() {
             return BuiltinThemeProvider.load();
         }
-        let raw = fs::read_to_string(self.path)
-            .with_context(|| format!("read {}", self.path.display()))?;
+        let raw =
+            read_theme_file(self.path).with_context(|| format!("read {}", self.path.display()))?;
         serde_json::from_str::<ThemePalette>(&raw)
             .context("parse explicit Splinterm theme JSON")?
             .input()
@@ -2605,9 +2638,9 @@ fn parse_color(value: &str) -> Result<u32> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-    use crate::color::{contrast_ratio, legacy_srgb::mix_quarters as mix_rgb_quarters};
+    use crate::color::{contrast_ratio, mix_linear};
     use crate::theme::{INACTIVE_TAB_MIN_CONTRAST, inactive_tab_foreground_fallback};
 
     #[test]
@@ -3028,7 +3061,7 @@ mod tests {
         }
     }
 
-    fn theme_colors(text: &str) -> ThemeColorConfig {
+    pub(crate) fn theme_colors(text: &str) -> ThemeColorConfig {
         parse(text).unwrap().config.theme_colors()
     }
 
@@ -4119,7 +4152,8 @@ mod tests {
         assert_eq!(resolved.active_tab_foreground, resolved.background);
         assert_ne!(resolved.active_tab_background, resolved.selection);
         assert_eq!(resolved.ui_accent(), 6);
-        assert_eq!(resolved.pane_border(), 2);
+        // A JSON theme without pane_border draws its ANSI 8.
+        assert_eq!(resolved.pane_border(), resolved.ansi[8]);
         assert_eq!(resolved.pane_border_active(), 6);
         assert_eq!(resolved.background_alpha, u16::MAX);
         assert!(!resolved.background_blur);
@@ -4242,7 +4276,7 @@ mod tests {
     /// Plan 0064's text-muted without a hint: text mixed 30% toward the
     /// surface in linear light, kept at 4.5:1.
     fn mixed_muted(theme: &ResolvedTheme) -> u32 {
-        use crate::color::{contrast_corrected, contrast_corrected_toward, mix_linear};
+        use crate::color::{contrast_corrected, contrast_corrected_toward};
         contrast_corrected_toward(
             mix_linear(theme.foreground, theme.background, 0.30),
             contrast_corrected(theme.foreground, theme.background),
@@ -4261,7 +4295,7 @@ mod tests {
         assert!(contrast_ratio(muted, background) < INACTIVE_TAB_MIN_CONTRAST);
         let mixed = inactive_tab_foreground_fallback(background, foreground, muted);
         let first_passing = (1..4)
-            .map(|quarters| mix_rgb_quarters(muted, foreground, quarters))
+            .map(|quarters| mix_linear(muted, foreground, f64::from(quarters) / 4.0))
             .find(|candidate| contrast_ratio(*candidate, background) >= INACTIVE_TAB_MIN_CONTRAST)
             .unwrap();
         assert_eq!(mixed, first_passing);
@@ -4274,11 +4308,10 @@ mod tests {
         // darker until it is readable, without exceeding the foreground.
         let (background, foreground, muted) = (0xff_fc_f0, 0x10_0f_0f, 0xb7_b5_ac);
         let light = inactive_tab_foreground_fallback(background, foreground, muted);
-        assert_eq!(light, 0x64_62_5e);
+        assert_eq!(light, 0x62_61_5c);
         let contrast = contrast_ratio(light, background);
         assert!(contrast >= INACTIVE_TAB_MIN_CONTRAST);
         assert!(contrast < contrast_ratio(foreground, background));
-        assert!((contrast - 5.92).abs() < 0.01);
 
         // A "muted" color louder than the foreground is never used or mixed in.
         assert_eq!(
@@ -4290,10 +4323,6 @@ mod tests {
             inactive_tab_foreground_fallback(0x00_00_00, 0x40_40_40, 0x30_30_30),
             0x40_40_40
         );
-        // Mixes are exact quarters with rounding.
-        assert_eq!(mix_rgb_quarters(0x00_00_00, 0xff_ff_ff, 0), 0x00_00_00);
-        assert_eq!(mix_rgb_quarters(0x00_00_00, 0xff_ff_ff, 2), 0x80_80_80);
-        assert_eq!(mix_rgb_quarters(0x00_00_00, 0xff_ff_ff, 4), 0xff_ff_ff);
     }
 
     #[test]
@@ -4959,7 +4988,7 @@ mod tests {
 
     /// Every theme source the pins below cover: built-in, JSON, and the
     /// stock Omarchy 4 and semantic-key fixtures.
-    fn provider_themes() -> Vec<(&'static str, ResolvedTheme)> {
+    pub(crate) fn provider_themes() -> Vec<(&'static str, ResolvedTheme)> {
         let mut themes = vec![
             ("builtin", ResolvedTheme::default()),
             ("json", json_theme(JSON_THEME)),
@@ -4989,7 +5018,12 @@ mod tests {
     /// which names no `muted` or `dark_foreground` and now mixes its text;
     /// `last-horizon`'s active pane border (b59790), now its
     /// `active_border_color`; and `semantic-keys`' pane border (6a6488),
-    /// now its `border`.
+    /// now its `border`. Milestone 5 then changed, on purpose: a JSON theme's
+    /// default pane border, now ANSI 8 (`json` 787e85); and each inactive
+    /// tab label ramped toward the text, now in linear light (`json`
+    /// 79818a, `tokyo-night` 8f97bb, `flexoki-light` 64625e,
+    /// `last-horizon` 817a7c, `legacy-gruvbox` 9d8d76, `semantic-keys`
+    /// 8680a1).
     #[allow(clippy::type_complexity)]
     const PROVIDER_PINS: [(&str, [u32; 12], u16, bool); 9] = [
         (
@@ -5005,7 +5039,7 @@ mod tests {
             "json",
             [
                 0x101820, 0xe0e4ea, 0xf0f0f0, 0x2a3a4a, 0xe0e4ea, 0x5599ff, 0x56606a, 0xe0e4ea,
-                0x79818a, 0x33bbee, 0x787e85, 0x33bbee,
+                0x8a9198, 0x33bbee, 0x56606a, 0x33bbee,
             ],
             u16::MAX,
             false,
@@ -5023,7 +5057,7 @@ mod tests {
             "tokyo-night",
             [
                 0x1a1b26, 0xa9b1d6, 0xc0caf5, 0x292e42, 0xc0caf5, 0x7aa2f7, 0x24283b, 0xa9b1d6,
-                0x8f97bb, 0x7aa2f7, 0x414868, 0x7aa2f7,
+                0x828aab, 0x7aa2f7, 0x414868, 0x7aa2f7,
             ],
             u16::MAX,
             true,
@@ -5032,7 +5066,7 @@ mod tests {
             "flexoki-light",
             [
                 0xfffcf0, 0x100f0f, 0x100f0f, 0xcecdc3, 0x100f0f, 0x205ea6, 0xe6e4d9, 0x100f0f,
-                0x64625e, 0x205ea6, 0xb7b5ac, 0x205ea6,
+                0x62615c, 0x205ea6, 0xb7b5ac, 0x205ea6,
             ],
             u16::MAX,
             true,
@@ -5041,7 +5075,7 @@ mod tests {
             "last-horizon",
             [
                 0x0c0b0c, 0xfafcfb, 0xe2dddc, 0x584e51, 0xe2dddc, 0xb59790, 0x0c0b0c, 0xfafcfb,
-                0x817a7c, 0xb59790, 0x584e51, 0xd6d3de,
+                0x989596, 0xb59790, 0x584e51, 0xd6d3de,
             ],
             u16::MAX,
             true,
@@ -5050,7 +5084,7 @@ mod tests {
             "legacy-gruvbox",
             [
                 0x282828, 0xd4be98, 0xd4be98, 0x504945, 0xd4be98, 0x7daea3, 0x3c3836, 0xd4be98,
-                0x9d8d76, 0x7daea3, 0x665c54, 0x7daea3,
+                0xa9977c, 0x7daea3, 0x665c54, 0x7daea3,
             ],
             u16::MAX,
             true,
@@ -5068,7 +5102,7 @@ mod tests {
             "semantic-keys",
             [
                 0x14111f, 0xd8d4ea, 0xf2efff, 0x2a2540, 0xf2efff, 0x5ec4ff, 0x1f1a30, 0xd8d4ea,
-                0x8680a1, 0x5ec4ff, 0x3d3654, 0x5ec4ff,
+                0x908ba8, 0x5ec4ff, 0x3d3654, 0x5ec4ff,
             ],
             u16::MAX,
             true,
@@ -5077,35 +5111,31 @@ mod tests {
 
     #[test]
     fn provider_themes_paint_their_pinned_colors() {
-        let themes = provider_themes();
-        assert_eq!(themes.len(), PROVIDER_PINS.len());
-        for ((name, theme), (pinned, colors, alpha, blur)) in themes.into_iter().zip(PROVIDER_PINS)
-        {
-            assert_eq!(name, pinned);
-            assert_eq!(
-                [
-                    theme.background,
-                    theme.foreground,
-                    theme.cursor,
-                    theme.selection,
-                    theme.selection_foreground,
-                    theme.url,
-                    theme.active_tab_background,
-                    theme.active_tab_foreground,
-                    theme.roles.text_muted,
-                    theme.roles.accent,
-                    theme.roles.divider,
-                    theme.roles.focus_ring,
-                ],
-                colors,
-                "{name}"
-            );
-            assert_eq!(
-                (theme.background_alpha, theme.background_blur),
-                (alpha, blur),
-                "{name}"
-            );
-        }
+        let painted = provider_themes()
+            .into_iter()
+            .map(|(name, theme)| {
+                (
+                    name,
+                    [
+                        theme.background,
+                        theme.foreground,
+                        theme.cursor,
+                        theme.selection,
+                        theme.selection_foreground,
+                        theme.url,
+                        theme.active_tab_background,
+                        theme.active_tab_foreground,
+                        theme.roles.text_muted,
+                        theme.roles.accent,
+                        theme.roles.divider,
+                        theme.roles.focus_ring,
+                    ],
+                    theme.background_alpha,
+                    theme.background_blur,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(painted, PROVIDER_PINS, "{painted:#08x?}");
     }
 
     #[test]
@@ -5424,5 +5454,42 @@ mod tests {
             load_provider_theme(&BuiltinThemeProvider).unwrap(),
             ResolvedTheme::default()
         );
+    }
+
+    /// Theme files are read only when they are regular files of a bounded
+    /// size, and a FIFO in their place is refused without blocking.
+    #[test]
+    fn theme_files_must_be_bounded_regular_files() {
+        let root = std::env::temp_dir().join(format!(
+            "splinterm-theme-file-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let regular = root.join("colors.toml");
+        fs::write(&regular, "accent = \"#123456\"\n").unwrap();
+        assert_eq!(read_theme_file(&regular).unwrap(), "accent = \"#123456\"\n");
+        let missing = read_theme_file(&root.join("absent.toml")).unwrap_err();
+        assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
+        let fifo = root.join("foot.ini");
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            &fifo,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        )
+        .unwrap();
+        let refused = read_theme_file(&fifo).unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::InvalidInput);
+        let large = root.join("shell.toml");
+        let limit = usize::try_from(MAX_THEME_FILE_BYTES).unwrap();
+        fs::write(&large, "#".repeat(limit)).unwrap();
+        assert_eq!(read_theme_file(&large).unwrap().len(), limit);
+        fs::write(&large, "#".repeat(limit + 1)).unwrap();
+        let refused = read_theme_file(&large).unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::InvalidData);
+        fs::remove_dir_all(root).unwrap();
     }
 }

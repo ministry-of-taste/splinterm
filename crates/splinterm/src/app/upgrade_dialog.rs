@@ -41,7 +41,9 @@ use splinterd::{
     dialog_shortcut::{DialogShortcut, DialogShortcutLease, Hyprctl, SystemHyprctl},
 };
 use splinterm::automation::HandoffDecisionPrompt;
-use splinterm::{DialogIdentity, DialogLine, DialogText, TrustedConsentUi, WindowOptions};
+use splinterm::{
+    DialogIdentity, DialogLine, DialogText, TrustedConsentUi, WindowOptions, config::ResolvedTheme,
+};
 use splinterm_protocol::{
     HandoffUnresponsiveWindow, MAX_HANDOFF_DOJO_NAME_BYTES, MAX_HANDOFF_WINDOW_DOJOS,
     MAX_HANDOFF_WINDOWS,
@@ -284,21 +286,32 @@ fn dialog_window_options(
 ///
 /// It dies with the command that asked. The workspace forbids `unsafe`, so
 /// the child cannot be given a `pre_exec` hook; instead it sets its own
-/// parent-death signal (`PR_SET_PDEATHSIG`, through rustix) before anything
-/// else, then checks that its parent is still the command named in the
-/// prompt, which covers a parent that died before the signal was set. The
-/// signal follows the thread that spawned the child, the runtime thread that
-/// drives the command for as long as the process lives.
-pub(in crate::app) fn run_upgrade_dialog_client(shortcut: Option<DialogShortcut>) -> Result<()> {
-    run_dialog_client::<UpgradeDialogPrompt>(shortcut)
+/// parent-death signal (`PR_SET_PDEATHSIG`, through rustix,
+/// [`tie_dialog_to_parent`]) before anything else, before even its theme is
+/// read, so a child blocked on a theme file dies with its parent too; it then
+/// checks that its parent is still the command named in the prompt, which
+/// covers a parent that died before the signal was set. The signal follows
+/// the thread that spawned the child, the runtime thread that drives the
+/// command for as long as the process lives.
+pub(in crate::app) fn run_upgrade_dialog_client(
+    shortcut: Option<DialogShortcut>,
+    theme: ResolvedTheme,
+) -> Result<()> {
+    run_dialog_client::<UpgradeDialogPrompt>(shortcut, theme)
+}
+
+/// Makes this dialog child die with the command that asked
+/// ([`run_upgrade_dialog_client`]). The command's entry calls it first.
+pub(in crate::app) fn tie_dialog_to_parent() -> Result<()> {
+    rustix::process::set_parent_process_death_signal(Some(rustix::process::Signal::KILL))
+        .context("tie the dialog to its command")
 }
 
 /// The body of every trusted dialog child: see [`run_upgrade_dialog_client`].
 pub(in crate::app) fn run_dialog_client<P: DialogPrompt>(
     shortcut: Option<DialogShortcut>,
+    theme: ResolvedTheme,
 ) -> Result<()> {
-    rustix::process::set_parent_process_death_signal(Some(rustix::process::Signal::KILL))
-        .context("tie the dialog to its command")?;
     let prompt: P =
         read_private_frame_bounded(&mut io::stdin().lock(), MAX_UPGRADE_DIALOG_FRAME_BYTES)?;
     prompt.validate()?;
@@ -306,7 +319,7 @@ pub(in crate::app) fn run_dialog_client<P: DialogPrompt>(
         bail!("the command that asked has exited");
     }
     let (decision, receiver) = std_mpsc::channel();
-    let registration = run_trusted_dialog_window(prompt.window_options(decision, shortcut))?;
+    let registration = run_trusted_dialog_window(prompt.window_options(decision, shortcut), theme)?;
     let proceed = receiver.try_recv().unwrap_or(false);
     let written = write_private_frame_bounded(
         &mut io::stdout().lock(),

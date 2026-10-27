@@ -18,9 +18,9 @@
 //!    `[colors]` keys without a new theme read.
 //!
 //! Every chrome color the Window paints comes from a role or from a
-//! component derived from roles. Plan 0064 milestone 2 introduced the roles
-//! without changing a painted pixel, so a few roles still keep their legacy
-//! derivation; each says so where it is derived.
+//! component derived from roles, mixed in linear light ([`crate::color`]),
+//! except the raised surface's fallback, a step taken in encoded sRGB as
+//! theme authors take their own.
 
 #![allow(
     clippy::unreadable_literal,
@@ -33,7 +33,7 @@ use anyhow::Result;
 
 use crate::color::{
     NON_TEXT_MIN_CONTRAST, TEXT_MIN_CONTRAST, contrast_corrected, contrast_corrected_toward,
-    contrast_floor_toward, contrast_ratio, legacy_srgb, mix_linear, strongest_contrast_endpoint,
+    contrast_floor_toward, contrast_ratio, mix_encoded, mix_linear, strongest_contrast_endpoint,
 };
 use crate::config::OmarchyShellSettings;
 
@@ -44,17 +44,20 @@ use crate::config::OmarchyShellSettings;
 /// against `surface`, and `danger`, `warning`, `success`, `info` and
 /// `remote_marker` keep 3:1 whether hinted or not. Colors a theme names for
 /// surfaces, `selection`, `divider`, `focus_ring` and `accent`, and the
-/// legacy derivations kept for `text_muted` and `divider`, carry no floor.
+/// ramp `text_muted` keeps from a theme's muted color, carry no floor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChromeRoles {
-    /// The chrome background: the tab strip, the Explorer and panels. Today
-    /// the terminal background.
+    /// The chrome background: the tab strip and the Explorer. Today the
+    /// terminal background.
     pub surface: u32,
-    /// A surface raised above `surface`. Omarchy `lighter_background`.
+    /// A surface raised above `surface`: menus, pickers and popups, and the
+    /// selected tab when the theme names one.
+    /// Omarchy `lighter_background`.
     pub surface_raised: u32,
     /// A surface sunk below `surface`. Omarchy `dark_background`.
     pub surface_sunken: u32,
-    /// The selected row's base color. Today the terminal selection.
+    /// The selected row of a menu, picker or the Explorer. Today the
+    /// terminal selection.
     pub selection: u32,
     /// Dividers, frames and inactive pane borders.
     pub divider: u32,
@@ -545,6 +548,8 @@ impl ThemeInput {
                 accent: Some(0x78d2ff),
                 // The built-in muted color is its ANSI 8.
                 text_muted: Some(0x928374),
+                // The built-in pane border, between its background and text.
+                divider: Some(0x7c7e80),
                 ..RoleHints::default()
             },
             components: ThemeComponents::default(),
@@ -610,7 +615,7 @@ pub(crate) fn active_tab_foreground_fallback(
 /// Otherwise, including when the foreground is below the floor, it keeps the
 /// plain foreground.
 ///
-/// The mixes are in encoded sRGB, a legacy kept so roles changed no pixel.
+/// The mixes are in linear light, as every other chrome mix.
 pub(crate) fn inactive_tab_foreground_fallback(
     background: u32,
     foreground: u32,
@@ -621,7 +626,7 @@ pub(crate) fn inactive_tab_foreground_fallback(
         return foreground;
     }
     (0..4)
-        .map(|quarters| legacy_srgb::mix_quarters(muted, foreground, quarters))
+        .map(|quarters| mix_linear(muted, foreground, f64::from(quarters) / 4.0))
         .find(|candidate| {
             let contrast = contrast_ratio(*candidate, background);
             (INACTIVE_TAB_MIN_CONTRAST..=foreground_contrast).contains(&contrast)
@@ -652,11 +657,13 @@ pub fn derive(input: &ThemeInput) -> ChromeRoles {
 ///   `selection` is the theme's, else the terminal selection. Overriding
 ///   `surface` or `text` recolors chrome only: the terminal grid keeps its
 ///   palette.
+/// - `surface_raised` is the theme's, else `text` mixed 8% over the
+///   surface in encoded sRGB: a step like Omarchy's own
+///   `lighter_background` (tokyo-night 1a1b26 to 24283b).
 /// - `accent` is the theme's accent, else ANSI 4; `focus_ring` is the
 ///   theme's, else the accent.
-/// - `divider` is the theme's, else the encoded-sRGB midpoint of surface and
-///   text, a legacy kept for JSON and built-in themes. The Omarchy provider
-///   always hints one, ending at ANSI 8.
+/// - `divider` is the theme's, else ANSI 8. The Omarchy provider always
+///   hints one, ending at ANSI 8, and the built-in palette names its own.
 /// - `text_muted` is a JSON theme's `inactive_tab_foreground`; else the
 ///   inactive-tab ramp from the theme's muted color, which keeps every
 ///   painted inactive tab label of a theme that names one (JSON and
@@ -731,16 +738,14 @@ pub fn derive_with(input: &ThemeInput, overrides: &RoleOverrides) -> ChromeRoles
         surface,
         surface_raised: given(Role::SurfaceRaised)
             .or(hints.surface_raised)
-            .unwrap_or_else(|| mix_linear(surface, text, 0.08)),
+            .unwrap_or_else(|| mix_encoded(surface, text, 0.08)),
         surface_sunken: given(Role::SurfaceSunken)
             .or(hints.surface_sunken)
             .unwrap_or_else(|| mix_linear(surface, 0, 0.06)),
         selection: given(Role::Selection)
             .or(hints.selection)
             .unwrap_or(terminal.selection),
-        divider: given(Role::Divider)
-            .or(hints.divider)
-            .unwrap_or_else(|| legacy_srgb::midpoint(surface, text)),
+        divider: given(Role::Divider).or(hints.divider).unwrap_or(ansi[8]),
         focus_ring: given(Role::FocusRing).or(focus_hint).unwrap_or(accent),
         text,
         text_muted,

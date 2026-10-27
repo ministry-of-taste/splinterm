@@ -10,8 +10,8 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::{
     color::{
-        TEXT_MIN_CONTRAST, contrast_corrected, contrast_corrected_toward, contrast_ratio,
-        mix_linear, packed_channels, relative_luminance, rgb_channels,
+        TEXT_MIN_CONTRAST, contrast_corrected, contrast_corrected_toward, contrast_floor_toward,
+        contrast_ratio, mix_linear, packed_channels, relative_luminance, rgb_channels,
     },
     config::{OmarchyShellSettings, ResolvedTheme},
     frontend::PickerHitTarget,
@@ -426,27 +426,31 @@ impl ChromeSurface {
         }
     }
 
-    /// The foregrounds painted directly on this surface's panel fill. Menus
-    /// (the action palette, pickers and Explorer) draw primary and secondary
-    /// text there; the accent rail only marks rows. Popups also draw the
-    /// accent as text: the Dojo prompt's unselected destructive choice.
-    fn panel_foregrounds(self, palette: &SessionPickerPalette) -> Vec<u32> {
-        match self {
-            Self::Menu => vec![palette.primary, palette.secondary],
-            Self::Popup => vec![palette.primary, palette.secondary, palette.selected_rail],
-        }
-    }
-
-    /// Every way text meets this surface's panel fill: straight on it, and on
-    /// an unselected row under the translucent hover highlight, the press
-    /// highlight, or both. The action palette, the session picker and the tab
-    /// context menu blend those highlights before painting primary or
-    /// secondary row text; selected rows sit on the opaque selected fill.
+    /// Every way text meets a panel fill: straight on it, and on an
+    /// unselected row under the translucent hover highlight, the press
+    /// highlight, or both. Panels draw primary and secondary text and the
+    /// danger label of a destructive action, such as Terminate, there; the
+    /// accent rail only marks rows. Popups also draw the accent as text: the
+    /// Dojo prompt's unselected Restore or Revoke. The action palette, the
+    /// session picker and the tab context menu blend those highlights before
+    /// painting row text; selected rows sit on the opaque selected fill.
     fn panel_text_layers(self, palette: &SessionPickerPalette) -> Vec<PanelTextLayer> {
-        let row_text = vec![palette.highlight_primary, palette.highlight_secondary];
+        let row_text = vec![
+            palette.highlight_primary,
+            palette.highlight_secondary,
+            palette.highlight_danger,
+        ];
         let mut layers = vec![PanelTextLayer {
             overlays: Vec::new(),
-            text: self.panel_foregrounds(palette),
+            text: match self {
+                Self::Menu => vec![palette.primary, palette.secondary, palette.danger],
+                Self::Popup => vec![
+                    palette.primary,
+                    palette.secondary,
+                    palette.danger,
+                    palette.selected_rail,
+                ],
+            },
         }];
         layers.extend(
             highlight_overlays(palette)
@@ -458,20 +462,6 @@ impl ChromeSurface {
         );
         layers
     }
-}
-
-/// Mixes two colours in encoded sRGB, the space the compositor blends in.
-#[cfg(test)]
-fn mix_encoded(first: u32, second: u32, second_weight: f64) -> u32 {
-    let first = rgb_channels(first);
-    let second = rgb_channels(second);
-    packed_channels(std::array::from_fn(|index| {
-        let mixed = f64::from(first[index]) * (1.0 - second_weight)
-            + f64::from(second[index]) * second_weight;
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let mixed = mixed.round().clamp(0.0, 255.0) as u8;
-        mixed
-    }))
 }
 
 /// Alpha, out of 255, of the translucent highlight blended over a hovered row.
@@ -534,6 +524,28 @@ fn panel_layers_readable(panel: u32, coverage: f64, layers: &[PanelTextLayer]) -
         .all(|layer| panel_layer_readable(panel, coverage, layer))
 }
 
+/// The least coverage from `configured` up at which every layer keeps the
+/// floor; fully opaque when some layer misses it even there.
+fn panel_layers_coverage(panel: u32, configured: f64, layers: &[PanelTextLayer]) -> f64 {
+    if panel_layers_readable(panel, configured, layers) {
+        return configured;
+    }
+    if !panel_layers_readable(panel, 1.0, layers) {
+        return 1.0;
+    }
+    let mut failing = configured;
+    let mut passing = 1.0_f64;
+    for _ in 0..24 {
+        let candidate = f64::midpoint(failing, passing);
+        if panel_layers_readable(panel, candidate, layers) {
+            passing = candidate;
+        } else {
+            failing = candidate;
+        }
+    }
+    passing
+}
+
 /// Whether `text` painted straight on the panel keeps the floor.
 #[cfg(test)]
 fn panel_text_readable(panel: u32, coverage: f64, text: &[u32]) -> bool {
@@ -580,9 +592,9 @@ pub(crate) fn chrome_panel_fill(
 /// `background-alpha` (`shell_alpha`) over a window whose background has
 /// `window_alpha`.
 ///
-/// The panel colour is the theme background, the same colour as the window's
-/// own glass, so the panel is drawn as that glass with the shell alpha layered
-/// over it: its coverage is `1 - (1 - shell) * (1 - window)`. An opaque window
+/// The panel is drawn over the window's own glass with the shell alpha
+/// layered over it, whatever the panel colour, the background or the raised
+/// surface: its coverage is `1 - (1 - shell) * (1 - window)`. An opaque window
 /// therefore keeps opaque panels, and a glassy one shows its blurred backdrop
 /// through them no more than through the terminal itself. Text over an
 /// unknown backdrop must stay readable, so the coverage is raised to the
@@ -597,23 +609,7 @@ fn chrome_panel_fill_layers(
     layers: &[PanelTextLayer],
 ) -> [u8; 4] {
     let configured = configured_panel_coverage(shell_alpha, window_alpha);
-    let coverage = if panel_layers_readable(panel, configured, layers) {
-        configured
-    } else if !panel_layers_readable(panel, 1.0, layers) {
-        1.0
-    } else {
-        let mut failing = configured;
-        let mut passing = 1.0_f64;
-        for _ in 0..24 {
-            let candidate = f64::midpoint(failing, passing);
-            if panel_layers_readable(panel, candidate, layers) {
-                passing = candidate;
-            } else {
-                failing = candidate;
-            }
-        }
-        passing
-    };
+    let coverage = panel_layers_coverage(panel, configured, layers);
     // Round coverage up so quantization never drops below the floor.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let alpha = (coverage * 255.0 - 1e-9).ceil().clamp(0.0, 255.0) as u8;
@@ -639,6 +635,16 @@ pub(crate) struct SessionPickerPalette {
     /// highlight, corrected to 4.5:1 against every opaque highlight state.
     pub(crate) highlight_primary: u32,
     pub(crate) highlight_secondary: u32,
+    /// A destructive action's label, such as Terminate, from the danger role
+    /// or ANSI 9, whichever reads better on the panel. `danger` and
+    /// `selected_danger` are mixed toward the text until they keep 4.5:1 on
+    /// the panel and the selected fill; `highlight_danger` is corrected
+    /// toward black or white until it keeps 4.5:1 under every highlight. On
+    /// a translucent panel `danger` and `highlight_danger` are also mixed
+    /// toward the text until they read at the primary text's coverage.
+    pub(crate) danger: u32,
+    pub(crate) selected_danger: u32,
+    pub(crate) highlight_danger: u32,
     pub(crate) shadow: [u8; 4],
     /// Status tints on the opaque panel and on the selected fill;
     /// `None` when `[explorer] status-colors=no`.
@@ -657,6 +663,18 @@ impl SessionPickerPalette {
             (self.highlight_primary, self.highlight_secondary)
         } else {
             (self.primary, self.secondary)
+        }
+    }
+
+    /// A destructive action's label on the selected fill, under a hover or
+    /// press highlight, or on the panel.
+    pub(crate) const fn row_danger(&self, selected: bool, highlighted: bool) -> u32 {
+        if selected {
+            self.selected_danger
+        } else if highlighted {
+            self.highlight_danger
+        } else {
+            self.danger
         }
     }
 
@@ -681,21 +699,43 @@ impl SessionPickerPalette {
     }
 }
 
+/// The opaque palette of a popup or menu, which sits on the raised surface,
+/// as Omarchy's own `[menu]` and `[popups]` do. Painters take
+/// [`chrome_panel_palette`], which also follows the shell alpha.
+#[cfg(test)]
 #[must_use]
 pub(crate) fn session_picker_palette(theme: ResolvedTheme) -> SessionPickerPalette {
+    panel_palette(theme, theme.roles.surface_raised)
+}
+
+/// The opaque palette of a panel drawn in `panel`. Its text is the `text`
+/// and `text-muted` roles and its selected row the `selection` role, each
+/// raised to 4.5:1 against what it sits on; the scrim behind a modal panel
+/// darkens the `surface`.
+fn panel_palette(theme: ResolvedTheme, panel: u32) -> SessionPickerPalette {
     let roles = theme.roles;
-    let primary = contrast_corrected(roles.text, roles.surface);
-    let secondary = contrast_corrected_toward(
-        mix_linear(primary, roles.surface, 0.30),
-        primary,
-        roles.surface,
-    );
-    let selected_fill = mix_linear(roles.surface, roles.selection, 0.24);
+    let primary = contrast_corrected(roles.text, panel);
+    let secondary = contrast_corrected_toward(roles.text_muted, primary, panel);
+    let selected_fill = roles.selection;
     let selected_primary = contrast_corrected(primary, selected_fill);
-    let selected_secondary = contrast_corrected_toward(
-        mix_linear(selected_primary, selected_fill, 0.30),
+    let selected_secondary =
+        contrast_corrected_toward(roles.text_muted, selected_primary, selected_fill);
+    // Destructive labels are text, so they start from the theme's red or
+    // bright red (ANSI 9), whichever reads better on the panel, unless
+    // `[colors] danger` chose the colour.
+    let danger_text = if roles.verbatim.contains(Role::Danger)
+        || contrast_ratio(roles.danger, panel) >= contrast_ratio(theme.ansi[9], panel)
+    {
+        roles.danger
+    } else {
+        theme.ansi[9]
+    };
+    let danger = contrast_floor_toward(danger_text, primary, panel, TEXT_MIN_CONTRAST);
+    let selected_danger = contrast_floor_toward(
+        danger_text,
         selected_primary,
         selected_fill,
+        TEXT_MIN_CONTRAST,
     );
     // A focus ring too close to the frame colour reads as no focus, so the
     // accent takes its place, unless `[colors] focus-ring` chose it.
@@ -706,7 +746,7 @@ pub(crate) fn session_picker_palette(theme: ResolvedTheme) -> SessionPickerPalet
     } else {
         roles.accent
     };
-    let [red, green, blue] = rgb_channels(mix_linear(roles.surface, 0, 0.80));
+    let [red, green, blue] = rgb_channels(modal_scrim(roles.surface));
     // Every opaque state an unselected highlighted row can be in.
     let highlight_states = [
         vec![(selected_fill, ROW_HOVER_ALPHA)],
@@ -716,15 +756,17 @@ pub(crate) fn session_picker_palette(theme: ResolvedTheme) -> SessionPickerPalet
             (roles.accent, ROW_PRESS_ALPHA),
         ],
     ]
-    .map(|overlays| visible_panel_color(roles.surface, 1.0, &overlays, 0));
+    .map(|overlays| visible_panel_color(panel, 1.0, &overlays, 0));
     let highlight_primary =
         contrast_corrected_against_all(primary, &highlight_states).unwrap_or(primary);
     let highlight_secondary =
         contrast_corrected_against_all(secondary, &highlight_states).unwrap_or(secondary);
-    let [panel_red, panel_green, panel_blue] = rgb_channels(roles.surface);
+    let highlight_danger =
+        contrast_corrected_against_all(danger, &highlight_states).unwrap_or(danger);
+    let [panel_red, panel_green, panel_blue] = rgb_channels(panel);
     SessionPickerPalette {
-        scrim: [red, green, blue, 140],
-        panel: roles.surface,
+        scrim: [red, green, blue, MODAL_SCRIM_ALPHA],
+        panel,
         panel_fill: [panel_red, panel_green, panel_blue, u8::MAX],
         primary,
         secondary,
@@ -736,10 +778,23 @@ pub(crate) fn session_picker_palette(theme: ResolvedTheme) -> SessionPickerPalet
         selected_secondary,
         highlight_primary,
         highlight_secondary,
+        danger,
+        selected_danger,
+        highlight_danger,
         shadow: [0, 0, 0, 89],
-        status_tints: Some(ChromeTints::on(&roles, roles.surface)),
+        status_tints: Some(ChromeTints::on(&roles, panel)),
         selected_status_tints: Some(ChromeTints::on(&roles, selected_fill)),
     }
+}
+
+/// How much of the scrim behind a modal panel covers the Window.
+pub(crate) const MODAL_SCRIM_ALPHA: u8 = 140;
+
+/// The scrim behind a modal panel: the `surface` darkened 80% toward black,
+/// so it dims the Window in the theme's own hue, dark or light.
+#[must_use]
+pub(crate) fn modal_scrim(surface: u32) -> u32 {
+    mix_linear(surface, 0, 0.80)
 }
 
 /// The overlay palette for a panel that follows the Omarchy shell's
@@ -751,7 +806,19 @@ pub(crate) fn chrome_panel_palette(
     theme: ResolvedTheme,
     surface: ChromeSurface,
 ) -> SessionPickerPalette {
-    let mut palette = session_picker_palette(theme);
+    chrome_panel_palette_on(theme, surface, theme.roles.surface_raised)
+}
+
+/// [`chrome_panel_palette`] for a panel drawn in `panel` instead of the
+/// raised surface: the docked Explorer, which is part of the Window rather
+/// than a popup over it.
+#[must_use]
+pub(crate) fn chrome_panel_palette_on(
+    theme: ResolvedTheme,
+    surface: ChromeSurface,
+    panel: u32,
+) -> SessionPickerPalette {
+    let mut palette = panel_palette(theme, panel);
     let shell_alpha = surface.shell_alpha(theme.shell);
     let configured = configured_panel_coverage(shell_alpha, theme.background_alpha);
     if configured < 1.0 {
@@ -766,15 +833,18 @@ pub(crate) fn chrome_panel_palette(
                 })
             })
             .collect::<Vec<_>>();
-        // Keep the opaque correction when no colour fits both backdrops; the
-        // coverage floor then raises the panel instead.
-        if let (Some(primary), Some(secondary)) = (
-            contrast_corrected_against_all(palette.highlight_primary, &backgrounds),
-            contrast_corrected_against_all(palette.highlight_secondary, &backgrounds),
-        ) {
-            palette.highlight_primary = primary;
-            palette.highlight_secondary = secondary;
+        // Each colour keeps its opaque correction when none fits both
+        // backdrops; the coverage floor then raises the panel instead.
+        for color in [
+            &mut palette.highlight_primary,
+            &mut palette.highlight_secondary,
+            &mut palette.highlight_danger,
+        ] {
+            if let Some(corrected) = contrast_corrected_against_all(*color, &backgrounds) {
+                *color = corrected;
+            }
         }
+        keep_secondary_text_within_primary_coverage(&mut palette, configured);
     }
     palette.panel_fill = chrome_panel_fill_layers(
         palette.panel,
@@ -783,6 +853,69 @@ pub(crate) fn chrome_panel_palette(
         &surface.panel_text_layers(&palette),
     );
     palette
+}
+
+/// Muted and danger text start from their roles, often right at the floor
+/// on the opaque panel, so over a backdrop they would need a far more
+/// opaque panel than the primary text does. On a translucent panel they are
+/// mixed toward the primary text, plain or highlighted, only as far as they
+/// need to read at the coverage the primary text needs: they never make the
+/// panel more opaque than it.
+fn keep_secondary_text_within_primary_coverage(
+    palette: &mut SessionPickerPalette,
+    configured: f64,
+) {
+    let overlays = highlight_overlays(palette);
+    let layer = |overlays: &[(u32, u8)], color: u32| PanelTextLayer {
+        overlays: overlays.to_vec(),
+        text: vec![color],
+    };
+    let mut primary_layers = vec![layer(&[], palette.primary)];
+    primary_layers.extend(
+        overlays
+            .iter()
+            .map(|overlays| layer(overlays, palette.highlight_primary)),
+    );
+    let panel = palette.panel;
+    let coverage = panel_layers_coverage(panel, configured, &primary_layers);
+    let plain = |color| panel_layer_readable(panel, coverage, &layer(&[], color));
+    let highlighted = |color| {
+        overlays
+            .iter()
+            .all(|overlays| panel_layer_readable(panel, coverage, &layer(overlays, color)))
+    };
+    palette.secondary = mixed_until_readable(palette.secondary, palette.primary, plain);
+    palette.danger = mixed_until_readable(palette.danger, palette.primary, plain);
+    palette.highlight_secondary = mixed_until_readable(
+        palette.highlight_secondary,
+        palette.highlight_primary,
+        highlighted,
+    );
+    palette.highlight_danger = mixed_until_readable(
+        palette.highlight_danger,
+        palette.highlight_primary,
+        highlighted,
+    );
+}
+
+/// `color` mixed toward `target`, in linear light, only as far as it takes
+/// to become `readable`; `color` itself when it already is or `target` is
+/// not.
+fn mixed_until_readable(color: u32, target: u32, readable: impl Fn(u32) -> bool) -> u32 {
+    if readable(color) || !readable(target) {
+        return color;
+    }
+    let mut failing = 0.0_f64;
+    let mut passing = 1.0_f64;
+    for _ in 0..24 {
+        let weight = f64::midpoint(failing, passing);
+        if readable(mix_linear(color, target, weight)) {
+            passing = weight;
+        } else {
+            failing = weight;
+        }
+    }
+    mix_linear(color, target, passing)
 }
 
 /// The translucent highlights an unselected row can carry: hover, press, or
@@ -1891,6 +2024,7 @@ pub(crate) fn paint_session_picker_overlay(
 mod tests {
     use super::super::super::pixel_index;
     use super::*;
+    use crate::color::mix_encoded;
     use crate::theme::ChromeRoles;
 
     #[test]
@@ -2670,8 +2804,11 @@ mod tests {
         ResolvedTheme {
             roles: ChromeRoles {
                 surface: 0x1a_1b_26,
+                surface_raised: 0x1a_1b_26,
                 text: 0xc0_ca_f5,
-                selection: 0x7a_a2_f7,
+                text_muted: 0x8f_97_bb,
+                selection: 0x29_2e_42,
+                danger: 0xf7_76_8e,
                 ..ChromeRoles::default()
             },
             background_alpha: foot_alpha(0.65),
@@ -2758,14 +2895,26 @@ mod tests {
             coverage(light - 2),
             &[0x5a_5a_5a]
         ));
-        // A palette whose secondary text was corrected to exactly the floor on
-        // the opaque panel has no headroom, so its panel stays opaque.
+        // Secondary text corrected to exactly the floor on the opaque panel
+        // has no headroom, so a translucent panel mixes it toward the primary
+        // text instead of turning opaque.
         let mut floored = theme;
         floored.roles.surface = 0xf5_f1_e8;
+        floored.roles.surface_raised = 0xf5_f1_e8;
         floored.roles.text = 0x22_24_28;
+        // A readable accent: popups also draw it as text.
+        floored.roles.accent = 0x2a_4a_8a;
+        let opaque = session_picker_palette(floored);
+        assert!(contrast_ratio(opaque.secondary, opaque.panel) < 4.6);
         let floored = chrome_panel_palette(floored, ChromeSurface::Popup);
-        assert!(contrast_ratio(floored.secondary, floored.panel) < 4.6);
-        assert_eq!(floored.panel_fill[3], u8::MAX);
+        let alpha = floored.panel_fill[3];
+        assert!(alpha < u8::MAX, "{alpha}");
+        assert_ne!(floored.secondary, opaque.secondary);
+        assert!(panel_text_readable(
+            floored.panel,
+            coverage(alpha),
+            &[floored.secondary]
+        ));
         // Text that misses the floor even on the opaque panel keeps it opaque.
         assert_eq!(
             chrome_panel_fill(0x77_77_77, 0, 0, &[0x78_78_78])[3],
@@ -2775,19 +2924,18 @@ mod tests {
 
     #[test]
     fn popup_accent_text_on_the_panel_joins_the_coverage_floor() {
-        // The Dojo prompt paints its unselected Terminate label in the accent
-        // (selected_rail) straight onto the popup's panel fill.
+        // The Dojo prompt paints its unselected Restore or Revoke label in
+        // the accent (selected_rail) straight onto the popup's panel fill.
         let mut theme = glassy_theme(0.0, 0.0);
+        let coverage = |fill: [u8; 4]| f64::from(fill[3]) / 255.0;
         let menu = chrome_panel_palette(theme, ChromeSurface::Menu);
         let popup = chrome_panel_palette(theme, ChromeSurface::Popup);
-        let coverage = |fill: [u8; 4]| f64::from(fill[3]) / 255.0;
         assert!(panel_text_readable(
             popup.panel,
             coverage(popup.panel_fill),
             &[popup.primary, popup.secondary, popup.selected_rail],
         ));
         assert!(popup.panel_fill[3] >= menu.panel_fill[3]);
-
         // An accent too dim to read even on the opaque panel keeps popups
         // opaque, while menus, which draw no accent text, stay translucent.
         theme.roles.accent = 0x20_22_30;
@@ -2798,6 +2946,38 @@ mod tests {
     }
 
     #[test]
+    fn danger_text_on_the_panel_joins_the_coverage_floor() {
+        // The Dojo prompt, the tab menu and the command palette paint
+        // Terminate in danger straight onto the panel fill.
+        let mut theme = glassy_theme(0.0, 0.0);
+        let coverage = |fill: [u8; 4]| f64::from(fill[3]) / 255.0;
+        for surface in [ChromeSurface::Menu, ChromeSurface::Popup] {
+            let palette = chrome_panel_palette(theme, surface);
+            assert!(palette.panel_fill[3] < u8::MAX, "{surface:?}");
+            assert!(panel_text_readable(
+                palette.panel,
+                coverage(palette.panel_fill),
+                &[palette.primary, palette.secondary, palette.danger],
+            ));
+        }
+        // A danger floored to exactly 4.5:1 on the opaque panel has no
+        // headroom over a backdrop, so a translucent panel raises it further
+        // rather than turning opaque.
+        theme.roles.danger = 0x20_22_30;
+        theme.ansi[9] = 0x20_22_30;
+        let opaque = session_picker_palette(theme);
+        assert!(contrast_ratio(opaque.danger, opaque.panel) < 4.6);
+        let palette = chrome_panel_palette(theme, ChromeSurface::Menu);
+        assert!(palette.panel_fill[3] < u8::MAX);
+        assert_ne!(palette.danger, opaque.danger);
+        assert!(panel_text_readable(
+            palette.panel,
+            coverage(palette.panel_fill),
+            &[palette.danger],
+        ));
+    }
+
+    #[test]
     fn hovered_and_pressed_rows_keep_the_floor_on_translucent_panels() {
         // The review palette: the bare panel alone allowed 240/255 coverage,
         // where the hover highlight dropped secondary text to about 4.15:1, and
@@ -2805,7 +2985,9 @@ mod tests {
         let theme = ResolvedTheme {
             roles: ChromeRoles {
                 surface: 0x63_05_86,
+                surface_raised: 0x63_05_86,
                 text: 0x6e_dc_dd,
+                text_muted: mix_linear(0x6e_dc_dd, 0x63_05_86, 0.30),
                 selection: 0x9c_c3_58,
                 ..ChromeRoles::default()
             },
@@ -2838,5 +3020,210 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// What popups and menus paint for each theme source (Plan 0064
+    /// milestone 5): the raised panel, its text and muted text, the
+    /// selected row and its text, a destructive label on the panel and on
+    /// the selected row, and the scrim.
+    #[allow(clippy::type_complexity)]
+    const PANEL_PINS: [(&str, [u32; 8]); 9] = [
+        (
+            "builtin",
+            [
+                0x20_23_27, 0xeb_eb_eb, 0x95_87_78, 0x35_4a_60, 0xeb_eb_eb, 0xfb_49_34, 0xf5_a0_9b,
+                0x03_04_05,
+            ],
+        ),
+        (
+            "json",
+            [
+                0x21_28_30, 0xe0_e4_ea, 0x8a_91_98, 0x2a_3a_4a, 0xe0_e4_ea, 0xee_5c_6b, 0xeb_83_8d,
+                0x03_06_0a,
+            ],
+        ),
+        (
+            "json-explicit",
+            [
+                0x21_28_30, 0xe0_e4_ea, 0x88_99_aa, 0x2a_3a_4a, 0xe0_e4_ea, 0xee_5c_6b, 0xeb_83_8d,
+                0x03_06_0a,
+            ],
+        ),
+        (
+            "tokyo-night",
+            [
+                0x24_28_3b, 0xa9_b1_d6, 0x86_8e_af, 0x29_2e_42, 0xa9_b1_d6, 0xff_7a_93, 0xff_7a_93,
+                0x07_07_0d,
+            ],
+        ),
+        (
+            "flexoki-light",
+            [
+                0xe6_e4_d9, 0x10_0f_0f, 0x62_61_5c, 0xce_cd_c3, 0x10_0f_0f, 0xb0_41_37, 0x97_37_2f,
+                0x7c_7a_74,
+            ],
+        ),
+        (
+            "last-horizon",
+            [
+                0x0c_0b_0c, 0xfa_fc_fb, 0x98_95_96, 0x58_4e_51, 0xfa_fc_fb, 0xc3_8b_7b, 0xd8_bd_b5,
+                0x02_02_02,
+            ],
+        ),
+        (
+            "legacy-gruvbox",
+            [
+                0x3c_38_36, 0xd4_be_98, 0xb2_9f_81, 0x50_49_45, 0xd4_be_98, 0xe4_8a_75, 0xd8_b3_90,
+                0x0e_0e_0e,
+            ],
+        ),
+        (
+            "alacritty-kanagawa",
+            [
+                0x2e_2e_34, 0xdc_d7_ba, 0xbc_b8_a0, 0x2d_4f_67, 0xdc_d7_ba, 0xe5_7464, 0xe0_b1_99,
+                0x09_09_0e,
+            ],
+        ),
+        (
+            "semantic-keys",
+            [
+                0x1f_1a_30, 0xd8_d4_ea, 0x90_8b_a8, 0x2a_25_40, 0xd8_d4_ea, 0xff_8a_94, 0xff_8a_94,
+                0x05_04_09,
+            ],
+        ),
+    ];
+
+    #[test]
+    fn popups_paint_the_raised_surface_and_the_text_roles_for_every_theme() {
+        let themes = crate::config::tests::provider_themes();
+        let painted = themes
+            .iter()
+            .map(|(name, theme)| {
+                let palette = session_picker_palette(*theme);
+                let [red, green, blue, alpha] = palette.scrim;
+                assert_eq!(alpha, MODAL_SCRIM_ALPHA, "{name}");
+                (
+                    *name,
+                    [
+                        palette.panel,
+                        palette.primary,
+                        palette.secondary,
+                        palette.selected_fill,
+                        palette.selected_primary,
+                        palette.danger,
+                        palette.selected_danger,
+                        packed_channels([red, green, blue]),
+                    ],
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(painted, PANEL_PINS, "{painted:#08x?}");
+        for (name, theme) in themes {
+            let palette = session_picker_palette(theme);
+            let roles = theme.roles;
+            assert_eq!(palette.panel, roles.surface_raised, "{name}");
+            assert_eq!(palette.selected_fill, roles.selection, "{name}");
+            assert_eq!(
+                packed_channels(palette.scrim[..3].try_into().unwrap()),
+                modal_scrim(roles.surface),
+                "{name}"
+            );
+            for (text, under) in [
+                (palette.primary, palette.panel),
+                (palette.secondary, palette.panel),
+                (palette.danger, palette.panel),
+                (palette.selected_primary, palette.selected_fill),
+                (palette.selected_secondary, palette.selected_fill),
+                (palette.selected_danger, palette.selected_fill),
+            ] {
+                assert!(
+                    contrast_ratio(text, under) >= TEXT_MIN_CONTRAST,
+                    "{name}: {text:06x} on {under:06x}"
+                );
+            }
+            // Hovered and pressed rows, over the full selection fill.
+            let hover = (palette.selected_fill, ROW_HOVER_ALPHA);
+            let press = (palette.selected_rail, ROW_PRESS_ALPHA);
+            for overlays in [vec![hover], vec![press], vec![hover, press]] {
+                let under = visible_panel_color(palette.panel, 1.0, &overlays, 0);
+                for text in [
+                    palette.highlight_primary,
+                    palette.highlight_secondary,
+                    palette.highlight_danger,
+                ] {
+                    assert!(
+                        contrast_ratio(text, under) >= TEXT_MIN_CONTRAST,
+                        "{name}: {text:06x} under {overlays:x?}"
+                    );
+                }
+            }
+            // Text that already keeps its floor is the role itself.
+            for (role, painted) in [
+                (roles.text, palette.primary),
+                (roles.text_muted, palette.secondary),
+            ] {
+                if contrast_ratio(role, palette.panel) >= TEXT_MIN_CONTRAST {
+                    assert_eq!(painted, role, "{name}");
+                }
+            }
+            // Danger text starts from red or bright red, whichever reads
+            // better on the panel.
+            let red = [roles.danger, theme.ansi[9]]
+                .into_iter()
+                .max_by(|left, right| {
+                    contrast_ratio(*left, palette.panel)
+                        .total_cmp(&contrast_ratio(*right, palette.panel))
+                })
+                .unwrap();
+            if contrast_ratio(red, palette.panel) >= TEXT_MIN_CONTRAST {
+                assert_eq!(palette.danger, red, "{name}");
+            }
+        }
+    }
+
+    /// The scrim darkens the theme's own surface, for a light theme too.
+    #[test]
+    fn the_scrim_darkens_the_surface() {
+        for surface in [0x000e_1216, 0xff_fc_f0, 0x80_40_20] {
+            let scrim = modal_scrim(surface);
+            assert_eq!(scrim, mix_linear(surface, 0, 0.80));
+            assert!(relative_luminance(scrim) < relative_luminance(surface));
+        }
+        assert_eq!(modal_scrim(0xff_ff_ff), 0x7c_7c_7c);
+    }
+
+    /// `[colors] surface-raised`, `selection` and `danger` recolour every
+    /// popup and menu, and their text stays readable on them.
+    #[test]
+    fn role_overrides_recolor_popups_and_menus() {
+        let theme = ResolvedTheme::from_input_with_colors(
+            &crate::theme::ThemeInput::builtin(),
+            &crate::config::tests::theme_colors(
+                "[colors]\nsurface-raised=#2a1c3c\nselection=#5a3c7c\ndanger=#ff4060\n",
+            ),
+        );
+        for palette in [
+            session_picker_palette(theme),
+            chrome_panel_palette(theme, ChromeSurface::Menu),
+            chrome_panel_palette(theme, ChromeSurface::Popup),
+        ] {
+            assert_eq!(palette.panel, 0x2a_1c_3c);
+            assert_eq!(palette.selected_fill, 0x5a_3c_7c);
+            assert_eq!(palette.danger, 0xff_40_60);
+            assert!(contrast_ratio(palette.selected_danger, 0x5a_3c_7c) >= TEXT_MIN_CONTRAST);
+            assert_eq!(palette.row_danger(true, false), palette.selected_danger);
+            assert_eq!(palette.row_danger(false, true), palette.highlight_danger);
+            assert_eq!(palette.row_danger(false, false), palette.danger);
+        }
+        // A danger too faint for the panel is raised toward the text, even
+        // when set by name: panels keep their text readable.
+        let faint = ResolvedTheme::from_input_with_colors(
+            &crate::theme::ThemeInput::builtin(),
+            &crate::config::tests::theme_colors("[colors]\ndanger=#3a2020\n"),
+        );
+        let palette = session_picker_palette(faint);
+        assert_eq!(faint.roles.danger, 0x3a_20_20);
+        assert_ne!(palette.danger, 0x3a_20_20);
+        assert!(contrast_ratio(palette.danger, palette.panel) >= TEXT_MIN_CONTRAST);
     }
 }

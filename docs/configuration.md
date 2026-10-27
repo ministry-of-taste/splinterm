@@ -795,16 +795,16 @@ come before their legacy aliases, in `omarchy-theme-color`'s order:
 
 | Role | Used for | Keys, in order | Without one |
 | --- | --- | --- | --- |
-| surface-raised | selected Dojo tab body | `lighter_background`, `lighter_bg` | Foot `bright0` |
+| surface-raised | menus, pickers, popups, selected Dojo tab body | `lighter_background`, `lighter_bg` | the foreground mixed 8% over the background in encoded sRGB; for the selected tab, Foot `bright0` |
 | surface-sunken | (not yet painted) | `dark_background`, `dark_bg` | the background mixed 6% toward black |
 | selection | the selected row's fill | `selection_background`, `selection` | Foot `selection-background` |
 | divider | pane borders, frames | `border`, `muted`, `color8` | Foot `bright0` |
 | focus-ring | active pane border, focused frames | `active_border_color` | the accent |
-| text-muted | inactive tab labels | `muted`, `dark_foreground`, `dark_fg` | the foreground mixed 30% toward the background |
+| text-muted | inactive tab labels, menu secondary text | `muted`, `dark_foreground`, `dark_fg` | the foreground mixed 30% toward the background |
 | accent | active tab underline, selection rails | `accent`, `cursor`, `blue`, `color4` | Foot cursor colour |
-| danger | needs input, error | `red`, `color1` | Foot `regular1` |
-| warning | working, "Asking" | `warning`, `yellow`, `color3` | Foot `regular3` |
-| success | idle | `success`, `green`, `color2` | Foot `regular2` |
+| danger | needs input, error, Terminate, a trusted dialog's no area | `red`, `color1` | Foot `regular1` |
+| warning | working, "Asking", a trusted dialog's frame | `warning`, `yellow`, `color3` | Foot `regular3` |
+| success | idle, a trusted dialog's yes area | `success`, `green`, `color2` | Foot `regular2` |
 | info | done | `cyan`, `color6` | Foot `regular6` |
 | remote-marker | the remote host tag | `signal`, `magenta`, `color5` | Foot `regular5` |
 
@@ -820,11 +820,13 @@ standard error. The theme's appearance, dark or light, is `colors.toml`
 white text contrasts more with the background.
 
 Omarchy itself falls back from `lighter_background` to `color0`, which is the
-terminal background. That would make the selected tab invisible, so Splinterm
-uses Foot `bright0` instead. The selected-tab body never borrows the terminal
-selection background. Its label and close affordance use whichever effective
-Foot background or foreground has higher WCAG contrast against that resolved tab
-body, preferring the foreground on an exact tie.
+terminal background. That would make the selected tab and the popups
+invisible, so Splinterm uses Foot `bright0` for the selected tab instead, and
+for popups the foreground mixed 8% over the background in encoded sRGB, a step
+like a theme's own `lighter_background`. The selected-tab body never borrows
+the terminal selection background. Its label and close affordance use
+whichever effective Foot background or foreground has higher WCAG contrast
+against that resolved tab body, preferring the foreground on an exact tie.
 
 Inactive tab labels and close affordances are muted. Splinterm starts from the
 resolved text-muted hint and keeps it when it has at
@@ -902,19 +904,19 @@ accent=#8c6c3e
 
 | Key | Painted today | Without the key |
 | --- | --- | --- |
-| `surface` | the tab strip, the Explorer panel, menus, pickers, popups and the gap behind a trusted dialog's answer areas | the terminal background |
-| `surface-raised` | the selected Dojo tab body | the theme's ([role table](#native-omarchy-theme-integration)); for the selected tab, Foot `bright0` when the theme names none |
+| `surface` | the tab strip and the Explorer panel; darkened 80% toward black, the scrim behind a modal picker | the terminal background |
+| `surface-raised` | menus, pickers, the command palette, the tab menu, the Dojo prompt, the history overlay and other popups, and the selected Dojo tab body | the theme's ([role table](#native-omarchy-theme-integration)), else `text` mixed 8% over `surface` in encoded sRGB; for the selected tab, Foot `bright0` when the theme names none |
 | `surface-sunken` | nothing yet | the theme's |
-| `selection` | the selected row of menus, pickers and the Explorer, mixed 24% over the panel | the theme's |
+| `selection` | the selected row of menus, pickers and the Explorer | the theme's |
 | `divider` | pane borders and frames, menu and picker frames, the tab strip border | the theme's |
 | `focus-ring` | the active pane border, focused frames and focused menu frames | the theme's, else `accent` |
-| `text` | tab labels and menu, picker and Explorer text, which those panels raise to 4.5:1 | the terminal foreground |
-| `text-muted` | inactive tab labels | the theme's, ramped from `text` |
+| `text` | tab labels, menu, picker and Explorer text, and trusted dialog text, which those panels and dialogs raise to 4.5:1 | the terminal foreground |
+| `text-muted` | inactive tab labels, and the secondary text of menus, pickers and the Explorer, raised to 4.5:1 there | the theme's, ramped from `text` |
 | `text-faint` | through `status-stale` only | `text` mixed 55% toward `surface` |
 | `accent` | the active tab underline, selection rails, the history overlay | the theme's |
-| `danger` | through `status-needs-input` and `status-error` only | the theme's |
-| `warning` | the "Asking" marker, and through `status-working` | the theme's |
-| `success` | through `status-idle` only | the theme's |
+| `danger` | Terminate in the command palette, the tab menu and the Dojo prompt, raised to 4.5:1 there; a trusted dialog's red (no) area; and through `status-needs-input` and `status-error` | the theme's |
+| `warning` | the "Asking" marker, a trusted dialog's frame, and through `status-working` | the theme's |
+| `success` | a trusted dialog's green (yes) area, and through `status-idle` | the theme's |
 | `info` | through `status-done` only | the theme's |
 | `status-needs-input` | the needs-input status glyph | `danger` |
 | `status-error` | the error status glyph | `danger` |
@@ -939,23 +941,35 @@ For each colour Splinterm takes the first of:
 4. Splinterm's derivation from other roles;
 5. the built-in palette.
 
-An overridden role is used as given, with one exception: menus, pickers and
-the Explorer raise their text to 4.5:1 against their own panel, as they do for
-every theme, so a `text` override too faint for a panel is raised there.
-Everywhere else the role is never mixed toward readable text or raised to a
-contrast floor, and a status role that follows it is drawn the same way. When
-it falls below its floor against `surface`, 4.5:1 for `text`, `text-muted`,
-`text-faint`, `remote-marker` and `warning` (which also paints the ASCII `A?`
-marker as text) and 3:1 for the other hue and status roles, Splinterm says so
-once on standard error, naming the section that set it, and still uses it. A
-`focus-ring` that is set itself is also always drawn, even where one too close
-to the frame colour would otherwise give way to the accent. A role that follows
-an overridden one follows the new value unless it is set itself: `accent`
-moves `focus-ring` when the theme names no focus ring of its own or names its
-accent as one (the shipped JSON theme does), `text` moves `text-muted`,
-`text-faint` and the floors of the derived hues, and `warning` moves
-`status-working`. A role key spelled with underscores, such as `focus_ring`,
-is reported with the name it means and ignored.
+An overridden role is used as given, with two exceptions, which apply to
+every theme. Menus, pickers and the Explorer raise their text, muted text
+and Terminate labels to 4.5:1 against their own panel and selected row, so a
+`text`, `text-muted` or `danger` override too faint for a panel is raised
+there; on a translucent panel, muted text and Terminate labels move toward
+the text as far as they need to read over any backdrop. Trusted dialogs
+(access consent, upgrade, restart), which take the theme as they open, with
+its `[colors]` keys, and are always opaque, raise their text to 4.5:1 and
+their frame and answer areas to 3:1 against their background. Their text
+tells you to click the red area to say no and the green one to say yes,
+so a `danger` that is not red or a `success` that is not green, whether the
+theme's or set here, gives way to Splinterm's own red or green there; areas
+too close to each other, or a frame too close to either, give way as well,
+and a dialog whose colours still cannot be kept apart takes Splinterm's own
+palette. Dialogs take only colours from the theme: their text size is the
+configured font's. Everywhere else the role is never mixed toward readable text
+or raised to a contrast floor, and a status role that follows it is drawn the
+same way. When it falls below its floor against `surface`, 4.5:1 for `text`,
+`text-muted`, `text-faint`, `remote-marker` and `warning` (which also paints
+the ASCII `A?` marker as text) and 3:1 for the other hue and status roles,
+Splinterm says so once on standard error, naming the section that set it,
+and still uses it. A `focus-ring` that is set itself is also always drawn,
+even where one too close to the frame colour would otherwise give way to the
+accent. A role that follows an overridden one follows the new value unless
+it is set itself: `accent` moves `focus-ring` when the theme names no focus
+ring of its own or names its accent as one (the shipped JSON theme does),
+`text` moves `text-muted`, `text-faint` and the floors of the derived hues,
+and `warning` moves `status-working`. A role key spelled with underscores,
+such as `focus_ring`, is reported with the name it means and ignored.
 
 `surface` and `text` recolour chrome only. The terminal keeps the theme's
 background, foreground and palette.

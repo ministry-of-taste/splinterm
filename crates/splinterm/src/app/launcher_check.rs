@@ -770,8 +770,11 @@ impl DialogPrompt for RestartDialogPrompt {
 
 /// The hidden `restart-dialog` child: shows one restart question and
 /// answers on stdout. Closing the Window answers "Not now".
-pub(in crate::app) fn run_restart_dialog_client(shortcut: Option<DialogShortcut>) -> Result<()> {
-    run_dialog_client::<RestartDialogPrompt>(shortcut)
+pub(in crate::app) fn run_restart_dialog_client(
+    shortcut: Option<DialogShortcut>,
+    theme: splinterm::config::ResolvedTheme,
+) -> Result<()> {
+    run_dialog_client::<RestartDialogPrompt>(shortcut, theme)
 }
 
 /// Runs the check and exits with its [`LauncherExit`].

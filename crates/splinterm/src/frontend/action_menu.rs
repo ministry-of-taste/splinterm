@@ -402,6 +402,13 @@ impl DojoPromptUi {
         }
     }
 
+    /// Whether the confirming choice ends running terminals, so it is
+    /// drawn in danger: Terminate a Dojo or a Lair. Restore and Revoke are
+    /// not.
+    pub(crate) const fn confirmation_destructive(&self) -> bool {
+        matches!(self, Self::Terminate(_) | Self::TerminateLair(_))
+    }
+
     pub(crate) const fn decision(&self) -> Option<TerminationDecision> {
         match self {
             Self::Terminate(prompt) => Some(prompt.decision()),
@@ -476,6 +483,14 @@ pub(crate) enum TabMenuActionId {
     CloseTab,
     CloseOtherTabs,
     TerminateDojo,
+}
+
+impl TabMenuActionId {
+    /// Whether the action ends running terminals, so its label is drawn in
+    /// danger.
+    pub(crate) const fn destructive(self) -> bool {
+        matches!(self, Self::TerminateLair | Self::TerminateDojo)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1215,6 +1230,15 @@ pub(crate) enum BuiltInCommandId {
 }
 
 impl BuiltInCommandId {
+    /// Whether the command ends running terminals, so its title is drawn in
+    /// danger.
+    pub(crate) const fn destructive(self) -> bool {
+        matches!(
+            self,
+            Self::TerminateCurrentDojo | Self::TerminateCurrentLair
+        )
+    }
+
     pub(crate) const ALL: &[Self] = &[
         Self::ShowKeybindings,
         Self::ReloadConfiguration,
