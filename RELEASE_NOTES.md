@@ -468,6 +468,17 @@ a hostile program running as your account.
   `active-tab-background` and `active-tab-alpha` for the selected tab,
   `tab-strip-alpha` for the strip, and `explorer-background` and
   `explorer-alpha` for the docked Explorer.
+- `[colors]` can also set any of the chrome's semantic roles by name, such as
+  `accent`, `focus-ring`, `text-muted`, `warning` or `status-working`, to
+  `#RRGGBB`, a terminal palette colour `color0` to `color15`, or `auto`.
+  `[colors-dark]` and `[colors-light]` set them for one appearance. A set
+  role is used as given, with one warning if it is hard to read (menus,
+  pickers and the Explorer still raise too-faint text on their panels), and
+  the roles that follow it follow it. They recolour chrome only, never the
+  terminal.
+- **Reload configuration** now applies every `[colors]` key, including
+  `alpha`, `blur` and the chrome keys above; a key you remove gives the
+  theme's own colour back.
 - Splinterm follows three settings from the Omarchy shell's `shell.toml`: panel
   alpha for menus and popups (raised as needed to keep text readable), the text
   size set by `omarchy-display-text-size`, and the top bar's height. Open

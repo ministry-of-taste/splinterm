@@ -47,7 +47,7 @@ pub use frontend::{
     LairPromptTarget, PerfTraceCorrelation, SelectorKind, SessionPickerCatalog,
     SessionPickerCreationTarget, SessionPickerDecision, SessionPickerItem, SessionPickerTarget,
     SessionPickerUi, TerminalGridLimits, ThemeUpdate, TrustedConsentUi, WindowCommand,
-    WindowDojoIdentity, WindowOptions, WindowPaneOptions, WindowTopologyCommand,
+    WindowDojoIdentity, WindowOptions, WindowPaneOptions, WindowThemeColors, WindowTopologyCommand,
     WindowTopologyUpdate, WindowUpdate,
 };
 pub use wayland::{

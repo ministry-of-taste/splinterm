@@ -138,8 +138,8 @@ use crate::frontend::{
     SessionPickerUi, TabContextMenuUi, TabMenuActionId, TabMenuContext, TabMenuDispatch,
     TabMenuRightPress, TerminalGridLimits, TerminationDecision, ThemeUpdate, TrustedConsentUi,
     TrustedDialogKey, TrustedInput, WindowCommand, WindowDojoIdentity, WindowOptions,
-    WindowPaneOptions, WindowTopologyCommand, WindowTopologyUpdate, WindowUpdate,
-    close_other_tabs_command, lair_lifecycle_command, tab_menu_right_press,
+    WindowPaneOptions, WindowThemeColors, WindowTopologyCommand, WindowTopologyUpdate,
+    WindowUpdate, close_other_tabs_command, lair_lifecycle_command, tab_menu_right_press,
 };
 use crate::geometry::{
     FontSize, OutputDpiObservation, Rect, SurfaceGeometry, WindowGeometry, buffer_to_logical_ceil,
@@ -1112,6 +1112,7 @@ fn assemble_app(
                 controller_label: options.controller_title,
             },
             theme: options.theme,
+            theme_colors: options.theme_colors.clone(),
             pane_divider_style: options.pane_divider_style,
             pane_gap: options.pane_gap,
             frame_title_mode: options.frame_title_mode,
@@ -2408,6 +2409,9 @@ struct PresentationState {
     explorer_chrome_cell: std::cell::Cell<Option<((u64, u32), u32)>>,
     title: TitleSettings,
     theme: ResolvedTheme,
+    /// This Window's `config.ini` `[colors]` keys, which configuration
+    /// reload replaces. Every theme the Window shows is resolved with them.
+    theme_colors: WindowThemeColors,
     pane_divider_style: PaneDividerStyle,
     /// `[multiplexer] pane-gap` in logical px, which configuration reload
     /// replaces.
@@ -3629,6 +3633,18 @@ struct ThemeUpdateImpact {
     /// `[main] ui-font-pixelsize` is unset): chrome is drawn again at its
     /// new size, and terminal frames stay as they are.
     redraw_chrome: bool,
+}
+
+impl ThemeUpdateImpact {
+    /// The effects of two theme changes in one pass.
+    const fn or(self, other: Self) -> Self {
+        Self {
+            rebuild_pixels: self.rebuild_pixels | other.rebuild_pixels,
+            reconcile_effect: self.reconcile_effect | other.reconcile_effect,
+            relayout_tab_strip: self.relayout_tab_strip | other.relayout_tab_strip,
+            redraw_chrome: self.redraw_chrome | other.redraw_chrome,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -6566,6 +6582,10 @@ impl App {
                     self.tab_state.topology_settings.as_ref(),
                     &loaded.config,
                 );
+                // The next update pass re-resolves the theme with them.
+                self.presentation
+                    .theme_colors
+                    .reload(loaded.config.theme_colors());
                 self.clipboard.image_directory = loaded.config.clipboard_image_directory;
                 self.input.keymap = loaded.config.keymap;
                 self.input.prefix_timeout =
@@ -10781,7 +10801,28 @@ impl App {
             return ThemeUpdateImpact::default();
         }
         self.presentation.theme_generation = update.generation;
-        let theme = update.theme;
+        // Resolved with this Window's `[colors]` keys: its role keys, which
+        // the watcher never applies, and whatever a configuration reload
+        // changed since the watcher started.
+        let theme = self.presentation.theme_colors.accept(update);
+        self.install_theme(theme)
+    }
+
+    /// Re-resolves the current theme after a configuration reload changed
+    /// this Window's `[colors]` keys. A key the reload removed gives the
+    /// theme's own value back.
+    fn apply_reloaded_theme_colors(&mut self) -> ThemeUpdateImpact {
+        match self
+            .presentation
+            .theme_colors
+            .recolor(self.presentation.theme)
+        {
+            Some(theme) => self.install_theme(theme),
+            None => ThemeUpdateImpact::default(),
+        }
+    }
+
+    fn install_theme(&mut self, theme: ResolvedTheme) -> ThemeUpdateImpact {
         self.surface
             .background_effect_state
             .set_requested_blur(theme.background_blur);
@@ -10989,11 +11030,11 @@ impl App {
             return Ok(());
         }
         let receiver_batch_size = pending.len();
-        let inactive = self.apply_inactive_updates()?;
+        let mut inactive = self.apply_inactive_updates()?;
         self.panes
             .pending_exited_splints
             .extend(inactive.exited.iter().copied());
-        if let Some(update) = inactive.theme {
+        if let Some(update) = inactive.theme.take() {
             retain_newest_theme(&mut next_theme, update);
         }
         let mut visual_changed = topology_changed | inactive.changed;
@@ -11005,20 +11046,25 @@ impl App {
         let mut effect_desired_changed = false;
         let mut font_reconciled = false;
         let mut strip_relayout = false;
+        let mut impact = ThemeUpdateImpact::default();
         if let Some(update) = next_theme {
             if inline_picker_open {
                 retain_newest_theme(&mut self.modal.deferred_picker_theme, update);
             } else {
-                let impact = self.apply_resolved_theme(update);
-                visual_changed |= impact.rebuild_pixels;
-                focused_visual_changed |= impact.rebuild_pixels;
-                full_frame_reload |= impact.rebuild_pixels;
-                rebuild_all_inactive |= impact.rebuild_pixels;
-                effect_desired_changed |= impact.reconcile_effect;
-                strip_relayout |= impact.relayout_tab_strip;
-                visual_changed |= impact.relayout_tab_strip | impact.redraw_chrome;
+                impact = self.apply_resolved_theme(update);
             }
         }
+        if !inline_picker_open {
+            // A configuration reload changed this Window's `[colors]` keys.
+            impact = impact.or(self.apply_reloaded_theme_colors());
+        }
+        visual_changed |= impact.rebuild_pixels;
+        focused_visual_changed |= impact.rebuild_pixels;
+        full_frame_reload |= impact.rebuild_pixels;
+        rebuild_all_inactive |= impact.rebuild_pixels;
+        effect_desired_changed |= impact.reconcile_effect;
+        strip_relayout |= impact.relayout_tab_strip;
+        visual_changed |= impact.relayout_tab_strip | impact.redraw_chrome;
         for update in pending {
             match update {
                 WindowUpdate::Snapshot {
@@ -18778,6 +18824,8 @@ mod tests {
             ThemeUpdate {
                 generation: 8,
                 theme,
+                colors: crate::config::ThemeColorConfig::NONE,
+                input: None,
             },
         );
         retain_newest_theme(
@@ -18785,6 +18833,8 @@ mod tests {
             ThemeUpdate {
                 generation: 3,
                 theme,
+                colors: crate::config::ThemeColorConfig::NONE,
+                input: None,
             },
         );
         retain_newest_theme(
@@ -18792,6 +18842,8 @@ mod tests {
             ThemeUpdate {
                 generation: 13,
                 theme,
+                colors: crate::config::ThemeColorConfig::NONE,
+                input: None,
             },
         );
         assert_eq!(pending.map(|update| update.generation), Some(13));
