@@ -118,6 +118,20 @@ while **Choose Dojo** lists only Dojos from the active Lair. **Recent Dojos**
 remains the global cross-Lair workflow. Their New actions create a Lair, a Dojo
 in the active Lair, and a fresh terminal Lair respectively.
 
+Recent Dojos and Choose Dojo are one `dojos` picker with two scopes, shown
+as `recent · this lair` in its frame: **Tab** switches between them and keeps
+what you typed. Each row is one line: the name, where it is (its Lair and
+working directory), and at the end the agent's state with its coloured dot
+(`needs input`, `working`, `done`) or how many of its panes run (`1/2`).
+Running Dojos list under `running`, others under `stopped`. In a narrow
+Window the location gives way first, then the state's word; the dot stays.
+
+Typing in any picker (`dojos`, `lairs`, `remotes`) filters at once; there is
+no `/` first, so `j` and `k` are letters, not moves. Arrows, Page Up and Page
+Down, Home and End move; Enter opens; `Ctrl+N` chooses the `+` row; `Ctrl+U`
+clears what you typed; Escape clears it, then closes. While you type, the `+`
+row and the headers give way to the matches, and the top match is selected.
+
 The trusted tab strip provides activation, a close target, and a `+` picker
 action. It is visible by default; hiding it is local to the current Window,
 reclaims its height for the pane grid, and does not persist or reappear when a

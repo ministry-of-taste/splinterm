@@ -298,6 +298,7 @@ pub(in crate::app) fn session_picker_item(entry: &SessionEntry) -> SessionPicker
         working_directory: entry.working_directory(),
         pane_count: entry.pane_count,
         running_pane_count: entry.running_panes,
+        agent: None,
     }
 }
 

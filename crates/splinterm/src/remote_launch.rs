@@ -47,6 +47,7 @@ fn remote_profile_item(profile: &RemoteProfile) -> SessionPickerItem {
         working_directory: String::new(),
         pane_count: 0,
         running_pane_count: 0,
+        agent: None,
     }
 }
 

@@ -546,7 +546,7 @@ impl<'a> PaletteBody<'a> {
 }
 
 /// `shown/total` while `query` filters; `total` otherwise.
-fn match_count_label(shown: usize, total: usize, query: &str) -> String {
+pub(super) fn match_count_label(shown: usize, total: usize, query: &str) -> String {
     if query.is_empty() {
         total.to_string()
     } else {
@@ -612,7 +612,7 @@ impl InputLineLayout {
 /// The input line: the accent `›`, the query, and a block cursor (an
 /// accent cell) where typing goes; with nothing typed, the placeholder in
 /// secondary text after the cursor.
-fn paint_palette_input(
+pub(super) fn paint_palette_input(
     painter: &mut ChromePainter<'_>,
     layout: &CommandPaletteLayout,
     palette: &SessionPickerPalette,
@@ -699,6 +699,7 @@ pub(crate) fn paint_command_palette(
     let chrome = ChromeBox {
         title: body.title(),
         right_label: &count,
+        right_active: None,
         legend: body.legend(),
     }
     .layout(painter.buffer_rect(layout.panel), scale_120, cell);
@@ -805,6 +806,7 @@ fn paint_palette_list(
                     &ListRow {
                         title: &binding.title,
                         matched: title_match(&binding.title, query),
+                        marker: None,
                         chips: &binding.chips,
                         chip_column: true,
                         trailing,
@@ -827,6 +829,7 @@ fn paint_palette_list(
                     &ListRow {
                         title: &entry.title,
                         matched: title_match(&entry.title, query),
+                        marker: None,
                         chips: &[],
                         chip_column: false,
                         trailing: &entry.status,
@@ -845,7 +848,7 @@ fn paint_palette_list(
 
 /// Where a list row's title goes in `row` (buffer px), for a line that
 /// lines up with the titles.
-fn title_column(painter: &mut ChromePainter<'_>, row: Rect) -> Result<Rect> {
+pub(super) fn title_column(painter: &mut ChromePainter<'_>, row: Rect) -> Result<Rect> {
     let cell = painter.cell(ChromeTextStyle::Regular)?;
     Ok(row_columns(row, painter.scaled(ROW_PADDING), cell.0, 0, 0).title)
 }
@@ -910,6 +913,7 @@ fn paint_command_row(
         &ListRow {
             title: descriptor.title,
             matched: title_match(descriptor.title, query),
+            marker: None,
             chips: &chips,
             chip_column: false,
             trailing,
@@ -1934,6 +1938,7 @@ mod tests {
                 let chrome = ChromeBox {
                     title: "commands",
                     right_label: &["3/62"],
+                    right_active: None,
                     legend: PaletteBody::Commands.legend(),
                 }
                 .layout(buffer_rect(layout.panel, scale), scale, cell);

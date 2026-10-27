@@ -275,6 +275,9 @@ pub(super) struct ChromeBoxLayout {
     pub(super) border: u32,
     pub(super) title: Option<BoxLabel>,
     pub(super) right_label: Option<BoxLabel>,
+    /// The right label in its parts and separators, each at its cells and
+    /// whether it is the active part, when one is marked and all fit.
+    pub(super) right_parts: Option<Vec<(BoxText, bool)>>,
     pub(super) legend: Option<BoxLegend>,
 }
 
@@ -286,6 +289,9 @@ pub(super) struct ChromeBox<'a> {
     /// Secondary text at the right of the top frame, in parts, most
     /// important first, joined by ` · `; may be empty.
     pub(super) right_label: &'a [&'a str],
+    /// The right label's part drawn bold in the accent, as the `dojos`
+    /// picker marks its scope, while every part is shown.
+    pub(super) right_active: Option<usize>,
     /// `(key, verb)` pairs in the bottom frame, most important first.
     pub(super) legend: &'a [(&'a str, &'a str)],
 }
@@ -388,6 +394,9 @@ impl ChromeBox<'_> {
             frame,
             border,
             title,
+            right_parts: right_label
+                .as_ref()
+                .and_then(|label| self.right_parts(span, label)),
             right_label,
             legend: self.legend_layout(span, band(bottom_line)),
         }
@@ -420,6 +429,33 @@ impl ChromeBox<'_> {
         let right_label =
             right_text.map(|text| span.label(&text, span.right().saturating_sub(right_need), y));
         (title, right_label)
+    }
+
+    /// `label`'s parts and the ` · ` between them, each placed at its own
+    /// cells, when a part is marked active and the label shows them all.
+    fn right_parts(&self, span: FrameSpan, label: &BoxLabel) -> Option<Vec<(BoxText, bool)>> {
+        let active = self.right_active?;
+        let parts = self
+            .right_label
+            .iter()
+            .copied()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>();
+        if parts.join(" · ") != label.text.text {
+            return None;
+        }
+        let mut x = label.text.rect.x;
+        let mut placed = Vec::with_capacity(parts.len() * 2);
+        for (index, part) in parts.iter().enumerate() {
+            if index > 0 {
+                placed.push((span.text(" · ", x, label.text.rect.y), false));
+                x = x.saturating_add(span.cell_width.saturating_mul(3));
+            }
+            let text = span.text(part, x, label.text.rect.y);
+            x = x.saturating_add(text.rect.width);
+            placed.push((text, index == active));
+        }
+        Some(placed)
     }
 
     /// The right label's parts that fit in `room` with their padding,
@@ -514,20 +550,29 @@ impl ChromeBoxLayout {
         frame_color: u32,
     ) -> Result<()> {
         paint_outline(painter, self.frame, self.border, frame_color);
-        for (label, style, color) in [
-            (&self.title, ChromeTextStyle::Bold, palette.primary),
-            (
-                &self.right_label,
-                ChromeTextStyle::Regular,
-                palette.secondary,
-            ),
-        ] {
-            if let Some(label) = label {
-                painter.fill(label.knockout, palette.panel_fill);
+        if let Some(title) = &self.title {
+            painter.fill(title.knockout, palette.panel_fill);
+            painter.text(
+                &title.text.text,
+                ChromeTextStyle::Bold,
+                title.text.rect,
+                PickerTextAlignment::Left,
+                palette.primary,
+            )?;
+        }
+        if let Some(label) = &self.right_label {
+            painter.fill(label.knockout, palette.panel_fill);
+            let whole = [(label.text.clone(), false)];
+            for (part, active) in self.right_parts.as_deref().unwrap_or(&whole) {
+                let (style, color) = if *active {
+                    (ChromeTextStyle::Bold, palette.accent_text)
+                } else {
+                    (ChromeTextStyle::Regular, palette.secondary)
+                };
                 painter.text(
-                    &label.text.text,
+                    &part.text,
                     style,
-                    label.text.rect,
+                    part.rect,
                     PickerTextAlignment::Left,
                     color,
                 )?;
@@ -619,6 +664,7 @@ mod tests {
                 let layout = ChromeBox {
                     title: "commands",
                     right_label: &["62"],
+                    right_active: None,
                     legend: &LEGEND,
                 }
                 .layout(panel, scale, cell);
@@ -643,6 +689,54 @@ mod tests {
         }
     }
 
+    /// The `dojos` picker's scope: its parts sit where the whole label
+    /// would, the active one marked; a label cut short marks none.
+    #[test]
+    fn a_marked_right_label_part_keeps_its_cells_in_the_label() {
+        for scale in SCALES {
+            for cell in cells_at(scale) {
+                for active in [0, 1] {
+                    let scope = ChromeBox {
+                        title: "dojos",
+                        right_label: &["recent", "this lair"],
+                        right_active: Some(active),
+                        legend: &LEGEND,
+                    };
+                    let layout = scope.layout(panel(scale, 560), scale, cell);
+                    let label = layout.right_label.as_ref().unwrap();
+                    assert_eq!(label.text.text, "recent · this lair");
+                    let parts = layout.right_parts.as_ref().unwrap();
+                    let texts = parts
+                        .iter()
+                        .map(|(part, _)| part.text.as_str())
+                        .collect::<String>();
+                    assert_eq!(texts, label.text.text);
+                    assert_eq!(parts[0].0.rect.x, label.text.rect.x);
+                    for pair in parts.windows(2) {
+                        assert_eq!(pair[1].0.rect.x, right(pair[0].0.rect));
+                    }
+                    assert_eq!(right(parts[2].0.rect), right(label.text.rect));
+                    let marked = parts
+                        .iter()
+                        .filter(|(_, marked)| *marked)
+                        .map(|(part, _)| part.text.as_str())
+                        .collect::<Vec<_>>();
+                    assert_eq!(marked, [["recent", "this lair"][active]]);
+                    // Too narrow for both parts: the label drops one, and
+                    // nothing is marked.
+                    let narrow = scope.layout(panel(scale, 160), scale, cell);
+                    if narrow
+                        .right_label
+                        .as_ref()
+                        .is_some_and(|label| label.text.text != "recent · this lair")
+                    {
+                        assert!(narrow.right_parts.is_none());
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn the_title_is_knocked_out_of_the_top_frame_clear_of_its_corners() {
         for scale in SCALES {
@@ -651,6 +745,7 @@ mod tests {
                 let layout = ChromeBox {
                     title: "key bindings",
                     right_label: &["3/62"],
+                    right_active: None,
                     legend: &LEGEND,
                 }
                 .layout(panel, scale, cell);
@@ -692,6 +787,7 @@ mod tests {
                     let layout = ChromeBox {
                         title: "agent access",
                         right_label: &PARTS,
+                        right_active: None,
                         legend: &LEGEND,
                     }
                     .layout(panel, scale, cell);
@@ -750,6 +846,7 @@ mod tests {
                 let layout = ChromeBox {
                     title: "agent access",
                     right_label: &["1 waiting", "first 512 only", "3"],
+                    right_active: None,
                     legend: &LEGEND,
                 }
                 .layout(panel(scale, 352), scale, cell);
@@ -764,6 +861,7 @@ mod tests {
                 let layout = ChromeBox {
                     title: "agent access",
                     right_label: &PARTS,
+                    right_active: None,
                     legend: &[],
                 }
                 .layout(panel(scale, 900), scale, cell);
@@ -790,6 +888,7 @@ mod tests {
                     let layout = ChromeBox {
                         title: "key bindings",
                         right_label: &[],
+                        right_active: None,
                         legend: &legend,
                     }
                     .layout(panel, scale, cell);
@@ -838,6 +937,7 @@ mod tests {
                 let wide = ChromeBox {
                     title: "key bindings",
                     right_label: &[],
+                    right_active: None,
                     legend: &legend,
                 }
                 .layout(panel(scale, 1600), scale, cell);
@@ -880,6 +980,7 @@ mod tests {
         let layout = ChromeBox {
             title: "commands",
             right_label: &["62"],
+            right_active: None,
             legend: &LEGEND,
         }
         .layout(panel, scale, cell);

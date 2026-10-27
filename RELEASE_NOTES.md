@@ -544,6 +544,20 @@ a hostile program running as your account.
   finds bindings by their keys (`↵`, `pgdn`), and shows the selected one's
   config name and source under the list. Each list shows up to ten rows,
   and Page Up and Page Down move by the rows shown.
+- The Dojo, Lair and remote pickers are the same box, placed like the
+  command palette, with one-line rows: the name, where it is (its Lair and
+  working directory), and at the end the agent's state with its coloured
+  dot (`needs input`, `working`, `done`) or the running panes (`1/2`). A
+  narrow Window drops the location first, then the state's word; the dot
+  stays. The `+` row (New terminal, New Dojo, New Lair) shows its
+  `ctrl` `n` chips. **Recent Dojos and Choose Dojo are one `dojos` picker**
+  with a `recent · this lair` scope in its frame that **Tab** switches,
+  keeping what you typed; running Dojos list under `running`, others under
+  `stopped`. **Typing filters at once in every picker**: there is no `/`
+  first, so `j` and `k` type rather than move. `Ctrl+U` clears the query
+  and Escape clears it, then closes. `R` retries only from the "could not
+  load" line. `splinterm dojos` reads the same: the `dojos` title, the
+  input line, one row per Dojo and `↑↓ move  ↵ open  esc close`.
 - Trusted dialogs (access consent, upgrade, restart) take your theme and its
   `[colors]` keys as they open, always opaque: the frame in `warning`, the
   left "no" button's edge and label in `danger` and the right "yes" button's

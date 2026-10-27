@@ -64,10 +64,11 @@ pub(super) fn title_match(title: &str, query: &str) -> Option<Range<usize>> {
 }
 
 /// Whether the row at `index` starts a group: the first row, or one whose
-/// group differs from the row above. `groups` is empty for a flat list.
+/// group differs from the row above. `groups` is empty for a flat list; a
+/// row whose group is empty (a picker's creation row) has no header.
 pub(super) fn starts_group(groups: &[&str], index: usize) -> bool {
-    !groups.is_empty()
-        && index < groups.len()
+    index < groups.len()
+        && !groups[index].is_empty()
         && (index == 0 || groups[index] != groups[index.saturating_sub(1)])
 }
 
@@ -386,6 +387,9 @@ pub(super) struct ListRow<'a> {
     pub(super) title: &'a str,
     /// The characters the query matched, drawn in the accent and bold.
     pub(super) matched: Option<Range<usize>>,
+    /// A glyph in the marker column while the row is not selected: a
+    /// picker's creation row shows `+`.
+    pub(super) marker: Option<&'a str>,
     /// The binding's keys, one chip each.
     pub(super) chips: &'a [String],
     /// Chips in the leading column (key bindings) rather than at the end.
@@ -476,16 +480,7 @@ pub(super) fn paint_row(
     row: &ListRow<'_>,
 ) -> Result<()> {
     let state = row.state;
-    if state.selected {
-        painter.fill(rect, opaque(palette.selected_fill));
-    } else if !state.disabled && state.hovered {
-        let [red, green, blue, _] = opaque(palette.selected_fill);
-        painter.blend(rect, [red, green, blue, ROW_HOVER_ALPHA]);
-    }
-    if !state.disabled && state.pressed {
-        let [red, green, blue, _] = opaque(palette.selected_rail);
-        painter.blend(rect, [red, green, blue, ROW_PRESS_ALPHA]);
-    }
+    paint_row_fill(painter, palette, rect, state);
     let colors = row_colors(palette, state);
     let cell = painter.cell(ChromeTextStyle::Regular)?;
     let scale_120 = painter.scale_120;
@@ -515,8 +510,22 @@ pub(super) fn paint_row(
             PickerTextAlignment::Left,
             colors.marker,
         )?;
+    } else if let Some(marker) = row.marker {
+        painter.text(
+            marker,
+            ChromeTextStyle::Regular,
+            columns.marker,
+            PickerTextAlignment::Left,
+            colors.accent,
+        )?;
     }
-    paint_title(painter, columns.title, row, &colors)?;
+    paint_title(
+        painter,
+        columns.title,
+        row.title,
+        row.matched.clone(),
+        &colors,
+    )?;
     if row.chip_column || trailing_chips {
         let room = if row.chip_column {
             columns.chips
@@ -565,12 +574,13 @@ pub(super) fn paint_row(
 fn paint_title(
     painter: &mut ChromePainter<'_>,
     clip: Rect,
-    row: &ListRow<'_>,
+    title: &str,
+    matched: Option<Range<usize>>,
     colors: &RowColors,
 ) -> Result<()> {
-    if row.matched.is_none() {
+    if matched.is_none() {
         return painter.text(
-            row.title,
+            title,
             ChromeTextStyle::Regular,
             clip,
             PickerTextAlignment::Left,
@@ -582,7 +592,7 @@ fn paint_title(
     let room_cells = clip.width / regular.max(bold).max(1);
     let end = clip.x.saturating_add(clip.width);
     let mut x = clip.x;
-    for (text, matched) in title_runs(row.title, row.matched.clone(), room_cells) {
+    for (text, matched) in title_runs(title, matched, room_cells) {
         let (style, cell_width, color) = if matched {
             (ChromeTextStyle::Bold, bold, colors.matched)
         } else {
@@ -599,6 +609,230 @@ fn paint_title(
             color,
         )?;
         x = x.saturating_add(width);
+    }
+    Ok(())
+}
+
+/// The selected, hovered or pressed fill under a row in `rect` (buffer px).
+fn paint_row_fill(
+    painter: &mut ChromePainter<'_>,
+    palette: &SessionPickerPalette,
+    rect: Rect,
+    state: RowState,
+) {
+    if state.selected {
+        painter.fill(rect, opaque(palette.selected_fill));
+    } else if !state.disabled && state.hovered {
+        let [red, green, blue, _] = opaque(palette.selected_fill);
+        painter.blend(rect, [red, green, blue, ROW_HOVER_ALPHA]);
+    }
+    if !state.disabled && state.pressed {
+        let [red, green, blue, _] = opaque(palette.selected_rail);
+        painter.blend(rect, [red, green, blue, ROW_PRESS_ALPHA]);
+    }
+}
+
+/// A picker row's name column, in cells, so the locations line up.
+pub(super) const PICKER_NAME_CELLS: u32 = 13;
+/// A location narrower than this many cells drops instead.
+pub(super) const PICKER_LOCATION_MIN_CELLS: u32 = 8;
+/// The agent state's dot, logical px square.
+const PICKER_DOT_SIZE: u32 = 7;
+
+/// One picker item's content: its name, where it is, and how it is.
+pub(super) struct PickerItemRow<'a> {
+    pub(super) name: &'a str,
+    /// The characters the query matched in the name.
+    pub(super) matched: Option<Range<usize>>,
+    /// The Lair and the working directory, in secondary text.
+    pub(super) location: &'a str,
+    /// The status word at the end: the agent state, or the running panes.
+    pub(super) status: &'a str,
+    /// The agent state's dot before the word, in its colour.
+    pub(super) dot: Option<u32>,
+    /// The word in the dot's colour (needs input, error) rather than in
+    /// secondary text.
+    pub(super) status_tinted: bool,
+    pub(super) state: RowState,
+}
+
+/// Where a picker row's parts go, in buffer px. A part that does not fit
+/// is `None`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct PickerItemColumns {
+    pub(super) marker: Rect,
+    pub(super) name: Rect,
+    pub(super) location: Option<Rect>,
+    /// The cell the agent dot sits in.
+    pub(super) dot: Option<Rect>,
+    pub(super) word: Option<Rect>,
+}
+
+/// A picker row's columns in `row` (buffer px): the marker and a cell of
+/// space, the name in a [`PICKER_NAME_CELLS`] column, a cell, the
+/// location, a cell, and the status at the right: the dot, a cell, the
+/// word. A narrow row drops the location first, giving the name its room,
+/// then the status word; the dot stays.
+pub(super) fn picker_item_columns(
+    row: Rect,
+    padding: u32,
+    cell_width: u32,
+    name_cells: u32,
+    has_location: bool,
+    word_cells: u32,
+    has_dot: bool,
+) -> PickerItemColumns {
+    let base = row_columns(row, padding, cell_width, 0, 0);
+    let content = base.title;
+    let left = content.x;
+    let right = content.x.saturating_add(content.width);
+    let cell = cell_width;
+    let dot_width = if has_dot { cell } else { 0 };
+    let word_width = word_cells.saturating_mul(cell);
+    let dot_gap = if has_dot && word_width > 0 { cell } else { 0 };
+    let full_status = dot_width.saturating_add(dot_gap).saturating_add(word_width);
+    let with_gap = |status: u32| {
+        if status > 0 {
+            status.saturating_add(cell)
+        } else {
+            0
+        }
+    };
+    let name_column = PICKER_NAME_CELLS.saturating_mul(cell);
+    let name_minimum = name_cells.min(PICKER_NAME_CELLS).saturating_mul(cell);
+    let location_need = name_column
+        .saturating_add(cell)
+        .saturating_add(PICKER_LOCATION_MIN_CELLS.saturating_mul(cell))
+        .saturating_add(with_gap(full_status));
+    let (show_location, show_word) = if has_location && content.width >= location_need {
+        (true, true)
+    } else if content.width >= name_minimum.saturating_add(with_gap(full_status)) {
+        (false, true)
+    } else {
+        (false, false)
+    };
+    let word = (show_word && word_width > 0).then(|| Rect {
+        x: right.saturating_sub(word_width).max(left),
+        width: word_width.min(content.width),
+        ..content
+    });
+    let dot_right = word.map_or(right, |word| word.x.saturating_sub(dot_gap));
+    let dot = has_dot.then(|| Rect {
+        x: dot_right.saturating_sub(dot_width).max(left),
+        width: dot_width.min(dot_right.saturating_sub(left)),
+        ..content
+    });
+    let status_left = dot.or(word).map_or(right, |status| status.x);
+    let name_end = if dot.is_some() || word.is_some() {
+        status_left.saturating_sub(cell).max(left)
+    } else {
+        right
+    };
+    let (name, location) = if show_location {
+        let name = Rect {
+            width: name_column.min(name_end.saturating_sub(left)),
+            ..content
+        };
+        let location_x = left.saturating_add(name_column).saturating_add(cell);
+        (
+            name,
+            Some(Rect {
+                x: location_x,
+                width: name_end.saturating_sub(location_x),
+                ..content
+            }),
+        )
+    } else {
+        (
+            Rect {
+                width: name_end.saturating_sub(left),
+                ..content
+            },
+            None,
+        )
+    };
+    PickerItemColumns {
+        marker: base.marker,
+        name,
+        location,
+        dot,
+        word,
+    }
+}
+
+/// One picker item row in `rect` (buffer px): the row's fill, the `›`
+/// when selected, the name with its matched characters, the location, and
+/// the status with its dot.
+pub(super) fn paint_picker_item_row(
+    painter: &mut ChromePainter<'_>,
+    palette: &SessionPickerPalette,
+    rect: Rect,
+    row: &PickerItemRow<'_>,
+) -> Result<()> {
+    let state = row.state;
+    paint_row_fill(painter, palette, rect, state);
+    let colors = row_colors(palette, state);
+    let cell = painter.cell(ChromeTextStyle::Regular)?;
+    let columns = picker_item_columns(
+        rect,
+        painter.scaled(ROW_PADDING),
+        cell.0,
+        text_cells(row.name),
+        !row.location.is_empty(),
+        text_cells(row.status),
+        row.dot.is_some(),
+    );
+    if state.selected {
+        painter.text(
+            "›",
+            ChromeTextStyle::Regular,
+            columns.marker,
+            PickerTextAlignment::Left,
+            colors.marker,
+        )?;
+    }
+    paint_title(
+        painter,
+        columns.name,
+        row.name,
+        row.matched.clone(),
+        &colors,
+    )?;
+    if let Some(location) = columns.location {
+        painter.text(
+            row.location,
+            ChromeTextStyle::Regular,
+            location,
+            PickerTextAlignment::Left,
+            colors.secondary,
+        )?;
+    }
+    if let (Some(dot), Some(color)) = (columns.dot, row.dot) {
+        let size = painter
+            .scaled(PICKER_DOT_SIZE)
+            .min(dot.width)
+            .min(dot.height);
+        painter.fill(
+            Rect {
+                x: dot.x.saturating_add(dot.width.saturating_sub(size) / 2),
+                y: dot.y.saturating_add(dot.height.saturating_sub(size) / 2),
+                width: size,
+                height: size,
+            },
+            opaque(color),
+        );
+    }
+    if let Some(word) = columns.word {
+        painter.text(
+            row.status,
+            ChromeTextStyle::Regular,
+            word,
+            PickerTextAlignment::Right,
+            match row.dot {
+                Some(color) if row.status_tinted => color,
+                _ => colors.secondary,
+            },
+        )?;
     }
     Ok(())
 }
@@ -816,6 +1050,69 @@ mod tests {
             .chips
             .is_empty()
         );
+    }
+
+    /// A picker row narrows by dropping its location first, then its
+    /// status word; the agent dot stays. No part overlaps another or runs
+    /// past the row, and the name keeps its room while the word shows.
+    #[test]
+    fn picker_rows_drop_the_location_then_the_status_word() {
+        let right = |rect: Rect| rect.x + rect.width;
+        for scale in [120, 150, 180, 240] {
+            let cell = 8 * scale / 120;
+            let padding = ROW_PADDING * scale / 120;
+            let (mut had_location, mut had_word) = (true, true);
+            for logical in (40..=600).rev() {
+                let row = Rect {
+                    x: 7,
+                    y: 3,
+                    width: logical * scale / 120,
+                    height: ROW_HEIGHT * scale / 120,
+                };
+                // `build` · `m5a · ~/src/splinterm` · ● `working`.
+                let columns = picker_item_columns(row, padding, cell, 5, true, 7, true);
+                let dot = columns.dot.expect("the dot stays");
+                assert!(right(dot) <= right(row) - padding.min(row.width / 4));
+                assert!(columns.name.x >= right(columns.marker));
+                assert!(
+                    right(columns.name) <= dot.x,
+                    "scale {scale} width {logical}"
+                );
+                if let Some(location) = columns.location {
+                    assert!(had_location, "a dropped location came back at {logical}");
+                    assert!(columns.word.is_some(), "the word drops after the location");
+                    assert_eq!(columns.name.width, PICKER_NAME_CELLS * cell);
+                    assert!(location.x >= right(columns.name) + cell);
+                    assert!(right(location) + cell <= dot.x);
+                    assert!(location.width >= PICKER_LOCATION_MIN_CELLS * cell);
+                }
+                if let Some(word) = columns.word {
+                    assert!(had_word, "a dropped word came back at {logical}");
+                    assert_eq!(word.width, 7 * cell);
+                    assert_eq!(right(dot) + cell, word.x);
+                    assert!(right(word) <= right(row));
+                    assert!(columns.name.width >= 5 * cell);
+                }
+                had_location = columns.location.is_some();
+                had_word = columns.word.is_some();
+                if logical == 560 {
+                    assert!(had_location && had_word, "a 560 px row shows everything");
+                }
+            }
+            assert!(!had_location && !had_word, "a 40 px row keeps only the dot");
+        }
+        // No agent: the running count is the word, and it drops with no
+        // dot left behind.
+        let row = Rect {
+            x: 0,
+            y: 0,
+            width: 120,
+            height: ROW_HEIGHT,
+        };
+        let columns = picker_item_columns(row, ROW_PADDING, 8, 10, true, 3, false);
+        assert_eq!(columns.dot, None);
+        assert!(columns.location.is_none() && columns.word.is_none());
+        assert_eq!(right(columns.name), right(row) - ROW_PADDING);
     }
 
     /// `ctrl shift p` narrows to `… shift p`, then `… p`, then `p` alone:

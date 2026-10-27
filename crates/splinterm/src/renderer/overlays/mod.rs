@@ -5,3 +5,4 @@ pub(super) mod explorer;
 pub(super) mod handoff;
 pub(super) mod history;
 pub(super) mod picker;
+pub(super) mod picker_box;

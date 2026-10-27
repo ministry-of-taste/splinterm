@@ -366,6 +366,9 @@ pub struct NavigationPickerRow {
     pub working_directory: String,
     pub pane_count: usize,
     pub running_pane_count: usize,
+    /// The most urgent agent state its Splints report, and whether it is
+    /// stale; display data only.
+    pub agent: Option<(AgentState, bool)>,
 }
 
 /// Complete policy view for one picker opening.
@@ -819,6 +822,13 @@ impl NavigationProjection {
                 .iter()
                 .filter(|splint| splint.node.lifecycle == NavigationLifecycle::Running)
                 .count(),
+            agent: crate::frontend::AgentAggregate::from_statuses(
+                dojo.splints
+                    .iter()
+                    .filter_map(|splint| splint.agent_status.as_ref()),
+            )
+            .top()
+            .map(|(state, stale, _)| (state, stale)),
         })
     }
 
