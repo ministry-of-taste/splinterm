@@ -29,16 +29,19 @@ use std::path::PathBuf;
 use anyhow::Result;
 
 use crate::color::{
-    NON_TEXT_MIN_CONTRAST, TEXT_MIN_CONTRAST, contrast_corrected_toward, contrast_floor_toward,
-    contrast_ratio, legacy_srgb, mix_linear,
+    NON_TEXT_MIN_CONTRAST, TEXT_MIN_CONTRAST, contrast_corrected, contrast_corrected_toward,
+    contrast_floor_toward, contrast_ratio, legacy_srgb, mix_linear,
 };
 use crate::config::OmarchyShellSettings;
 
 /// The semantic colors Splinterm's own chrome is drawn from.
 ///
-/// Text roles keep 4.5:1 against the surface they sit on, other roles 3:1,
-/// except where a theme names the color itself or a legacy derivation is
-/// kept; see [`derive`].
+/// Which contrast floor a role keeps depends on where its color came from;
+/// see [`RoleHints`] and [`derive`]. A derived `text_faint` keeps 4.5:1
+/// against `surface`, and `danger`, `warning`, `success`, `info` and
+/// `remote_marker` keep 3:1 whether hinted or not. Colors a theme names for
+/// surfaces, `selection`, `divider`, `focus_ring` and `accent`, and the
+/// legacy derivations kept for `text_muted` and `divider`, carry no floor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChromeRoles {
     /// The chrome background: the tab strip, the Explorer and panels. Today
@@ -105,7 +108,21 @@ pub struct TerminalPalette {
     pub ansi: [u32; 16],
 }
 
-/// Colors a theme suggests for roles. `None` leaves the role to [`derive`].
+/// Colors a theme's own files suggest for roles. `None` leaves the role to
+/// [`derive`]'s fallback. [`derive`] treats hints three ways:
+///
+/// - Used as given, with no contrast floor: `surface_raised`,
+///   `surface_sunken`, `selection`, `divider`, `focus_ring` and `accent`.
+/// - A starting point for the inactive-tab ramp: `text_muted` is mixed
+///   toward `text` in quarter steps until it is readable; see
+///   [`inactive_tab_foreground_fallback`].
+/// - A starting point raised to the 3:1 non-text floor against `surface` by
+///   mixing toward readable text: `danger`, `warning`, `success`, `info` and
+///   `remote_marker`.
+///
+/// Hints are not user overrides. `[colors]` role overrides (Plan 0064 M4)
+/// must be applied verbatim, after derivation, in their own layer rather
+/// than entering here, or they would be ramped or floored like a hint.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RoleHints {
     pub surface_raised: Option<u32>,
@@ -113,10 +130,10 @@ pub struct RoleHints {
     pub selection: Option<u32>,
     pub divider: Option<u32>,
     pub focus_ring: Option<u32>,
-    /// The theme's muted color. Unlike the other hints it is a starting
-    /// point: [`derive`] mixes it toward `text` until it is readable.
+    /// The theme's muted color: a starting point for the inactive-tab ramp.
     pub text_muted: Option<u32>,
     pub accent: Option<u32>,
+    /// Starting points floored to 3:1 against the surface.
     pub danger: Option<u32>,
     pub warning: Option<u32>,
     pub success: Option<u32>,
@@ -132,7 +149,8 @@ pub struct ThemeComponents {
     pub active_tab_background: Option<u32>,
     /// The selected Dojo tab's label.
     pub active_tab_foreground: Option<u32>,
-    /// Inactive tab labels: the `text_muted` role itself.
+    /// Inactive tab labels. When given it pins the `text_muted` role
+    /// verbatim: no ramp and no contrast floor.
     pub inactive_tab_foreground: Option<u32>,
 }
 
@@ -276,7 +294,7 @@ pub(crate) fn inactive_tab_foreground_fallback(
 ///
 /// The roles nothing paints yet follow Plan 0064's role table: a hint, else
 /// the ANSI color for their hue, raised to their contrast floor against the
-/// surface by mixing toward text. The agent status roles take herdr's
+/// surface by mixing toward readable text. The agent status roles take herdr's
 /// mapping onto them.
 #[must_use]
 pub fn derive(input: &ThemeInput) -> ChromeRoles {
@@ -289,11 +307,15 @@ pub fn derive(input: &ThemeInput) -> ChromeRoles {
     let text_muted = input.components.inactive_tab_foreground.unwrap_or_else(|| {
         inactive_tab_foreground_fallback(surface, text, hints.text_muted.unwrap_or(ansi[8]))
     });
-    let text_faint = contrast_corrected_toward(mix_linear(text, surface, 0.55), text, surface);
+    // Floors aim at readable text, not the raw foreground: a foreground
+    // below 4.5:1 would otherwise send every floored role to pure black or
+    // white, louder than the text and indistinguishable from each other.
+    let readable = contrast_corrected(text, surface);
+    let text_faint = contrast_corrected_toward(mix_linear(text, surface, 0.55), readable, surface);
     let signal = |hint: Option<u32>, fallback: u32| {
         contrast_floor_toward(
             hint.unwrap_or(fallback),
-            text,
+            readable,
             surface,
             NON_TEXT_MIN_CONTRAST,
         )
@@ -386,5 +408,43 @@ mod tests {
         let roles = derive(&input);
         assert_eq!(roles.warning, 0xff_aa_00);
         assert_eq!(roles.surface_raised, 0x22_22_22);
+    }
+
+    #[test]
+    fn floors_aim_at_readable_text_when_the_foreground_is_too_faint() {
+        // A foreground well under 4.5:1 on its background.
+        let mut input = ThemeInput::builtin();
+        input.terminal.background = 0x30_30_30;
+        input.terminal.foreground = 0x50_50_50;
+        input.terminal.ansi[1] = 0x40_10_10;
+        input.terminal.ansi[2] = 0x10_40_10;
+        input.terminal.ansi[3] = 0x40_40_10;
+        input.terminal.ansi[6] = 0x10_40_40;
+        input.terminal.ansi[5] = 0x40_10_40;
+        let roles = derive(&input);
+        let text_contrast = contrast_ratio(roles.text, roles.surface);
+        assert!(text_contrast < TEXT_MIN_CONTRAST);
+        let faint = contrast_ratio(roles.text_faint, roles.surface);
+        assert!(faint >= TEXT_MIN_CONTRAST);
+        assert!(
+            faint < 7.0,
+            "faint text stays near its floor instead of pure white: {faint}"
+        );
+        let signals = [
+            roles.danger,
+            roles.warning,
+            roles.success,
+            roles.info,
+            roles.remote_marker,
+        ];
+        for signal in signals {
+            assert!(contrast_ratio(signal, roles.surface) >= NON_TEXT_MIN_CONTRAST);
+            assert_ne!(signal, 0x00ff_ffff);
+            assert_ne!(signal, 0);
+        }
+        // The hues stay apart instead of collapsing onto one endpoint.
+        for (index, signal) in signals.iter().enumerate() {
+            assert!(!signals[index + 1..].contains(signal));
+        }
     }
 }

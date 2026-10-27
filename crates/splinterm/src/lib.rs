@@ -13,7 +13,7 @@ pub mod background_effect;
 mod box_drawing;
 pub mod child_spawn;
 pub mod clipboard_image;
-pub mod color;
+mod color;
 pub mod config;
 pub mod diagnostics;
 pub mod endpoint;

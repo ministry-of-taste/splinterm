@@ -1511,6 +1511,8 @@ pub struct ThemePalette {
     pub active_tab_background: Option<String>,
     #[serde(default)]
     pub active_tab_foreground: Option<String>,
+    /// Inactive tab labels. When given it pins the `text_muted` role
+    /// verbatim, with no ramp and no contrast floor.
     #[serde(default)]
     pub inactive_tab_foreground: Option<String>,
     pub url: String,
@@ -1753,6 +1755,7 @@ impl ThemePalette {
     ///
     /// # Errors
     /// Returns an error when any required role is not a six-digit RGB color.
+    #[cfg(test)]
     pub fn resolve(&self) -> Result<ResolvedTheme> {
         self.input().map(|input| ResolvedTheme::from_input(&input))
     }
@@ -2204,16 +2207,9 @@ pub fn load_omarchy_theme(theme_dir: &Path) -> Result<ResolvedTheme> {
 /// # Errors
 /// Returns an error when the theme is absent, incomplete, changing, or
 /// malformed.
+#[cfg(test)]
 pub fn load_live_omarchy_theme(theme_dir: &Path) -> Result<ResolvedTheme> {
     load_provider_theme(&OmarchyThemeProvider::live(theme_dir))
-}
-
-/// Loads an explicit project JSON role map, or the safe fallback when absent.
-///
-/// # Errors
-/// Returns an error when an existing theme file is unreadable or invalid.
-pub fn load_theme(path: &Path) -> Result<ResolvedTheme> {
-    load_provider_theme(&JsonThemeProvider::new(path))
 }
 
 /// Loads a provider's input and derives its theme, before `config.ini`
@@ -4321,11 +4317,13 @@ mod tests {
         themes
     }
 
-    /// The colors each source painted before chrome roles existed (Plan
-    /// 0064 milestone 2), recorded from the pre-role resolver: background,
-    /// foreground, cursor, selection, selection text, URL, selected tab
-    /// body and label, inactive tab label, accent, pane border, active pane
-    /// border, then alpha and blur.
+    /// The colors each source paints: background, foreground, cursor,
+    /// selection, selection text, URL, selected tab body and label, inactive
+    /// tab label, accent, pane border, active pane border, then alpha and
+    /// blur. Every row but `semantic-keys` was recorded from the resolver
+    /// before chrome roles existed (Plan 0064 milestone 2); the
+    /// `semantic-keys` fixture is new with roles, and its row records what
+    /// the role resolver gives it.
     #[allow(clippy::type_complexity)]
     const PROVIDER_PINS: [(&str, [u32; 12], u16, bool); 9] = [
         (
