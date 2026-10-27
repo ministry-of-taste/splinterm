@@ -63,6 +63,10 @@ pub const CLIPPED_MARKER: &str = "…";
 /// The mark before every trusted dialog's title.
 pub const TITLE_MARK: &str = "⚠";
 
+/// The least columns between the title and the countdown in the frame's
+/// top edge, so a stretch of frame shows between them.
+pub const COUNTDOWN_GAP_COLUMNS: usize = 3;
+
 /// What a line is: body text the layout wraps and may drop, or one of the
 /// texts the box sets into its frame and buttons.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -843,6 +847,10 @@ pub struct DialogChrome {
     /// The legend's forms, best first, each as runs of text and ink. The
     /// first that fits inside the frame is shown; none, when none fits.
     pub legend: Vec<Vec<(String, DialogInk)>>,
+    /// The time left to answer, such as "0:42", set into the frame's top
+    /// edge at its right end; dropped, never cut, when it would not fit
+    /// beside the whole title.
+    pub countdown: Option<String>,
 }
 
 /// A composed grid's rows, each a run of cells from column 0.
@@ -882,7 +890,8 @@ fn fitted(text: &str, columns: usize) -> String {
 }
 
 /// `text` (a dialog's laid-out `body`) composed into the box of a grid
-/// `columns` by `grid_rows`: the title on the frame's top edge, the body
+/// `columns` by `grid_rows`: the title on the frame's top edge (and the
+/// countdown at its right end, while both fit), the body
 /// below it, the buttons' labels and keys centred in their halves, and the
 /// first form of the legend that fits on the frame's bottom edge.
 ///
@@ -900,17 +909,37 @@ pub fn compose(
     let mut rows: ComposedRows = vec![Vec::new(); grid_rows.max(1)];
     let inside_end = columns.saturating_sub(FRAME_INSET_COLUMNS);
     let places = chrome_rows(grid_rows);
+    let title = title_text(text.title());
+    // The countdown keeps a stretch of frame between it and the title, and
+    // goes before the title would be cut.
+    let countdown = chrome.countdown.as_deref().filter(|countdown| {
+        title.chars().count() + COUNTDOWN_GAP_COLUMNS + countdown.chars().count()
+            <= text_columns(columns)
+    });
     put(
         &mut rows[0],
         FRAME_INSET_COLUMNS,
         inside_end,
-        &fitted(&title_text(text.title()), text_columns(columns)),
+        &fitted(&title, text_columns(columns)),
         DialogCell {
             ink: DialogInk::Title,
             bold: true,
             ..DialogCell::default()
         },
     );
+    if let Some(countdown) = countdown {
+        let width = countdown.chars().count();
+        put(
+            &mut rows[0],
+            inside_end - width,
+            inside_end,
+            countdown,
+            DialogCell {
+                ink: DialogInk::Secondary,
+                ..DialogCell::default()
+            },
+        );
+    }
     for (index, (row_text, style)) in body.rows.iter().zip(&body.styles).enumerate() {
         let Some(row) = rows.get_mut(CHROME_TOP_ROWS + index) else {
             break;
@@ -1479,6 +1508,7 @@ mod tests {
             allow_keys: "g".to_owned(),
             allow_enabled: true,
             legend: legend(&["l".repeat(61).as_str(), "click inside to use the keyboard"]),
+            countdown: None,
         };
         let rows = compose(&variants[0], &body, &chrome, columns, grid_rows);
         assert_eq!(rows.len(), grid_rows);
@@ -1551,6 +1581,7 @@ mod tests {
             allow_keys: "g".to_owned(),
             allow_enabled: false,
             legend: legend(&["l".repeat(40).as_str()]),
+            countdown: None,
         };
         // 30 columns: 12 per label, so "Allow Look once" is cut.
         let columns = 30;
@@ -1590,5 +1621,49 @@ mod tests {
         slots.dedup();
         assert_eq!(slots.len(), DialogInk::SLOTTED.len() + 1);
         assert!(slots.iter().all(|slot| *slot < 16));
+    }
+
+    /// The countdown sits at the right end of the frame's top edge, apart
+    /// from the title, and goes before the title would be cut: the title
+    /// always shows whole when it fits alone.
+    #[test]
+    fn the_countdown_sits_at_the_frame_right_and_drops_before_the_title_is_cut() {
+        let variants = text(vec![
+            DialogLine::title("close windows to upgrade?"),
+            DialogLine::new("body"),
+        ]);
+        let chrome = DialogChrome {
+            countdown: Some("0:42".to_owned()),
+            ..DialogChrome::default()
+        };
+        let title = "⚠ close windows to upgrade?";
+        let title_columns = title.chars().count();
+        let row0 = |columns: usize| {
+            let body = layout(&variants, 0, text_columns(columns), usize::MAX);
+            compose(&variants[0], &body, &chrome, columns, 10).swap_remove(0)
+        };
+        // Roomy: the title from the left, the countdown ending inside the
+        // frame, in secondary text.
+        let roomy = row0(64);
+        let shown = row_string(&roomy);
+        assert!(shown.starts_with(&format!("  {title}")), "{shown:?}");
+        assert!(shown.ends_with("0:42"), "{shown:?}");
+        assert_eq!(shown.chars().count(), 64 - FRAME_INSET_COLUMNS);
+        assert_eq!(
+            roomy[64 - FRAME_INSET_COLUMNS - 1].ink,
+            DialogInk::Secondary
+        );
+        // Exactly room for both and the gap.
+        let tight = title_columns + COUNTDOWN_GAP_COLUMNS + 4 + 2 * FRAME_INSET_COLUMNS;
+        assert!(row_string(&row0(tight)).ends_with("0:42"));
+        // One column less: the countdown goes, and the title stays whole.
+        let narrower = row_string(&row0(tight - 1));
+        assert!(!narrower.contains("0:42"), "{narrower:?}");
+        assert_eq!(narrower.trim(), title);
+        // Without one, nothing shows at the right.
+        let none = DialogChrome::default();
+        let body = layout(&variants, 0, text_columns(64), usize::MAX);
+        let plain = row_string(&compose(&variants[0], &body, &none, 64, 10)[0]);
+        assert_eq!(plain.trim(), title);
     }
 }

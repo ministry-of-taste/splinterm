@@ -724,6 +724,11 @@ struct RestartDialogPrompt {
     parent_pid: u32,
     /// The question's paragraphs, which the dialog wraps to its width.
     lines: Vec<DialogLine>,
+    /// How long the launcher waits for an answer, which the frame counts
+    /// down; 0, from a launcher that did not send it, shows no countdown.
+    /// Display only: the launcher's own deadline still decides.
+    #[serde(default)]
+    respond_within_seconds: u64,
 }
 
 impl DialogPrompt for RestartDialogPrompt {
@@ -773,6 +778,7 @@ impl DialogPrompt for RestartDialogPrompt {
             .collect::<Vec<_>>();
         TrustedConsentUi::restart(decision)
             .with_shortcut(shortcut)
+            .with_respond_within(Duration::from_secs(self.respond_within_seconds))
             .with_text(DialogText {
                 lines,
                 minimum_rows: MIN_DIALOG_ROWS,
@@ -1048,6 +1054,7 @@ async fn ask(question: &RestartQuestion) -> bool {
             capability,
             parent_pid: std::process::id(),
             lines: dialog_lines(question),
+            respond_within_seconds: RESPOND_WITHIN.as_secs(),
         },
         Err(error) => {
             eprintln!("splinterm: could not ask ({error:#}); nothing was restarted.");
@@ -1531,6 +1538,7 @@ mod tests {
             capability: vec![1; CAPABILITY_BYTES],
             parent_pid: 42,
             lines,
+            respond_within_seconds: RESPOND_WITHIN.as_secs(),
         };
         prompt.validate().unwrap();
         let (decision, _receiver) = std_mpsc::channel();
@@ -1594,6 +1602,7 @@ mod tests {
                 capability: vec![1; CAPABILITY_BYTES],
                 parent_pid: 42,
                 lines: dialog_lines(&question),
+                respond_within_seconds: RESPOND_WITHIN.as_secs(),
             };
             prompt.validate().unwrap();
             for shortcut in [Some(DialogShortcut::default()), None] {
@@ -1612,6 +1621,7 @@ mod tests {
             capability: vec![1; CAPABILITY_BYTES],
             parent_pid: 42,
             lines: vec![DialogLine::new("question")],
+            respond_within_seconds: 0,
         };
         good.validate().unwrap();
         for bad in [

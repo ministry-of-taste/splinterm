@@ -598,7 +598,11 @@ its text, and two buttons at the bottom, a red no button on the left and a
 green yes button on the right that names exactly what it does, such as
 **Allow Look once** or **Restart now, end 4 shells**. Under each button's
 label are the keys that give that answer. The frame's bottom edge says how to
-engage the keyboard until you do, then which keys answer.
+engage the keyboard until you do, then which keys answer. The box casts a
+hard shadow, as the popups inside a Window do. The upgrade and restart
+questions show the time left to answer, such as `0:42`, at the right end of
+the top edge; when it runs out, the question ends as it always has. The
+access prompt shows no countdown.
 
 Each dialog asks for one fixed size: the size at which all of its text fits
 above the buttons, but never larger than the screen space the compositor

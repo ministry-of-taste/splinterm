@@ -1,6 +1,10 @@
 //! Platform-independent construction options for graphical windows and panes.
 
-use std::{path::PathBuf, sync::mpsc::Sender as StdSender, time::Instant};
+use std::{
+    path::PathBuf,
+    sync::mpsc::Sender as StdSender,
+    time::{Duration, Instant},
+};
 
 use tokio::sync::{
     mpsc::{Receiver, Sender},
@@ -94,6 +98,12 @@ pub struct TrustedConsentUi {
     /// Whether the current snapshot's legend says the keys are live: it
     /// is drawn again once a click or the shortcut engages the keyboard.
     legend_live: bool,
+    /// When the asker stops waiting for an answer, if the dialog knows; the
+    /// frame then shows the time left. Display only: what happens then is
+    /// the asker's.
+    deadline: Option<Instant>,
+    /// The time left the current snapshot shows.
+    countdown_shown: Option<String>,
 }
 
 impl TrustedConsentUi {
@@ -125,6 +135,8 @@ impl TrustedConsentUi {
             frame: None,
             clipped: false,
             legend_live: false,
+            deadline: None,
+            countdown_shown: None,
         }
     }
 
@@ -143,6 +155,8 @@ impl TrustedConsentUi {
             frame: None,
             clipped: false,
             legend_live: false,
+            deadline: None,
+            countdown_shown: None,
         }
     }
 
@@ -161,6 +175,8 @@ impl TrustedConsentUi {
             frame: None,
             clipped: false,
             legend_live: false,
+            deadline: None,
+            countdown_shown: None,
         }
     }
 
@@ -178,6 +194,20 @@ impl TrustedConsentUi {
     #[must_use]
     pub fn with_text(mut self, text: DialogText) -> Self {
         self.text = Some(text);
+        self
+    }
+
+    /// How long the asker waits for an answer, from now: the frame's top
+    /// edge then counts it down. It only shows the time; the asker ends the
+    /// dialog when it runs out, as before. A zero wait, from an asker that
+    /// sent none, shows no countdown.
+    #[must_use]
+    pub fn with_respond_within(mut self, within: Duration) -> Self {
+        self.deadline = if within.is_zero() {
+            None
+        } else {
+            Instant::now().checked_add(within)
+        };
         self
     }
 
@@ -285,6 +315,7 @@ impl TrustedConsentUi {
         self.clipped = layout.clipped;
         self.frame = Some(frame);
         self.legend_live = self.keyboard_engaged();
+        self.countdown_shown = self.countdown(now);
         let chrome = self.chrome();
         Some(dialog_text::dialog_snapshot(
             dialog_text::compose(text, &layout, &chrome, frame.grid_columns, frame.grid_rows),
@@ -316,7 +347,47 @@ impl TrustedConsentUi {
             legend: self
                 .kind
                 .legend(self.legend_live, choices > 1, self.shortcut),
+            countdown: self.countdown_shown.clone(),
         }
+    }
+
+    /// The time left to answer at `now`, as "m:ss", rounded up, so it
+    /// shows "0:00" only once the time is up. `None` without a deadline.
+    fn countdown(&self, now: Instant) -> Option<String> {
+        let left = self.deadline?.saturating_duration_since(now);
+        let seconds = left.as_secs() + u64::from(left.subsec_nanos() > 0);
+        Some(format!("{}:{:02}", seconds / 60, seconds % 60))
+    }
+
+    /// How long until the countdown the frame shows changes, from `now`:
+    /// the Window wakes then to draw it again. `None` without one, or once
+    /// it shows "0:00".
+    pub(crate) fn countdown_wait(&self, now: Instant) -> Option<Duration> {
+        self.frame?;
+        let left = self.deadline?.saturating_duration_since(now);
+        if left.is_zero() {
+            return (self.countdown_shown != self.countdown(now)).then_some(Duration::ZERO);
+        }
+        // The shown second changes when `left` crosses a whole second; a
+        // millisecond past it, so the Window never wakes just before.
+        let into_second = Duration::from_nanos(u64::from(left.subsec_nanos()));
+        let wait = if into_second.is_zero() {
+            Duration::from_secs(1)
+        } else {
+            into_second
+        };
+        Some(wait + Duration::from_millis(1))
+    }
+
+    /// Whether the countdown the frame shows is out of date at `now`.
+    pub(crate) fn countdown_stale(&self, now: Instant) -> bool {
+        self.frame.is_some() && self.countdown_shown != self.countdown(now)
+    }
+
+    /// A redraw when a click that answers nothing, outside any row, just
+    /// engaged the keyboard and the legend still says how to engage it.
+    pub(crate) fn engagement_redraw(&self) -> Option<TrustedInput> {
+        self.with_legend(None)
     }
 
     /// `input`, or a redraw when the keyboard was just engaged and the
@@ -1287,5 +1358,118 @@ mod tests {
             long.key_input(TrustedDialogKey::Escape, false, armed),
             Some(TrustedInput::Answer(false))
         );
+    }
+
+    /// The top row of a dialog's snapshot, as text, without trailing blanks.
+    fn top_row(snapshot: &TerminalSnapshot) -> String {
+        snapshot.visible_rows[0]
+            .cells
+            .iter()
+            .map(|cell| cell.content.as_str())
+            .collect::<String>()
+            .trim_end()
+            .to_owned()
+    }
+
+    /// Where the asker's deadline is known, the frame's top edge shows the
+    /// time left, rounded up, at its right end; the Window wakes as each
+    /// second passes, and redraws only when the time shown is out of date.
+    /// It is display only: once the time is up it shows "0:00", stops
+    /// waking, and the answers work exactly as before.
+    #[test]
+    fn a_known_deadline_counts_down_at_the_frame_right_and_changes_nothing() {
+        let (decision, _answers) = std::sync::mpsc::channel();
+        let mut dialog = TrustedConsentUi::upgrade(decision)
+            .with_respond_within(Duration::from_secs(125))
+            .with_text(consent_text(0));
+        assert!(dialog.deadline.is_some());
+        let start = Instant::now();
+        dialog.deadline = Some(start + Duration::from_secs(125));
+        // Nothing to count down before the dialog has a layout.
+        assert_eq!(dialog.countdown_wait(start), None);
+        assert!(!dialog.countdown_stale(start));
+        let snapshot = dialog.lay_out(narrow_frame(), start).unwrap();
+        let top = top_row(&snapshot);
+        assert!(top.ends_with("2:05"), "{top:?}");
+        // It ends inside the frame, two columns in from the grid's edge.
+        assert_eq!(top.chars().count(), 40 - dialog_text::FRAME_INSET_COLUMNS);
+        let millisecond = Duration::from_millis(1);
+        assert_eq!(
+            dialog.countdown_wait(start),
+            Some(Duration::from_secs(1) + millisecond)
+        );
+        let into = start + Duration::from_millis(400);
+        assert!(!dialog.countdown_stale(into));
+        assert_eq!(
+            dialog.countdown_wait(into),
+            Some(Duration::from_millis(600) + millisecond)
+        );
+        let next = start + Duration::from_secs(1) + millisecond;
+        assert!(dialog.countdown_stale(next));
+        assert!(top_row(&dialog.render(next).unwrap()).ends_with("2:04"));
+        assert!(!dialog.countdown_stale(next));
+        // Half a second left still shows a whole one.
+        let deadline = start + Duration::from_secs(125);
+        let last = start + Duration::from_millis(124_500);
+        assert!(top_row(&dialog.render(last).unwrap()).ends_with("0:01"));
+        assert_eq!(dialog.countdown_wait(deadline), Some(Duration::ZERO));
+        let after = deadline + Duration::from_secs(10);
+        assert!(top_row(&dialog.render(after).unwrap()).ends_with("0:00"));
+        assert_eq!(dialog.countdown_wait(after), None);
+        assert!(!dialog.countdown_stale(after));
+        // The answers ignore it.
+        dialog.engage(after);
+        let armed = after + UPGRADE_ARMING_DELAY;
+        assert_eq!(
+            dialog.key_input(TrustedDialogKey::Escape, false, armed),
+            Some(TrustedInput::Answer(false))
+        );
+        assert_eq!(
+            dialog.key_input(TrustedDialogKey::G, false, armed),
+            Some(TrustedInput::Answer(true))
+        );
+        assert_eq!(
+            dialog.action_area_input(true, armed),
+            Some(TrustedInput::Answer(true))
+        );
+    }
+
+    /// A dialog that does not know its deadline shows no countdown and
+    /// never wakes for one: the access consent (its deadline is the
+    /// daemon's) and a question whose asker sent a zero wait.
+    #[test]
+    fn without_a_known_deadline_nothing_counts_down() {
+        let (decision, _answers) = std::sync::mpsc::channel();
+        let restart = TrustedConsentUi::restart(decision)
+            .with_respond_within(Duration::ZERO)
+            .with_text(consent_text(0));
+        for mut dialog in [consent_two_durations(), restart] {
+            let start = Instant::now();
+            let snapshot = dialog.lay_out(narrow_frame(), start).unwrap();
+            assert!(
+                !top_row(&snapshot).contains(':'),
+                "{:?}",
+                top_row(&snapshot)
+            );
+            let later = start + Duration::from_secs(300);
+            assert_eq!(dialog.countdown_wait(later), None);
+            assert!(!dialog.countdown_stale(later));
+        }
+    }
+
+    /// A click inside that lands on no cell (in the padding around the
+    /// grid) engages the dialog and asks for one redraw, so the legend
+    /// says the keys are live; once redrawn, such clicks ask for nothing.
+    #[test]
+    fn a_click_outside_every_cell_redraws_the_legend_once() {
+        let mut dialog = consent_dialog();
+        let start = Instant::now();
+        dialog.lay_out(narrow_frame(), start).unwrap();
+        assert_eq!(dialog.engagement_redraw(), None);
+        dialog.engage(start);
+        assert_eq!(dialog.engagement_redraw(), Some(TrustedInput::Redraw));
+        let redrawn = snapshot_text(&dialog.render(start).unwrap());
+        assert!(!redrawn.contains("click inside"), "{redrawn}");
+        assert_eq!(dialog.engagement_redraw(), None);
     }
 }

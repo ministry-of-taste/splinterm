@@ -71,8 +71,7 @@ running daemon by themselves.
   `splinterm-mcp` at the same version.
 - The agent access prompt no longer grants on Enter: Enter denies, and only `G`
   or the green Allow button grants. Its keys do nothing until you click inside
-  it or
-  press the dialog shortcut (see "Trusted dialogs").
+  it or press the dialog shortcut (see "Trusted dialogs").
 - **Revoke all access** (`Ctrl+Shift+R`) asks with exact counts before it acts,
   except in a Window opened on a single Splint (`splinterm launch --splint-id
   ID`), which has no command palette.
@@ -117,10 +116,9 @@ running daemon by themselves.
   Without one, or from inside a Splinterm terminal, a small trusted "Splinterm —
   Upgrade" dialog asks instead (see "Trusted dialogs"); only `G` or its green
   **Proceed** button proceeds. Closing it or not answering cancels; with no
-  answer in time
-  the command prints "No answer about the Windows within N seconds;
-  cancelling." Proceeding closes those Windows; their terminals keep running
-  and reopen from Recent Dojos.
+  answer in time the command prints "No answer about the Windows within N
+  seconds; cancelling." Proceeding closes those Windows; their terminals keep
+  running and reopen from Recent Dojos.
 - If the new build fails before it takes over, the daemon rolls back to the
   previous build in the same process and keeps every terminal. Windows show
   "Rolled back".
@@ -155,8 +153,8 @@ running daemon by themselves.
   **Restart now, end N shells**, with the daemon's exact count. For a daemon
   it cannot read, the count is a best-effort "end about N shells", or "end all
   running shells" when none can be counted. When the daemon reports that
-  nothing blocks a live
-  upgrade, the dialog says to choose **Not now** and run `splinterm upgrade`.
+  nothing blocks a live upgrade, the dialog says to choose **Not now** and run
+  `splinterm upgrade`.
 - With no answer, the launcher prints "splinterm: no answer within 120 seconds,
   so nothing was restarted." instead of a failure, and exits as for **Not now**
   (status 3).
@@ -308,6 +306,9 @@ a hostile program running as your account.
   then which keys answer. The access prompt now says that the agent names
   itself and Splinterm cannot verify that name. A button label too long for
   its half counts as hidden text, so the dialog can then only be declined.
+  The box casts the same hard shadow as the in-Window popups. The upgrade and
+  restart questions count their time to answer down at the right of the top
+  edge, such as `0:42`; the access prompt shows no countdown.
 
 ## Agent status
 

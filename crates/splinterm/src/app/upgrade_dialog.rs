@@ -277,6 +277,7 @@ fn dialog_window_options(
 ) -> WindowOptions {
     TrustedConsentUi::upgrade(decision)
         .with_shortcut(shortcut)
+        .with_respond_within(Duration::from_secs(prompt.respond_within_seconds))
         .with_text(dialog_text(prompt))
         .with_identity(question_identity())
         .into_window_options()

@@ -12,7 +12,7 @@ use crate::{
     },
     config::ResolvedTheme,
     frontend::{
-        DialogFrame, DialogText, dialog_font_step,
+        DialogFrame, DialogText, TrustedInput, dialog_font_step,
         dialog_text::{
             DialogInk, NATURAL_MAX_TEXT_COLUMNS, SELECTION_SLOT, chrome_rows, natural_columns,
             natural_rows, text_columns, text_rows,
@@ -24,6 +24,7 @@ use crate::{
 };
 use splinterm_core::SplintId;
 use splinterm_protocol::{MAX_COLUMNS, MAX_ROWS, TerminalRow, TerminalSnapshot};
+use wayland_client::QueueHandle;
 
 use super::{
     App, CachedFrameTitle, SCALE_DENOMINATOR, apply_theme, rebuild_pane_scaled_frame_with_context,
@@ -169,6 +170,14 @@ const BUTTON_HEIGHT_PIXELS: u32 = 56;
 /// The gap between the two buttons, in logical pixels.
 const BUTTON_GAP_PIXELS: u32 = 6;
 
+/// How far the box's hard shadow falls below and right of it, in logical
+/// pixels: the in-Window popups' offset.
+const SHADOW_OFFSET_PIXELS: u32 = 6;
+
+/// How dark the hard shadow is: this much black over the background, as
+/// the in-Window popups' shadow is.
+const SHADOW_DARKNESS: f64 = 0.35;
+
 /// Where a trusted dialog's box goes in its buffer, in buffer pixels: the
 /// frame, the openings in its edges for the title and the legend, and the
 /// two buttons. Drawing ([`paint_trusted_consent_chrome`]) and hit testing
@@ -187,6 +196,10 @@ pub(super) struct TrustedChrome {
     deny: Rect,
     allow: Rect,
     edge: u32,
+    /// The hard shadow: the bands, right of and below the grid, where the
+    /// grid shifted down and right by the offset shows. Nothing is drawn
+    /// there but the shadow; the Window's padding holds it.
+    shadow: Vec<Rect>,
 }
 
 /// Whether a click `y` logical pixels down a Window at `scale_120` is on
@@ -227,6 +240,54 @@ fn frame_openings(row: Option<&TerminalRow>, geometry: &WindowGeometry) -> Vec<(
         }
     }
     openings
+}
+
+/// The hard shadow of `geometry`'s grid in a `width` by `height` buffer at
+/// `scale_120`: the band right of the grid and the band below it, where
+/// the grid moved down and right by the shadow's offset would show, cut to
+/// the buffer.
+///
+/// It falls outside the whole grid, not just outside the frame, so the
+/// title, the legend and the frame, which sit in the grid's edge cells,
+/// never stand on it. The Window's padding, wider than the offset at every
+/// scale, holds it, so the natural size already makes room for it.
+fn shadow_bands(geometry: &WindowGeometry, scale_120: u32, width: u32, height: u32) -> Vec<Rect> {
+    let offset = SHADOW_OFFSET_PIXELS
+        .saturating_mul(scale_120)
+        .div_ceil(SCALE_DENOMINATOR);
+    let grid = geometry.grid_rect;
+    let right = grid
+        .x
+        .saturating_add(geometry.columns.saturating_mul(geometry.cell.width));
+    let bottom = grid
+        .y
+        .saturating_add(geometry.rows.saturating_mul(geometry.cell.height));
+    let clip = |x: u32, y: u32, end_x: u32, end_y: u32| {
+        let (end_x, end_y) = (end_x.min(width), end_y.min(height));
+        Rect {
+            x,
+            y,
+            width: end_x.saturating_sub(x),
+            height: end_y.saturating_sub(y),
+        }
+    };
+    [
+        clip(
+            right,
+            grid.y.saturating_add(offset),
+            right.saturating_add(offset),
+            bottom.saturating_add(offset),
+        ),
+        clip(
+            grid.x.saturating_add(offset),
+            bottom,
+            right,
+            bottom.saturating_add(offset),
+        ),
+    ]
+    .into_iter()
+    .filter(|band| band.width > 0 && band.height > 0)
+    .collect()
 }
 
 /// The red (left) and green (right) buttons between `left` and `right` and
@@ -302,6 +363,7 @@ pub(super) fn trusted_chrome(
             deny,
             allow,
             edge,
+            shadow: Vec::new(),
         };
     };
     let (cell_width, cell_height) = (geometry.cell.width.max(1), geometry.cell.height.max(1));
@@ -365,6 +427,7 @@ pub(super) fn trusted_chrome(
         deny,
         allow,
         edge,
+        shadow: shadow_bands(geometry, scale_120, width, height),
     }
 }
 
@@ -395,6 +458,28 @@ impl App {
     /// the rows of its buttons, exactly where
     /// [`paint_trusted_consent_chrome`] paints them. The pointer's side of
     /// the Window's middle picks the button.
+    /// How long until a trusted dialog's countdown needs drawing again;
+    /// `None` without a dialog that counts down.
+    pub(super) fn trusted_countdown_timeout(&self) -> Option<std::time::Duration> {
+        self.modal
+            .trusted_consent
+            .as_ref()?
+            .countdown_wait(Instant::now())
+    }
+
+    /// Draws a trusted dialog again when the time left it shows has
+    /// changed. Display only: nothing answers when the time runs out.
+    pub(super) fn tick_trusted_countdown(&mut self, queue_handle: &QueueHandle<Self>) {
+        if self
+            .modal
+            .trusted_consent
+            .as_ref()
+            .is_some_and(|consent| consent.countdown_stale(Instant::now()))
+        {
+            self.trusted_dialog_input(Some(TrustedInput::Redraw), queue_handle);
+        }
+    }
+
     pub(super) fn trusted_consent_action_area_at(&self, y: f64) -> bool {
         let scale_120 = self.surface.scale_120;
         let content = self.content_rect();
@@ -626,6 +711,10 @@ pub(super) struct TrustedConsentColors {
     pub(super) allow_keys: u32,
     /// The right button's label and keys while it cannot say yes.
     pub(super) allow_off: u32,
+    /// The hard shadow below and right of the box: black over the
+    /// background. Nothing is drawn on it, so no contrast is measured
+    /// against it.
+    pub(super) shadow: u32,
 }
 
 /// The theme roles a trusted dialog takes its colors from.
@@ -784,6 +873,7 @@ impl TrustedConsentColors {
             deny_keys: contrast_corrected(secondary, deny_tint),
             allow_keys: contrast_corrected(secondary, allow_tint),
             allow_off: contrast_corrected(secondary, allow_tint_dimmed),
+            shadow: mix_encoded(background, 0, SHADOW_DARKNESS),
         }
     }
 
@@ -937,8 +1027,9 @@ fn edge_rects(button: Rect, edge: u32) -> [Rect; 4] {
 }
 
 /// Paints a trusted dialog's box, `chrome` ([`trusted_chrome`]), over its
-/// text, in `colors`: the red (left) and green (right) buttons, then the
-/// frame, open where the title and the legend show.
+/// text, in `colors`: the hard shadow below and right of it, the red (left)
+/// and green (right) buttons, then the frame, open where the title and the
+/// legend show.
 ///
 /// Each button's tint goes behind the text: only its pixels that still
 /// show the dialog's background (or an earlier tint) take it, so the label
@@ -961,6 +1052,7 @@ pub(super) fn paint_trusted_consent_chrome(
         deny,
         allow,
         edge: edge_pixels,
+        shadow,
     } = chrome;
     let index = |x: u32, y: u32| {
         (x < width && y < height)
@@ -984,6 +1076,9 @@ pub(super) fn paint_trusted_consent_chrome(
         colors.allow_tint_dimmed,
     ]
     .map(opaque_pixel);
+    for band in shadow {
+        fill(canvas, band, colors.shadow);
+    }
     let (allow_tint, allow_edge) = if proceed_enabled {
         (colors.allow_tint, colors.allow)
     } else {
@@ -1805,6 +1900,135 @@ mod tests {
         canvas[index..index + 4].try_into().unwrap()
     }
 
+    fn overlaps(a: Rect, b: Rect) -> bool {
+        a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height
+    }
+
+    /// The hard shadow stays inside the buffer and off the box: no band
+    /// touches the frame, a button, or a cell that shows a character, so
+    /// none of them is measured against a background it does not sit on.
+    fn assert_shadow_clear(
+        chrome: &TrustedChrome,
+        snapshot: &TerminalSnapshot,
+        geometry: &WindowGeometry,
+        size: &str,
+    ) {
+        let (width, height) = (geometry.buffer_width(), geometry.buffer_height());
+        let grid = geometry.grid_rect;
+        let (cell_width, cell_height) = (geometry.cell.width, geometry.cell.height);
+        assert!(!chrome.shadow.is_empty(), "{size}");
+        for band in chrome.shadow.iter().copied() {
+            assert!(
+                band.x + band.width <= width && band.y + band.height <= height,
+                "{size}: {band:?}"
+            );
+            for part in [chrome.frame, chrome.deny, chrome.allow] {
+                assert!(!overlaps(band, part), "{size}: {band:?} on {part:?}");
+            }
+            for row in 0..snapshot.rows {
+                for column in visible_columns(snapshot, row) {
+                    let cell = Rect {
+                        x: grid.x + column * cell_width,
+                        y: grid.y + u32::try_from(row).unwrap() * cell_height,
+                        width: cell_width,
+                        height: cell_height,
+                    };
+                    assert!(
+                        !overlaps(band, cell),
+                        "{size}: {band:?} on row {row} column {column}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// At its natural size, at 1x and at 1.25x, the dialog leaves room for
+    /// its hard shadow: the frame ends at least the shadow's offset inside
+    /// the buffer, and the two bands, right of and below the grid and as
+    /// thick as the offset, are painted 35% black over the background, and
+    /// nothing else is. A click on them is on no button.
+    #[test]
+    fn the_hard_shadow_falls_below_and_right_of_the_box_inside_the_window() {
+        let variants = restart_text();
+        let colors = TrustedConsentColors::fixed();
+        assert_eq!(colors.shadow, mix_encoded(colors.background, 0, 0.35));
+        assert_ne!(colors.shadow, colors.background);
+        let shadow_pixel = opaque_pixel(colors.shadow);
+        for (scale_120, offset) in [(SCALE_DENOMINATOR, 6), (150, 8)] {
+            let natural = WindowGeometry::for_grid(
+                u32::try_from(natural_columns(&variants)).unwrap(),
+                u32::try_from(natural_rows(&variants)).unwrap(),
+                cell(),
+                TerminalPadding::DEFAULT,
+                scale_120,
+            )
+            .unwrap();
+            let fit = fit_at(
+                &variants,
+                natural.logical_width(),
+                natural.logical_height(),
+                scale_120,
+            );
+            assert!(fit.fits(), "{scale_120}: {fit:?}");
+            let mut dialog = restart_dialog();
+            let snapshot = laid_out(&mut dialog, &fit);
+            let geometry = fit.geometry;
+            let (width, height) = (geometry.buffer_width(), geometry.buffer_height());
+            let chrome = trusted_chrome(
+                width,
+                height,
+                scale_120,
+                Some(&geometry),
+                &snapshot.visible_rows,
+            );
+            let frame = chrome.frame;
+            assert!(frame.x + frame.width + offset <= width, "{scale_120}");
+            assert!(frame.y + frame.height + offset <= height, "{scale_120}");
+            let grid = geometry.grid_rect;
+            let right = grid.x + geometry.columns * geometry.cell.width;
+            let bottom = grid.y + geometry.rows * geometry.cell.height;
+            assert_eq!(
+                chrome.shadow,
+                vec![
+                    Rect {
+                        x: right,
+                        y: grid.y + offset,
+                        width: offset,
+                        height: bottom - grid.y,
+                    },
+                    Rect {
+                        x: grid.x + offset,
+                        y: bottom,
+                        width: right - grid.x - offset,
+                        height: offset,
+                    },
+                ],
+                "{scale_120}"
+            );
+            assert_shadow_clear(&chrome, &snapshot, &geometry, &format!("{scale_120}"));
+            let mut canvas = background_canvas(width, height, colors);
+            paint_trusted_consent_chrome(&mut canvas, width, height, chrome.clone(), colors, true);
+            let in_shadow = |x: u32, y: u32| {
+                chrome.shadow.iter().any(|band| {
+                    (band.x..band.x + band.width).contains(&x)
+                        && (band.y..band.y + band.height).contains(&y)
+                })
+            };
+            for y in 0..height {
+                for x in 0..width {
+                    assert_eq!(
+                        pixel_at(&canvas, width, x, y) == shadow_pixel,
+                        in_shadow(x, y),
+                        "{scale_120} at {x},{y}"
+                    );
+                }
+            }
+            let below = f64::from(bottom + offset / 2) * f64::from(SCALE_DENOMINATOR)
+                / f64::from(scale_120);
+            assert!(!buttons_hit(below, scale_120, &chrome), "{scale_120}");
+        }
+    }
+
     /// At its natural size the dialog fits exactly, and in every smaller or
     /// odd Window (the 2026-10-22 tiles among them), at 1x and at 1.25x, its
     /// box holds it: the body ends above the buttons, the buttons above the
@@ -1874,6 +2098,7 @@ mod tests {
                 let (cell_width, cell_height) = (geometry.cell.width, geometry.cell.height);
                 let row_top = |row: usize| grid.y + u32::try_from(row).unwrap() * cell_height;
                 let places = chrome_rows(geometry.rows as usize);
+                assert_shadow_clear(&chrome, &snapshot, &geometry, &size);
                 // The body ends above the buttons; the buttons end above
                 // the legend's row.
                 if let Some(last) =
@@ -2128,6 +2353,7 @@ mod tests {
                 height: 30,
             },
             edge: 1,
+            shadow: Vec::new(),
         };
         let glyph = [1, 2, 3, 0xff];
         let mut canvas = background_canvas(width, height, colors);

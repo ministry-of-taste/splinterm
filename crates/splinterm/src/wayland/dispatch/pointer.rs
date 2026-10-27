@@ -200,7 +200,12 @@ impl PointerHandler for App {
                         let input = if in_action_area {
                             consent.action_area_input(proceed_area, now)
                         } else {
-                            cell.and_then(|position| consent.row_input(position.row, now))
+                            match cell {
+                                Some(position) => consent.row_input(position.row, now),
+                                // Outside every cell: nothing to answer or
+                                // select, but the legend may need redrawing.
+                                None => consent.engagement_redraw(),
+                            }
                         };
                         self.trusted_dialog_input(input, queue_handle);
                         continue;
