@@ -474,6 +474,14 @@ pub(in crate::app) fn load_startup_theme(config: &AppConfig) -> ResolvedTheme {
     load_startup_theme_for_watch(config).for_window(&config.theme_colors())
 }
 
+/// The theme a trusted dialog child opens with, read once as
+/// [`load_startup_theme`] does but without printing the source's
+/// diagnostics, which other Windows report: what a dialog child prints is
+/// kept only to explain why it failed.
+pub(in crate::app) fn load_dialog_theme(config: &AppConfig) -> ResolvedTheme {
+    load_startup_theme_with_reporter(config, |_| {}).for_window(&config.theme_colors())
+}
+
 /// Loads the startup theme for a Window that also starts `watch_theme`.
 pub(in crate::app) fn load_startup_theme_for_watch(config: &AppConfig) -> StartupTheme {
     load_startup_theme_with_reporter(config, |diagnostic| eprintln!("{diagnostic}"))

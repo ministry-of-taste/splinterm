@@ -1102,7 +1102,11 @@ pub(crate) fn paint_command_palette(
                 scale_120,
                 renderer_generation,
                 buffer_rect(row.title, scale_120),
-                primary,
+                if enabled && row.command.destructive() {
+                    palette.row_danger(is_selected, highlighted)
+                } else {
+                    primary
+                },
                 false,
             )?;
             if !layout.compact {
@@ -1396,6 +1400,12 @@ pub(crate) fn paint_tab_context_menu(
         } else {
             palette.secondary
         };
+        // Terminate Lair and Terminate Dojo end running terminals.
+        let label_color = if enabled && row.action.destructive() {
+            palette.row_danger(selected, highlighted)
+        } else {
+            primary
+        };
         if selected {
             let inset = 3_u32
                 .saturating_mul(scale_120)
@@ -1440,7 +1450,7 @@ pub(crate) fn paint_tab_context_menu(
             scale_120,
             renderer_generation,
             buffer_rect(row.title, scale_120),
-            primary,
+            label_color,
             false,
         )?;
     }
@@ -1825,12 +1835,12 @@ pub(crate) fn paint_dojo_prompt(
                 scale_120,
                 renderer_generation,
                 rect,
-                if selected {
-                    palette.selected_primary
-                } else if decision == TerminationDecision::Terminate {
-                    palette.selected_rail
-                } else {
-                    palette.primary
+                // Terminate is drawn in danger, selected or not.
+                match (decision == TerminationDecision::Terminate, selected) {
+                    (true, true) => palette.selected_danger,
+                    (true, false) => palette.danger,
+                    (false, true) => palette.selected_primary,
+                    (false, false) => palette.primary,
                 },
                 false,
             )?;
@@ -2853,7 +2863,10 @@ mod tests {
             },
             roles: crate::theme::ChromeRoles {
                 surface: 0x1a_1b_26,
+                surface_raised: 0x1a_1b_26,
                 text: 0xc0_ca_f5,
+                text_muted: 0x8f_97_bb,
+                danger: 0xf7_76_8e,
                 ..crate::theme::ChromeRoles::default()
             },
             ..ResolvedTheme::default()

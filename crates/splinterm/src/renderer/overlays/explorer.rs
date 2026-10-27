@@ -33,7 +33,7 @@ use super::{
     },
     picker::{
         ChromeSurface, PickerTextAlignment, SessionPickerPalette, SessionPickerTextCache,
-        SessionPickerTextKey, chrome_panel_palette, editable_text, paint_picker_source,
+        SessionPickerTextKey, chrome_panel_palette_on, editable_text, paint_picker_source,
         paint_picker_source_tinted, paint_picker_source_within, paint_picker_text,
         picker_cell_width, truncate_picker_text,
     },
@@ -901,9 +901,8 @@ pub(crate) fn lair_explorer_palette(
     theme: ResolvedTheme,
     status_colors: bool,
 ) -> SessionPickerPalette {
-    let mut panel_theme = theme;
-    panel_theme.roles.surface = theme.explorer_background();
-    let mut palette = chrome_panel_palette(panel_theme, ChromeSurface::Menu);
+    let mut palette =
+        chrome_panel_palette_on(theme, ChromeSurface::Menu, theme.explorer_background());
     palette.panel_fill = premultiplied_theme_rgba(palette.panel, theme.explorer_alpha());
     palette.with_status_colors(status_colors)
 }
@@ -3884,16 +3883,7 @@ mod tests {
         });
         let palette = lair_explorer_palette(light, true);
         assert_eq!(palette.panel_fill, [0xf0, 0xf0, 0xf0, 0xff]);
-        let expected = chrome_panel_palette(
-            ResolvedTheme {
-                roles: crate::theme::ChromeRoles {
-                    surface: 0xf0_f0_f0,
-                    ..light.roles
-                },
-                ..light
-            },
-            ChromeSurface::Menu,
-        );
+        let expected = chrome_panel_palette_on(light, ChromeSurface::Menu, 0xf0_f0_f0);
         assert_eq!(palette.primary, expected.primary);
         assert_ne!(palette.primary, lair_explorer_palette(theme, true).primary);
 

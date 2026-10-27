@@ -478,6 +478,14 @@ pub(crate) enum TabMenuActionId {
     TerminateDojo,
 }
 
+impl TabMenuActionId {
+    /// Whether the action ends running terminals, so its label is drawn in
+    /// danger.
+    pub(crate) const fn destructive(self) -> bool {
+        matches!(self, Self::TerminateLair | Self::TerminateDojo)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TabMenuContext {
     pub(crate) lair_id: LairId,
@@ -1215,6 +1223,15 @@ pub(crate) enum BuiltInCommandId {
 }
 
 impl BuiltInCommandId {
+    /// Whether the command ends running terminals, so its title is drawn in
+    /// danger.
+    pub(crate) const fn destructive(self) -> bool {
+        matches!(
+            self,
+            Self::TerminateCurrentDojo | Self::TerminateCurrentLair
+        )
+    }
+
     pub(crate) const ALL: &[Self] = &[
         Self::ShowKeybindings,
         Self::ReloadConfiguration,

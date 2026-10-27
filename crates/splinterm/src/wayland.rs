@@ -196,8 +196,8 @@ mod terminal_state;
 #[cfg(test)]
 use chrome::divider_junction;
 use chrome::{
-    frame_title_maximum_cells, paint_pane_chrome, paint_trusted_consent_chrome,
-    sanitize_frame_title,
+    TrustedConsentColors, frame_title_maximum_cells, paint_pane_chrome,
+    paint_trusted_consent_chrome, sanitize_frame_title,
 };
 pub use clipboard::encode_bracketed_paste;
 use clipboard::{
@@ -12618,7 +12618,7 @@ impl App {
                     self.surface.scale_120,
                     status,
                     chrome_panel_fill(
-                        self.presentation.theme.roles.surface,
+                        self.presentation.theme.roles.surface_raised,
                         ChromeSurface::Popup.shell_alpha(self.presentation.theme.shell),
                         self.presentation.theme.background_alpha,
                         &[self.presentation.theme.roles.accent],
@@ -12632,7 +12632,7 @@ impl App {
                     width,
                     height,
                     button_top,
-                    self.presentation.theme.roles.surface,
+                    TrustedConsentColors::from_theme(self.presentation.theme),
                     proceed_enabled,
                 );
             }

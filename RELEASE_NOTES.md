@@ -464,6 +464,18 @@ a hostile program running as your account.
   Explorer turn translucent with blur when glass is on, while text and icons
   stay opaque and crisp. The selected Dojo tab stays opaque, so it stands
   clearly apart from the inactive tabs. Toggling applies live.
+- Menus, pickers, the command palette, the tab menu, the Dojo prompt and
+  other popups sit on the theme's raised surface (Omarchy
+  `lighter_background`), with its text, muted text and selection colours, as
+  Omarchy's own menus do. Terminate is drawn in the theme's red. A theme
+  that names no raised surface gets its text mixed 8% over its background,
+  for the selected tab too, which used to take ANSI 8.
+- Trusted dialogs (access consent, upgrade, restart) take your theme and its
+  `[colors]` keys as they open, always opaque: the frame in `warning`, the
+  left "no" area in `danger` and the right "yes" area in `success`, kept
+  readable. Since their text names the areas red and green, a theme whose
+  danger is not red or success not green gets Splinterm's own red and green
+  there. They still open without keyboard focus.
 - New `[colors]` keys in `config.ini` let you choose these yourself:
   `active-tab-background` and `active-tab-alpha` for the selected tab,
   `tab-strip-alpha` for the strip, and `explorer-background` and

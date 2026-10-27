@@ -384,7 +384,9 @@ pub(in crate::app) fn keyboard_hint(noun: &str, shortcut: Option<DialogShortcut>
 /// once it has focus.
 pub(in crate::app) fn run_trusted_dialog_window(
     options: WindowOptions,
+    theme: ResolvedTheme,
 ) -> Result<BackgroundRegistration> {
+    let options = WindowOptions { theme, ..options };
     let shortcut = options
         .trusted_consent
         .as_ref()
@@ -406,9 +408,17 @@ fn global_dialog_shortcut() -> bool {
 /// person's configuration, as every other Window does. Without it the child
 /// draws with the explicit startup fallback font alone, ignoring
 /// `main.font` and Fontconfig's `monospace`, and fails where that font is
-/// not installed. Dialogs keep the default, opaque theme.
-pub(in crate::app) fn configure_dialog_renderer(config: &AppConfig) -> Result<()> {
-    super::sessions::configure_picker_renderer(config, ResolvedTheme::default())
+/// not installed. It returns the theme the dialog draws with: the person's
+/// theme as of opening, with its `[colors]` keys, always opaque, so nothing
+/// behind the dialog shows through it.
+pub(in crate::app) fn configure_dialog_renderer(config: &AppConfig) -> Result<ResolvedTheme> {
+    let theme = ResolvedTheme {
+        background_alpha: u16::MAX,
+        background_blur: false,
+        ..super::theme_watch::load_dialog_theme(config)
+    };
+    super::sessions::configure_picker_renderer(config, theme)?;
+    Ok(theme)
 }
 
 /// The consent dialog's Window at the natural size of its text, answering on
@@ -430,7 +440,10 @@ fn consent_window_options(
         .into_window_options()
 }
 
-pub(in crate::app) fn run_consent_client(shortcut: Option<DialogShortcut>) -> Result<()> {
+pub(in crate::app) fn run_consent_client(
+    shortcut: Option<DialogShortcut>,
+    theme: ResolvedTheme,
+) -> Result<()> {
     let prompt: ConsentPrompt = read_private_frame(&mut io::stdin().lock())?;
     if let Err(reason) = prompt.validate() {
         bail!("invalid trusted consent prompt: {reason}");
@@ -438,7 +451,7 @@ pub(in crate::app) fn run_consent_client(shortcut: Option<DialogShortcut>) -> Re
     let capability = prompt.capability.clone();
     let (decision, receiver) = std_mpsc::channel();
     let registration =
-        run_trusted_dialog_window(consent_window_options(prompt, decision, shortcut))?;
+        run_trusted_dialog_window(consent_window_options(prompt, decision, shortcut), theme)?;
     // Closing the Window, or any way out without an answer, denies.
     let decision = receiver.try_recv().unwrap_or(ConsentDecision::Deny);
     let written = write_private_frame(

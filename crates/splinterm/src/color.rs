@@ -4,9 +4,6 @@
 //! linear light, and contrast is the WCAG 2 ratio of relative luminances.
 //! Theme derivation (`crate::theme`) and the overlay palettes share these
 //! functions, so a role and the panel painted from it agree on every value.
-//!
-//! [`legacy_srgb`] keeps the two encoded-sRGB mixes that some of today's
-//! derived chrome colors still come from; see its documentation.
 
 /// WCAG AA contrast for normal-size text.
 pub const TEXT_MIN_CONTRAST: f64 = 4.5;
@@ -131,34 +128,6 @@ pub fn contrast_corrected(foreground: u32, background: u32) -> u32 {
     )
 }
 
-/// Encoded-sRGB mixes that today's derivation of a few painted chrome colors
-/// still uses, kept exactly so that moving to semantic roles changes no
-/// pixel: the inactive-tab label's muted ramp and a JSON or built-in theme's
-/// default pane border. Nothing new may use them. The semantic-key and
-/// surface milestones of Plan 0064 move these derivations to linear light.
-pub mod legacy_srgb {
-    /// Mixes `second` into `first` in quarters of encoded sRGB: 0 keeps
-    /// `first`, 4 gives `second`, rounding half up.
-    #[must_use]
-    pub fn mix_quarters(first: u32, second: u32, second_quarters: u32) -> u32 {
-        let channel = |shift: u32| {
-            let first = first >> shift & 0xff;
-            let second = second >> shift & 0xff;
-            (first * (4 - second_quarters) + second * second_quarters + 2) / 4
-        };
-        channel(16) << 16 | channel(8) << 8 | channel(0)
-    }
-
-    /// The encoded-sRGB midpoint of two colors, each channel rounded down.
-    #[must_use]
-    pub fn midpoint(first: u32, second: u32) -> u32 {
-        let red = u32::midpoint(first >> 16 & 0xff, second >> 16 & 0xff);
-        let green = u32::midpoint(first >> 8 & 0xff, second >> 8 & 0xff);
-        let blue = u32::midpoint(first & 0xff, second & 0xff);
-        red << 16 | green << 8 | blue
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,7 +138,6 @@ mod tests {
         assert_eq!(mix_linear(0x10_20_30, 0xf0_e0_d0, 1.0), 0xf0_e0_d0);
         // Half of the light of white is brighter than the encoded midpoint.
         assert_eq!(mix_linear(0, 0x00ff_ffff, 0.5), 0x00bc_bcbc);
-        assert_eq!(legacy_srgb::midpoint(0, 0x00ff_ffff), 0x007f_7f7f);
         for channel in 0..=u8::MAX {
             assert_eq!(srgb_channel(linear_channel(channel)), channel);
         }
@@ -189,13 +157,5 @@ mod tests {
             contrast_corrected_toward(0x10_10_10, 0x20_20_20, 0x18_18_18),
             0x00ff_ffff
         );
-    }
-
-    #[test]
-    fn legacy_srgb_mixes_keep_their_exact_rounding() {
-        assert_eq!(legacy_srgb::mix_quarters(0, 0x00ff_ffff, 0), 0);
-        assert_eq!(legacy_srgb::mix_quarters(0, 0x00ff_ffff, 2), 0x0080_8080);
-        assert_eq!(legacy_srgb::mix_quarters(0, 0x00ff_ffff, 4), 0x00ff_ffff);
-        assert_eq!(legacy_srgb::midpoint(0x000e_1216, 0x00eb_ebeb), 0x007c_7e80);
     }
 }

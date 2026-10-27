@@ -568,23 +568,23 @@ async fn run_configured_command(
             }
         }
         Command::Consent => {
-            configure_dialog_renderer(&config)?;
+            let theme = configure_dialog_renderer(&config)?;
             let shortcut = config.dialog_shortcut;
-            tokio::task::spawn_blocking(move || run_consent_client(shortcut))
+            tokio::task::spawn_blocking(move || run_consent_client(shortcut, theme))
                 .await
                 .context("trusted consent task failed")?
         }
         Command::UpgradeDialog => {
-            configure_dialog_renderer(&config)?;
+            let theme = configure_dialog_renderer(&config)?;
             let shortcut = config.dialog_shortcut;
-            tokio::task::spawn_blocking(move || run_upgrade_dialog_client(shortcut))
+            tokio::task::spawn_blocking(move || run_upgrade_dialog_client(shortcut, theme))
                 .await
                 .context("trusted upgrade dialog task failed")?
         }
         Command::RestartDialog => {
-            configure_dialog_renderer(&config)?;
+            let theme = configure_dialog_renderer(&config)?;
             let shortcut = config.dialog_shortcut;
-            tokio::task::spawn_blocking(move || run_restart_dialog_client(shortcut))
+            tokio::task::spawn_blocking(move || run_restart_dialog_client(shortcut, theme))
                 .await
                 .context("trusted restart dialog task failed")?
         }

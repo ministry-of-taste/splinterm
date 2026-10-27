@@ -6,6 +6,10 @@ use anyhow::{Context, Result};
 use unicode_width::UnicodeWidthChar;
 
 use crate::{
+    color::{
+        NON_TEXT_MIN_CONTRAST, contrast_corrected, contrast_floor_toward, mix_linear, rgb_channels,
+        strongest_contrast_endpoint,
+    },
     config::ResolvedTheme,
     frontend::{
         DialogFrame, DialogText, MINIMUM_ACTION_ROWS, action_area_top, dialog_font_step,
@@ -385,6 +389,9 @@ impl App {
         mut snapshot: TerminalSnapshot,
     ) -> Result<()> {
         apply_theme(&mut snapshot, self.presentation.theme);
+        let colors = TrustedConsentColors::from_theme(self.presentation.theme);
+        snapshot.default_colors[0] = colors.text;
+        snapshot.default_colors[1] = colors.background;
         snapshot.revision = self
             .panes
             .pane
@@ -405,21 +412,108 @@ impl App {
     }
 }
 
-/// The green area's color while the dialog cannot say yes.
-const DIMMED_PROCEED: u32 = 0x0024_302a;
+/// The colors a trusted dialog paints with, from its Window's theme.
+///
+/// The dialog's text tells the person to click "the red left area" to say
+/// no and "the green right area" to say yes, so the two areas must stay
+/// recognisably red and green whatever the theme says: a `danger` or
+/// `success` role that is not red or green (a theme or a `[colors]` key
+/// that swaps them, or a monochrome palette) gives way to Splinterm's own
+/// red and green. Every non-text color keeps 3:1 against the background and
+/// the text keeps 4.5:1, moved toward black or white as needed, which keeps
+/// their hue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct TrustedConsentColors {
+    /// The dialog's body, behind its text and between the action areas.
+    pub(super) background: u32,
+    /// The dialog's text.
+    pub(super) text: u32,
+    /// The frame: the `warning` role.
+    pub(super) border: u32,
+    /// The left area, which says no: the `danger` role.
+    pub(super) deny: u32,
+    /// The right area, which says yes: the `success` role.
+    pub(super) allow: u32,
+    /// The right area while the dialog cannot say yes (part of its text is
+    /// hidden): `allow` faded most of the way into the background.
+    pub(super) allow_dimmed: u32,
+}
 
-/// Paints a trusted dialog's amber border and its red (left) and green
-/// (right) action areas, which begin `button_top` pixels down
-/// ([`App::trusted_consent_action_top`]). The gap between the areas is
-/// filled with `background`, so nothing drawn below `button_top` shows
-/// through it. While the dialog cannot say yes (part of its text is
-/// hidden), the green area is drawn dimmed.
+/// Splinterm's own red for the deny area, when the theme's `danger` is not red.
+const FALLBACK_DENY: u32 = 0x0070_2020;
+/// Splinterm's own green for the allow area, when the theme's `success` is
+/// not green.
+const FALLBACK_ALLOW: u32 = 0x0020_7040;
+/// How far the dimmed allow area fades into the background.
+const DIMMED_ALLOW_FADE: f64 = 0.75;
+
+impl TrustedConsentColors {
+    pub(super) fn from_theme(theme: ResolvedTheme) -> Self {
+        let background = theme.background;
+        let endpoint = strongest_contrast_endpoint(background);
+        let non_text =
+            |color| contrast_floor_toward(color, endpoint, background, NON_TEXT_MIN_CONTRAST);
+        let area = |role, fallback, hue: fn(f64) -> bool| {
+            let color = non_text(role);
+            if hue_degrees(color).is_some_and(hue) {
+                color
+            } else {
+                non_text(fallback)
+            }
+        };
+        let allow = area(theme.roles.success, FALLBACK_ALLOW, is_green_hue);
+        Self {
+            background,
+            text: contrast_corrected(theme.roles.text, background),
+            border: non_text(theme.roles.warning),
+            deny: area(theme.roles.danger, FALLBACK_DENY, is_red_hue),
+            allow,
+            allow_dimmed: mix_linear(allow, background, DIMMED_ALLOW_FADE),
+        }
+    }
+}
+
+/// The hue of `color` in degrees, or `None` for a color too close to grey
+/// to have one a person would name.
+fn hue_degrees(color: u32) -> Option<f64> {
+    let [red, green, blue] = rgb_channels(color).map(i32::from);
+    let max = red.max(green).max(blue);
+    let chroma = max - red.min(green).min(blue);
+    if chroma < 40 {
+        return None;
+    }
+    let (offset, difference) = if max == red {
+        (0, green - blue)
+    } else if max == green {
+        (120, blue - red)
+    } else {
+        (240, red - green)
+    };
+    Some((f64::from(offset) + 60.0 * f64::from(difference) / f64::from(chroma)).rem_euclid(360.0))
+}
+
+/// Red, from crimson and rose to red-orange.
+fn is_red_hue(hue: f64) -> bool {
+    !(30.0..320.0).contains(&hue)
+}
+
+/// Green, from olive (Gruvbox's green) to teal-green.
+fn is_green_hue(hue: f64) -> bool {
+    (55.0..=170.0).contains(&hue)
+}
+
+/// Paints a trusted dialog's border and its red (left) and green (right)
+/// action areas, which begin `button_top` pixels down
+/// ([`App::trusted_consent_action_top`]), in `colors`. The gap between the
+/// areas is filled with the background, so nothing drawn below
+/// `button_top` shows through it. While the dialog cannot say yes (part of
+/// its text is hidden), the green area is drawn dimmed.
 pub(super) fn paint_trusted_consent_chrome(
     canvas: &mut [u8],
     width: u32,
     height: u32,
     button_top: u32,
-    background: u32,
+    colors: TrustedConsentColors,
     proceed_enabled: bool,
 ) {
     fn fill(canvas: &mut [u8], width: u32, x0: u32, y0: u32, x1: u32, y1: u32, rgb: u32) {
@@ -436,7 +530,7 @@ pub(super) fn paint_trusted_consent_chrome(
         }
     }
     let border = trusted_consent_border(width, height);
-    fill(canvas, width, 0, 0, width, border, 0x00e0_a030);
+    fill(canvas, width, 0, 0, width, border, colors.border);
     fill(
         canvas,
         width,
@@ -444,9 +538,9 @@ pub(super) fn paint_trusted_consent_chrome(
         height.saturating_sub(border),
         width,
         height,
-        0x00e0_a030,
+        colors.border,
     );
-    fill(canvas, width, 0, 0, border, height, 0x00e0_a030);
+    fill(canvas, width, 0, 0, border, height, colors.border);
     fill(
         canvas,
         width,
@@ -454,7 +548,7 @@ pub(super) fn paint_trusted_consent_chrome(
         0,
         width,
         height,
-        0x00e0_a030,
+        colors.border,
     );
     let middle = width / 2;
     fill(
@@ -464,7 +558,7 @@ pub(super) fn paint_trusted_consent_chrome(
         button_top,
         middle.saturating_add(2),
         height.saturating_sub(border),
-        background,
+        colors.background,
     );
     fill(
         canvas,
@@ -473,7 +567,7 @@ pub(super) fn paint_trusted_consent_chrome(
         button_top,
         middle.saturating_sub(2),
         height.saturating_sub(border),
-        0x0070_2020,
+        colors.deny,
     );
     fill(
         canvas,
@@ -483,9 +577,9 @@ pub(super) fn paint_trusted_consent_chrome(
         width.saturating_sub(border),
         height.saturating_sub(border),
         if proceed_enabled {
-            0x0020_7040
+            colors.allow
         } else {
-            DIMMED_PROCEED
+            colors.allow_dimmed
         },
     );
 }
@@ -1124,6 +1218,7 @@ pub(super) fn paint_pane_chrome(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::color::{TEXT_MIN_CONTRAST, contrast_ratio};
     use crate::frontend::{DialogLine, dialog_text};
     use crate::pane::PaneGeometry;
     use splinterm_core::Axis;
@@ -1318,7 +1413,7 @@ mod tests {
                     buffer_width,
                     buffer_height,
                     top,
-                    0x0014_1820,
+                    FIXED_COLORS,
                     !dialog.clipped(),
                 );
                 let border = trusted_consent_border(buffer_width, buffer_height);
@@ -1430,7 +1525,7 @@ mod tests {
     fn the_gap_between_the_action_areas_is_painted_over() {
         let (width, height) = (200, 100);
         let mut canvas = vec![0xff; usize::try_from(width * height * 4).unwrap()];
-        paint_trusted_consent_chrome(&mut canvas, width, height, 70, 0x0014_1820, true);
+        paint_trusted_consent_chrome(&mut canvas, width, height, 70, FIXED_COLORS, true);
         let pixel = |x: u32, y: u32| {
             let index = usize::try_from((y * width + x) * 4).unwrap();
             [
@@ -1450,7 +1545,7 @@ mod tests {
         // Above the action areas the canvas is untouched.
         assert_eq!(pixel(100, 60), [0xff, 0xff, 0xff, 0xff]);
         // A dialog that cannot say yes dims its green area.
-        paint_trusted_consent_chrome(&mut canvas, width, height, 70, 0x0014_1820, false);
+        paint_trusted_consent_chrome(&mut canvas, width, height, 70, FIXED_COLORS, false);
         let index = usize::try_from((80 * width + 150) * 4).unwrap();
         assert_eq!(canvas[index..index + 4], [0x2a, 0x30, 0x24, 0xff]);
     }
@@ -1993,5 +2088,204 @@ mod tests {
             },
             [0x44, 0x88, 0xcc, 0xff],
         ));
+    }
+
+    /// The colors trusted dialogs painted before they followed the theme.
+    const FIXED_COLORS: TrustedConsentColors = TrustedConsentColors {
+        background: 0x0014_1820,
+        text: 0x00f4_f0e8,
+        border: 0x00e0_a030,
+        deny: 0x0070_2020,
+        allow: 0x0020_7040,
+        allow_dimmed: 0x0024_302a,
+    };
+
+    /// Each theme source's trusted dialog: background, text, border, deny
+    /// area, allow area, and the dimmed allow area.
+    const CONSENT_PINS: [(&str, [u32; 6]); 9] = [
+        (
+            "builtin",
+            [
+                0x000e_1216,
+                0xeb_eb_eb,
+                0xd7_99_21,
+                0xcc_24_1d,
+                0x98_97_1a,
+                0x51_51_17,
+            ],
+        ),
+        (
+            "json",
+            [
+                0x10_18_20, 0xe0_e4_ea, 0xcc_aa_33, 0xcc_33_44, 0x44_aa_55, 0x25_5c_33,
+            ],
+        ),
+        (
+            "json-explicit",
+            [
+                0x10_18_20, 0xe0_e4_ea, 0xcc_aa_33, 0xcc_33_44, 0x44_aa_55, 0x25_5c_33,
+            ],
+        ),
+        (
+            "tokyo-night",
+            [
+                0x1a_1b_26, 0xa9_b1_d6, 0xe0_af_68, 0xf7_76_8e, 0x9e_ce_6a, 0x56_70_40,
+            ],
+        ),
+        (
+            "flexoki-light",
+            [
+                0xff_fc_f0, 0x10_0f_0f, 0xb6_8d_14, 0xd1_4d_41, 0x87_9a_39, 0xe8_e8_d5,
+            ],
+        ),
+        (
+            "last-horizon",
+            [
+                0x0c_0b_0c, 0xfa_fc_fb, 0x6b_5e_73, 0xc3_8b_7b, 0x20_70_40, 0x13_3a_21,
+            ],
+        ),
+        (
+            "legacy-gruvbox",
+            [
+                0x28_28_28, 0xd4_be_98, 0xd8_a6_57, 0xea_69_62, 0xa9_b6_65, 0x5f_66_3e,
+            ],
+        ),
+        (
+            "alacritty-kanagawa",
+            [
+                0x1f_1f_28, 0xdc_d7_ba, 0xc0_a3_6e, 0xc3_40_43, 0x76_94_6a, 0x43_52_40,
+            ],
+        ),
+        (
+            "semantic-keys",
+            [
+                0x14_11_1f, 0xd8_d4_ea, 0xff_b3_47, 0xff_5f_6d, 0x5f_d7_8f, 0x34_74_4f,
+            ],
+        ),
+    ];
+
+    fn consent_pins(colors: TrustedConsentColors) -> [u32; 6] {
+        [
+            colors.background,
+            colors.text,
+            colors.border,
+            colors.deny,
+            colors.allow,
+            colors.allow_dimmed,
+        ]
+    }
+
+    /// The dialog's frame and areas keep 3:1 and its text 4.5:1 against its
+    /// background, and the areas stay red and green as its text says.
+    fn assert_consent_colors_hold(name: &str, colors: TrustedConsentColors) {
+        let background = colors.background;
+        assert!(
+            contrast_ratio(colors.text, background) >= TEXT_MIN_CONTRAST,
+            "{name}"
+        );
+        for color in [colors.border, colors.deny, colors.allow] {
+            assert!(
+                contrast_ratio(color, background) >= NON_TEXT_MIN_CONTRAST,
+                "{name}: {color:06x} on {background:06x}"
+            );
+        }
+        assert!(hue_degrees(colors.deny).is_some_and(is_red_hue), "{name}");
+        assert!(
+            hue_degrees(colors.allow).is_some_and(is_green_hue),
+            "{name}"
+        );
+        assert!(
+            contrast_ratio(colors.allow_dimmed, background)
+                < contrast_ratio(colors.allow, background),
+            "{name}"
+        );
+    }
+
+    #[test]
+    fn trusted_dialogs_take_their_theme_colors() {
+        let themes = crate::config::tests::provider_themes();
+        let painted = themes
+            .iter()
+            .map(|(name, theme)| {
+                (
+                    *name,
+                    consent_pins(TrustedConsentColors::from_theme(*theme)),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(painted, CONSENT_PINS, "{painted:#08x?}");
+        for (name, theme) in themes {
+            let colors = TrustedConsentColors::from_theme(theme);
+            assert_eq!(colors.background, theme.background, "{name}");
+            assert_consent_colors_hold(name, colors);
+        }
+    }
+
+    /// A danger that is not red, or a success that is not green, gives way
+    /// to Splinterm's own, since the dialog's text names the areas by color.
+    #[test]
+    fn trusted_dialog_areas_stay_red_and_green() {
+        let builtin = ResolvedTheme::default();
+        let fallback = TrustedConsentColors {
+            deny: contrast_floor_toward(
+                FALLBACK_DENY,
+                0xff_ff_ff,
+                builtin.background,
+                NON_TEXT_MIN_CONTRAST,
+            ),
+            allow: contrast_floor_toward(
+                FALLBACK_ALLOW,
+                0xff_ff_ff,
+                builtin.background,
+                NON_TEXT_MIN_CONTRAST,
+            ),
+            ..TrustedConsentColors::from_theme(builtin)
+        };
+        for (danger, success) in [
+            // Swapped.
+            (0x44_cc_55, 0xee_44_44),
+            // Grey and blue.
+            (0x88_88_88, 0x33_66_ee),
+            // Yellow and magenta.
+            (0xee_cc_33, 0xcc_33_cc),
+        ] {
+            let mut theme = builtin;
+            theme.roles.danger = danger;
+            theme.roles.success = success;
+            let colors = TrustedConsentColors::from_theme(theme);
+            assert_eq!(colors.deny, fallback.deny, "{danger:06x}");
+            assert_eq!(colors.allow, fallback.allow, "{success:06x}");
+            assert_consent_colors_hold("fallback", colors);
+        }
+        // Light backgrounds keep the fallback red and green readable too.
+        let mut light = builtin;
+        light.background = 0xff_fc_f0;
+        light.roles.danger = 0x33_66_ee;
+        light.roles.success = 0x33_66_ee;
+        assert_consent_colors_hold("light fallback", TrustedConsentColors::from_theme(light));
+        // Hues near each boundary.
+        assert!(hue_degrees(0xf9_26_72).is_some_and(is_red_hue));
+        assert!(hue_degrees(0xb8_bb_26).is_some_and(is_green_hue));
+        assert!(!hue_degrees(0xff_80_00).is_some_and(is_red_hue));
+        assert_eq!(hue_degrees(0x80_80_80), None);
+    }
+
+    /// `[colors] danger`, `success`, `warning` and `text` recolour the
+    /// dialog, within its floors.
+    #[test]
+    fn role_overrides_recolor_trusted_dialogs() {
+        let theme = ResolvedTheme::from_input_with_colors(
+            &crate::theme::ThemeInput::builtin(),
+            &crate::config::tests::theme_colors(
+                "[colors]\ndanger=#ff3355\nsuccess=#33dd66\nwarning=#ffaa00\ntext=#202020\n",
+            ),
+        );
+        let colors = TrustedConsentColors::from_theme(theme);
+        assert_eq!(colors.deny, 0xff_33_55);
+        assert_eq!(colors.allow, 0x33_dd_66);
+        assert_eq!(colors.border, 0xff_aa_00);
+        // Text too dark for the dialog is raised to 4.5:1.
+        assert_ne!(colors.text, 0x20_20_20);
+        assert_consent_colors_hold("overrides", colors);
     }
 }

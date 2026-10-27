@@ -41,7 +41,9 @@ use splinterd::{
     dialog_shortcut::{DialogShortcut, DialogShortcutLease, Hyprctl, SystemHyprctl},
 };
 use splinterm::automation::HandoffDecisionPrompt;
-use splinterm::{DialogIdentity, DialogLine, DialogText, TrustedConsentUi, WindowOptions};
+use splinterm::{
+    DialogIdentity, DialogLine, DialogText, TrustedConsentUi, WindowOptions, config::ResolvedTheme,
+};
 use splinterm_protocol::{
     HandoffUnresponsiveWindow, MAX_HANDOFF_DOJO_NAME_BYTES, MAX_HANDOFF_WINDOW_DOJOS,
     MAX_HANDOFF_WINDOWS,
@@ -289,13 +291,17 @@ fn dialog_window_options(
 /// prompt, which covers a parent that died before the signal was set. The
 /// signal follows the thread that spawned the child, the runtime thread that
 /// drives the command for as long as the process lives.
-pub(in crate::app) fn run_upgrade_dialog_client(shortcut: Option<DialogShortcut>) -> Result<()> {
-    run_dialog_client::<UpgradeDialogPrompt>(shortcut)
+pub(in crate::app) fn run_upgrade_dialog_client(
+    shortcut: Option<DialogShortcut>,
+    theme: ResolvedTheme,
+) -> Result<()> {
+    run_dialog_client::<UpgradeDialogPrompt>(shortcut, theme)
 }
 
 /// The body of every trusted dialog child: see [`run_upgrade_dialog_client`].
 pub(in crate::app) fn run_dialog_client<P: DialogPrompt>(
     shortcut: Option<DialogShortcut>,
+    theme: ResolvedTheme,
 ) -> Result<()> {
     rustix::process::set_parent_process_death_signal(Some(rustix::process::Signal::KILL))
         .context("tie the dialog to its command")?;
@@ -306,7 +312,7 @@ pub(in crate::app) fn run_dialog_client<P: DialogPrompt>(
         bail!("the command that asked has exited");
     }
     let (decision, receiver) = std_mpsc::channel();
-    let registration = run_trusted_dialog_window(prompt.window_options(decision, shortcut))?;
+    let registration = run_trusted_dialog_window(prompt.window_options(decision, shortcut), theme)?;
     let proceed = receiver.try_recv().unwrap_or(false);
     let written = write_private_frame_bounded(
         &mut io::stdout().lock(),
