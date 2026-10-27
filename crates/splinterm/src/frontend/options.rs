@@ -24,7 +24,8 @@ use crate::{
 
 use super::{
     AuthorityStatus, SessionPickerUi, TrustedDialogKey, TrustedDialogKind, WindowCommand,
-    WindowDojoIdentity, WindowTopologyCommand, WindowTopologyUpdate, WindowUpdate,
+    WindowDojoIdentity, WindowThemeColors, WindowTopologyCommand, WindowTopologyUpdate,
+    WindowUpdate,
     dialog_text::{self, DialogIdentity, DialogText},
     trusted_dialog::{AccessChoice, ConsentAction, Engagement},
 };
@@ -493,6 +494,9 @@ pub struct WindowOptions {
     pub app_id: String,
     /// Current project-owned Omarchy role mapping.
     pub theme: ResolvedTheme,
+    /// The `config.ini` `[colors]` keys `theme` was resolved with, and the
+    /// input it came from, so a configuration reload can resolve it again.
+    pub theme_colors: WindowThemeColors,
     /// `[main] ui-font-pixelsize`; `None` lets chrome text follow the theme's
     /// Omarchy text size, otherwise 14 px ([`crate::config::resolve_ui_font_size`]).
     pub ui_font_size: Option<FontSize>,
@@ -590,6 +594,7 @@ impl Default for WindowOptions {
             title: None,
             app_id: APP_ID.to_owned(),
             theme: ResolvedTheme::default(),
+            theme_colors: WindowThemeColors::default(),
             ui_font_size: None,
             pane_divider_style: PaneDividerStyle::Line,
             pane_gap: 0,

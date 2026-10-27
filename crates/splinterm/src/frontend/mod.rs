@@ -54,7 +54,8 @@ pub(crate) use lair_explorer::{
     LairExplorerAccess, LairExplorerDecision, LairExplorerFilter, LairExplorerRow, LairExplorerUi,
 };
 pub use message::{
-    AuthorityStatus, FontUpdate, PerfTraceCorrelation, ThemeUpdate, WindowCommand, WindowUpdate,
+    AuthorityStatus, FontUpdate, PerfTraceCorrelation, ThemeUpdate, WindowCommand,
+    WindowThemeColors, WindowUpdate,
 };
 pub(crate) use navigation_accessibility::{
     NavigationAccessAction, NavigationAccessContext, NavigationAccessibility,

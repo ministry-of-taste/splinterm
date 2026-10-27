@@ -123,6 +123,7 @@ substitution, but do not sandbox hostile processes running as your own user.
 | `colors.tab-strip-alpha` | tab strip coverage, behind the inactive tabs | 0.0–1.0; unset (terminal background alpha) |
 | `colors.explorer-background` | docked Lair Explorer panel colour, `#RRGGBB` or `0xRRGGBB`; its text colours are chosen against it | unset (terminal background) |
 | `colors.explorer-alpha` | docked Lair Explorer panel coverage | 0.0–1.0; unset (terminal background alpha) |
+| `colors.<role>` | a semantic chrome role's colour, such as `colors.accent` or `colors.status-working`; `[colors-dark]` and `[colors-light]` take the same keys for one appearance ([Role overrides](#role-overrides)) | `#RRGGBB`, `0xRRGGBB`, `color0`–`color15` or `auto`; unset (theme-owned) |
 | `scrollback.lines` | daemon terminal history budget | 0–1,000,000; 1000 |
 | `clipboard.image-directory` | explicit absolute private directory for user-requested local clipboard PNG saves | unset; no temporary fallback |
 | `cursor.style` | `block`, `beam`, or `underline` | block |
@@ -177,7 +178,11 @@ reads `config.ini` and its keymap file again for the Window it runs in and
 applies exactly these settings: the `[key-bindings]` keymap (profile, overlay
 file, and `prefix-timeout-ms`), `clipboard.image-directory` (an in-flight save
 is cancelled), `main.ui-font-pixelsize` and `multiplexer.tab-strip-border`
-(chrome is drawn again at once),
+(chrome is drawn again at once), every `[colors]` key, including `alpha`,
+`blur`, the [chrome background](#chrome-backgrounds) keys and the
+[role keys](#role-overrides) of `[colors]`, `[colors-dark]` and
+`[colors-light]` (the theme is resolved again at once, and a key the file no
+longer sets gives the theme's own value back),
 `explorer.agent-status`, `explorer.status-colors`, `explorer.status-glyphs`,
 `explorer.full-height`, `multiplexer.divider-style`,
 `multiplexer.frame-title`, `multiplexer.pane-gap`, `multiplexer.close-unused`,
@@ -282,8 +287,10 @@ or capability falls back to ordinary transparency with one bounded diagnostic;
 opaque alpha and `blur=no` own no effect object. The protocol is still staging;
 the validated initial target is Hyprland 0.56.1 or newer, while other
 compositors require compatible version-1 blur capability. `alpha-mode=matching/all`
-remains unsupported. Other `[colors]` options direct users to the active
-Omarchy palette or an explicit `main.theme` JSON override. `[key-bindings]`
+remains unsupported. Other `[colors]` options, such as Foot's terminal palette
+keys, direct users to the active Omarchy palette or an explicit `main.theme`
+JSON override; the [role keys](#role-overrides) recolour Splinterm's own
+chrome, never the terminal. `[key-bindings]`
 selects the typed built-in `splinterm` profile and an optional strict TOML
 overlay, so keyboard dispatch and command-palette shortcut labels share one
 action registry. This avoids claiming arbitrary `foot.ini` compatibility.
@@ -874,7 +881,84 @@ styles, and accessible text and search always use state words.
 `explorer.status-colors=no` draws status glyphs and the "Asking" marker in
 the colour of the text around them; the remote tag is not a status and
 stays remote-marker. JSON and built-in themes take the same roles from
-their ANSI colours.
+their ANSI colours. A colour a [role key](#role-overrides) sets is drawn as
+given, without that mixing.
+
+### Role overrides
+
+`config.ini` can set any of Splinterm's semantic chrome roles itself, over
+whatever the theme gives. Each role has a `[colors]` key of its own name:
+
+```ini
+[colors]
+accent=#e0af68
+focus-ring=color4
+status-working=auto
+
+[colors-light]
+accent=#8c6c3e
+```
+
+| Key | Used for | Without the key |
+| --- | --- | --- |
+| `surface` | the tab strip, the Explorer and other chrome backgrounds | the terminal background |
+| `surface-raised` | the selected Dojo tab body | the theme's ([role table](#native-omarchy-theme-integration)) |
+| `surface-sunken` | (not yet painted) | the theme's |
+| `selection` | the selected row's fill | the theme's |
+| `divider` | pane borders, frames | the theme's |
+| `focus-ring` | the active pane border, focused frames | the theme's, else `accent` |
+| `text` | chrome text | the terminal foreground |
+| `text-muted` | inactive tab labels | the theme's, ramped from `text` |
+| `text-faint` | faint text | `text` mixed 55% toward `surface` |
+| `accent` | the active tab underline, selection rails | the theme's |
+| `danger` | errors | the theme's |
+| `warning` | warnings, the "Asking" marker | the theme's |
+| `success` | success | the theme's |
+| `info` | information | the theme's |
+| `status-needs-input` | an agent waiting for input | `danger` |
+| `status-error` | an agent that reported an error | `danger` |
+| `status-working` | an agent at work | `warning` |
+| `status-done` | an agent that finished | `info` |
+| `status-idle` | an idle agent | `success` |
+| `status-stale` | a status that is no longer current | `text-faint` |
+| `remote-marker` | the remote host tag | the theme's |
+
+A value is `#RRGGBB` or `0xRRGGBB`; `colorN`, the terminal palette's ANSI
+colour N from `color0` to `color15`, which follows theme switches; or `auto`,
+the theme's own value, the same as leaving the key out. Anything else fails
+startup with the line number, as for the other `[colors]` keys.
+
+For each colour Splinterm takes the first of:
+
+1. a [chrome background](#chrome-backgrounds) key, `active-tab-background`
+   over `surface-raised` and `explorer-background` over `surface`;
+2. the role key;
+3. the theme's own colour for the role, including a JSON theme's
+   `active_tab_background` and `inactive_tab_foreground`;
+4. Splinterm's derivation from other roles;
+5. the built-in palette.
+
+An overridden role is used as given. It is never mixed toward readable text
+or raised to a contrast floor, and a status role that follows it is drawn the
+same way. When it falls below its floor against `surface`, 4.5:1 for `text`,
+`text-muted`, `text-faint` and `remote-marker` and 3:1 for the hue and status
+roles, Splinterm says so once on standard error and still uses it. Menus,
+pickers and the Explorer still correct the text they draw for their own
+panel, as they do for every theme. A role that follows an overridden one
+follows the new value unless it is set itself: `accent` moves `focus-ring`
+when the theme names no focus ring, `text` moves `text-muted`, `text-faint`
+and the floors of the derived hues, and `warning` moves `status-working`.
+
+`surface` and `text` recolour chrome only. The terminal keeps the theme's
+background, foreground and palette.
+
+`[colors-dark]` and `[colors-light]` take the same role keys and apply over
+`[colors]` to a theme of that appearance only (see
+[Native Omarchy theme integration](#native-omarchy-theme-integration) for how
+the appearance is read), so `auto` there clears a `[colors]` value for that
+appearance. They take no other key. **Reload configuration** applies every
+role key at once, and a key the file no longer sets gives the theme's own
+value back.
 
 ### Glassy Windows
 
@@ -1029,8 +1113,9 @@ close glyph colour chosen again, whichever of the terminal background or
 foreground has the higher contrast against it. A changed `explorer-background`
 gets its text colours corrected to 4.5:1 against it, as the theme background
 does. Alphas give no contrast guarantee against the backdrop, as for the
-terminal itself. Like `alpha` and `blur`, the keys are read when a Window
-opens; **Reload configuration** does not apply them.
+terminal itself. **Reload configuration** applies these keys at once, as it
+does `alpha` and `blur`, and a key the file no longer sets gives the default
+back.
 
 #### Text size
 

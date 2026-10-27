@@ -4,7 +4,8 @@ use std::{collections::HashMap, env, future::Future, path::PathBuf, sync::Arc, t
 
 use anyhow::{Context, Result, bail};
 use splinterm::{
-    PerfTraceCorrelation, PhaseEnd, WindowCommand, WindowOptions, WindowSurface, WindowUpdate,
+    PerfTraceCorrelation, PhaseEnd, WindowCommand, WindowOptions, WindowSurface, WindowThemeColors,
+    WindowUpdate,
     automation::{
         Connection, DaemonChange, DaemonIdentity, MAX_RENDERER_IMAGE_RESIDENT_BYTES,
         SharedImageContentCache, is_connection_loss, protocol_error, retry_until,
@@ -731,7 +732,9 @@ async fn run_live_multipane_window_inner(
         return first_dojo_gone(owner_still_lists);
     };
     let startup_theme = load_startup_theme_for_watch(&config);
-    let theme = startup_theme.theme;
+    let colors = config.theme_colors();
+    let theme = startup_theme.for_window(&colors);
+    let theme_colors = WindowThemeColors::new(colors, Some(Arc::clone(&startup_theme.input)));
     renderer::configure(RendererOptions {
         font: config.font.clone(),
         font_ligatures: config.font_ligatures,
@@ -849,6 +852,7 @@ async fn run_live_multipane_window_inner(
                 title: window_config.title,
                 app_id: resolved_window_app_id(app_id),
                 theme,
+                theme_colors,
                 ui_font_size: window_config.ui_font_size,
                 pane_divider_style: window_config.pane_divider_style,
                 pane_gap: window_config.pane_gap,
@@ -892,7 +896,9 @@ pub(super) async fn run_live_window(
         diagnostics.ensure_window(None, Some(splint_id));
     }
     let startup_theme = load_startup_theme_for_watch(&config);
-    let theme = startup_theme.theme;
+    let colors = config.theme_colors();
+    let theme = startup_theme.for_window(&colors);
+    let theme_colors = WindowThemeColors::new(colors, Some(Arc::clone(&startup_theme.input)));
     renderer::configure(RendererOptions {
         font: config.font.clone(),
         font_ligatures: config.font_ligatures,
@@ -1007,6 +1013,7 @@ pub(super) async fn run_live_window(
             cursor_blink: window_config.cursor_blink,
             title: window_config.title,
             theme,
+            theme_colors,
             ui_font_size: window_config.ui_font_size,
             pane_divider_style: window_config.pane_divider_style,
             pane_gap: window_config.pane_gap,

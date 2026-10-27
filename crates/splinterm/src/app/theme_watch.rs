@@ -1,7 +1,10 @@
 use std::{
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use anyhow::Result;
@@ -10,10 +13,10 @@ use splinterm::{
     config::{
         AppConfig, ChromeColorOverrides, JsonThemeProvider, OmarchyShellConcern,
         OmarchyShellSettings, OmarchyTextSizeFallback, OmarchyThemeProvider, OmarchyThemeRoots,
-        OmarchyThemeSelection, ResolvedTheme, ThemeSource, ThemeSourceLoad, load_omarchy_shell,
-        load_provider_theme, load_theme_source_for_startup,
+        OmarchyThemeSelection, ResolvedTheme, ThemeColorConfig, ThemeSource, ThemeSourceLoad,
+        load_omarchy_shell, load_theme_source_for_startup,
     },
-    theme::ThemeProvider,
+    theme::{ThemeInput, ThemeProvider},
 };
 use tokio::sync::mpsc;
 
@@ -37,7 +40,9 @@ pub(in crate::app) struct ThemeOverrides {
     /// (`ui_text_size_px`) is always published, so a Window whose
     /// configuration reload drops the key can fall back to it live.
     pub(in crate::app) follow_ui_text_size: bool,
-    /// The `[colors]` chrome background keys.
+    /// The `[colors]` chrome background keys. Role keys are applied by the
+    /// Window, which re-resolves each update from its theme input with its
+    /// own `[colors]` keys whenever they differ from these.
     pub(in crate::app) chrome: ChromeColorOverrides,
 }
 
@@ -49,6 +54,16 @@ impl ThemeOverrides {
             follow_text_size: config.follows_omarchy_text_size(),
             follow_ui_text_size: config.ui_font_size.is_none(),
             chrome: config.chrome_colors,
+        }
+    }
+
+    /// The `[colors]` keys the watcher's themes are resolved with.
+    fn colors(self) -> ThemeColorConfig {
+        ThemeColorConfig {
+            alpha: self.alpha,
+            blur: self.blur,
+            chrome: self.chrome,
+            roles: None,
         }
     }
 
@@ -337,6 +352,10 @@ fn with_omarchy_shell(
 
 struct StartupThemeLoad {
     theme: ResolvedTheme,
+    /// What the source gave, its shell settings layered as `theme`'s are.
+    input: ThemeInput,
+    /// The `[colors]` keys `theme` was resolved with.
+    colors: ThemeColorConfig,
     /// Everything to print at startup, prefixed.
     diagnostics: Vec<String>,
     /// The raw shell diagnostics among them, which seed the live watcher.
@@ -354,18 +373,18 @@ fn prepare_startup_theme_with_loader(
     load: impl FnOnce(&ThemeSource) -> Result<ThemeSourceLoad>,
 ) -> StartupThemeLoad {
     let mut diagnostics = Vec::new();
-    let (theme, observed) = match load(source) {
+    let (theme, mut input, observed) = match load(source) {
         Ok(loaded) => {
             let observed = if loaded.used_omarchy_fallback {
                 absent_startup_observation(source)
             } else {
                 None
             };
-            (loaded.theme, observed)
+            (loaded.theme, loaded.input, observed)
         }
         Err(error) => {
             diagnostics.push(format!("{error:#}; using safe fallback palette"));
-            (ResolvedTheme::default(), None)
+            (ResolvedTheme::default(), ThemeInput::builtin(), None)
         }
     };
     let layers = match source {
@@ -387,9 +406,12 @@ fn prepare_startup_theme_with_loader(
         ),
         None => theme,
     };
+    input.shell.settings = theme.shell;
     diagnostics.extend(shell_diagnostics.iter().cloned());
     StartupThemeLoad {
         theme: overrides.apply(theme),
+        input,
+        colors: overrides.colors(),
         diagnostics: diagnostics
             .into_iter()
             .map(|diagnostic| format!("splinterm theme: {diagnostic}"))
@@ -402,7 +424,13 @@ fn prepare_startup_theme_with_loader(
 /// The startup theme a live watcher continues from, with the shell
 /// diagnostics startup already printed and optional absence already observed.
 pub(in crate::app) struct StartupTheme {
+    /// The theme as the watcher resolves it: without `[colors]` role keys,
+    /// which each Window applies itself; see [`Self::for_window`].
     pub(in crate::app) theme: ResolvedTheme,
+    /// What the source gave, for a Window to resolve again.
+    pub(in crate::app) input: Arc<ThemeInput>,
+    /// The `[colors]` keys `theme` was resolved with.
+    pub(in crate::app) colors: ThemeColorConfig,
     shell_reported: Vec<String>,
     // Only the validated absence decision crosses the async startup boundary;
     // the watcher revalidates it and builds its own fingerprint at each poll.
@@ -424,9 +452,18 @@ impl From<StartupThemeLoad> for StartupTheme {
     fn from(loaded: StartupThemeLoad) -> Self {
         Self {
             theme: loaded.theme,
+            input: Arc::new(loaded.input),
+            colors: loaded.colors,
             shell_reported: loaded.shell_diagnostics,
             optional_absence: loaded.observed.is_some(),
         }
+    }
+}
+
+impl StartupTheme {
+    /// The theme a Window with the `[colors]` keys `colors` opens with.
+    pub(in crate::app) fn for_window(&self, colors: &ThemeColorConfig) -> ResolvedTheme {
+        self.theme.recolored(&self.input, &self.colors, colors)
     }
 }
 
@@ -434,7 +471,7 @@ impl From<StartupThemeLoad> for StartupTheme {
 /// the standalone Dojo and session picker and the remote-status window: they
 /// keep the palette and shell settings as of opening.
 pub(in crate::app) fn load_startup_theme(config: &AppConfig) -> ResolvedTheme {
-    load_startup_theme_for_watch(config).theme
+    load_startup_theme_for_watch(config).for_window(&config.theme_colors())
 }
 
 /// Loads the startup theme for a Window that also starts `watch_theme`.
@@ -446,6 +483,7 @@ pub(in crate::app) fn load_startup_theme_for_watch(config: &AppConfig) -> Startu
 /// last good one, which `OmarchyThemeSelection` holds through transient gaps.
 /// Rejected shell settings are reported through `shell_diagnostics` and never
 /// reject the palette; an invalid text size keeps the current one.
+#[cfg(test)]
 fn resolve_live_theme_update(
     source: ActiveThemeSource<'_>,
     selection: &mut OmarchyThemeSelection,
@@ -453,7 +491,22 @@ fn resolve_live_theme_update(
     current: ResolvedTheme,
     shell_diagnostics: &mut Vec<String>,
 ) -> Result<Option<ResolvedTheme>> {
-    let palette = load_provider_theme(source.provider().as_ref())?;
+    resolve_live_theme(source, selection, overrides, current, shell_diagnostics)
+        .map(|next| next.map(|(theme, _)| theme))
+}
+
+/// Loads the active source as [`resolve_live_theme_update`] does, with the
+/// input the theme was resolved from, its shell settings layered as the
+/// theme's are.
+fn resolve_live_theme(
+    source: ActiveThemeSource<'_>,
+    selection: &mut OmarchyThemeSelection,
+    overrides: ThemeOverrides,
+    current: ResolvedTheme,
+    shell_diagnostics: &mut Vec<String>,
+) -> Result<Option<(ResolvedTheme, ThemeInput)>> {
+    let mut input = source.provider().load()?;
+    let palette = ResolvedTheme::from_input(&input);
     if let ActiveThemeSource::Omarchy { index, .. } = source {
         selection.accepted(index);
     }
@@ -464,14 +517,15 @@ fn resolve_live_theme_update(
         if root.gap {
             let mut theme = palette;
             theme.shell = current.shell;
+            input.shell.settings = current.shell;
             let next = overrides.apply(theme);
-            return Ok((next != current).then_some(next));
+            return Ok((next != current).then_some((next, input)));
         }
         if root.layers.theme_dir.is_dir() {
             selection.accepted(root.index);
         }
     }
-    let next = overrides.apply(match source.shell() {
+    let layered = match source.shell() {
         Some(layers) => with_omarchy_shell(
             palette,
             layers,
@@ -480,8 +534,10 @@ fn resolve_live_theme_update(
             shell_diagnostics,
         ),
         None => palette,
-    });
-    Ok((next != current).then_some(next))
+    };
+    input.shell.settings = layered.shell;
+    let next = overrides.apply(layered);
+    Ok((next != current).then_some((next, input)))
 }
 
 #[derive(Default)]
@@ -573,7 +629,7 @@ async fn watch_theme_with_reporter(
         }
         observed = Some(next_fingerprint);
         let mut shell_diagnostics = Vec::new();
-        let resolved = resolve_live_theme_update(
+        let resolved = resolve_live_theme(
             active,
             &mut selection,
             overrides,
@@ -586,18 +642,23 @@ async fn watch_theme_with_reporter(
             }
         }
         match resolved {
-            Ok(Some(next)) => {
+            Ok(Some((next, input))) => {
                 current = next;
                 diagnostics.accepted();
                 let update = ThemeUpdate {
                     generation: NEXT_THEME_UPDATE_GENERATION.fetch_add(1, Ordering::Relaxed),
                     theme: next,
+                    colors: overrides.colors(),
+                    input: Some(Arc::new(input)),
                 };
                 let delivered = match &sink {
                     ThemeUpdateSink::Panes(updates) => {
                         let mut delivered = false;
                         for updates in updates {
-                            delivered |= updates.send(WindowUpdate::Theme(update)).await.is_ok();
+                            delivered |= updates
+                                .send(WindowUpdate::Theme(update.clone()))
+                                .await
+                                .is_ok();
                         }
                         delivered
                     }
@@ -755,10 +816,9 @@ mod tests {
             .config,
         );
         // Startup and every live theme update pass through `apply`.
-        let glassy = ResolvedTheme {
-            background_alpha: u16::MAX / 2,
-            ..ResolvedTheme::default()
-        };
+        let mut input = splinterm::theme::ThemeInput::builtin();
+        input.shell.background_alpha = u16::MAX / 2;
+        let glassy = ResolvedTheme::from_input(&input);
         let applied = overrides.apply(glassy);
         assert_eq!(applied.chrome.active_tab_alpha, u16::MAX / 2);
         assert_eq!(applied.tab_strip_alpha(), u16::MAX);
@@ -952,9 +1012,7 @@ mod tests {
             ThemeOverrides {
                 alpha: alpha_override,
                 blur: blur_override,
-                follow_text_size: true,
-                follow_ui_text_size: true,
-                chrome: ChromeColorOverrides::NONE,
+                ..NO_OVERRIDES
             },
             current,
             &mut Vec::new(),

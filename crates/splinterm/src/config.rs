@@ -16,6 +16,7 @@ use std::{
     fs,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use anyhow::{Context, Result, bail};
@@ -29,8 +30,10 @@ use crate::{
     keymap::{KeymapProfile, ResolvedKeymap, resolve_keymap},
     preset::PresetCatalog,
     theme::{
-        Appearance, BuiltinThemeProvider, ChromeRoles, RoleHints, TerminalPalette, ThemeComponents,
-        ThemeInput, ThemeProvider, ThemeShellInput, active_tab_foreground_fallback, derive,
+        Appearance, BuiltinThemeProvider, ChromeRoles, Role, RoleHints, RoleOverrideLayers,
+        RoleOverrides, RoleValue, TerminalPalette, ThemeComponents, ThemeInput, ThemeProvider,
+        ThemeShellInput, active_tab_foreground_fallback, derive_with,
+        override_contrast_diagnostics,
     },
 };
 
@@ -91,6 +94,9 @@ pub struct AppConfig {
     /// Optional chrome background overrides (`[colors] active-tab-*`,
     /// `tab-strip-alpha`, `explorer-*`). Absent keys keep the theme's value.
     pub chrome_colors: ChromeColorOverrides,
+    /// `[colors]`, `[colors-dark]` and `[colors-light]` role keys, when any
+    /// is set; shared, since every Window's theme carries them.
+    pub role_colors: Option<Arc<RoleOverrideLayers>>,
     /// Explicit project JSON override. When absent, Splinterm follows the
     /// active Omarchy theme directly.
     pub theme_path: Option<PathBuf>,
@@ -278,6 +284,7 @@ impl Default for AppConfig {
             background_alpha: None,
             background_blur: None,
             chrome_colors: ChromeColorOverrides::default(),
+            role_colors: None,
             theme_path: None,
             clipboard_image_directory: None,
             pane_divider_style: PaneDividerStyle::Line,
@@ -337,6 +344,17 @@ impl AppConfig {
     #[must_use]
     pub fn follows_omarchy_text_size(&self) -> bool {
         self.font_size_authority == FontAuthority::NativeOmarchy
+    }
+
+    /// Every `[colors]` key that changes the resolved theme.
+    #[must_use]
+    pub fn theme_colors(&self) -> ThemeColorConfig {
+        ThemeColorConfig {
+            alpha: self.background_alpha,
+            blur: self.background_blur,
+            chrome: self.chrome_colors,
+            roles: self.role_colors.clone(),
+        }
     }
 }
 
@@ -1066,6 +1084,7 @@ fn parse_with_base(text: &str, config_dir: &Path) -> Result<ConfigLoad> {
     let mut explicit_font_policy_line = None;
     let mut legacy_dpi_aware_line = None;
     let mut explicit_font_size_line = None;
+    let mut role_colors = RoleOverrideLayers::NONE;
     let mut section = String::new();
     for (index, raw) in text.lines().enumerate() {
         let line = raw.trim();
@@ -1080,6 +1099,8 @@ fn parse_with_base(text: &str, config_dir: &Path) -> Result<ConfigLoad> {
                     | "scrollback"
                     | "cursor"
                     | "colors"
+                    | "colors-dark"
+                    | "colors-light"
                     | "key-bindings"
                     | "presets"
                     | "multiplexer"
@@ -1104,6 +1125,12 @@ fn parse_with_base(text: &str, config_dir: &Path) -> Result<ConfigLoad> {
         } else {
             format!("{section}.{key}")
         };
+        if let Some(layer) = role_colors.section_mut(&section)
+            && let Some(role) = Role::from_key(&key)
+        {
+            layer.set(role, parse_role_value(value, index)?);
+            continue;
+        }
         let unsupported = match full.as_str() {
             "clipboard.image-directory" => {
                 let path = PathBuf::from(nonempty(value, index)?);
@@ -1440,6 +1467,7 @@ fn parse_with_base(text: &str, config_dir: &Path) -> Result<ConfigLoad> {
             diagnostics.push(format!("line {}: unsupported option {full}", index + 1));
         }
     }
+    config.role_colors = (role_colors != RoleOverrideLayers::NONE).then(|| Arc::new(role_colors));
     if let (Some(legacy), Some(explicit)) = (legacy_dpi_aware_line, explicit_font_policy_line) {
         bail!(
             "line {legacy}: legacy dpi-aware conflicts with font-sizing-policy on line {explicit}; remove the legacy key"
@@ -1489,6 +1517,27 @@ where
 
 fn parse_config_color(value: &str, line: usize) -> Result<u32> {
     parse_color(value).map_err(|error| anyhow::anyhow!("line {}: {error}", line + 1))
+}
+
+/// A `[colors]` role value: `auto`, `colorN` for N from 0 to 15, or a color
+/// as the other `[colors]` keys take it.
+fn parse_role_value(value: &str, line: usize) -> Result<RoleValue> {
+    let value = value.trim();
+    let lower = value.to_ascii_lowercase();
+    if lower == "auto" {
+        return Ok(RoleValue::Auto);
+    }
+    if let Some(digits) = lower.strip_prefix("color") {
+        // Only the plain spellings color0 to color15.
+        return match digits.parse::<u8>() {
+            Ok(index) if index < 16 && index.to_string() == digits => Ok(RoleValue::Palette(index)),
+            _ => bail!(
+                "line {}: {value:?} must be auto, color0 to color15, #RRGGBB or 0xRRGGBB",
+                line + 1
+            ),
+        };
+    }
+    parse_config_color(value, line).map(RoleValue::Color)
 }
 
 fn parse_alpha(value: &str, line: usize) -> Result<f32> {
@@ -1607,6 +1656,39 @@ pub struct ResolvedTheme {
     pub shell: OmarchyShellSettings,
 }
 
+/// Every `config.ini` `[colors]` key that changes a resolved theme. Each
+/// absent key keeps the theme's value.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ThemeColorConfig {
+    /// `[colors] alpha`.
+    pub alpha: Option<u16>,
+    /// `[colors] blur`.
+    pub blur: Option<bool>,
+    /// The chrome background keys of `[colors]`.
+    pub chrome: ChromeColorOverrides,
+    /// The role keys of `[colors]`, `[colors-dark]` and `[colors-light]`;
+    /// `None` when there are none.
+    pub roles: Option<Arc<RoleOverrideLayers>>,
+}
+
+impl ThemeColorConfig {
+    /// No `[colors]` key set.
+    pub const NONE: Self = Self {
+        alpha: None,
+        blur: None,
+        chrome: ChromeColorOverrides::NONE,
+        roles: None,
+    };
+
+    /// The role overrides in effect for a theme of `appearance`.
+    #[must_use]
+    pub fn role_overrides(&self, appearance: Appearance) -> RoleOverrides {
+        self.roles.as_ref().map_or(RoleOverrides::NONE, |layers| {
+            layers.for_appearance(appearance)
+        })
+    }
+}
+
 impl Default for ResolvedTheme {
     /// The built-in palette.
     fn default() -> Self {
@@ -1677,17 +1759,36 @@ impl ResolvedTheme {
     /// from them, before any `config.ini` override.
     #[must_use]
     pub fn from_input(input: &ThemeInput) -> Self {
+        Self::from_input_with(input, &RoleOverrides::NONE)
+    }
+
+    /// Derives the roles of `input` under `[colors]` role overrides, and
+    /// the chrome components that follow from them.
+    #[must_use]
+    pub fn from_input_with(input: &ThemeInput, overrides: &RoleOverrides) -> Self {
         let terminal = input.terminal;
-        let roles = derive(input);
-        let active_tab_background = input.components.active_tab_background.unwrap_or(
-            // Without a theme's raised surface, the selected tab keeps the
-            // Foot `bright0` ramp rather than the derived `surface_raised`.
-            if input.hints.surface_raised.is_some() {
-                roles.surface_raised
-            } else {
-                terminal.ansi[8]
-            },
-        );
+        let roles = derive_with(input, overrides);
+        // An overridden raised surface is the selected tab's body, over a
+        // JSON theme's own; the label is then chosen for contrast.
+        let raised_override = overrides.color(Role::SurfaceRaised, &terminal.ansi);
+        let active_tab_background = raised_override
+            .or(input.components.active_tab_background)
+            .unwrap_or(
+                // Without a theme's raised surface, the selected tab keeps the
+                // Foot `bright0` ramp rather than the derived `surface_raised`.
+                if input.hints.surface_raised.is_some() {
+                    roles.surface_raised
+                } else {
+                    terminal.ansi[8]
+                },
+            );
+        let active_tab_foreground = input
+            .components
+            .active_tab_foreground
+            .filter(|_| raised_override.is_none())
+            .unwrap_or_else(|| {
+                active_tab_foreground_fallback(roles.surface, roles.text, active_tab_background)
+            });
         Self {
             background: terminal.background,
             foreground: terminal.foreground,
@@ -1698,15 +1799,50 @@ impl ResolvedTheme {
             ansi: terminal.ansi,
             roles,
             active_tab_background,
-            active_tab_foreground: input.components.active_tab_foreground.unwrap_or_else(|| {
-                active_tab_foreground_fallback(roles.surface, roles.text, active_tab_background)
-            }),
+            active_tab_foreground,
             background_alpha: input.shell.background_alpha,
             background_blur: input.shell.background_blur,
             chrome: ChromeBackgrounds::default(),
             shell: input.shell.settings,
             appearance: input.appearance,
         }
+    }
+
+    /// Resolves `input` with all of `colors`, the `config.ini` `[colors]`
+    /// keys: its role overrides for the theme's appearance, then the chrome
+    /// keys, alpha and blur. A key `colors` does not set keeps the theme's
+    /// own value, so resolving again without a key restores it. Each
+    /// overridden role below its contrast floor is reported once.
+    #[must_use]
+    pub fn from_input_with_colors(input: &ThemeInput, colors: &ThemeColorConfig) -> Self {
+        let roles = colors.role_overrides(input.appearance);
+        let theme = Self::from_input_with(input, &roles)
+            .with_color_overrides(colors.alpha, colors.blur)
+            .with_chrome_overrides(colors.chrome);
+        for diagnostic in override_contrast_diagnostics(&theme.roles, &roles) {
+            if first_theme_diagnostic(&diagnostic) {
+                eprintln!("splinterm theme: {diagnostic}");
+            }
+        }
+        theme
+    }
+
+    /// This theme, resolved from `input` with the `[colors]` keys
+    /// `current`, resolved instead with `colors`. The shell settings layered
+    /// onto it are kept; nothing changes when the keys are the same.
+    #[must_use]
+    pub fn recolored(
+        self,
+        input: &ThemeInput,
+        current: &ThemeColorConfig,
+        colors: &ThemeColorConfig,
+    ) -> Self {
+        if current == colors {
+            return self;
+        }
+        let mut theme = Self::from_input_with_colors(input, colors);
+        theme.shell = self.shell;
+        theme
     }
 
     /// The application accent: the `accent` role.
@@ -2188,6 +2324,8 @@ enum MissingOmarchyTheme {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ThemeSourceLoad {
     pub theme: ResolvedTheme,
+    /// What the source gave, which `theme` was resolved from.
+    pub input: ThemeInput,
     /// The native loader used its no-source fallback. Callers must still
     /// validate that optional paths are genuinely absent before staying quiet.
     pub used_omarchy_fallback: bool,
@@ -2403,6 +2541,7 @@ pub fn load_theme_source_for_startup(source: &ThemeSource) -> Result<ThemeSource
     };
     Ok(ThemeSourceLoad {
         theme: ResolvedTheme::from_input(&loaded.input),
+        input: loaded.input,
         used_omarchy_fallback: loaded.used_omarchy_fallback,
     })
 }
@@ -2866,6 +3005,196 @@ mod tests {
                 .to_string();
             assert!(error.starts_with("line 2:"), "{bad}: {error}");
         }
+    }
+
+    fn theme_colors(text: &str) -> ThemeColorConfig {
+        parse(text).unwrap().config.theme_colors()
+    }
+
+    #[test]
+    fn role_color_keys_parse_every_value_form_in_each_section() {
+        let loaded = parse(
+            "[colors]\naccent=#102030\ndanger=0x405060\ntext-muted=color8\nfocus-ring=AUTO\n\
+             status-needs-input=color15\n\
+             [colors-dark]\naccent=color4\n[colors-light]\nsurface=#FAFAFA\n",
+        )
+        .unwrap();
+        assert!(loaded.diagnostics.is_empty(), "{:?}", loaded.diagnostics);
+        let layers = loaded.config.role_colors.as_deref().copied().unwrap();
+        let mut colors = RoleOverrides::NONE;
+        colors.set(Role::Accent, RoleValue::Color(0x10_20_30));
+        colors.set(Role::Danger, RoleValue::Color(0x40_50_60));
+        colors.set(Role::TextMuted, RoleValue::Palette(8));
+        colors.set(Role::FocusRing, RoleValue::Auto);
+        colors.set(Role::StatusNeedsInput, RoleValue::Palette(15));
+        let mut dark = RoleOverrides::NONE;
+        dark.set(Role::Accent, RoleValue::Palette(4));
+        let mut light = RoleOverrides::NONE;
+        light.set(Role::Surface, RoleValue::Color(0xfa_fa_fa));
+        assert_eq!(
+            layers,
+            RoleOverrideLayers {
+                colors,
+                dark,
+                light
+            }
+        );
+        assert_eq!(loaded.config.theme_colors().roles.as_deref(), Some(&layers));
+        assert_eq!(parse("").unwrap().config.role_colors, None);
+        assert_eq!(theme_colors(""), ThemeColorConfig::NONE);
+        // The shipped file's commented `[colors]` examples parse once
+        // uncommented, and it sets none of them.
+        let shipped = include_str!("../../../config/splinterm/config.ini");
+        assert_eq!(parse(shipped).unwrap().config.role_colors, None);
+        let examples = shipped
+            .lines()
+            .skip_while(|line| *line != "# [colors]")
+            .take_while(|line| !line.is_empty())
+            .filter_map(|line| line.strip_prefix("# "))
+            .filter(|line| line.starts_with('[') || line.contains('='))
+            .collect::<Vec<_>>();
+        assert!(examples.len() > 10, "{examples:?}");
+        let uncommented = parse(&examples.join("\n")).unwrap();
+        assert!(
+            uncommented.diagnostics.is_empty(),
+            "{:?}",
+            uncommented.diagnostics
+        );
+        let layers = uncommented.config.role_colors.unwrap();
+        assert_eq!(
+            layers.colors.color(Role::FocusRing, &[0x01; 16]),
+            Some(0x01)
+        );
+        assert_ne!(layers.dark, RoleOverrides::NONE);
+        assert_ne!(layers.light, RoleOverrides::NONE);
+        // The other `[colors]` keys stay where they were.
+        assert!(
+            parse("[colors-dark]\nalpha=0.5\n")
+                .unwrap()
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("unsupported option colors-dark.alpha"))
+        );
+        for bad in [
+            "accent=red",
+            "accent=color16",
+            "accent=color01",
+            "accent=color-1",
+            "accent=color",
+            "accent=colour3",
+            "text=#12345",
+            "text=",
+            "remote-marker=auto please",
+        ] {
+            for section in ["colors", "colors-dark", "colors-light"] {
+                let error = parse(&format!("[{section}]\n{bad}\n"))
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.starts_with("line 2:"), "{section} {bad}: {error}");
+            }
+        }
+    }
+
+    #[test]
+    fn component_keys_rank_over_role_keys_and_role_keys_over_the_theme() {
+        let mut input = ThemeInput::builtin();
+        input.hints.surface_raised = Some(0x22_22_22);
+        input.components.active_tab_background = Some(0x33_33_33);
+        input.components.active_tab_foreground = Some(0x01_01_01);
+        let theme = ResolvedTheme::from_input_with_colors(&input, &ThemeColorConfig::NONE);
+        assert_eq!(theme, ResolvedTheme::from_input(&input));
+        assert_eq!(theme.roles.surface_raised, 0x22_22_22);
+        assert_eq!(theme.active_tab_background, 0x33_33_33);
+        assert_eq!(theme.active_tab_foreground, 0x01_01_01);
+
+        // The role key replaces the theme's raised surface and its selected
+        // tab, whose label is then chosen for contrast.
+        let theme = ResolvedTheme::from_input_with_colors(
+            &input,
+            &theme_colors("[colors]\nsurface-raised=#f0f0f0\n"),
+        );
+        assert_eq!(theme.roles.surface_raised, 0xf0_f0_f0);
+        assert_eq!(theme.active_tab_background, 0xf0_f0_f0);
+        assert_eq!(theme.active_tab_foreground, theme.roles.surface);
+
+        // The #222 component key wins over the role key.
+        let theme = ResolvedTheme::from_input_with_colors(
+            &input,
+            &theme_colors("[colors]\nsurface-raised=#f0f0f0\nactive-tab-background=#102030\n"),
+        );
+        assert_eq!(theme.roles.surface_raised, 0xf0_f0_f0);
+        assert_eq!(theme.active_tab_background, 0x10_20_30);
+        let theme = ResolvedTheme::from_input_with_colors(
+            &input,
+            &theme_colors("[colors]\nsurface=#101010\n"),
+        );
+        assert_eq!(theme.explorer_background(), 0x10_10_10);
+        let theme = ResolvedTheme::from_input_with_colors(
+            &input,
+            &theme_colors("[colors]\nsurface=#101010\nexplorer-background=#202020\n"),
+        );
+        assert_eq!(theme.explorer_background(), 0x20_20_20);
+        assert_eq!(theme.roles.surface, 0x10_10_10);
+    }
+
+    #[test]
+    fn surface_and_text_role_keys_recolor_chrome_but_not_the_terminal() {
+        let input = ThemeInput::builtin();
+        let theme = ResolvedTheme::from_input_with_colors(
+            &input,
+            &theme_colors("[colors]\nsurface=#202020\ntext=color15\n"),
+        );
+        assert_eq!(theme.roles.surface, 0x20_20_20);
+        assert_eq!(theme.roles.text, input.terminal.ansi[15]);
+        assert_eq!(theme.explorer_background(), 0x20_20_20);
+        assert_eq!(theme.background, input.terminal.background);
+        assert_eq!(theme.foreground, input.terminal.foreground);
+        assert_eq!(theme.ansi, input.terminal.ansi);
+        assert_eq!(theme.selection, input.terminal.selection);
+        assert_eq!(theme.cursor, input.terminal.cursor);
+    }
+
+    #[test]
+    fn per_appearance_role_sections_follow_the_theme_appearance() {
+        let colors = theme_colors(
+            "[colors]\naccent=#111111\ndanger=#222222\n\
+             [colors-dark]\naccent=#333333\n[colors-light]\ndanger=auto\n",
+        );
+        let dark = ThemeInput::builtin();
+        let theme = ResolvedTheme::from_input_with_colors(&dark, &colors);
+        assert_eq!(theme.roles.accent, 0x33_33_33);
+        assert_eq!(theme.roles.danger, 0x22_22_22);
+        let light = ThemeInput {
+            appearance: Appearance::Light,
+            ..dark
+        };
+        let theme = ResolvedTheme::from_input_with_colors(&light, &colors);
+        assert_eq!(theme.roles.accent, 0x11_11_11);
+        assert_eq!(
+            theme.roles.danger,
+            ResolvedTheme::from_input(&light).roles.danger
+        );
+    }
+
+    #[test]
+    fn recoloring_with_other_keys_resolves_the_input_again() {
+        let input = ThemeInput::builtin();
+        let mut themed = ResolvedTheme::from_input(&input);
+        // Shell layers the watcher adds after resolving.
+        themed.shell.popup_alpha = 9;
+        let none = ThemeColorConfig::NONE;
+        assert_eq!(themed.recolored(&input, &none, &none), themed);
+        let set =
+            theme_colors("[colors]\nwarning=#ff8800\nalpha=0.25\nblur=no\ntab-strip-alpha=0.5\n");
+        let recolored = themed.recolored(&input, &none, &set);
+        assert_eq!(recolored.roles.warning, 0xff_88_00);
+        assert_eq!(recolored.roles.status_working, 0xff_88_00);
+        assert_eq!(recolored.background_alpha, foot_alpha(0.25));
+        assert!(!recolored.background_blur);
+        assert_eq!(recolored.tab_strip_alpha(), foot_alpha(0.5));
+        assert_eq!(recolored.shell.popup_alpha, 9);
+        // Removing the keys again restores the theme's own values.
+        assert_eq!(recolored.recolored(&input, &set, &none), themed);
     }
 
     #[test]
@@ -4929,7 +5258,7 @@ mod tests {
             &mut diagnostics,
         )
         .unwrap();
-        let roles = derive(&input);
+        let roles = crate::theme::derive(&input);
         assert_eq!(roles.warning, 0xff_aa_00);
         assert_eq!(roles.divider, input.terminal.ansi[8]);
         assert_eq!(diagnostics.len(), 3, "{diagnostics:?}");
