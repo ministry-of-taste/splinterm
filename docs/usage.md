@@ -221,15 +221,18 @@ its row; it never runs under one.
 Explorer and of its agents section is two lines tall. A Splint row's second
 line, muted under its name, shows the agent's detail while the Splint reports
 one and agent status is shown, else the Splint's working directory with your
-home directory written `~`. A long detail keeps its first words. A long
-directory keeps its start and its last components, `~/…/crates/splinterm`.
-The directory is where the Splint was started or last relaunched; it does not
+home directory written `~`; a remote Window writes the remote host's
+directories in full. A long detail keeps its first words. A long directory
+keeps its start and its last components, `~/…/crates/splinterm`. The
+directory is where the Splint was started or last relaunched; it does not
 follow a `cd` in its shell. Lair and Dojo rows centre their one line, and the
-rail keeps one line per Lair. The selection, a click, and a chevron's target
-cover both lines. Assistive technology reads the directory with the row, for
-example *Running · in ~/Projects/splinterm*. The agents section counts lines:
-its label is one line and each of its rows two. A configuration reload that
-changes `row-lines` lays the rows out again at once.
+rail keeps one line per Lair. A list too short for one two-line row shows
+one-line rows instead, so the selection stays in view. The selection, a
+click, and a chevron's target cover both lines. Assistive technology reads
+the directory with the row, for example *Running · in ~/Projects/splinterm*.
+The agents section counts lines: its label is one line and each of its rows
+two. A configuration reload that changes `row-lines` lays the rows out again
+at once.
 
 The footer has two lines. The first is an action line, `new · menu · «`:
 **new** makes a new Lair from the focused Splint's directory, as **New

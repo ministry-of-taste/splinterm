@@ -52,7 +52,7 @@ pub use dialog_text::{DialogIdentity, DialogLine, DialogLineRole, DialogText};
 pub(crate) use lair_explorer::LairExplorerRowKind;
 pub(crate) use lair_explorer::{
     LairExplorerAccess, LairExplorerAgentRow, LairExplorerDecision, LairExplorerDetail,
-    LairExplorerFilter, LairExplorerRow, LairExplorerUi,
+    LairExplorerFilter, LairExplorerRow, LairExplorerUi, explorer_home,
 };
 pub use message::{
     AuthorityStatus, FontUpdate, PerfTraceCorrelation, ThemeUpdate, WindowCommand,

@@ -139,7 +139,8 @@ use crate::frontend::{
     TabMenuRightPress, TerminalGridLimits, TerminationDecision, ThemeUpdate, TrustedConsentUi,
     TrustedDialogKey, TrustedInput, WindowCommand, WindowDojoIdentity, WindowOptions,
     WindowPaneOptions, WindowThemeColors, WindowTopologyCommand, WindowTopologyUpdate,
-    WindowUpdate, close_other_tabs_command, lair_lifecycle_command, tab_menu_right_press,
+    WindowUpdate, close_other_tabs_command, explorer_home, lair_lifecycle_command,
+    tab_menu_right_press,
 };
 use crate::geometry::{
     FontSize, OutputDpiObservation, Rect, SurfaceGeometry, WindowGeometry, buffer_to_logical_ceil,
@@ -1235,7 +1236,8 @@ fn assemble_app(
             pending_remote_splits: HashMap::new(),
             dirty_inactive_panes: HashSet::new(),
         },
-        explorer: LairExplorerUi::new(options.explorer_collapsed, options.explorer_two_line_rows),
+        explorer: LairExplorerUi::new(options.explorer_collapsed, options.explorer_two_line_rows)
+            .with_home(explorer_home(options.remote_display_identity.is_some())),
         accessibility: navigation_accessibility::WindowAccessibility::new(update_waker.clone()),
         access: agent_access::WindowAccess::default(),
         handoff: HandoffFrontend::new(options.handoff_status.take(), update_waker),

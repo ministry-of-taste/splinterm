@@ -262,7 +262,8 @@ pub(crate) struct LairExplorerUi {
     /// `[explorer] row-lines=2`: Splint rows take a second line.
     two_line_rows: bool,
     /// The home directory a working directory is written relative to, as
-    /// `~`; `None` when `HOME` is unset or not an absolute path.
+    /// `~`; `None` in a remote Window, or when `HOME` is unset or not an
+    /// absolute path (see [`explorer_home`]).
     home: Option<String>,
 }
 
@@ -290,10 +291,7 @@ impl Default for LairExplorerUi {
             agent_spinner: AgentSpinner::STATIC,
             access_marks: AccessMarks::default(),
             two_line_rows: false,
-            home: std::env::var("HOME")
-                .ok()
-                .map(|home| home.trim_end_matches('/').to_owned())
-                .filter(|home| home.starts_with('/')),
+            home: explorer_home(false),
         }
     }
 }
@@ -308,6 +306,14 @@ impl LairExplorerUi {
             two_line_rows,
             ..Self::default()
         }
+    }
+
+    /// This Explorer with working directories written relative to `home`, or
+    /// never shortened for `None` (see [`explorer_home`]).
+    #[must_use]
+    pub(crate) fn with_home(mut self, home: Option<String>) -> Self {
+        self.home = home;
+        self
     }
 
     pub(crate) fn can_context(&self, node: NavigationNodeId) -> bool {
@@ -1786,6 +1792,20 @@ const fn is_live(lifecycle: NavigationLifecycle) -> bool {
         lifecycle,
         NavigationLifecycle::Running | NavigationLifecycle::Starting
     )
+}
+
+/// The home directory a Window's Explorer writes as `~`: the local `HOME`
+/// when it is an absolute path other than `/`, and `None` for a `remote`
+/// Window, whose working directories are the remote host's, so the local
+/// home must not shorten them and the remote user's is not known.
+pub(crate) fn explorer_home(remote: bool) -> Option<String> {
+    if remote {
+        return None;
+    }
+    std::env::var("HOME")
+        .ok()
+        .map(|home| home.trim_end_matches('/').to_owned())
+        .filter(|home| home.starts_with('/'))
 }
 
 /// `directory` with the home directory `home` written `~`: `~` for the
@@ -4026,6 +4046,28 @@ pub(super) mod tests {
         assert_eq!(home_relative("/srv/data", home), "/srv/data");
         assert_eq!(home_relative("/home/user/x", None), "/home/user/x");
         assert_eq!(home_relative("/home/user/x", Some("")), "/home/user/x");
+    }
+
+    /// A remote Window's working directories are the remote host's, so the
+    /// local home never shortens them.
+    #[test]
+    fn remote_windows_write_working_directories_in_full() {
+        assert_eq!(explorer_home(true), None);
+        let mut explorer = LairExplorerUi::new(false, true).with_home(explorer_home(true));
+        explorer.set_view(agent_view([None, None]));
+        let rows = expanded_rows(&mut explorer);
+        assert_eq!(
+            rows[2].detail,
+            Some(LairExplorerDetail::Directory(
+                "/home/user/Projects/splinterm".into()
+            ))
+        );
+        let mut local = LairExplorerUi::new(false, true).with_home(Some("/home/user".into()));
+        local.set_view(agent_view([None, None]));
+        assert_eq!(
+            expanded_rows(&mut local)[2].detail,
+            Some(LairExplorerDetail::Directory("~/Projects/splinterm".into()))
+        );
     }
 
     /// With two-line rows a Splint row's second line is the agent's detail

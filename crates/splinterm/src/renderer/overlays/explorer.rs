@@ -684,10 +684,17 @@ fn lair_explorer_layout_with_header(
         .height
         .saturating_sub(list_top)
         .saturating_sub(footer_height);
+    // A list too short for one row of two lines shows rows of one, so the
+    // selection stays in view.
+    let row_height = if (ROW_HEIGHT..metrics.row_height()).contains(&list_height) {
+        ROW_HEIGHT
+    } else {
+        metrics.row_height()
+    };
     let (start, capacity, row_layouts) = row_slots(
         panel,
         (list_top, list_height),
-        metrics.row_height(),
+        row_height,
         rows,
         selected,
         requested_start,
@@ -717,7 +724,7 @@ fn lair_explorer_layout_with_header(
             Vec::new()
         },
         rows: row_layouts,
-        row_height: metrics.row_height(),
+        row_height,
         visible_start: start,
         visible_capacity: capacity,
         mode,
@@ -5844,14 +5851,13 @@ mod tests {
     #[test]
     fn two_line_rows_are_twice_as_tall_and_the_rail_keeps_one_line() {
         let rows = lair_rows(40);
-        for height in [120, 180, 400, 600, 901] {
+        for height in [180, 400, 600, 901] {
             let content = Rect {
                 x: 0,
                 y: 34,
                 width: 1000,
                 height,
             };
-            let one = lair_explorer_layout(content, 640, &rows, None, 0).unwrap();
             let last = rows[39].id;
             let two = two_line_layout(content, &rows, Some(last));
             assert_eq!(two.row_height, ROW_HEIGHT * 2);
@@ -5861,7 +5867,7 @@ mod tests {
                 two.visible_capacity,
                 (list_height / (ROW_HEIGHT * 2)) as usize
             );
-            assert_eq!(two.visible_capacity, one.visible_capacity / 2, "{height}");
+            assert!(two.visible_capacity >= 1, "{height}");
             assert_eq!(two.rows.len(), two.visible_capacity);
             for (index, laid) in two.rows.iter().enumerate() {
                 let index = u32::try_from(index).unwrap();
@@ -5869,9 +5875,7 @@ mod tests {
                 assert_eq!(laid.rect.height, ROW_HEIGHT * 2);
                 assert!(laid.rect.y + laid.rect.height <= two.footer.y);
             }
-            if two.visible_capacity > 0 {
-                assert_eq!(two.rows.last().map(|laid| laid.id), Some(last));
-            }
+            assert_eq!(two.rows.last().map(|laid| laid.id), Some(last));
             for collapsed in [false, true] {
                 let shown = |metrics| {
                     lair_explorer_shown_layout(
@@ -5893,6 +5897,60 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A list with room for a row of one line but not of two shows rows of
+    /// one line, with the selection in view, rather than none; a list with
+    /// room for a row of two shows rows of two, and one with no room for a
+    /// line shows none.
+    #[test]
+    fn short_lists_fall_back_to_one_line_rows() {
+        let rows = lair_rows(5);
+        let last = rows[4].id;
+        let mut seen = [false; 3];
+        for height in 1..=200 {
+            let content = Rect {
+                x: 0,
+                y: 34,
+                width: 1000,
+                height,
+            };
+            let Some(two) = lair_explorer_layout_with_header(
+                content,
+                HEADER_HEIGHT,
+                640,
+                TWO_LINES,
+                &rows,
+                Some(last),
+                0,
+            ) else {
+                continue;
+            };
+            let list_top = content.y + HEADER_HEIGHT + HEADER_SPACER;
+            let list_height = two.footer.y.saturating_sub(list_top);
+            let expected = if list_height < ROW_HEIGHT {
+                seen[0] = true;
+                0
+            } else if list_height < ROW_HEIGHT * 2 {
+                seen[1] = true;
+                assert_eq!(two.row_height, ROW_HEIGHT, "list {list_height}");
+                1
+            } else {
+                seen[2] = true;
+                assert_eq!(two.row_height, ROW_HEIGHT * 2, "list {list_height}");
+                (list_height / (ROW_HEIGHT * 2)) as usize
+            };
+            assert_eq!(two.visible_capacity, expected, "list {list_height}");
+            assert_eq!(two.rows.len(), expected, "list {list_height}");
+            for laid in &two.rows {
+                assert_eq!(laid.rect.height, two.row_height);
+                assert!(laid.rect.y + laid.rect.height <= two.footer.y);
+            }
+            if expected > 0 {
+                assert_eq!(two.rows.last().map(|laid| laid.id), Some(last));
+            }
+        }
+        assert_eq!(seen, [true; 3], "every kind of list is exercised");
     }
 
     /// A press anywhere on either line of a two-line row hits that row,
@@ -6100,7 +6158,7 @@ mod tests {
             width: 1000,
             height: 600,
         };
-        for scale in [120, 150, 240] {
+        for scale in [120, 150, 180, 240] {
             let canvas_width = surface.width * scale / 120 + 1;
             let canvas_height = surface.height * scale / 120 + 1;
             let with_rows = splint_rows(3, detail.as_ref());
@@ -6149,41 +6207,212 @@ mod tests {
             };
             let with = draw(&with_rows, &with_agents, None);
             let bare = draw(&bare_rows, &bare_agents, None);
-            let panel = buffer_rect(layout.panel, scale);
-            let right = panel.x + panel.width - scale.div_ceil(120);
-            let seconds: Vec<Rect> = layout
-                .rows
-                .iter()
-                .chain(&section.rows)
-                .map(|laid| row_text_lines(laid.rect, true, scale).1.unwrap())
-                .collect();
-            let mut inked = vec![false; seconds.len()];
+            let bounds = second_line_bounds(&context, &layout, (&with_rows, &with_agents), scale);
+            assert_eq!(bounds.len(), 5, "scale {scale}");
+            let mut inked = vec![false; bounds.len()];
             for (index, (a, b)) in with.chunks_exact(4).zip(bare.chunks_exact(4)).enumerate() {
                 if a == b {
                     continue;
                 }
                 let x = u32::try_from(index).unwrap() % canvas_width;
                 let y = u32::try_from(index).unwrap() / canvas_width;
-                let line = seconds
+                let line = bounds
                     .iter()
-                    .position(|line| (line.y..line.y + line.height).contains(&y));
+                    .position(|(line, ..)| (line.y..line.y + line.height).contains(&y));
+                let Some(line) = line else {
+                    panic!("scale {scale}: second-line ink at {x},{y} off every second line");
+                };
+                let (_, left, right) = bounds[line];
                 assert!(
-                    line.is_some() && x < right,
-                    "scale {scale}: second-line ink at {x},{y}"
+                    (left..right).contains(&x),
+                    "scale {scale}: row {line}'s second-line ink at {x},{y} outside {left}..{right}"
                 );
-                inked[line.unwrap()] = true;
-                // Past the dot and the disclosure slot, under the label.
-                assert!(x >= panel.x + LEVEL_INDENT * scale / 120, "{x},{y}");
+                inked[line] = true;
             }
             assert!(inked.iter().all(|&inked| inked), "scale {scale}: {inked:?}");
-            // The selection covers both lines, its accent bar from the
-            // row's left edge.
+            // The selection covers both lines.
             let chosen = &layout.rows[1];
             let selected = draw(&with_rows, &with_agents, Some(chosen.id));
             let rect = buffer_rect(chosen.rect, scale);
-            for y in [rect.y + 1, rect.y + rect.height - 2] {
-                let at = ((y * canvas_width + rect.x) * 4) as usize;
-                assert_ne!(with[at..at + 4], selected[at..at + 4], "scale {scale}, {y}");
+            assert_selection_covers_both_lines((&with, &selected), canvas_width, rect, bounds[1].2);
+        }
+    }
+
+    /// Asserts that the selection changes `rect` on both lines: its accent
+    /// bar at the row's left edge, and its fill on the second line in the
+    /// middle and in the row's right inset, past the text ending at
+    /// `text_end`.
+    fn assert_selection_covers_both_lines(
+        (plain, selected): (&[u8], &[u8]),
+        canvas_width: u32,
+        rect: Rect,
+        text_end: u32,
+    ) {
+        let bottom = rect.y + rect.height - 2;
+        assert!(text_end + 1 < rect.x + rect.width, "{rect:?}");
+        for (x, y) in [
+            (rect.x, rect.y + 1),
+            (rect.x, bottom),
+            (rect.x + rect.width / 2, bottom),
+            (text_end + 1, bottom),
+        ] {
+            let at = ((y * canvas_width + x) * 4) as usize;
+            assert_ne!(
+                plain[at..at + 4],
+                selected[at..at + 4],
+                "{rect:?} at {x},{y}"
+            );
+        }
+    }
+
+    /// Each painted row's second line in buffer px, with the left and right
+    /// edges its detail paints between: in the tree from past the name's
+    /// dot and disclosure slot to the row's right inset, and in the agents
+    /// section from past the glyph column and its gap to the divider's
+    /// inset.
+    fn second_line_bounds(
+        context: &RenderContext,
+        layout: &LairExplorerLayout,
+        (rows, agents): (&[LairExplorerRow], &[LairExplorerAgentRow]),
+        scale: u32,
+    ) -> Vec<(Rect, u32, u32)> {
+        let cell = chrome_cell_width(context, scale);
+        let inset = LEVEL_INDENT.saturating_mul(scale).div_ceil(120);
+        let columns = ExplorerColumns::of(rows);
+        let mut bounds = Vec::new();
+        for (laid, row) in layout
+            .rows
+            .iter()
+            .zip(rows.iter().skip(layout.visible_start))
+        {
+            let (first, second) = row_text_lines(laid.rect, true, scale);
+            let (source, first_mark) = row_columns_source(row, columns, chrome_icons_available());
+            let (name, column_clip) =
+                row_text_clips(first, row.level, inset, cell, source.cells(), first_mark);
+            let left = (name.x + cell * ROW_NAME_PREFIX_CELLS).min(name.x + name.width);
+            bounds.push((second.unwrap(), left, column_clip.x + column_clip.width));
+        }
+        if let Some(section) = &layout.agents {
+            let panel = buffer_rect(layout.panel, scale);
+            let divider = panel.x + panel.width - scale.div_ceil(120).max(1);
+            for (laid, agent) in section
+                .rows
+                .iter()
+                .zip(agents.iter().skip(section.visible_start))
+            {
+                let (first, second) = row_text_lines(laid.rect, true, scale);
+                let line = agents_text_line(first, inset, divider);
+                let glyphs = agent
+                    .row
+                    .agent_column
+                    .as_ref()
+                    .map_or(0, |column| cell * u32::try_from(column.cells()).unwrap());
+                let left = line.x + (glyphs + cell).min(line.width);
+                bounds.push((second.unwrap(), left, line.x + line.width));
+            }
+        }
+        bounds
+    }
+
+    /// With two-line rows a Lair, a Dojo, and a Splint with no second line
+    /// keep one line, centred in their two-line row.
+    #[test]
+    fn rows_without_a_second_line_centre_their_one_line() {
+        use super::super::picker::session_picker_palette;
+        use crate::config::ResolvedTheme;
+
+        let context = RenderContext::new(u16::MAX);
+        let lair_id = LairId::new();
+        let dojo_id = splinterm_core::DojoId::new();
+        let lair = row(NavigationNodeId::Lair(lair_id));
+        let dojo = LairExplorerRow {
+            id: NavigationNodeId::Dojo { lair_id, dojo_id },
+            kind: LairExplorerRowKind::Dojo,
+            label: "editor".into(),
+            level: 2,
+            ..lair.clone()
+        };
+        let splint = LairExplorerRow {
+            id: NavigationNodeId::Splint {
+                lair_id,
+                dojo_id,
+                splint_id: splinterm_core::SplintId::new(),
+            },
+            kind: LairExplorerRowKind::Splint,
+            label: "shell".into(),
+            level: 3,
+            expanded: None,
+            ..lair.clone()
+        };
+        let surface = Rect {
+            x: 0,
+            y: 0,
+            width: 1000,
+            height: 400,
+        };
+        for scale in [120, 150, 180, 240] {
+            let canvas_width = surface.width * scale / 120 + 1;
+            let canvas_height = surface.height * scale / 120 + 1;
+            // The top and bottom of a row's ink in its row of a layout of
+            // `metrics`, from the row's top, and the row's height.
+            let ink = |painted: &LairExplorerRow, metrics: LairExplorerMetrics| {
+                let rows = [painted.clone()];
+                let layout = lair_explorer_layout_with_header(
+                    surface,
+                    HEADER_HEIGHT,
+                    640,
+                    metrics,
+                    &rows,
+                    None,
+                    0,
+                )
+                .unwrap();
+                let draw = |rows: &[LairExplorerRow]| {
+                    let mut canvas = vec![0; (canvas_width * canvas_height * 4) as usize];
+                    paint(
+                        &context,
+                        &mut canvas,
+                        canvas_width,
+                        canvas_height,
+                        scale,
+                        &layout,
+                        session_picker_palette(ResolvedTheme::default()),
+                        rows,
+                        None,
+                        false,
+                        LairExplorerFilter::All,
+                    );
+                    canvas
+                };
+                let (with, without) = (draw(&rows), draw(&[]));
+                let rect = buffer_rect(layout.rows[0].rect, scale);
+                let ys: Vec<u32> = with
+                    .chunks_exact(4)
+                    .zip(without.chunks_exact(4))
+                    .enumerate()
+                    .filter(|(_, (a, b))| a != b)
+                    .map(|(index, _)| u32::try_from(index).unwrap())
+                    .map(|index| (index % canvas_width, index / canvas_width))
+                    .filter(|&(x, y)| {
+                        (rect.x..rect.x + rect.width).contains(&x)
+                            && (rect.y..rect.y + rect.height).contains(&y)
+                    })
+                    .map(|(_, y)| y - rect.y)
+                    .collect();
+                let top = *ys.iter().min().expect("the row paints");
+                let bottom = *ys.iter().max().unwrap();
+                (top, bottom, rect.height)
+            };
+            for painted in [&lair, &dojo, &splint] {
+                let (top, bottom, one) = ink(painted, UNMEASURED);
+                let (top_two, bottom_two, two) = ink(painted, TWO_LINES);
+                let shift = (two - one) / 2;
+                let what = format!("scale {scale}, {:?}", painted.kind);
+                assert!(top_two.abs_diff(top + shift) <= 1, "{what}: {top_two}");
+                assert!(
+                    bottom_two.abs_diff(bottom + shift) <= 1,
+                    "{what}: {bottom_two}"
+                );
             }
         }
     }
