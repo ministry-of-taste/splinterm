@@ -217,8 +217,9 @@ picker (`splinterm dojos`). Input stays paused in every Window until the answer.
 - Without a terminal, or when the command runs inside a Splinterm terminal
   (whose input the upgrade pauses), a small trusted dialog titled
   "Splinterm — Upgrade", in the style of the access consent dialog, asks
-  instead. `D`, `Escape`, `Enter`, or the red left area cancels; only `G` or the
-  green right area proceeds. Its keys stay inert until you click inside it or
+  instead. `D`, `Escape`, `Enter`, or the red left **Cancel** button cancels;
+  only `G` or the green right **Proceed** button proceeds. Its keys stay inert
+  until you click inside it or
   press Ctrl+Alt+G, and under Omarchy it can appear without focus (see
   [Trusted dialogs](usage.md#trusted-dialogs)); keys and the proceed click
   count only about 600 ms after that, so typing meant for another Window cannot
@@ -273,11 +274,12 @@ daemon's build identity with the installed client's:
 - another build with live terminals, or a daemon it cannot read (a 0.1.x
   daemon, another protocol, or no answer, after one retry), opens a trusted
   dialog titled "Splinterm — Upgrade". **Not now** is the default and opens
-  nothing: `Enter`, `Escape`, `D`, the red left area, closing the dialog, or no
-  answer within 120 seconds. Only `R` or the green right area chooses
-  **Restart now (ends N shells)**, with the daemon's exact count; for a daemon
-  it cannot read, "ends about N shells" from a best-effort count of running
-  workload units, or "all running shells". The dialog takes no keyboard focus;
+  nothing: `Enter`, `Escape`, `D`, the red left **Not now** button, closing the
+  dialog, or no answer within 120 seconds. Only `R` or the green right button
+  chooses **Restart now, end N shells**, with the daemon's exact count; for a
+  daemon it cannot read, "end about N shells" from a best-effort count of
+  running workload units, or "end all running shells". The dialog takes no
+  keyboard focus;
   keys count only about 600 ms after a click inside it or Ctrl+Alt+G. Once the
   dialog is armed, `R` acts when it goes down, so a hold that began before
   arming is ignored but one that begins after arming counts as a press; key

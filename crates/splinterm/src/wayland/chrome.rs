@@ -8,20 +8,22 @@ use unicode_width::UnicodeWidthChar;
 use crate::{
     color::{
         NON_TEXT_MIN_CONTRAST, contrast_corrected, contrast_floor_toward, contrast_ratio,
-        mix_linear, rgb_channels, strongest_contrast_endpoint,
+        mix_encoded, mix_linear, rgb_channels, strongest_contrast_endpoint,
     },
     config::ResolvedTheme,
     frontend::{
-        DialogFrame, DialogText, MINIMUM_ACTION_ROWS, action_area_top, dialog_font_step,
-        dialog_text::{natural_columns, natural_rows, text_rows},
-        dialog_text_rows,
+        DialogFrame, DialogText, dialog_font_step,
+        dialog_text::{
+            DialogInk, NATURAL_MAX_TEXT_COLUMNS, SELECTION_SLOT, chrome_rows, natural_columns,
+            natural_rows, text_columns, text_rows,
+        },
     },
     geometry::{CellGeometry, Rect, TerminalPadding, WindowGeometry, logical_extent_to_buffer},
     pane::{PaneChrome, PaneDivider, PaneLayout},
     renderer::{ChromeText, background_bgra, paint_box_drawing_cell},
 };
 use splinterm_core::SplintId;
-use splinterm_protocol::{MAX_COLUMNS, MAX_ROWS, TerminalSnapshot};
+use splinterm_protocol::{MAX_COLUMNS, MAX_ROWS, TerminalRow, TerminalSnapshot};
 
 use super::{
     App, CachedFrameTitle, SCALE_DENOMINATOR, apply_theme, rebuild_pane_scaled_frame_with_context,
@@ -84,13 +86,15 @@ struct TrustedFit {
     wrap_columns: usize,
     /// The rows the text takes at `wrap_columns`.
     needed_rows: usize,
-    /// The most rows of text that end above the shortest action areas.
+    /// The most body rows the box leaves room for.
     room_rows: usize,
+    /// Whether every selection's button labels fit their buttons.
+    buttons_fit: bool,
 }
 
 impl TrustedFit {
     const fn fits(&self) -> bool {
-        self.needed_rows <= self.room_rows
+        self.needed_rows <= self.room_rows && self.buttons_fit
     }
 
     const fn frame(&self) -> DialogFrame {
@@ -104,10 +108,10 @@ impl TrustedFit {
 }
 
 /// How `variants` fit a Window whose `content` rectangle (logical pixels)
-/// holds a grid of `cell` sized cells, exactly as the Window draws and hit
-/// tests it: the same grid fit, the same translation, and the same
-/// [`trusted_consent_action_top`]. `None` when the content cannot hold the
-/// protocol minimum grid.
+/// holds a grid of `cell` sized cells, exactly as the Window draws it: the
+/// same grid fit and the same translation. The body takes the box's
+/// [`chrome_rows`] room, and the button labels the columns of their halves.
+/// `None` when the content cannot hold the protocol minimum grid.
 fn trusted_dialog_fit(
     content: Rect,
     cell: CellGeometry,
@@ -132,131 +136,265 @@ fn trusted_dialog_fit(
         logical_extent_to_buffer(content.y, scale_120).ok()?,
     )
     .ok()?;
-    let wrap_columns = natural_columns(variants).min(usize::try_from(geometry.columns).ok()?);
+    let columns = usize::try_from(geometry.columns).ok()?;
+    let wrap_columns = text_columns(columns).min(NATURAL_MAX_TEXT_COLUMNS);
     Some(TrustedFit {
         geometry,
         wrap_columns,
         needed_rows: text_rows(variants, wrap_columns),
-        room_rows: usize::try_from(trusted_consent_text_room(
-            geometry.buffer_width(),
-            geometry.buffer_height(),
-            geometry.grid_rect.y,
-            cell.height,
-            geometry.rows,
-        ))
-        .ok()?,
+        room_rows: chrome_rows(usize::try_from(geometry.rows).ok()?).body_room,
+        buttons_fit: variants.iter().all(|variant| variant.buttons_fit(columns)),
     })
 }
 
-/// The most of a dialog's `rows` grid rows that can hold text and still end
-/// above its action areas ([`trusted_consent_action_top`]).
-pub(super) fn trusted_consent_text_room(
-    width: u32,
-    height: u32,
-    grid_top: u32,
-    cell_height: u32,
-    rows: u32,
-) -> u32 {
-    (0..=rows)
-        .rev()
-        .find(|&text_rows| {
-            let bottom = grid_top.saturating_add(text_rows.saturating_mul(cell_height));
-            trusted_consent_action_top(width, height, grid_top, cell_height, text_rows) >= bottom
-        })
-        .unwrap_or(0)
+/// Logical pixels `pixels` at `scale_120`, in buffer pixels, rounded, and
+/// at least `minimum`.
+fn scaled_pixels(pixels: u32, scale_120: u32, minimum: u32) -> u32 {
+    (pixels
+        .saturating_mul(scale_120)
+        .saturating_add(SCALE_DENOMINATOR / 2)
+        / SCALE_DENOMINATOR)
+        .max(minimum)
 }
 
-/// Whether a click `y` logical pixels down a Window at `scale_120` lands in
-/// action areas that begin `action_top` buffer pixels down.
-fn in_action_area(y: f64, scale_120: u32, action_top: u32) -> bool {
-    y * f64::from(scale_120) / f64::from(SCALE_DENOMINATOR) >= f64::from(action_top)
+/// The frame's thickness, in logical pixels.
+const FRAME_LINE_PIXELS: u32 = 2;
+
+/// Each button's edge, in logical pixels.
+const BUTTON_EDGE_PIXELS: u32 = 1;
+
+/// How tall each button is, in logical pixels, within 2½ and 3 rows.
+const BUTTON_HEIGHT_PIXELS: u32 = 56;
+
+/// The gap between the two buttons, in logical pixels.
+const BUTTON_GAP_PIXELS: u32 = 6;
+
+/// Where a trusted dialog's box goes in its buffer, in buffer pixels: the
+/// frame, the openings in its edges for the title and the legend, and the
+/// two buttons. Drawing ([`paint_trusted_consent_chrome`]) and hit testing
+/// ([`App::trusted_consent_action_area_at`]) both take it from
+/// [`trusted_chrome`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct TrustedChrome {
+    /// The frame's outer edge; its lines run `line` pixels inside it.
+    frame: Rect,
+    line: u32,
+    /// Spans `(x, end)` of the top and the bottom line left open for the
+    /// title and the legend, left to right.
+    top_openings: Vec<(u32, u32)>,
+    bottom_openings: Vec<(u32, u32)>,
+    /// The red left (no) and green right (yes) buttons, edges included.
+    deny: Rect,
+    allow: Rect,
+    edge: u32,
 }
 
-/// Where the action areas begin in a dialog drawn with `geometry` whose
-/// snapshot shows `text_rows` rows of text: the one computation both
-/// drawing and hit testing use.
-fn geometry_action_top(
-    width: u32,
-    height: u32,
-    geometry: &WindowGeometry,
-    text_rows: usize,
-) -> u32 {
-    trusted_consent_action_top(
-        width,
-        height,
-        geometry.grid_rect.y,
-        geometry.cell.height,
-        u32::try_from(text_rows)
-            .unwrap_or(u32::MAX)
-            .min(geometry.rows),
+/// Whether a click `y` logical pixels down a Window at `scale_120` is on
+/// the rows of `chrome`'s buttons, which share their rows.
+fn buttons_hit(y: f64, scale_120: u32, chrome: &TrustedChrome) -> bool {
+    let y = y * f64::from(scale_120) / f64::from(SCALE_DENOMINATOR);
+    let top = chrome.deny.y;
+    y >= f64::from(top) && y < f64::from(top.saturating_add(chrome.deny.height))
+}
+
+/// The openings, as `(x, end)` buffer spans, a frame line through `row`
+/// leaves for its text: every column within one of a visible character.
+fn frame_openings(row: Option<&TerminalRow>, geometry: &WindowGeometry) -> Vec<(u32, u32)> {
+    let Some(row) = row else {
+        return Vec::new();
+    };
+    let width = geometry.cell.width;
+    let grid = geometry.grid_rect;
+    let shown: Vec<bool> = row
+        .cells
+        .iter()
+        .map(|cell| !cell.content.trim().is_empty())
+        .collect();
+    let mut openings: Vec<(u32, u32)> = Vec::new();
+    for column in 0..shown.len() {
+        let near = column.saturating_sub(1)..=(column + 1).min(shown.len() - 1);
+        if !shown[near].iter().any(|visible| *visible) {
+            continue;
+        }
+        let Ok(column) = u32::try_from(column) else {
+            break;
+        };
+        let x = grid.x.saturating_add(column.saturating_mul(width));
+        let end = x.saturating_add(width);
+        match openings.last_mut() {
+            Some((_, last)) if *last == x => *last = end,
+            _ => openings.push((x, end)),
+        }
+    }
+    openings
+}
+
+/// The red (left) and green (right) buttons between `left` and `right` and
+/// from `top` to `bottom`, split at `middle`, where the pointer's halves
+/// meet: each keeps clear of it by half of `gap`.
+fn button_pair(
+    middle: u32,
+    gap: u32,
+    (left, right): (u32, u32),
+    (top, bottom): (u32, u32),
+) -> (Rect, Rect) {
+    let deny_end = middle.saturating_sub(gap / 2);
+    let allow_x = middle.saturating_add(gap - gap / 2);
+    let height = bottom.saturating_sub(top);
+    (
+        Rect {
+            x: left,
+            y: top,
+            width: deny_end.saturating_sub(left),
+            height,
+        },
+        Rect {
+            x: allow_x,
+            y: top,
+            width: right.saturating_sub(allow_x),
+            height,
+        },
     )
 }
 
-/// Whether a click `y` logical pixels down a dialog drawn with `geometry`
-/// at `scale_120`, showing `text_rows` rows of text, is in its action areas.
-fn action_area_hit(y: f64, scale_120: u32, geometry: &WindowGeometry, text_rows: usize) -> bool {
-    let top = geometry_action_top(
-        geometry.buffer_width(),
-        geometry.buffer_height(),
-        geometry,
-        text_rows,
-    );
-    in_action_area(y, scale_120, top)
-}
-
-/// The width of a trusted dialog's amber border, in buffer pixels.
-fn trusted_consent_border(width: u32, height: u32) -> u32 {
-    width.min(height).div_ceil(80).max(4)
-}
-
-/// Where a trusted dialog's action areas begin in its `width` by `height`
-/// buffer, whose grid starts `grid_top` pixels down and shows `text_rows`
-/// rows of text, each `cell_height` pixels tall: below the text, at least
-/// [`MINIMUM_ACTION_ROWS`] rows above the border
-/// ([`action_area_top`]).
-pub(super) fn trusted_consent_action_top(
+/// The box of a trusted dialog drawn in a `width` by `height` buffer at
+/// `scale_120`, whose grid is `geometry` and whose snapshot rows are
+/// `rows`.
+///
+/// The frame runs through the middle of the grid's first and last rows and
+/// columns, open where the title (first row) and the legend (last row)
+/// show. The buttons span the box inside the frame, split at the middle of
+/// the buffer, as the pointer's halves are, and take the label and keys
+/// rows ([`chrome_rows`]) with a little room above and below, never
+/// reaching the body above or the legend below. Without a grid the buttons
+/// take the bottom fifth inside a frame at the buffer's edge.
+pub(super) fn trusted_chrome(
     width: u32,
     height: u32,
-    grid_top: u32,
-    cell_height: u32,
-    text_rows: u32,
-) -> u32 {
-    let border = trusted_consent_border(width, height);
-    let text_bottom = grid_top.saturating_add(text_rows.saturating_mul(cell_height));
-    let minimum = cell_height
-        .saturating_mul(MINIMUM_ACTION_ROWS)
-        .saturating_add(border);
-    action_area_top(height, text_bottom, minimum)
+    scale_120: u32,
+    geometry: Option<&WindowGeometry>,
+    rows: &[TerminalRow],
+) -> TrustedChrome {
+    let line = scaled_pixels(FRAME_LINE_PIXELS, scale_120, 2);
+    let edge = scaled_pixels(BUTTON_EDGE_PIXELS, scale_120, 1);
+    let gap = scaled_pixels(BUTTON_GAP_PIXELS, scale_120, 4);
+    let buttons =
+        |gap, left, right, top, bottom| button_pair(width / 2, gap, (left, right), (top, bottom));
+    let Some(geometry) = geometry else {
+        let inset = line.saturating_mul(4);
+        let (deny, allow) = buttons(
+            gap,
+            inset,
+            width.saturating_sub(inset),
+            height.saturating_mul(78) / 100,
+            height.saturating_sub(inset),
+        );
+        return TrustedChrome {
+            frame: Rect {
+                x: line,
+                y: line,
+                width: width.saturating_sub(2 * line),
+                height: height.saturating_sub(2 * line),
+            },
+            line,
+            top_openings: Vec::new(),
+            bottom_openings: Vec::new(),
+            deny,
+            allow,
+            edge,
+        };
+    };
+    let (cell_width, cell_height) = (geometry.cell.width.max(1), geometry.cell.height.max(1));
+    let grid = geometry.grid_rect;
+    let last_column = geometry.columns.saturating_sub(1);
+    let last_row = geometry.rows.saturating_sub(1);
+    let middle_x = |column: u32| {
+        grid.x
+            .saturating_add(column.saturating_mul(cell_width))
+            .saturating_add(cell_width / 2)
+    };
+    let middle_y = |row: u32| {
+        grid.y
+            .saturating_add(row.saturating_mul(cell_height))
+            .saturating_add(cell_height / 2)
+    };
+    let left = middle_x(0).saturating_sub(line / 2);
+    let top = middle_y(0).saturating_sub(line / 2);
+    let right = middle_x(last_column)
+        .saturating_add(line - line / 2)
+        .min(width);
+    let bottom = middle_y(last_row)
+        .saturating_add(line - line / 2)
+        .min(height);
+    let places = chrome_rows(usize::try_from(geometry.rows).unwrap_or(0));
+    let row_top = |row: usize| {
+        grid.y.saturating_add(
+            u32::try_from(row)
+                .unwrap_or(u32::MAX)
+                .saturating_mul(cell_height),
+        )
+    };
+    // Two rows of text with room around them, never more than half a row
+    // above or below: the body ends a row above, the legend a row below.
+    let button_height = scaled_pixels(BUTTON_HEIGHT_PIXELS, scale_120, 0)
+        .clamp(cell_height * 2 + cell_height / 2, cell_height * 3);
+    let room = (button_height - cell_height * 2) / 2;
+    // Never more than half a cell, so the labels, which keep a column clear
+    // of the middle ([`dialog_text::button_columns`]), stay inside their
+    // buttons even where the grid sits a little off the buffer's middle.
+    let (deny, allow) = buttons(
+        gap.min(cell_width / 2).max(2),
+        middle_x(1),
+        middle_x(last_column.saturating_sub(1)),
+        row_top(places.label).saturating_sub(room),
+        row_top(places.keys + 1).saturating_add(room).min(height),
+    );
+    TrustedChrome {
+        frame: Rect {
+            x: left,
+            y: top,
+            width: right.saturating_sub(left),
+            height: bottom.saturating_sub(top),
+        },
+        line,
+        top_openings: frame_openings(rows.first(), geometry),
+        bottom_openings: frame_openings(
+            rows.get(usize::try_from(last_row).unwrap_or(usize::MAX)),
+            geometry,
+        ),
+        deny,
+        allow,
+        edge,
+    }
 }
 
 impl App {
-    /// Where this trusted dialog's action areas begin, in buffer pixels, in
-    /// a `width` by `height` buffer that shows `geometry`'s grid. Without a
-    /// grid they take the bottom 22%.
+    /// This trusted dialog's box ([`trusted_chrome`]) in a `width` by
+    /// `height` buffer that shows `geometry`'s grid: the frame, and the
+    /// buttons the Window draws and answers clicks on.
     pub(super) fn trusted_consent_action_top(
         &self,
         width: u32,
         height: u32,
         geometry: Option<&WindowGeometry>,
-    ) -> u32 {
-        let Some(geometry) = geometry else {
-            return trusted_consent_action_top(width, height, 0, 0, 0);
-        };
-        geometry_action_top(width, height, geometry, self.trusted_text_rows())
+    ) -> TrustedChrome {
+        trusted_chrome(
+            width,
+            height,
+            self.surface.scale_120,
+            geometry,
+            self.panes
+                .pane
+                .snapshot
+                .as_ref()
+                .map_or(&[], |snapshot| snapshot.visible_rows.as_slice()),
+        )
     }
 
-    /// How many rows of the dialog's snapshot hold text.
-    fn trusted_text_rows(&self) -> usize {
-        self.panes
-            .pane
-            .snapshot
-            .as_ref()
-            .map_or(0, |snapshot| dialog_text_rows(&snapshot.visible_rows))
-    }
-
-    /// Whether a click `y` logical pixels down this trusted dialog falls in
-    /// its action areas, exactly where [`paint_trusted_consent_chrome`]
-    /// paints them.
+    /// Whether a click `y` logical pixels down this trusted dialog falls on
+    /// the rows of its buttons, exactly where
+    /// [`paint_trusted_consent_chrome`] paints them. The pointer's side of
+    /// the Window's middle picks the button.
     pub(super) fn trusted_consent_action_area_at(&self, y: f64) -> bool {
         let scale_120 = self.surface.scale_120;
         let content = self.content_rect();
@@ -271,10 +409,20 @@ impl App {
                 )
                 .ok()
         });
-        let Some(geometry) = geometry else {
-            return y >= f64::from(self.surface.logical_height) * 0.78;
-        };
-        action_area_hit(y, scale_120, &geometry, self.trusted_text_rows())
+        let (width, height) = geometry.as_ref().map_or_else(
+            || {
+                (
+                    logical_extent_to_buffer(self.surface.logical_width, scale_120).unwrap_or(0),
+                    logical_extent_to_buffer(self.surface.logical_height, scale_120).unwrap_or(0),
+                )
+            },
+            |geometry| (geometry.buffer_width(), geometry.buffer_height()),
+        );
+        buttons_hit(
+            y,
+            scale_120,
+            &self.trusted_consent_action_top(width, height, geometry.as_ref()),
+        )
     }
 
     /// Lays a trusted dialog's text out again whenever its Window's size,
@@ -284,8 +432,9 @@ impl App {
     /// the configured font, as both its minimum and maximum size; this keeps
     /// that request right at the current scale. When the compositor gives
     /// another size anyway (a tiling compositor that ignores the request),
-    /// the text wraps to the columns that fit and, when it still runs into
-    /// the action areas, the font steps down to no less than
+    /// the text wraps to the columns that fit and, when it still needs more
+    /// rows than the box leaves it or a button label is wider than its
+    /// button, the font steps down to no less than
     /// `DIALOG_FONT_FLOOR_PERCENT` of the configured size. Only below that
     /// are rows dropped, hint rows last (`dialog_text::layout`).
     pub(super) fn relayout_trusted_dialog(&mut self) -> Result<()> {
@@ -388,9 +537,11 @@ impl App {
         &mut self,
         mut snapshot: TerminalSnapshot,
     ) -> Result<()> {
-        // The Window's theme already carries the dialog's colors
-        // ([`trusted_dialog_theme`], applied as the Window is prepared).
-        apply_theme(&mut snapshot, self.presentation.theme);
+        // The Window's theme already carries the dialog's colors and the
+        // palette slots its cells are drawn from ([`trusted_dialog_theme`],
+        // applied as the Window is prepared); deriving them again keeps
+        // them, and restores them should the theme ever be replaced.
+        apply_theme(&mut snapshot, trusted_dialog_theme(self.presentation.theme));
         snapshot.revision = self
             .panes
             .pane
@@ -413,65 +564,111 @@ impl App {
 
 /// The colors a trusted dialog paints with, from its Window's theme.
 ///
-/// The dialog's text tells the person to click "the red left area" to say
-/// no and "the green right area" to say yes, so the two areas must stay
-/// recognisably red and green, apart from each other in hue and lightness,
-/// and apart from the frame, whatever the theme says (a theme or a
-/// `[colors]` key may swap them, and a caller chooses the environment the
-/// dialog reads its theme from):
+/// The dialog's text tells the person to click "the red Deny button
+/// (left)" to say no and "the green Allow button (right)" to say yes. Each
+/// button is a light tint of its colour with an edge and a label in it, so
+/// the edges carry the colour: they must stay recognisably red and green,
+/// apart from each other in hue and lightness, and apart from the frame,
+/// whatever the theme says (a theme or a `[colors]` key may swap them, and
+/// a caller chooses the environment the dialog reads its theme from):
 /// - a `danger` that is not red or a `success` that is not green gives way
-///   to Splinterm's own red or green, and areas too close to each other
+///   to Splinterm's own red or green, and edges too close to each other
 ///   give way to Splinterm's own for one of them, then for both;
-/// - a frame too close to either area gives way to Splinterm's own amber,
+/// - a frame too close to either edge gives way to Splinterm's own amber,
 ///   then to black or white;
 /// - when even those fail, as on a mid-tone background where the floors
 ///   leave no hue, the whole dialog takes Splinterm's fixed palette.
 ///
-/// Every non-text color keeps 3:1 against the background and the text
-/// keeps 4.5:1, moved toward black or white as needed.
+/// Every non-text color (the frame and both edges) keeps 3:1 against the
+/// background, and all text keeps 4.5:1 against what it sits on: the body
+/// text, secondary text and title against the background, the selected
+/// choice against the selection fill, and each label and its keys against
+/// its button's tint. Each is moved toward black or white as needed.
 ///
 /// The hue check is deliberately coarse ([`is_red_hue`], [`is_green_hue`]):
-/// a yellow can pass as green and an orange or pink as red. The areas then
+/// a yellow can pass as green and an orange or pink as red. The edges then
 /// still differ by at least [`MIN_AREA_HUE_DISTANCE`] in hue and
 /// [`MIN_AREA_CONTRAST`] in lightness, and the text names each by its side
-/// as well as its colour.
+/// and its label as well as its colour.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct TrustedConsentColors {
-    /// The dialog's body, behind its text and between the action areas.
+    /// The dialog's body, behind its text and around its buttons.
     pub(super) background: u32,
     /// The dialog's text.
     pub(super) text: u32,
     /// The frame: the `warning` role.
     pub(super) border: u32,
-    /// The left area, which says no: the `danger` role.
+    /// The left button's edge, which says no: the `danger` role.
     pub(super) deny: u32,
-    /// The right area, which says yes: the `success` role.
+    /// The right button's edge, which says yes: the `success` role.
     pub(super) allow: u32,
-    /// The right area while the dialog cannot say yes (part of its text is
-    /// hidden): `allow` faded most of the way into the background.
+    /// The right button's edge while the dialog cannot say yes (part of its
+    /// text is hidden): `allow` faded most of the way into the background.
     pub(super) allow_dimmed: u32,
+    /// Secondary text: labels, notes, choices not offered, the legend.
+    pub(super) secondary: u32,
+    /// The title, in the frame's colour as text.
+    pub(super) title: u32,
+    /// The fill behind the selected choice.
+    pub(super) selection: u32,
+    /// The selected choice's text.
+    pub(super) selected_text: u32,
+    /// The buttons' fills: their edge's colour over the background.
+    pub(super) deny_tint: u32,
+    pub(super) allow_tint: u32,
+    /// The right button's fill while the dialog cannot say yes.
+    pub(super) allow_tint_dimmed: u32,
+    /// The labels, in their edge's colour as text on their tint.
+    pub(super) deny_label: u32,
+    pub(super) allow_label: u32,
+    /// The keys under the labels, secondary text on their tint.
+    pub(super) deny_keys: u32,
+    pub(super) allow_keys: u32,
+    /// The right button's label and keys while it cannot say yes.
+    pub(super) allow_off: u32,
 }
 
-/// Splinterm's own red for the deny area, when the theme's `danger` is not red.
+/// The theme roles a trusted dialog takes its colors from.
+#[derive(Clone, Copy, Debug)]
+struct TrustedRoles {
+    text: u32,
+    muted: u32,
+    warning: u32,
+    danger: u32,
+    success: u32,
+    selection: u32,
+    accent: u32,
+}
+
+/// Splinterm's own red for the deny edge, when the theme's `danger` is not red.
 const FALLBACK_DENY: u32 = 0x0070_2020;
-/// Splinterm's own green for the allow area, when the theme's `success` is
+/// Splinterm's own green for the allow edge, when the theme's `success` is
 /// not green.
 const FALLBACK_ALLOW: u32 = 0x0020_7040;
 /// Splinterm's own amber for the frame, when the theme's `warning` is too
-/// close to an area.
+/// close to an edge.
 const FALLBACK_BORDER: u32 = 0x00e0_a030;
-/// The fixed palette's background and text, the dialog's colors before it
-/// followed the theme.
+/// The fixed palette's background, text, secondary text, selection and
+/// accent: the dialog's colors before it followed the theme, and the
+/// colors it falls back to.
 const FIXED_BACKGROUND: u32 = 0x0014_1820;
 const FIXED_TEXT: u32 = 0x00f4_f0e8;
-/// How far the dimmed allow area fades into the background.
+const FIXED_MUTED: u32 = 0x00a0_9a90;
+const FIXED_SELECTION: u32 = 0x0028_3040;
+const FIXED_ACCENT: u32 = 0x007a_a2f7;
+/// How far the dimmed allow edge and fill fade into the background.
 const DIMMED_ALLOW_FADE: f64 = 0.75;
-/// The least hue difference, in degrees, between the deny and allow areas.
+/// How much of its edge's colour a button's fill takes over the background.
+const BUTTON_TINT: f64 = 0.14;
+/// The least contrast between the selection fill and the background, so
+/// the selected choice shows as a row and not only by its marker.
+const MIN_SELECTION_CONTRAST: f64 = 1.15;
+/// The least hue difference, in degrees, between the deny and allow edges.
 const MIN_AREA_HUE_DISTANCE: f64 = 60.0;
-/// The least contrast between the deny and allow areas, so they differ in
+/// The least contrast between the deny and allow edges, so they differ in
 /// lightness as well as hue, for colour-blind eyes.
 const MIN_AREA_CONTRAST: f64 = 1.3;
-/// The frame is apart from an area when their hues differ by this much, or
+/// The frame is apart from an edge when their hues differ by this much, or
 /// their lightness by [`MIN_FRAME_CONTRAST`].
 const MIN_FRAME_HUE_DISTANCE: f64 = 30.0;
 const MIN_FRAME_CONTRAST: f64 = 1.5;
@@ -481,36 +678,44 @@ impl TrustedConsentColors {
         let roles = theme.roles;
         Self::pick(
             theme.background,
-            roles.text,
-            roles.warning,
-            roles.danger,
-            roles.success,
+            TrustedRoles {
+                text: roles.text,
+                muted: roles.text_muted,
+                warning: roles.warning,
+                danger: roles.danger,
+                success: roles.success,
+                selection: roles.selection,
+                accent: roles.accent,
+            },
         )
         .unwrap_or_else(Self::fixed)
     }
 
     /// Splinterm's fixed palette, floored as any theme's is.
     fn fixed() -> Self {
-        Self::pick(
-            FIXED_BACKGROUND,
-            FIXED_TEXT,
-            FALLBACK_BORDER,
-            FALLBACK_DENY,
-            FALLBACK_ALLOW,
-        )
-        .unwrap_or(Self {
-            background: FIXED_BACKGROUND,
+        let roles = TrustedRoles {
             text: FIXED_TEXT,
-            border: FALLBACK_BORDER,
-            deny: FALLBACK_DENY,
-            allow: FALLBACK_ALLOW,
-            allow_dimmed: mix_linear(FALLBACK_ALLOW, FIXED_BACKGROUND, DIMMED_ALLOW_FADE),
+            muted: FIXED_MUTED,
+            warning: FALLBACK_BORDER,
+            danger: FALLBACK_DENY,
+            success: FALLBACK_ALLOW,
+            selection: FIXED_SELECTION,
+            accent: FIXED_ACCENT,
+        };
+        Self::pick(FIXED_BACKGROUND, roles).unwrap_or_else(|| {
+            Self::finish(
+                FIXED_BACKGROUND,
+                roles,
+                FALLBACK_BORDER,
+                FALLBACK_DENY,
+                FALLBACK_ALLOW,
+            )
         })
     }
 
-    /// The colors on `background`, or `None` when the areas cannot be kept
+    /// The colors on `background`, or `None` when the edges cannot be kept
     /// red, green and apart there.
-    fn pick(background: u32, text: u32, warning: u32, danger: u32, success: u32) -> Option<Self> {
+    fn pick(background: u32, roles: TrustedRoles) -> Option<Self> {
         let endpoint = strongest_contrast_endpoint(background);
         let non_text =
             |color| contrast_floor_toward(color, endpoint, background, NON_TEXT_MIN_CONTRAST);
@@ -532,23 +737,69 @@ impl TrustedConsentColors {
         };
         // The theme's pair first, then each of its colors with Splinterm's
         // own for the other, then Splinterm's pair.
-        let (deny, allow) = candidates(danger, FALLBACK_DENY, is_red_hue)
+        let (deny, allow) = candidates(roles.danger, FALLBACK_DENY, is_red_hue)
             .flat_map(|deny| {
-                candidates(success, FALLBACK_ALLOW, is_green_hue).map(move |allow| (deny, allow))
+                candidates(roles.success, FALLBACK_ALLOW, is_green_hue)
+                    .map(move |allow| (deny, allow))
             })
             .find_map(|(deny, allow)| areas(deny, allow))?;
-        let border = [warning, FALLBACK_BORDER, endpoint]
+        let border = [roles.warning, FALLBACK_BORDER, endpoint]
             .into_iter()
             .map(non_text)
             .find(|border| frame_apart(*border, deny) && frame_apart(*border, allow))?;
-        Some(Self {
+        Some(Self::finish(background, roles, border, deny, allow))
+    }
+
+    /// Every color, from the background, the roles, and the frame and edge
+    /// colors already chosen: the text floored against what it sits on, and
+    /// the fills mixed from the edges.
+    fn finish(background: u32, roles: TrustedRoles, border: u32, deny: u32, allow: u32) -> Self {
+        let endpoint = strongest_contrast_endpoint(background);
+        let selection = contrast_floor_toward(
+            roles.selection,
+            endpoint,
             background,
-            text: contrast_corrected(text, background),
+            MIN_SELECTION_CONTRAST,
+        );
+        let secondary = contrast_corrected(roles.muted, background);
+        let deny_tint = mix_encoded(background, deny, BUTTON_TINT);
+        let allow_tint = mix_encoded(background, allow, BUTTON_TINT);
+        let allow_tint_dimmed = mix_linear(allow_tint, background, DIMMED_ALLOW_FADE);
+        Self {
+            background,
+            text: contrast_corrected(roles.text, background),
             border,
             deny,
             allow,
             allow_dimmed: mix_linear(allow, background, DIMMED_ALLOW_FADE),
-        })
+            secondary,
+            title: contrast_corrected(border, background),
+            selection,
+            selected_text: contrast_corrected(roles.accent, selection),
+            deny_tint,
+            allow_tint,
+            allow_tint_dimmed,
+            deny_label: contrast_corrected(deny, deny_tint),
+            allow_label: contrast_corrected(allow, allow_tint),
+            deny_keys: contrast_corrected(secondary, deny_tint),
+            allow_keys: contrast_corrected(secondary, allow_tint),
+            allow_off: contrast_corrected(secondary, allow_tint_dimmed),
+        }
+    }
+
+    /// The color a dialog cell in `ink` is drawn in.
+    pub(super) const fn ink(&self, ink: DialogInk) -> u32 {
+        match ink {
+            DialogInk::Text => self.text,
+            DialogInk::Secondary => self.secondary,
+            DialogInk::Title => self.title,
+            DialogInk::SelectedText => self.selected_text,
+            DialogInk::DenyLabel => self.deny_label,
+            DialogInk::AllowLabel => self.allow_label,
+            DialogInk::DenyKeys => self.deny_keys,
+            DialogInk::AllowKeys => self.allow_keys,
+            DialogInk::AllowOff => self.allow_off,
+        }
     }
 }
 
@@ -622,10 +873,11 @@ fn is_green_hue(hue: f64) -> bool {
 }
 
 /// `theme` with the trusted dialog's colors written into it: its
-/// background, text and the roles its chrome paints. The dialog's Window
-/// draws with this theme from its first frame, so its snapshot's defaults,
-/// its padding and its chrome all agree, and deriving the colors from it
-/// again gives the same colors.
+/// background, text and the roles its chrome paints, and the palette slots
+/// its snapshot's cells are drawn from (`dialog_text::DialogInk::slot`,
+/// [`SELECTION_SLOT`]). The dialog's Window draws with this theme from its
+/// first frame, so its snapshot's colors, its padding and its chrome all
+/// agree, and deriving the colors from it again gives the same colors.
 pub(super) fn trusted_dialog_theme(theme: ResolvedTheme) -> ResolvedTheme {
     let colors = TrustedConsentColors::from_theme(theme);
     let mut theme = theme;
@@ -633,92 +885,159 @@ pub(super) fn trusted_dialog_theme(theme: ResolvedTheme) -> ResolvedTheme {
     theme.foreground = colors.text;
     theme.roles.surface = colors.background;
     theme.roles.text = colors.text;
+    theme.roles.text_muted = colors.secondary;
     theme.roles.warning = colors.border;
     theme.roles.danger = colors.deny;
     theme.roles.success = colors.allow;
+    theme.roles.selection = colors.selection;
+    theme.roles.accent = colors.selected_text;
+    for ink in DialogInk::SLOTTED {
+        if let Some(slot) = ink.slot().and_then(|slot| theme.ansi.get_mut(slot)) {
+            *slot = colors.ink(ink);
+        }
+    }
+    if let Some(slot) = theme.ansi.get_mut(SELECTION_SLOT) {
+        *slot = colors.selection;
+    }
     theme
 }
 
-/// Paints a trusted dialog's border and its red (left) and green (right)
-/// action areas, which begin `button_top` pixels down
-/// ([`App::trusted_consent_action_top`]), in `colors`. The gap between the
-/// areas is filled with the background, so nothing drawn below
-/// `button_top` shows through it. While the dialog cannot say yes (part of
-/// its text is hidden), the green area is drawn dimmed.
+/// `rgb` as a canvas pixel.
+const fn opaque_pixel(rgb: u32) -> [u8; 4] {
+    let [_, red, green, blue] = rgb.to_be_bytes();
+    [blue, green, red, 0xff]
+}
+
+/// The four sides of `button`'s edge, `edge` pixels thick (no more than half
+/// the button).
+fn edge_rects(button: Rect, edge: u32) -> [Rect; 4] {
+    let thick = edge.min(button.width / 2).min(button.height / 2);
+    let right = button.x.saturating_add(button.width).saturating_sub(thick);
+    let bottom = button.y.saturating_add(button.height).saturating_sub(thick);
+    [
+        Rect {
+            height: thick,
+            ..button
+        },
+        Rect {
+            y: bottom,
+            height: thick,
+            ..button
+        },
+        Rect {
+            width: thick,
+            ..button
+        },
+        Rect {
+            x: right,
+            width: thick,
+            ..button
+        },
+    ]
+}
+
+/// Paints a trusted dialog's box, `chrome` ([`trusted_chrome`]), over its
+/// text, in `colors`: the red (left) and green (right) buttons, then the
+/// frame, open where the title and the legend show.
+///
+/// Each button's tint goes behind the text: only its pixels that still
+/// show the dialog's background (or an earlier tint) take it, so the label
+/// and keys drawn there stay whole. Its edge is drawn around it. While the
+/// dialog cannot say yes (part of its text is hidden), the green button is
+/// drawn dimmed.
 pub(super) fn paint_trusted_consent_chrome(
     canvas: &mut [u8],
     width: u32,
     height: u32,
-    button_top: u32,
+    chrome: TrustedChrome,
     colors: TrustedConsentColors,
     proceed_enabled: bool,
 ) {
-    fn fill(canvas: &mut [u8], width: u32, x0: u32, y0: u32, x1: u32, y1: u32, rgb: u32) {
-        let [_, red, green, blue] = rgb.to_be_bytes();
-        for y in y0.min(y1)..y1 {
-            for x in x0.min(x1)..x1 {
-                let Ok(index) = usize::try_from((y * width + x) * 4) else {
-                    continue;
-                };
-                if let Some(pixel) = canvas.get_mut(index..index + 4) {
-                    pixel.copy_from_slice(&[blue, green, red, 0xff]);
+    let TrustedChrome {
+        frame,
+        line,
+        top_openings,
+        bottom_openings,
+        deny,
+        allow,
+        edge: edge_pixels,
+    } = chrome;
+    let index = |x: u32, y: u32| {
+        (x < width && y < height)
+            .then(|| usize::try_from((u64::from(y) * u64::from(width) + u64::from(x)) * 4).ok())
+            .flatten()
+    };
+    let fill = |canvas: &mut [u8], rect: Rect, rgb: u32| {
+        let pixel = opaque_pixel(rgb);
+        for y in rect.y..rect.y.saturating_add(rect.height).min(height) {
+            for x in rect.x..rect.x.saturating_add(rect.width).min(width) {
+                if let Some(target) = index(x, y).and_then(|at| canvas.get_mut(at..at + 4)) {
+                    target.copy_from_slice(&pixel);
                 }
             }
         }
-    }
-    let border = trusted_consent_border(width, height);
-    fill(canvas, width, 0, 0, width, border, colors.border);
-    fill(
-        canvas,
-        width,
-        0,
-        height.saturating_sub(border),
-        width,
-        height,
-        colors.border,
-    );
-    fill(canvas, width, 0, 0, border, height, colors.border);
-    fill(
-        canvas,
-        width,
-        width.saturating_sub(border),
-        0,
-        width,
-        height,
-        colors.border,
-    );
-    let middle = width / 2;
-    fill(
-        canvas,
-        width,
-        middle.saturating_sub(2),
-        button_top,
-        middle.saturating_add(2),
-        height.saturating_sub(border),
+    };
+    let behind_text = [
         colors.background,
-    );
-    fill(
-        canvas,
-        width,
-        border,
-        button_top,
-        middle.saturating_sub(2),
-        height.saturating_sub(border),
-        colors.deny,
-    );
-    fill(
-        canvas,
-        width,
-        middle.saturating_add(2),
-        button_top,
-        width.saturating_sub(border),
-        height.saturating_sub(border),
-        if proceed_enabled {
-            colors.allow
-        } else {
-            colors.allow_dimmed
-        },
-    );
+        colors.deny_tint,
+        colors.allow_tint,
+        colors.allow_tint_dimmed,
+    ]
+    .map(opaque_pixel);
+    let (allow_tint, allow_edge) = if proceed_enabled {
+        (colors.allow_tint, colors.allow)
+    } else {
+        (colors.allow_tint_dimmed, colors.allow_dimmed)
+    };
+    for (button, tint, edge) in [
+        (deny, colors.deny_tint, colors.deny),
+        (allow, allow_tint, allow_edge),
+    ] {
+        let tint = opaque_pixel(tint);
+        for y in button.y..button.y.saturating_add(button.height).min(height) {
+            for x in button.x..button.x.saturating_add(button.width).min(width) {
+                if let Some(target) = index(x, y).and_then(|at| canvas.get_mut(at..at + 4))
+                    && behind_text.iter().any(|pixel| *pixel == *target)
+                {
+                    target.copy_from_slice(&tint);
+                }
+            }
+        }
+        for side in edge_rects(button, edge_pixels) {
+            fill(canvas, side, edge);
+        }
+    }
+    let right = frame.x.saturating_add(frame.width).saturating_sub(line);
+    let bottom = frame.y.saturating_add(frame.height).saturating_sub(line);
+    for (y, openings) in [(frame.y, top_openings), (bottom, bottom_openings)] {
+        let mut x = frame.x;
+        for (open, end) in openings.into_iter().chain([(u32::MAX, u32::MAX)]) {
+            let stop = open.min(frame.x.saturating_add(frame.width));
+            fill(
+                canvas,
+                Rect {
+                    x,
+                    y,
+                    width: stop.saturating_sub(x),
+                    height: line,
+                },
+                colors.border,
+            );
+            x = x.max(end);
+        }
+    }
+    for x in [frame.x, right] {
+        fill(
+            canvas,
+            Rect {
+                x,
+                y: frame.y,
+                width: line,
+                height: frame.height,
+            },
+            colors.border,
+        );
+    }
 }
 
 #[allow(
@@ -1356,21 +1675,22 @@ pub(super) fn paint_pane_chrome(
 mod tests {
     use super::*;
     use crate::color::TEXT_MIN_CONTRAST;
-    use crate::frontend::{DialogLine, dialog_text};
+    use crate::frontend::{DialogLine, DialogStyle, dialog_text};
     use crate::pane::PaneGeometry;
     use splinterm_core::Axis;
 
-    /// The restart question's shape: prose paragraphs wrapped at 76, then
-    /// the deadline and the three hint lines.
+    /// The restart question's shape: a title, prose paragraphs wrapped at
+    /// 76, the deadline, the hint that names the buttons, and the two
+    /// button labels.
     fn restart_text() -> Vec<DialogText> {
         let prose = |text: &str| DialogLine::new(text).with_wrap_at(76);
         vec![DialogText {
             lines: vec![
-                DialogLine::new("TRUSTED SPLINTERM UPGRADE QUESTION"),
-                DialogLine::blank(),
+                DialogLine::title("restart splinterd?"),
                 prose(
                     "The running Splinterm daemon does not speak this client's protocol. It is an older release, such as 0.1.x, or another incompatible build, so this client (Splinterm 0.2.1) cannot ask it for its shells or ask it to hand them over.",
-                ),
+                )
+                .with_style(DialogStyle::Strong),
                 prose(
                     "About 3 shells appear to be running: a best-effort count of its running workload units.",
                 ),
@@ -1385,16 +1705,13 @@ mod tests {
                 ),
                 DialogLine::blank(),
                 DialogLine::hint(
-                    "[D / Esc / Enter  Not now]     [R  Restart now (ends about 3 shells)]",
-                ),
-                DialogLine::hint(
-                    "Click the red left area for Not now or the green right area to restart.",
-                ),
-                DialogLine::hint(
-                    "Click inside this dialog or press Ctrl+Alt+G first to answer with the keyboard.",
-                ),
+                    "R or the green Restart button (right) restarts. Enter, Escape, D, or the red Not now button (left) answer Not now.",
+                )
+                .with_wrap_at(76),
+                DialogLine::deny("Not now"),
+                DialogLine::allow("Restart now, end about 3 shells"),
             ],
-            minimum_rows: 18,
+            minimum_rows: 0,
         }]
     }
 
@@ -1450,51 +1767,59 @@ mod tests {
             .collect()
     }
 
-    const RED: [u8; 4] = [0x20, 0x20, 0x70, 0xff];
+    /// The columns of `row` that show a character.
+    fn visible_columns(snapshot: &TerminalSnapshot, row: usize) -> Vec<u32> {
+        snapshot.visible_rows[row]
+            .cells
+            .iter()
+            .enumerate()
+            .filter(|(_, cell)| !cell.content.trim().is_empty())
+            .map(|(column, _)| u32::try_from(column).unwrap())
+            .collect()
+    }
 
-    /// Every answer hint shows when the text fits; when it does not, the
-    /// notice that the question cannot say yes takes their place.
+    /// The answer hint shows when the text fits; when it does not, the
+    /// notice that the question cannot say yes takes its place.
     fn assert_answer_rows(
         dialog: &crate::frontend::TrustedConsentUi,
         shown: &[String],
-        text_rows: usize,
         size: &str,
     ) {
+        let starts = |text: &str| shown.iter().any(|row| row.trim_start().starts_with(text));
         if dialog.clipped() {
-            assert!(
-                shown
-                    .iter()
-                    .any(|row| row.starts_with("Part of this question is hidden")),
-                "{size}: {shown:#?}"
-            );
-            assert!(
-                !shown.iter().any(|row| row.starts_with("[D / Esc")),
-                "{size}"
-            );
+            assert!(starts("Part of this question"), "{size}: {shown:#?}");
+            assert!(!starts("R or the green"), "{size}");
         } else {
-            assert!(!shown.iter().any(|row| row == dialog_text::CLIPPED_MARKER));
-            for hint in ["[D / Esc / Enter", "Click the red left area"] {
-                assert!(
-                    shown.iter().any(|row| row.starts_with(hint)),
-                    "{size}: {hint}: {shown:#?}"
-                );
-            }
-            assert!(
-                shown[text_rows - 1].ends_with("keyboard."),
-                "{size}: {shown:#?}"
-            );
+            assert!(!starts(dialog_text::CLIPPED_MARKER), "{size}: {shown:#?}");
+            assert!(starts("R or the green"), "{size}: {shown:#?}");
         }
+    }
+
+    /// A canvas `width` by `height` in the dialog's background.
+    fn background_canvas(width: u32, height: u32, colors: TrustedConsentColors) -> Vec<u8> {
+        opaque_pixel(colors.background).repeat(usize::try_from(width * height).unwrap())
+    }
+
+    fn pixel_at(canvas: &[u8], width: u32, x: u32, y: u32) -> [u8; 4] {
+        let index = usize::try_from((y * width + x) * 4).unwrap();
+        canvas[index..index + 4].try_into().unwrap()
     }
 
     /// At its natural size the dialog fits exactly, and in every smaller or
     /// odd Window (the 2026-10-22 tiles among them), at 1x and at 1.25x, its
-    /// text is laid out again, ends above the action areas as they are
-    /// painted, and a click (in logical pixels, converted to buffer pixels)
-    /// is in an action area exactly where those areas are painted. Every
-    /// size shows how to answer: the hints, or the notice that replaces
-    /// them while text is hidden.
+    /// box holds it: the body ends above the buttons, the buttons above the
+    /// legend, each label and its keys inside its own button, the legend
+    /// and the title inside the frame, which is open behind them, and a
+    /// click (in logical pixels, converted to buffer pixels) is on a button
+    /// exactly where the buttons are painted. Every size shows how to
+    /// answer: the hint, or the notice that replaces it while text is
+    /// hidden.
     #[test]
-    fn relaid_text_stays_above_the_drawn_action_areas_and_clicks_agree() {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one walk over every size checks the box, its paint and its hit test together"
+    )]
+    fn the_box_holds_the_text_and_its_painted_buttons_and_clicks_agree() {
         let variants = restart_text();
         let natural = WindowGeometry::for_grid(
             u32::try_from(natural_columns(&variants)).unwrap(),
@@ -1510,8 +1835,13 @@ mod tests {
             natural.logical_height(),
             SCALE_DENOMINATOR,
         );
-        assert!(natural_fit.fits());
-        assert_eq!(natural_fit.wrap_columns, natural_columns(&variants));
+        assert!(natural_fit.fits(), "{natural_fit:?}");
+        assert_eq!(
+            usize::try_from(natural_fit.geometry.columns).unwrap(),
+            natural_columns(&variants)
+        );
+        assert_eq!(natural_fit.needed_rows, natural_fit.room_rows);
+        let colors = TrustedConsentColors::fixed();
         let sizes = [
             (natural.logical_width(), natural.logical_height()),
             (621, 368),
@@ -1531,48 +1861,105 @@ mod tests {
                 let geometry = fit.geometry;
                 assert!(snapshot.columns <= geometry.columns as usize, "{size}");
                 assert!(snapshot.rows <= geometry.rows as usize, "{size}");
-                let text_rows = dialog_text_rows(&snapshot.visible_rows);
                 let (buffer_width, buffer_height) =
                     (geometry.buffer_width(), geometry.buffer_height());
-                let top = geometry_action_top(buffer_width, buffer_height, &geometry, text_rows);
-                let text_bottom =
-                    geometry.grid_rect.y + u32::try_from(text_rows).unwrap() * geometry.cell.height;
-                assert!(
-                    text_bottom <= top,
-                    "{size}: text ends at {text_bottom}, actions at {top}"
+                let chrome = trusted_chrome(
+                    buffer_width,
+                    buffer_height,
+                    scale_120,
+                    Some(&geometry),
+                    &snapshot.visible_rows,
                 );
-                // The painted red area and the hit test agree on every
-                // buffer row above the bottom border.
-                let mut canvas =
-                    vec![0; usize::try_from(buffer_width * buffer_height * 4).unwrap()];
+                let grid = geometry.grid_rect;
+                let (cell_width, cell_height) = (geometry.cell.width, geometry.cell.height);
+                let row_top = |row: usize| grid.y + u32::try_from(row).unwrap() * cell_height;
+                let places = chrome_rows(geometry.rows as usize);
+                // The body ends above the buttons; the buttons end above
+                // the legend's row.
+                if let Some(last) =
+                    (1..places.label).rfind(|row| !row_text(&snapshot, *row).trim().is_empty())
+                {
+                    assert!(row_top(last + 1) <= chrome.deny.y, "{size}: {chrome:?}");
+                }
+                assert!(
+                    chrome.deny.y + chrome.deny.height <= row_top(places.legend),
+                    "{size}: {chrome:?}"
+                );
+                // Each label and its keys sit inside their own button.
+                for row in [places.label, places.keys] {
+                    for column in visible_columns(&snapshot, row) {
+                        let x = grid.x + column * cell_width;
+                        let end = x + cell_width;
+                        let button = if x >= buffer_width / 2 {
+                            chrome.allow
+                        } else {
+                            chrome.deny
+                        };
+                        assert!(
+                            x >= button.x + chrome.edge
+                                && end + chrome.edge <= button.x + button.width,
+                            "{size}: column {column} of row {row} outside {button:?}"
+                        );
+                    }
+                }
+                let labels = row_text(&snapshot, places.label);
+                assert!(labels.contains("Not now"), "{size}: {labels:?}");
+                assert_eq!(
+                    labels.contains("Restart now, end about 3 shells"),
+                    fit.buttons_fit,
+                    "{size}: {labels:?}"
+                );
+                assert!(
+                    row_text(&snapshot, places.keys).contains("esc · d · ↵"),
+                    "{size}"
+                );
+                // The legend and the title stay inside the frame.
+                for row in [0, places.legend] {
+                    for column in visible_columns(&snapshot, row) {
+                        assert!(
+                            (2..geometry.columns - 2).contains(&column),
+                            "{size}: column {column} of row {row}"
+                        );
+                    }
+                }
+                let mut canvas = background_canvas(buffer_width, buffer_height, colors);
                 paint_trusted_consent_chrome(
                     &mut canvas,
                     buffer_width,
                     buffer_height,
-                    top,
-                    FIXED_COLORS,
+                    chrome.clone(),
+                    colors,
                     !dialog.clipped(),
                 );
-                let border = trusted_consent_border(buffer_width, buffer_height);
-                let x = buffer_width / 4;
-                for y in border..buffer_height - border {
-                    let index = usize::try_from((y * buffer_width + x) * 4).unwrap();
-                    let painted_red = canvas[index..index + 4] == RED;
+                // The frame is open behind every title character.
+                for column in visible_columns(&snapshot, 0) {
+                    let x = grid.x + column * cell_width + cell_width / 2;
+                    assert_ne!(
+                        pixel_at(&canvas, buffer_width, x, chrome.frame.y),
+                        opaque_pixel(colors.border),
+                        "{size}: title column {column}"
+                    );
+                }
+                // The painted red edge and the hit test agree on every
+                // buffer row.
+                for y in 0..buffer_height {
+                    let painted_red = pixel_at(&canvas, buffer_width, chrome.deny.x, y)
+                        == opaque_pixel(colors.deny);
                     let logical_y =
                         (f64::from(y) + 0.5) * f64::from(SCALE_DENOMINATOR) / f64::from(scale_120);
                     assert_eq!(
-                        action_area_hit(logical_y, scale_120, &geometry, text_rows),
+                        buttons_hit(logical_y, scale_120, &chrome),
                         painted_red,
                         "{size} at buffer row {y}"
                     );
                 }
-                assert_answer_rows(&dialog, &shown_rows(&snapshot), text_rows, &size);
+                assert_answer_rows(&dialog, &shown_rows(&snapshot), &size);
             }
         }
-        // The reported 621x368 tile does not fit at this font, so it says
-        // so and cannot restart.
+        // The smallest tile does not fit at this font, so it says so and
+        // cannot restart.
         let mut dialog = restart_dialog();
-        laid_out(&mut dialog, &fit_at(&variants, 621, 368, SCALE_DENOMINATOR));
+        laid_out(&mut dialog, &fit_at(&variants, 300, 200, SCALE_DENOMINATOR));
         assert!(dialog.clipped());
     }
 
@@ -1581,36 +1968,104 @@ mod tests {
     #[test]
     fn narrow_windows_rewrap_and_short_ones_say_what_is_hidden() {
         let variants = restart_text();
-        let narrow = fit_at(&variants, 621, 600, SCALE_DENOMINATOR);
-        assert!(narrow.wrap_columns < natural_columns(&variants));
+        let narrow = fit_at(&variants, 621, 700, SCALE_DENOMINATOR);
+        assert!(narrow.wrap_columns < dialog_text::natural_text_columns(&variants));
         assert!(narrow.fits(), "{narrow:?}");
-        let short = fit_at(&variants, 621, 200, SCALE_DENOMINATOR);
+        let mut dialog = restart_dialog();
+        laid_out(&mut dialog, &narrow);
+        assert!(!dialog.clipped());
+        let short = fit_at(&variants, 621, 260, SCALE_DENOMINATOR);
         assert!(!short.fits());
         let mut dialog = restart_dialog();
         let shown = shown_rows(&laid_out(&mut dialog, &short));
         assert!(
-            shown.iter().any(|row| row == dialog_text::CLIPPED_MARKER),
+            shown
+                .iter()
+                .any(|row| row.trim() == dialog_text::CLIPPED_MARKER),
             "{shown:#?}"
         );
         assert!(
             shown
                 .iter()
-                .any(|row| row.starts_with("Part of this question is hidden")),
+                .any(|row| row.trim_start().starts_with("Part of this question")),
             "{shown:#?}"
+        );
+        assert!(dialog.clipped());
+    }
+
+    /// A Window whose body fits but whose Allow label is wider than its
+    /// button cuts the label, says what is hidden, and cannot say yes: its
+    /// green button is painted dimmed.
+    #[test]
+    fn a_cut_allow_label_counts_as_hidden_text() {
+        let variants = restart_text();
+        // 60 columns: each button holds 27 characters; the label has 31.
+        let width = 60 * 8 + 24;
+        let fit = fit_at(&variants, width, 900, SCALE_DENOMINATOR);
+        assert_eq!(fit.geometry.columns, 60);
+        assert!(fit.needed_rows <= fit.room_rows, "{fit:?}");
+        assert!(!fit.buttons_fit);
+        assert!(!fit.fits());
+        let mut dialog = restart_dialog();
+        let snapshot = laid_out(&mut dialog, &fit);
+        assert!(dialog.clipped());
+        let places = chrome_rows(fit.geometry.rows as usize);
+        let labels = row_text(&snapshot, places.label);
+        assert!(labels.contains("Restart now, end about 3 s…"), "{labels:?}");
+        assert_answer_rows(&dialog, &shown_rows(&snapshot), "cut label");
+        let geometry = fit.geometry;
+        let (buffer_width, buffer_height) = (geometry.buffer_width(), geometry.buffer_height());
+        let chrome = trusted_chrome(
+            buffer_width,
+            buffer_height,
+            SCALE_DENOMINATOR,
+            Some(&geometry),
+            &snapshot.visible_rows,
+        );
+        let colors = TrustedConsentColors::fixed();
+        let mut canvas = background_canvas(buffer_width, buffer_height, colors);
+        paint_trusted_consent_chrome(
+            &mut canvas,
+            buffer_width,
+            buffer_height,
+            chrome.clone(),
+            colors,
+            !dialog.clipped(),
+        );
+        assert_eq!(
+            pixel_at(&canvas, buffer_width, chrome.allow.x, chrome.allow.y + 4),
+            opaque_pixel(colors.allow_dimmed)
+        );
+        assert_eq!(
+            pixel_at(
+                &canvas,
+                buffer_width,
+                chrome.allow.x + 4,
+                chrome.allow.y + 4
+            ),
+            opaque_pixel(colors.allow_tint_dimmed)
         );
     }
 
-    /// The font decision fed by the real fit: in the reported 621x368 tile
-    /// a 9x19 cell does not fit and a 7x14 one does, so the dialog steps
+    /// The font decision fed by the real fit: a Window that holds the
+    /// dialog at a 7x14 cell does not at a 9x19 one, so the dialog steps
     /// down to it, unless that is below 70% of the configured size.
     #[test]
     fn the_font_steps_down_to_a_cell_that_really_fits() {
         let variants = restart_text();
         let large = CellGeometry::from_metrics(9, 19, 15, 4, 15).unwrap();
         let small = CellGeometry::from_metrics(7, 14, 11, 3, 11).unwrap();
+        let tile = WindowGeometry::for_grid(
+            u32::try_from(natural_columns(&variants)).unwrap(),
+            u32::try_from(natural_rows(&variants)).unwrap(),
+            small,
+            TerminalPadding::DEFAULT,
+            SCALE_DENOMINATOR,
+        )
+        .unwrap();
         let fits = |cell| {
             trusted_dialog_fit(
-                content(621, 368),
+                content(tile.logical_width(), tile.logical_height()),
                 cell,
                 TerminalPadding::DEFAULT,
                 SCALE_DENOMINATOR,
@@ -1644,47 +2099,86 @@ mod tests {
         assert_eq!(bounded_fixed_size(natural, Some((3840, 2160))), natural);
     }
 
+    /// The buttons' tints go behind the text and their edges around them;
+    /// the frame is open where its text shows, and nothing else is touched.
     #[test]
-    fn text_room_ends_above_the_shortest_action_areas() {
-        // 368 px tall, 17 px rows from 4 px down: the border is 5 px, so
-        // the shortest action areas take 2 * 17 + 5 px.
-        let room = trusted_consent_text_room(621, 368, 4, 17, 21);
-        assert_eq!(room, (368 - 39 - 4) / 17);
-        let bottom = 4 + room * 17;
-        assert!(trusted_consent_action_top(621, 368, 4, 17, room) >= bottom);
-        assert!(trusted_consent_action_top(621, 368, 4, 17, room + 1) < bottom + 17);
-        assert_eq!(trusted_consent_text_room(621, 368, 4, 17, 3), 3);
-        assert_eq!(trusted_consent_text_room(100, 30, 4, 17, 1), 1);
+    fn buttons_are_tinted_behind_their_text_and_the_frame_left_open() {
+        let (width, height) = (200, 100);
+        let colors = TrustedConsentColors::fixed();
+        let chrome = TrustedChrome {
+            frame: Rect {
+                x: 4,
+                y: 4,
+                width: 192,
+                height: 92,
+            },
+            line: 2,
+            top_openings: vec![(20, 60)],
+            bottom_openings: vec![(20, 40), (40, 80)],
+            deny: Rect {
+                x: 10,
+                y: 60,
+                width: 87,
+                height: 30,
+            },
+            allow: Rect {
+                x: 103,
+                y: 60,
+                width: 87,
+                height: 30,
+            },
+            edge: 1,
+        };
+        let glyph = [1, 2, 3, 0xff];
+        let mut canvas = background_canvas(width, height, colors);
+        let at = usize::try_from((75 * width + 50) * 4).unwrap();
+        canvas[at..at + 4].copy_from_slice(&glyph);
+        paint_trusted_consent_chrome(&mut canvas, width, height, chrome.clone(), colors, true);
+        let pixel = |canvas: &[u8], x, y| pixel_at(canvas, width, x, y);
+        assert_eq!(pixel(&canvas, 30, 75), opaque_pixel(colors.deny_tint));
+        assert_eq!(pixel(&canvas, 150, 75), opaque_pixel(colors.allow_tint));
+        // Text drawn in a button stays.
+        assert_eq!(pixel(&canvas, 50, 75), glyph);
+        assert_eq!(pixel(&canvas, 10, 75), opaque_pixel(colors.deny));
+        assert_eq!(pixel(&canvas, 96, 75), opaque_pixel(colors.deny));
+        assert_eq!(pixel(&canvas, 150, 60), opaque_pixel(colors.allow));
+        assert_eq!(pixel(&canvas, 150, 89), opaque_pixel(colors.allow));
+        // The gap between the buttons and the body above are untouched.
+        let background = opaque_pixel(colors.background);
+        assert_eq!(pixel(&canvas, 100, 75), background);
+        assert_eq!(pixel(&canvas, 100, 40), background);
+        // The frame, open behind its title and legend.
+        let border = opaque_pixel(colors.border);
+        assert_eq!(pixel(&canvas, 10, 4), border);
+        assert_eq!(pixel(&canvas, 40, 5), background);
+        assert_eq!(pixel(&canvas, 60, 4), border);
+        assert_eq!(pixel(&canvas, 30, 94), background);
+        assert_eq!(pixel(&canvas, 79, 95), background);
+        assert_eq!(pixel(&canvas, 80, 94), border);
+        assert_eq!(pixel(&canvas, 4, 50), border);
+        assert_eq!(pixel(&canvas, 195, 50), border);
+        assert_eq!(pixel(&canvas, 2, 50), background);
+        // A dialog that cannot say yes dims its green button; painting
+        // again replaces the earlier tint.
+        paint_trusted_consent_chrome(&mut canvas, width, height, chrome, colors, false);
+        assert_eq!(
+            pixel(&canvas, 150, 75),
+            opaque_pixel(colors.allow_tint_dimmed)
+        );
+        assert_eq!(pixel(&canvas, 150, 60), opaque_pixel(colors.allow_dimmed));
+        assert_eq!(pixel(&canvas, 30, 75), opaque_pixel(colors.deny_tint));
     }
 
-    /// Nothing drawn under the action areas shows between them.
+    /// Without a grid the buttons take the bottom fifth, and the hit test
+    /// agrees.
     #[test]
-    fn the_gap_between_the_action_areas_is_painted_over() {
-        let (width, height) = (200, 100);
-        let mut canvas = vec![0xff; usize::try_from(width * height * 4).unwrap()];
-        paint_trusted_consent_chrome(&mut canvas, width, height, 70, FIXED_COLORS, true);
-        let pixel = |x: u32, y: u32| {
-            let index = usize::try_from((y * width + x) * 4).unwrap();
-            [
-                canvas[index],
-                canvas[index + 1],
-                canvas[index + 2],
-                canvas[index + 3],
-            ]
-        };
-        for y in 70..96 {
-            for x in 98..102 {
-                assert_eq!(pixel(x, y), [0x20, 0x18, 0x14, 0xff], "{x},{y}");
-            }
-        }
-        assert_eq!(pixel(50, 80), [0x20, 0x20, 0x70, 0xff]);
-        assert_eq!(pixel(150, 80), [0x40, 0x70, 0x20, 0xff]);
-        // Above the action areas the canvas is untouched.
-        assert_eq!(pixel(100, 60), [0xff, 0xff, 0xff, 0xff]);
-        // A dialog that cannot say yes dims its green area.
-        paint_trusted_consent_chrome(&mut canvas, width, height, 70, FIXED_COLORS, false);
-        let index = usize::try_from((80 * width + 150) * 4).unwrap();
-        assert_eq!(canvas[index..index + 4], [0x2a, 0x30, 0x24, 0xff]);
+    fn without_a_grid_the_buttons_take_the_bottom_fifth() {
+        let chrome = trusted_chrome(400, 300, SCALE_DENOMINATOR, None, &[]);
+        assert_eq!(chrome.deny.y, 234);
+        assert!(buttons_hit(250.0, SCALE_DENOMINATOR, &chrome));
+        assert!(!buttons_hit(200.0, SCALE_DENOMINATOR, &chrome));
+        assert!(chrome.deny.x + chrome.deny.width < 200);
+        assert!(chrome.allow.x > 200);
     }
 
     #[test]
@@ -2227,16 +2721,6 @@ mod tests {
         ));
     }
 
-    /// The colors trusted dialogs painted before they followed the theme.
-    const FIXED_COLORS: TrustedConsentColors = TrustedConsentColors {
-        background: 0x0014_1820,
-        text: 0x00f4_f0e8,
-        border: 0x00e0_a030,
-        deny: 0x0070_2020,
-        allow: 0x0020_7040,
-        allow_dimmed: 0x0024_302a,
-    };
-
     /// Each theme source's trusted dialog: background, text, border, deny
     /// area, allow area, and the dimmed allow area.
     const CONSENT_PINS: [(&str, [u32; 6]); 9] = [
@@ -2353,6 +2837,51 @@ mod tests {
                 < contrast_ratio(colors.allow, background),
             "{name}"
         );
+        // Every text keeps 4.5:1 on what it sits on: the background, the
+        // selection fill, or its button's tint.
+        for (what, text, under) in [
+            ("text", colors.text, background),
+            ("secondary", colors.secondary, background),
+            ("title", colors.title, background),
+            ("selected", colors.selected_text, colors.selection),
+            ("deny label", colors.deny_label, colors.deny_tint),
+            ("allow label", colors.allow_label, colors.allow_tint),
+            ("deny keys", colors.deny_keys, colors.deny_tint),
+            ("allow keys", colors.allow_keys, colors.allow_tint),
+            ("allow off", colors.allow_off, colors.allow_tint_dimmed),
+        ] {
+            assert!(
+                contrast_ratio(text, under) >= TEXT_MIN_CONTRAST,
+                "{name}: {what} {text:06x} on {under:06x}"
+            );
+        }
+        // The selection shows as a row, and each button as a fill.
+        assert!(
+            contrast_ratio(colors.selection, background) >= MIN_SELECTION_CONTRAST - 0.01,
+            "{name}: selection {:06x}",
+            colors.selection
+        );
+        assert_ne!(colors.deny_tint, background, "{name}");
+        assert_ne!(colors.allow_tint, background, "{name}");
+        assert_ne!(colors.deny_tint, colors.allow_tint, "{name}");
+    }
+
+    /// The dialog's theme carries its inks in the palette slots its
+    /// snapshot's cells name, so the text the Window draws is in the colors
+    /// the guard checked.
+    #[test]
+    fn trusted_dialog_theme_fills_the_dialog_inks() {
+        for (name, theme) in crate::config::tests::provider_themes() {
+            let colors = TrustedConsentColors::from_theme(theme);
+            let dialog = trusted_dialog_theme(theme);
+            for ink in DialogInk::SLOTTED {
+                let slot = ink.slot().unwrap();
+                assert_eq!(dialog.ansi[slot], colors.ink(ink), "{name}: {ink:?}");
+            }
+            assert_eq!(dialog.ansi[SELECTION_SLOT], colors.selection, "{name}");
+            assert_eq!(dialog.foreground, colors.text, "{name}");
+        }
+        assert_eq!(DialogInk::Text.slot(), None);
     }
 
     #[test]

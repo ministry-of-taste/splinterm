@@ -383,7 +383,8 @@ once, without a prompt; the result's `source` names the grant
 **The prompt.** The prompt appears without taking keyboard focus, and its keys
 stay inert until the person clicks inside it, so nothing an agent or the person
 types elsewhere can answer it. After that click it is default-deny: Enter,
-Escape, and `D` deny, and only `G` or a click on the grant area grants, after a
+Escape, and `D` deny, and only `G` or a click on the green Allow button
+grants, after a
 short arming delay. Earlier releases granted on Enter. A person who has not
 got to the prompt yet simply leaves the request pending. The prompt shows the
 host's reported MCP client name as a label only.

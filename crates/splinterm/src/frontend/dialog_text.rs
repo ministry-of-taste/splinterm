@@ -1,12 +1,23 @@
 //! The text of a trusted dialog, kept as logical lines so the Window can lay
 //! it out again for whatever size the compositor gives it.
 //!
+//! A dialog is drawn as one box inside its Window (Plan 0065): a `warning`
+//! frame through the middle of the grid's first and last rows and columns,
+//! the title set into the top edge, the keyboard legend into the bottom one,
+//! and two labelled buttons, Deny on the left and Allow on the right, above
+//! the legend. Between them sit the body rows, inset
+//! [`FRAME_INSET_COLUMNS`] from each side. The frame and the button fills
+//! are painted by the Window (`wayland::chrome`); every character, the
+//! title, the button labels and the legend among them, is a cell of the
+//! dialog's static snapshot, in the terminal grid font.
+//!
 //! A dialog asks for one fixed size, its *natural* size: as wide as its
-//! longest line (within [`NATURAL_MIN_COLUMNS`]..=[`NATURAL_MAX_COLUMNS`])
-//! and tall enough that its text ends above the action areas. Tiling
-//! compositors float a Window whose minimum and maximum sizes are equal. A
-//! compositor that gives it another size anyway gets the same text wrapped
-//! again, at spaces, to the columns that fit (see [`layout`]).
+//! longest body row plus the frame (within
+//! [`NATURAL_MIN_COLUMNS`]..=[`NATURAL_MAX_COLUMNS`]) and as its button
+//! labels need, and tall enough for its body and the [`CHROME_ROWS`].
+//! Tiling compositors float a Window whose minimum and maximum sizes are
+//! equal. A compositor that gives it another size anyway gets the same text
+//! wrapped again, at spaces, to the columns that fit (see [`layout`]).
 
 use serde::{Deserialize, Serialize};
 use splinterm_core::SplintId;
@@ -15,28 +26,82 @@ use splinterm_protocol::{
     TerminalSnapshot, UnderlineStyle,
 };
 
-/// The narrowest a dialog asks to be, in columns.
+/// The narrowest a dialog asks to be, in columns, frame included.
 pub const NATURAL_MIN_COLUMNS: usize = 64;
 
-/// The widest a dialog asks to be, in columns. A longer line wraps.
-pub const NATURAL_MAX_COLUMNS: usize = 120;
+/// The widest a dialog's body rows are laid out, in columns. A longer line
+/// wraps.
+pub const NATURAL_MAX_TEXT_COLUMNS: usize = 120;
 
-/// The share of a dialog's natural rows its text may take: the action areas
-/// cover the bottom 22%, and a little room is left between.
-pub const TEXT_ROWS_PERCENT: usize = 72;
+/// The columns the frame takes on each side of the body: the frame's own
+/// column and one blank column inside it.
+pub const FRAME_INSET_COLUMNS: usize = 2;
+
+/// The widest a dialog asks to be, in columns, frame included.
+pub const NATURAL_MAX_COLUMNS: usize = NATURAL_MAX_TEXT_COLUMNS + 2 * FRAME_INSET_COLUMNS;
+
+/// The grid rows above the body: the title row, which the frame's top edge
+/// runs through, and one blank row.
+pub const CHROME_TOP_ROWS: usize = 2;
+
+/// The grid rows below the body: a blank row, the button labels, the keys
+/// under them, a blank row, and the legend row, which the frame's bottom
+/// edge runs through.
+pub const CHROME_BOTTOM_ROWS: usize = 5;
+
+/// Every grid row that is not body.
+pub const CHROME_ROWS: usize = CHROME_TOP_ROWS + CHROME_BOTTOM_ROWS;
+
+/// The columns a button label keeps clear of the dialog's middle, where the
+/// two buttons meet.
+const BUTTON_MIDDLE_COLUMNS: usize = 1;
 
 /// What shows in place of the last body row kept when a dialog too small
 /// even at its smallest font must drop rows.
 pub const CLIPPED_MARKER: &str = "…";
 
-/// How a line ranks when a dialog too small to show all of its text must
-/// drop rows: hint rows are dropped last.
+/// The mark before every trusted dialog's title.
+pub const TITLE_MARK: &str = "⚠";
+
+/// What a line is: body text the layout wraps and may drop, or one of the
+/// texts the box sets into its frame and buttons.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DialogLineRole {
     #[default]
     Body,
-    /// How to answer: the key and click hints and the keyboard hint.
+    /// How to answer: dropped last when rows must go.
     Hint,
+    /// The lowercase title set into the frame's top edge.
+    Title,
+    /// The red left (no) button's label.
+    Deny,
+    /// The green right (yes) button's label: what it grants or does.
+    Allow,
+}
+
+impl DialogLineRole {
+    /// Whether the line is body text, laid out between the frame's edges.
+    #[must_use]
+    pub const fn is_body(self) -> bool {
+        matches!(self, Self::Body | Self::Hint)
+    }
+}
+
+/// How a body line is drawn.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DialogStyle {
+    /// Primary text.
+    #[default]
+    Text,
+    /// Primary text in bold: the request itself.
+    Strong,
+    /// Secondary text: notes, labels, choices that are not offered.
+    Secondary,
+    /// The selected choice: accent text on the selection fill across the
+    /// box.
+    Selected,
+    /// A group heading in secondary text with a rule to the box's right.
+    Group,
 }
 
 /// One logical line of dialog text: a paragraph the layout wraps at spaces.
@@ -50,6 +115,12 @@ pub struct DialogLine {
     /// dialog; `None` for the dialog's width.
     pub wrap_at: Option<usize>,
     pub role: DialogLineRole,
+    #[serde(default)]
+    pub style: DialogStyle,
+    /// How many characters at the start of its first row are a label, drawn
+    /// in secondary text (a key in a key/value table).
+    #[serde(default)]
+    pub lead: usize,
     /// The access consent duration a click on any of its rows selects.
     #[serde(skip)]
     pub duration: Option<usize>,
@@ -87,6 +158,50 @@ impl DialogLine {
         }
     }
 
+    /// The title set into the frame's top edge.
+    #[must_use]
+    pub fn title(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            role: DialogLineRole::Title,
+            ..Self::default()
+        }
+    }
+
+    /// The red left button's label.
+    #[must_use]
+    pub fn deny(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            role: DialogLineRole::Deny,
+            ..Self::default()
+        }
+    }
+
+    /// The green right button's label.
+    #[must_use]
+    pub fn allow(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            role: DialogLineRole::Allow,
+            ..Self::default()
+        }
+    }
+
+    /// Draws it in `style`.
+    #[must_use]
+    pub const fn with_style(mut self, style: DialogStyle) -> Self {
+        self.style = style;
+        self
+    }
+
+    /// Draws the first `characters` of its first row as a label.
+    #[must_use]
+    pub const fn with_lead(mut self, characters: usize) -> Self {
+        self.lead = characters;
+        self
+    }
+
     /// Indents its wrapped rows by `columns`.
     #[must_use]
     pub const fn with_indent(mut self, columns: usize) -> Self {
@@ -122,6 +237,98 @@ pub struct DialogText {
     pub lines: Vec<DialogLine>,
     /// The fewest grid rows the dialog asks for.
     pub minimum_rows: usize,
+}
+
+impl DialogText {
+    /// The text of its first line with `role`, or "" without one.
+    fn chrome_text(&self, role: DialogLineRole) -> &str {
+        self.lines
+            .iter()
+            .find(|line| line.role == role)
+            .map_or("", |line| line.text.as_str())
+    }
+
+    /// The title set into the frame.
+    #[must_use]
+    pub fn title(&self) -> &str {
+        self.chrome_text(DialogLineRole::Title)
+    }
+
+    /// The red left button's label.
+    #[must_use]
+    pub fn deny_label(&self) -> &str {
+        self.chrome_text(DialogLineRole::Deny)
+    }
+
+    /// The green right button's label.
+    #[must_use]
+    pub fn allow_label(&self) -> &str {
+        self.chrome_text(DialogLineRole::Allow)
+    }
+
+    /// Whether both button labels fit their buttons in a dialog `columns`
+    /// wide. A label that does not fit is cut, and a dialog that cuts its
+    /// Allow label cannot say yes.
+    #[must_use]
+    pub fn buttons_fit(&self, columns: usize) -> bool {
+        let room = button_label_columns(columns);
+        [self.deny_label(), self.allow_label()]
+            .iter()
+            .all(|label| label.chars().count() <= room)
+    }
+}
+
+/// The columns each button's label may take in a dialog `columns` wide:
+/// its half of the box, inside the frame and clear of the middle.
+#[must_use]
+pub const fn button_label_columns(columns: usize) -> usize {
+    (columns / 2).saturating_sub(FRAME_INSET_COLUMNS + BUTTON_MIDDLE_COLUMNS)
+}
+
+/// The columns body rows may take in a dialog `columns` wide.
+#[must_use]
+pub const fn text_columns(columns: usize) -> usize {
+    let inside = columns.saturating_sub(2 * FRAME_INSET_COLUMNS);
+    if inside == 0 { 1 } else { inside }
+}
+
+/// Where the box's rows go in a grid `grid_rows` tall. A grid shorter than
+/// [`CHROME_ROWS`] has no room for body rows, and its rows overlap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChromeRows {
+    /// The row of the button labels.
+    pub label: usize,
+    /// The row of the keys under them.
+    pub keys: usize,
+    /// The row the frame's bottom edge runs through, with the legend.
+    pub legend: usize,
+    /// How many body rows fit between the title and the buttons.
+    pub body_room: usize,
+}
+
+/// The box's rows in a grid `grid_rows` tall: the buttons and the legend
+/// keep the bottom, the body takes what is left below the title.
+#[must_use]
+pub const fn chrome_rows(grid_rows: usize) -> ChromeRows {
+    ChromeRows {
+        label: grid_rows.saturating_sub(4),
+        keys: grid_rows.saturating_sub(3),
+        legend: grid_rows.saturating_sub(1),
+        body_room: grid_rows.saturating_sub(CHROME_ROWS),
+    }
+}
+
+/// The columns, from first to past the last, a button's label may take:
+/// the left (deny) half or the right (allow) half of a box `columns` wide.
+#[must_use]
+pub const fn button_columns(columns: usize, allow: bool) -> (usize, usize) {
+    let room = button_label_columns(columns);
+    if allow {
+        let end = columns.saturating_sub(FRAME_INSET_COLUMNS);
+        (end.saturating_sub(room), end)
+    } else {
+        (FRAME_INSET_COLUMNS, FRAME_INSET_COLUMNS + room)
+    }
 }
 
 /// What a dialog's snapshot is called and which Splint identity it carries.
@@ -230,17 +437,26 @@ pub fn wrap_line(line: &DialogLine, columns: usize) -> Vec<String> {
     rows
 }
 
+/// How one laid-out body row is drawn.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RowStyle {
+    pub style: DialogStyle,
+    /// The characters at its start drawn as a label.
+    pub lead: usize,
+}
+
 /// One wrapped row and where it came from.
 struct LaidRow {
     text: String,
     role: DialogLineRole,
     duration: Option<usize>,
+    style: RowStyle,
 }
 
 /// How many rows each slot takes in `text` at `columns`.
 fn slot_rows(text: &DialogText, columns: usize) -> Vec<(u8, usize)> {
     let mut slots: Vec<(u8, usize)> = Vec::new();
-    for line in &text.lines {
+    for line in text.lines.iter().filter(|line| line.role.is_body()) {
         let Some(slot) = line.slot else { continue };
         let rows = if line.text.trim().is_empty() {
             0
@@ -274,13 +490,21 @@ fn wrapped_rows(text: &DialogText, columns: usize, tallest: &[(u8, usize)]) -> V
     let mut rows = Vec::new();
     let mut used: Vec<(u8, usize)> = Vec::new();
     for (index, line) in text.lines.iter().enumerate() {
+        if !line.role.is_body() {
+            continue;
+        }
         let anchor_only = line.slot.is_some() && line.text.trim().is_empty();
         if !anchor_only {
-            for row in wrap_line(line, columns) {
+            for (wrapped, row) in wrap_line(line, columns).into_iter().enumerate() {
                 rows.push(LaidRow {
                     text: row,
                     role: line.role,
                     duration: line.duration,
+                    style: RowStyle {
+                        style: line.style,
+                        // The label is on the first row only.
+                        lead: if wrapped == 0 { line.lead } else { 0 },
+                    },
                 });
             }
         }
@@ -312,6 +536,7 @@ fn wrapped_rows(text: &DialogText, columns: usize, tallest: &[(u8, usize)]) -> V
                     text: String::new(),
                     role: line.role,
                     duration: None,
+                    style: RowStyle::default(),
                 });
             }
         }
@@ -330,40 +555,65 @@ pub fn text_rows(variants: &[DialogText], columns: usize) -> usize {
         .unwrap_or(0)
 }
 
-/// The columns a dialog asks for: its widest row, laid out no wider than
-/// [`NATURAL_MAX_COLUMNS`], within
+/// The columns a dialog asks for, frame included: its widest body row, laid
+/// out no wider than [`NATURAL_MAX_TEXT_COLUMNS`], and enough for its
+/// title and button labels, within
 /// [`NATURAL_MIN_COLUMNS`]..=[`NATURAL_MAX_COLUMNS`].
 #[must_use]
 pub fn natural_columns(variants: &[DialogText]) -> usize {
-    let tallest = tallest_slots(variants, NATURAL_MAX_COLUMNS);
-    variants
+    let tallest = tallest_slots(variants, NATURAL_MAX_TEXT_COLUMNS);
+    let body = variants
         .iter()
-        .flat_map(|variant| wrapped_rows(variant, NATURAL_MAX_COLUMNS, &tallest))
+        .flat_map(|variant| wrapped_rows(variant, NATURAL_MAX_TEXT_COLUMNS, &tallest))
         .map(|row| row.text.chars().count())
         .max()
-        .unwrap_or(1)
+        .unwrap_or(1);
+    let chrome = variants
+        .iter()
+        .map(|variant| {
+            let label = variant
+                .deny_label()
+                .chars()
+                .count()
+                .max(variant.allow_label().chars().count());
+            // The smallest width whose buttons hold the label.
+            let buttons = 2 * (label + FRAME_INSET_COLUMNS + BUTTON_MIDDLE_COLUMNS);
+            let title = title_text(variant.title()).chars().count();
+            buttons.max(title + 2 * FRAME_INSET_COLUMNS)
+        })
+        .max()
+        .unwrap_or(0);
+    (body + 2 * FRAME_INSET_COLUMNS)
+        .max(chrome)
         .clamp(NATURAL_MIN_COLUMNS, NATURAL_MAX_COLUMNS)
 }
 
-/// The grid rows a dialog asks for at [`natural_columns`]: enough that its
-/// text takes at most [`TEXT_ROWS_PERCENT`] of them, and at least its
-/// [`DialogText::minimum_rows`].
+/// The columns a dialog's body rows wrap at in its natural size.
+#[must_use]
+pub fn natural_text_columns(variants: &[DialogText]) -> usize {
+    text_columns(natural_columns(variants))
+}
+
+/// The grid rows a dialog asks for at [`natural_columns`]: its body rows
+/// and the [`CHROME_ROWS`], and at least its [`DialogText::minimum_rows`].
 #[must_use]
 pub fn natural_rows(variants: &[DialogText]) -> usize {
-    let rows = text_rows(variants, natural_columns(variants));
+    let rows = text_rows(variants, natural_text_columns(variants));
     let minimum = variants
         .iter()
         .map(|variant| variant.minimum_rows)
         .max()
         .unwrap_or(0);
-    (rows * 100).div_ceil(TEXT_ROWS_PERCENT).max(minimum).max(1)
+    (rows + CHROME_ROWS).max(minimum)
 }
 
-/// One laid-out rendering of a dialog's text.
+/// One laid-out rendering of a dialog's body text.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DialogLayout {
     /// The rows of text, top to bottom.
     pub rows: Vec<String>,
+    /// How each row is drawn, one per row.
+    pub styles: Vec<RowStyle>,
     /// Every row that shows a duration, with that duration's index.
     pub duration_rows: Vec<(usize, usize)>,
     /// Whether rows were dropped because they did not fit.
@@ -398,12 +648,27 @@ pub fn layout_with_notice(
     max_rows: usize,
     notice: Option<&str>,
 ) -> DialogLayout {
+    layout_hiding(variants, selected, columns, max_rows, notice, false)
+}
+
+/// [`layout_with_notice`] for a dialog that also hides text outside its
+/// body when `hidden` (a button label cut to fit): it counts as clipped,
+/// and shows its notice, even when every body row fits.
+#[must_use]
+pub fn layout_hiding(
+    variants: &[DialogText],
+    selected: usize,
+    columns: usize,
+    max_rows: usize,
+    notice: Option<&str>,
+    hidden: bool,
+) -> DialogLayout {
     let Some(text) = variants.get(selected).or_else(|| variants.first()) else {
         return DialogLayout::default();
     };
     let tallest = tallest_slots(variants, columns);
     let mut rows = wrapped_rows(text, columns, &tallest);
-    let clipped = rows.len() > max_rows;
+    let clipped = hidden || rows.len() > max_rows;
     if let Some(notice) = notice.filter(|_| clipped) {
         rows.retain(|row| row.role != DialogLineRole::Hint);
         rows.extend(
@@ -413,6 +678,7 @@ pub fn layout_with_notice(
                     text,
                     role: DialogLineRole::Hint,
                     duration: None,
+                    style: RowStyle::default(),
                 }),
         );
     }
@@ -460,12 +726,14 @@ pub fn layout_with_notice(
         }
         if Some(index) == last_body {
             laid.rows.push(CLIPPED_MARKER.to_owned());
+            laid.styles.push(RowStyle::default());
             continue;
         }
         if let Some(duration) = row.duration {
             laid.duration_rows.push((laid.rows.len(), duration));
         }
         laid.rows.push(row.text);
+        laid.styles.push(row.style);
     }
     laid
 }
@@ -473,7 +741,295 @@ pub fn layout_with_notice(
 /// `variants[selected]` laid out at its natural size, every row shown.
 #[must_use]
 pub fn natural_layout(variants: &[DialogText], selected: usize) -> DialogLayout {
-    layout(variants, selected, natural_columns(variants), usize::MAX)
+    layout(
+        variants,
+        selected,
+        natural_text_columns(variants),
+        usize::MAX,
+    )
+}
+
+/// The title as the frame shows it: the warning mark, then the title, or
+/// nothing without one.
+fn title_text(title: &str) -> String {
+    if title.is_empty() {
+        String::new()
+    } else {
+        format!("{TITLE_MARK} {title}")
+    }
+}
+
+/// What a dialog cell is drawn in. Each ink but [`DialogInk::Text`] is one
+/// slot of the snapshot's palette, which the Window fills from the dialog's
+/// floored colors (`wayland::chrome::trusted_dialog_theme`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DialogInk {
+    /// Primary text: the snapshot's default foreground.
+    #[default]
+    Text,
+    /// Secondary text on the dialog's background.
+    Secondary,
+    /// The title, in warning text.
+    Title,
+    /// A selected choice's text, on the selection fill.
+    SelectedText,
+    /// The Deny label, on the red tint.
+    DenyLabel,
+    /// The Allow label, on the green tint.
+    AllowLabel,
+    /// The Deny keys, on the red tint.
+    DenyKeys,
+    /// The Allow keys, on the green tint.
+    AllowKeys,
+    /// The Allow label and keys while it cannot say yes.
+    AllowOff,
+}
+
+impl DialogInk {
+    /// Every ink that takes a palette slot.
+    pub const SLOTTED: [Self; 8] = [
+        Self::Secondary,
+        Self::Title,
+        Self::SelectedText,
+        Self::DenyLabel,
+        Self::AllowLabel,
+        Self::DenyKeys,
+        Self::AllowKeys,
+        Self::AllowOff,
+    ];
+
+    /// The palette slot it is drawn from, or `None` for the default
+    /// foreground.
+    #[must_use]
+    pub const fn slot(self) -> Option<usize> {
+        match self {
+            Self::Text => None,
+            Self::Secondary => Some(1),
+            Self::Title => Some(2),
+            Self::SelectedText => Some(3),
+            Self::DenyLabel => Some(4),
+            Self::AllowLabel => Some(5),
+            Self::DenyKeys => Some(6),
+            Self::AllowKeys => Some(7),
+            Self::AllowOff => Some(8),
+        }
+    }
+}
+
+/// The palette slot of the selection fill behind a selected choice.
+pub const SELECTION_SLOT: usize = 9;
+
+/// One cell of a composed dialog.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DialogCell {
+    pub character: char,
+    pub ink: DialogInk,
+    pub bold: bool,
+    /// Whether it sits on the selection fill.
+    pub selected: bool,
+}
+
+/// What the box shows besides the body: the button keys and labels'
+/// state, and the legend set into the frame's bottom edge.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DialogChrome {
+    /// The keys under the Deny label.
+    pub deny_keys: String,
+    /// The keys under the Allow label.
+    pub allow_keys: String,
+    /// Whether the dialog can say yes now; the Allow label is drawn off
+    /// while it cannot.
+    pub allow_enabled: bool,
+    /// The legend's forms, best first, each as runs of text and ink. The
+    /// first that fits inside the frame is shown; none, when none fits.
+    pub legend: Vec<Vec<(String, DialogInk)>>,
+}
+
+/// A composed grid's rows, each a run of cells from column 0.
+type ComposedRows = Vec<Vec<DialogCell>>;
+
+/// Writes `text` into `row` from `column`, no further than `end`.
+fn put(row: &mut Vec<DialogCell>, column: usize, end: usize, text: &str, cell: DialogCell) {
+    for (offset, character) in text.chars().enumerate() {
+        let at = column + offset;
+        if at >= end {
+            break;
+        }
+        if row.len() <= at {
+            row.resize(
+                at + 1,
+                DialogCell {
+                    character: ' ',
+                    ..DialogCell::default()
+                },
+            );
+        }
+        row[at] = DialogCell { character, ..cell };
+    }
+}
+
+/// `text` cut to `columns` characters, its last an ellipsis when it was
+/// cut.
+fn fitted(text: &str, columns: usize) -> String {
+    if text.chars().count() <= columns {
+        return text.to_owned();
+    }
+    let mut cut: String = text.chars().take(columns.saturating_sub(1)).collect();
+    if columns > 0 {
+        cut.push_str(CLIPPED_MARKER);
+    }
+    cut
+}
+
+/// `text` (a dialog's laid-out `body`) composed into the box of a grid
+/// `columns` by `grid_rows`: the title on the frame's top edge, the body
+/// below it, the buttons' labels and keys centred in their halves, and the
+/// first form of the legend that fits on the frame's bottom edge.
+///
+/// The body is placed as laid out, never cut here: the layout already kept
+/// it to [`ChromeRows::body_room`] rows of [`text_columns`]. A label wider
+/// than its button is cut ([`DialogText::buttons_fit`] says when).
+#[must_use]
+pub fn compose(
+    text: &DialogText,
+    body: &DialogLayout,
+    chrome: &DialogChrome,
+    columns: usize,
+    grid_rows: usize,
+) -> ComposedRows {
+    let mut rows: ComposedRows = vec![Vec::new(); grid_rows.max(1)];
+    let inside_end = columns.saturating_sub(FRAME_INSET_COLUMNS);
+    let places = chrome_rows(grid_rows);
+    put(
+        &mut rows[0],
+        FRAME_INSET_COLUMNS,
+        inside_end,
+        &fitted(&title_text(text.title()), text_columns(columns)),
+        DialogCell {
+            ink: DialogInk::Title,
+            bold: true,
+            ..DialogCell::default()
+        },
+    );
+    for (index, (row_text, style)) in body.rows.iter().zip(&body.styles).enumerate() {
+        let Some(row) = rows.get_mut(CHROME_TOP_ROWS + index) else {
+            break;
+        };
+        compose_body_row(row, row_text, *style, columns);
+    }
+    for (allow, label) in [(false, text.deny_label()), (true, text.allow_label())] {
+        let (start, end) = button_columns(columns, allow);
+        let (label_ink, keys_ink) = match (allow, chrome.allow_enabled) {
+            (false, _) => (DialogInk::DenyLabel, DialogInk::DenyKeys),
+            (true, true) => (DialogInk::AllowLabel, DialogInk::AllowKeys),
+            (true, false) => (DialogInk::AllowOff, DialogInk::AllowOff),
+        };
+        let keys = if allow {
+            &chrome.allow_keys
+        } else {
+            &chrome.deny_keys
+        };
+        for (row, shown, ink, bold) in [
+            (places.label, fitted(label, end - start), label_ink, true),
+            (places.keys, fitted(keys, end - start), keys_ink, false),
+        ] {
+            let width = shown.chars().count();
+            let column = start + (end - start - width) / 2;
+            if let Some(row) = rows.get_mut(row) {
+                put(
+                    row,
+                    column,
+                    end,
+                    &shown,
+                    DialogCell {
+                        ink,
+                        bold,
+                        ..DialogCell::default()
+                    },
+                );
+            }
+        }
+    }
+    let room = text_columns(columns);
+    if let Some(form) = chrome.legend.iter().find(|form| {
+        form.iter()
+            .map(|(text, _)| text.chars().count())
+            .sum::<usize>()
+            <= room
+    }) && let Some(row) = rows.get_mut(places.legend)
+    {
+        let mut column = FRAME_INSET_COLUMNS;
+        for (text, ink) in form {
+            put(
+                row,
+                column,
+                inside_end,
+                text,
+                DialogCell {
+                    ink: *ink,
+                    ..DialogCell::default()
+                },
+            );
+            column += text.chars().count();
+        }
+    }
+    rows
+}
+
+/// One body row in its style, inset inside the frame.
+fn compose_body_row(row: &mut Vec<DialogCell>, text: &str, style: RowStyle, columns: usize) {
+    let inside_end = columns.saturating_sub(FRAME_INSET_COLUMNS);
+    let selected = style.style == DialogStyle::Selected;
+    if selected {
+        // The selection fill runs across the box, inside the frame.
+        let fill = DialogCell {
+            character: ' ',
+            selected: true,
+            ..DialogCell::default()
+        };
+        row.clear();
+        row.push(DialogCell {
+            character: ' ',
+            ..DialogCell::default()
+        });
+        row.resize(columns.saturating_sub(1).max(1), fill);
+    }
+    let (ink, bold) = match style.style {
+        DialogStyle::Text => (DialogInk::Text, false),
+        DialogStyle::Strong => (DialogInk::Text, true),
+        DialogStyle::Secondary | DialogStyle::Group => (DialogInk::Secondary, false),
+        DialogStyle::Selected => (DialogInk::SelectedText, false),
+    };
+    let cell = DialogCell {
+        ink,
+        bold,
+        selected,
+        ..DialogCell::default()
+    };
+    let lead: String = text.chars().take(style.lead).collect();
+    let rest: String = text.chars().skip(style.lead).collect();
+    let lead_ink = if selected {
+        DialogInk::SelectedText
+    } else {
+        DialogInk::Secondary
+    };
+    put(
+        row,
+        FRAME_INSET_COLUMNS,
+        inside_end,
+        &lead,
+        DialogCell {
+            ink: lead_ink,
+            ..cell
+        },
+    );
+    let after_lead = FRAME_INSET_COLUMNS + lead.chars().count();
+    put(row, after_lead, inside_end, &rest, cell);
+    if style.style == DialogStyle::Group {
+        let start = FRAME_INSET_COLUMNS + text.chars().count() + 1;
+        let rule = "─".repeat(inside_end.saturating_sub(start));
+        put(row, start, inside_end, &rule, cell);
+    }
 }
 
 fn dialog_input_modes() -> TerminalInputModes {
@@ -489,26 +1045,23 @@ fn dialog_input_modes() -> TerminalInputModes {
     }
 }
 
-/// A static, cursorless snapshot of `rows` in a `columns` by `grid_rows`
-/// grid, in the trusted dialog colors. The grid grows to hold every row;
-/// blank rows fill the rest.
-#[must_use]
-pub fn dialog_snapshot(
-    rows: Vec<String>,
-    columns: usize,
-    grid_rows: usize,
-    identity: &DialogIdentity,
-) -> TerminalSnapshot {
-    let columns = rows
-        .iter()
-        .map(|row| row.chars().count())
-        .max()
-        .unwrap_or(0)
-        .max(columns)
-        .max(1);
-    let grid_rows = rows.len().max(grid_rows).max(1);
-    let attributes = CellAttributes {
-        bold: false,
+/// The snapshot attributes of one composed cell: its ink and fill as
+/// palette slots, and bold.
+fn cell_attributes(cell: DialogCell) -> CellAttributes {
+    let (foreground_source, foreground) =
+        cell.ink.slot().map_or((ColorSource::Default, 0), |slot| {
+            (ColorSource::Base16, u32::try_from(slot).unwrap_or(0))
+        });
+    let (background_source, background) = if cell.selected {
+        (
+            ColorSource::Base16,
+            u32::try_from(SELECTION_SLOT).unwrap_or(0),
+        )
+    } else {
+        (ColorSource::Default, 0)
+    };
+    CellAttributes {
+        bold: cell.bold,
         dim: false,
         italic: false,
         underline: UnderlineStyle::None,
@@ -518,22 +1071,57 @@ pub fn dialog_snapshot(
         blink: false,
         conceal: false,
         reverse: false,
-        foreground_source: ColorSource::Default,
-        foreground: 0,
-        background_source: ColorSource::Default,
-        background: 0,
-    };
+        foreground_source,
+        foreground,
+        background_source,
+        background,
+    }
+}
+
+/// Plain rows of primary text as composed cells.
+#[must_use]
+pub fn plain_rows(rows: Vec<String>) -> Vec<Vec<DialogCell>> {
+    rows.into_iter()
+        .map(|row| {
+            row.chars()
+                .map(|character| DialogCell {
+                    character,
+                    ..DialogCell::default()
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// A static, cursorless snapshot of `rows` in a `columns` by `grid_rows`
+/// grid, in the trusted dialog colors. The grid grows to hold every row;
+/// blank rows fill the rest.
+#[must_use]
+pub fn dialog_snapshot(
+    rows: Vec<Vec<DialogCell>>,
+    columns: usize,
+    grid_rows: usize,
+    identity: &DialogIdentity,
+) -> TerminalSnapshot {
+    let columns = rows
+        .iter()
+        .map(Vec::len)
+        .max()
+        .unwrap_or(0)
+        .max(columns)
+        .max(1);
+    let grid_rows = rows.len().max(grid_rows).max(1);
     let mut visible_rows: Vec<_> = rows
         .into_iter()
         .map(|row| TerminalRow {
             row_id: None,
             linebreak: false,
             cells: row
-                .chars()
-                .map(|character| TerminalCell {
-                    content: character.to_string(),
+                .into_iter()
+                .map(|cell| TerminalCell {
+                    content: cell.character.to_string(),
                     spacer_remaining: None,
-                    attributes,
+                    attributes: cell_attributes(cell),
                 })
                 .collect(),
         })
@@ -649,20 +1237,25 @@ mod tests {
     }
 
     #[test]
-    fn natural_size_holds_the_widest_line_and_leaves_the_action_rows() {
+    fn natural_size_holds_the_widest_line_the_labels_and_the_chrome_rows() {
         let variants = vec![DialogText {
             lines: vec![
+                DialogLine::title("a title"),
                 DialogLine::new("TITLE"),
                 DialogLine::new("x".repeat(80)),
                 DialogLine::new("y ".repeat(90)).with_wrap_at(100),
+                DialogLine::deny("Deny"),
+                DialogLine::allow("Allow"),
             ],
             minimum_rows: 0,
         }];
-        assert_eq!(natural_columns(&variants), 99);
-        let rows = text_rows(&variants, 100);
+        // The widest row is 50 `y`s wrapped at 100: 99 columns, and the
+        // frame's inset on each side.
+        assert_eq!(natural_columns(&variants), 99 + 2 * FRAME_INSET_COLUMNS);
+        assert_eq!(natural_text_columns(&variants), 99);
+        let rows = text_rows(&variants, 99);
         assert_eq!(rows, 4);
-        assert_eq!(natural_rows(&variants), (4 * 100_usize).div_ceil(72));
-        assert!(rows * 100 <= natural_rows(&variants) * TEXT_ROWS_PERCENT);
+        assert_eq!(natural_rows(&variants), 4 + CHROME_ROWS);
         // Short text still asks for the narrowest width and its minimum rows.
         let short = vec![DialogText {
             lines: vec![DialogLine::new("hi")],
@@ -670,10 +1263,40 @@ mod tests {
         }];
         assert_eq!(natural_columns(&short), NATURAL_MIN_COLUMNS);
         assert_eq!(natural_rows(&short), 18);
-        // Nothing is ever cut at the natural size.
+        // A long label or title widens the box until it fits.
+        let labelled = |title: &str, allow: &str| {
+            vec![DialogText {
+                lines: vec![
+                    DialogLine::title(title),
+                    DialogLine::new("hi"),
+                    DialogLine::deny("Deny"),
+                    DialogLine::allow(allow),
+                ],
+                minimum_rows: 0,
+            }]
+        };
+        let allow = "a".repeat(40);
+        let wide = labelled("t", &allow);
+        assert_eq!(natural_columns(&wide), 2 * (40 + 3));
+        assert!(wide[0].buttons_fit(natural_columns(&wide)));
+        assert!(!wide[0].buttons_fit(natural_columns(&wide) - 1));
+        let titled = labelled(&"t".repeat(70), "Allow");
+        assert_eq!(natural_columns(&titled), 70 + 2 + 2 * FRAME_INSET_COLUMNS);
+        // Never wider than the cap, however long the text.
+        let huge = text(vec![DialogLine::new("z".repeat(500))]);
+        assert_eq!(natural_columns(&huge), NATURAL_MAX_COLUMNS);
+        // Nothing is ever cut at the natural size, and the frame's texts
+        // are not body rows.
         let laid = natural_layout(&variants, 0);
         assert!(!laid.clipped);
         assert_eq!(laid.rows.len(), rows);
+        assert_eq!(laid.styles.len(), rows);
+        assert!(
+            !laid
+                .rows
+                .iter()
+                .any(|row| row == "a title" || row == "Allow")
+        );
     }
 
     #[test]
@@ -779,10 +1402,193 @@ mod tests {
             title: "Upgrade question".to_owned(),
             ..DialogIdentity::default()
         };
-        let snapshot = dialog_snapshot(vec!["one".into(), "a longer row".into()], 4, 6, &identity);
+        let snapshot = dialog_snapshot(
+            plain_rows(vec!["one".into(), "a longer row".into()]),
+            4,
+            6,
+            &identity,
+        );
         assert_eq!(snapshot.validate().map_err(|error| error.message), Ok(()));
         assert_eq!((snapshot.columns, snapshot.rows), (12, 6));
         assert_eq!(snapshot.title, "Upgrade question");
         assert_eq!(snapshot.cursor_row, -1);
+    }
+
+    /// The box's rows: the title on the first, the body from the third, the
+    /// labels and keys above a blank row and the legend on the last.
+    #[test]
+    fn the_chrome_keeps_the_bottom_rows_and_the_buttons_keep_their_halves() {
+        assert_eq!(
+            chrome_rows(25),
+            ChromeRows {
+                label: 21,
+                keys: 22,
+                legend: 24,
+                body_room: 18,
+            }
+        );
+        assert_eq!(chrome_rows(3).body_room, 0);
+        for columns in [20, 63, 64, 65, 100, 124] {
+            let (deny_start, deny_end) = button_columns(columns, false);
+            let (allow_start, allow_end) = button_columns(columns, true);
+            assert_eq!(deny_end - deny_start, button_label_columns(columns));
+            assert_eq!(allow_end - allow_start, button_label_columns(columns));
+            // Inside the frame, and each wholly on its own side of the
+            // middle, where the pointer's halves meet.
+            assert_eq!(deny_start, FRAME_INSET_COLUMNS);
+            assert_eq!(allow_end, columns - FRAME_INSET_COLUMNS);
+            assert!(2 * deny_end < columns, "{columns}");
+            assert!(2 * allow_start > columns, "{columns}");
+            assert_eq!(text_columns(columns), columns - 2 * FRAME_INSET_COLUMNS);
+        }
+        assert_eq!(text_columns(3), 1);
+    }
+
+    fn row_string(row: &[DialogCell]) -> String {
+        row.iter().map(|cell| cell.character).collect()
+    }
+
+    fn boxed() -> Vec<DialogText> {
+        text(vec![
+            DialogLine::title("agent access request"),
+            DialogLine::new("'probe' wants to Look").with_style(DialogStyle::Strong),
+            DialogLine::new("program   /usr/bin/probe").with_lead(10),
+            DialogLine::new("how long").with_style(DialogStyle::Group),
+            DialogLine::new("( ) Once").with_style(DialogStyle::Selected),
+            DialogLine::hint("G or the green Allow button (right) grants."),
+            DialogLine::deny("Deny"),
+            DialogLine::allow("Allow Look once"),
+        ])
+    }
+
+    fn legend(forms: &[&str]) -> Vec<Vec<(String, DialogInk)>> {
+        forms
+            .iter()
+            .map(|form| vec![((*form).to_owned(), DialogInk::Secondary)])
+            .collect()
+    }
+
+    #[test]
+    fn compose_places_the_title_body_labels_keys_and_legend() {
+        let variants = boxed();
+        let (columns, grid_rows) = (64, 14);
+        let body = layout(&variants, 0, text_columns(columns), 7);
+        assert!(!body.clipped);
+        let chrome = DialogChrome {
+            deny_keys: "esc · d · ↵".to_owned(),
+            allow_keys: "g".to_owned(),
+            allow_enabled: true,
+            legend: legend(&["l".repeat(61).as_str(), "click inside to use the keyboard"]),
+        };
+        let rows = compose(&variants[0], &body, &chrome, columns, grid_rows);
+        assert_eq!(rows.len(), grid_rows);
+        // The title, bold, in the frame's colour, from inside the frame.
+        assert!(row_string(&rows[0]).starts_with("  ⚠ agent access request"));
+        assert!(rows[0][2..].iter().take(3).all(|cell| cell.bold));
+        assert_eq!(rows[0][2].ink, DialogInk::Title);
+        assert!(rows[1].is_empty());
+        // The body from the third row, inset, in its styles.
+        assert_eq!(row_string(&rows[2]), "  'probe' wants to Look");
+        assert!(rows[2][2].bold);
+        assert_eq!(rows[3][2].ink, DialogInk::Secondary);
+        assert_eq!(rows[3][12].ink, DialogInk::Text);
+        let group = row_string(&rows[4]);
+        assert!(group.starts_with("  how long ─"), "{group}");
+        assert_eq!(group.chars().count(), columns - FRAME_INSET_COLUMNS);
+        // The selected choice fills inside the frame, its text in accent.
+        assert_eq!(rows[5].len(), columns - 1);
+        assert!(!rows[5][0].selected);
+        assert!(rows[5][1..].iter().all(|cell| cell.selected));
+        assert_eq!(rows[5][2].ink, DialogInk::SelectedText);
+        // The labels and keys centred in their halves, Deny on the left.
+        let places = chrome_rows(grid_rows);
+        let label_row = row_string(&rows[places.label]);
+        let keys_row = row_string(&rows[places.keys]);
+        for (allow, label, keys) in [
+            (false, "Deny", "esc · d · ↵"),
+            (true, "Allow Look once", "g"),
+        ] {
+            let (start, end) = button_columns(columns, allow);
+            let mut at = label_row.chars().collect::<Vec<_>>();
+            at.resize(columns, ' ');
+            let found: String = at[start..end].iter().collect();
+            assert_eq!(found.trim(), label, "{label_row:?}");
+            let left = found.len() - found.trim_start().len();
+            let right = found.len() - found.trim_end().len();
+            assert!(left.abs_diff(right) <= 1, "{label}: {left} {right}");
+            let key_cells: String = keys_row.chars().skip(start).take(end - start).collect();
+            assert_eq!(key_cells.trim(), keys);
+        }
+        let deny_column = label_row.find('D').unwrap();
+        assert_eq!(rows[places.label][deny_column].ink, DialogInk::DenyLabel);
+        assert!(rows[places.label][deny_column].bold);
+        let allow_column = label_row.chars().position(|c| c == 'A').unwrap();
+        assert_eq!(rows[places.label][allow_column].ink, DialogInk::AllowLabel);
+        let g = keys_row.chars().position(|c| c == 'g').unwrap();
+        assert_eq!(rows[places.keys][g].ink, DialogInk::AllowKeys);
+        assert!(!rows[places.keys][g].bold);
+        // The first legend form that fits inside the frame: 61 columns do
+        // not fit in 60.
+        assert_eq!(
+            row_string(&rows[places.legend]),
+            "  click inside to use the keyboard"
+        );
+        assert!(rows[places.legend - 1].is_empty());
+        // Nothing reaches the frame's columns.
+        for row in &rows {
+            let chars: Vec<char> = row.iter().map(|cell| cell.character).collect();
+            for column in [0, 1, columns - 2, columns - 1] {
+                assert!(chars.get(column).is_none_or(|c| *c == ' '), "{chars:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn compose_dims_a_disabled_allow_and_cuts_what_does_not_fit() {
+        let variants = boxed();
+        let chrome = DialogChrome {
+            deny_keys: "esc · d · ↵".to_owned(),
+            allow_keys: "g".to_owned(),
+            allow_enabled: false,
+            legend: legend(&["l".repeat(40).as_str()]),
+        };
+        // 30 columns: 12 per label, so "Allow Look once" is cut.
+        let columns = 30;
+        assert!(!variants[0].buttons_fit(columns));
+        assert!(variants[0].buttons_fit(64));
+        let body = layout_hiding(
+            &variants,
+            0,
+            text_columns(columns),
+            usize::MAX,
+            Some("hidden"),
+            !variants[0].buttons_fit(columns),
+        );
+        assert!(body.clipped);
+        assert_eq!(body.rows.last().map(String::as_str), Some("hidden"));
+        let rows = compose(&variants[0], &body, &chrome, columns, 40);
+        let places = chrome_rows(40);
+        let label_row = row_string(&rows[places.label]);
+        assert!(label_row.contains("Allow Look …"), "{label_row:?}");
+        let allow_column = label_row.chars().position(|c| c == 'A').unwrap();
+        assert_eq!(rows[places.label][allow_column].ink, DialogInk::AllowOff);
+        let g = row_string(&rows[places.keys])
+            .chars()
+            .position(|c| c == 'g')
+            .unwrap();
+        assert_eq!(rows[places.keys][g].ink, DialogInk::AllowOff);
+        // No legend form fits, so none shows.
+        assert!(rows[places.legend].is_empty());
+        // Each ink but the default takes its own palette slot, apart from
+        // the selection's.
+        let mut slots: Vec<usize> = DialogInk::SLOTTED
+            .iter()
+            .filter_map(|ink| ink.slot())
+            .collect();
+        slots.push(SELECTION_SLOT);
+        slots.sort_unstable();
+        slots.dedup();
+        assert_eq!(slots.len(), DialogInk::SLOTTED.len() + 1);
+        assert!(slots.iter().all(|slot| *slot < 16));
     }
 }

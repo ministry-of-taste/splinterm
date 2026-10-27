@@ -64,7 +64,7 @@ enum TrustedAnswer {
 struct AccessConsentDialog {
     choice: AccessChoice,
     durations: Vec<GrantDuration>,
-    /// The rows of the current layout that show a duration.
+    /// The rows of the current snapshot that show a duration.
     duration_rows: Vec<(usize, usize)>,
     render: AccessConsentRenderer,
 }
@@ -91,6 +91,9 @@ pub struct TrustedConsentUi {
     /// Whether that layout hides part of the text. While it does, nothing
     /// grants, proceeds, or restarts; only the no answers count.
     clipped: bool,
+    /// Whether the current snapshot's legend says the keys are live: it
+    /// is drawn again once a click or the shortcut engages the keyboard.
+    legend_live: bool,
 }
 
 impl TrustedConsentUi {
@@ -121,6 +124,7 @@ impl TrustedConsentUi {
             identity: DialogIdentity::default(),
             frame: None,
             clipped: false,
+            legend_live: false,
         }
     }
 
@@ -138,6 +142,7 @@ impl TrustedConsentUi {
             identity: DialogIdentity::default(),
             frame: None,
             clipped: false,
+            legend_live: false,
         }
     }
 
@@ -155,6 +160,7 @@ impl TrustedConsentUi {
             identity: DialogIdentity::default(),
             frame: None,
             clipped: false,
+            legend_live: false,
         }
     }
 
@@ -232,7 +238,7 @@ impl TrustedConsentUi {
         }
         let columns = dialog_text::natural_columns(&variants);
         Some(DialogFrame {
-            wrap_columns: columns,
+            wrap_columns: dialog_text::text_columns(columns),
             grid_columns: columns,
             grid_rows: dialog_text::natural_rows(&variants),
             max_text_rows: usize::MAX,
@@ -242,37 +248,86 @@ impl TrustedConsentUi {
     /// Lays the current selection's text out in `frame` and returns its
     /// snapshot; later redraws keep that frame. `None` without text.
     ///
-    /// A layout that hides part of the text shows
+    /// The body takes at most the rows the box leaves it
+    /// ([`dialog_text::ChromeRows::body_room`]). A layout that hides part of
+    /// the text, a body row or a button label, shows
     /// [`TrustedDialogKind::clipped_notice`] in place of the answer hints
     /// and makes every yes answer inert. When the whole text shows again,
     /// an engaged dialog arms again from `now`, so a yes counts only once
     /// the whole text has been in view for the arming delay.
     pub(crate) fn lay_out(&mut self, frame: DialogFrame, now: Instant) -> Option<TerminalSnapshot> {
         let variants = self.variants();
-        if variants.is_empty() {
-            return None;
-        }
-        let layout = dialog_text::layout_with_notice(
+        let selected = self.selected_variant();
+        let text = variants.get(selected).or_else(|| variants.first())?;
+        let max_rows = frame
+            .max_text_rows
+            .min(dialog_text::chrome_rows(frame.grid_rows).body_room);
+        let layout = dialog_text::layout_hiding(
             &variants,
-            self.selected_variant(),
+            selected,
             frame.wrap_columns,
-            frame.max_text_rows,
+            max_rows,
             Some(self.kind.clipped_notice()),
+            !text.buttons_fit(frame.grid_columns),
         );
         if let Some(access) = self.access.as_mut() {
-            access.duration_rows.clone_from(&layout.duration_rows);
+            // A click lands on a snapshot row; the body starts below the
+            // title.
+            access.duration_rows = layout
+                .duration_rows
+                .iter()
+                .map(|(row, index)| (row + dialog_text::CHROME_TOP_ROWS, *index))
+                .collect();
         }
         if self.clipped && !layout.clipped {
             self.rearm(now);
         }
         self.clipped = layout.clipped;
         self.frame = Some(frame);
+        self.legend_live = self.keyboard_engaged();
+        let chrome = self.chrome();
         Some(dialog_text::dialog_snapshot(
-            layout.rows,
+            dialog_text::compose(text, &layout, &chrome, frame.grid_columns, frame.grid_rows),
             frame.grid_columns,
             frame.grid_rows,
             &self.identity,
         ))
+    }
+
+    /// Whether a click inside or the dialog shortcut engaged the keyboard.
+    fn keyboard_engaged(&self) -> bool {
+        self.access.as_ref().map_or_else(
+            || self.engagement.engaged(),
+            |access| access.choice.engagement().engaged(),
+        )
+    }
+
+    /// The box around the current layout: the keys under each button, the
+    /// Allow button's state, and the legend.
+    fn chrome(&self) -> dialog_text::DialogChrome {
+        let choices = self
+            .access
+            .as_ref()
+            .map_or(0, |access| access.choice.offered());
+        dialog_text::DialogChrome {
+            deny_keys: self.kind.deny_keys().to_owned(),
+            allow_keys: self.kind.allow_keys().to_owned(),
+            allow_enabled: !self.clipped,
+            legend: self
+                .kind
+                .legend(self.legend_live, choices > 1, self.shortcut),
+        }
+    }
+
+    /// `input`, or a redraw when the keyboard was just engaged and the
+    /// legend still says how to engage it.
+    fn with_legend(&self, input: Option<TrustedInput>) -> Option<TrustedInput> {
+        match input {
+            None if self.legend_live != self.keyboard_engaged() && self.frame.is_some() => {
+                Some(TrustedInput::Redraw)
+            }
+            input => input,
+        }
     }
 
     /// Lays the text out for a new Window size, scale, or font
@@ -353,40 +408,50 @@ impl TrustedConsentUi {
     ) -> Option<TrustedInput> {
         if key == TrustedDialogKey::Engage {
             // The dialog shortcut engages as a click inside does and never
-            // answers; the arming delay then applies as usual.
+            // answers; the arming delay then applies as usual. The legend
+            // then says which keys answer.
             if !repeat {
                 self.engage(now);
             }
-            return None;
+            return self.with_legend(None);
         }
-        if let Some(access) = &self.access {
+        let input = if let Some(access) = &self.access {
             let action = access.choice.key(key, repeat, now);
-            return self.consent_input(action, now);
-        }
-        self.kind
-            .key_decision(key, repeat, self.engagement, now)
-            .filter(|proceed| !(*proceed && self.clipped))
-            .map(TrustedInput::Answer)
+            self.consent_input(action, now)
+        } else {
+            self.kind
+                .key_decision(key, repeat, self.engagement, now)
+                .filter(|proceed| !(*proceed && self.clipped))
+                .map(TrustedInput::Answer)
+        };
+        self.with_legend(input)
     }
 
-    /// A click in the bottom action areas: the right one grants or proceeds.
+    /// A click on the buttons: the right (Allow) one grants or proceeds.
     pub(crate) fn action_area_input(
         &mut self,
         proceed_area: bool,
         now: Instant,
     ) -> Option<TrustedInput> {
-        if let Some(access) = &self.access {
+        let input = if let Some(access) = &self.access {
             let action = access.choice.click_action_area(proceed_area, now);
-            return self.consent_input(action, now);
-        }
-        self.kind
-            .click_decision(proceed_area, self.engagement, now)
-            .filter(|proceed| !(*proceed && self.clipped))
-            .map(TrustedInput::Answer)
+            self.consent_input(action, now)
+        } else {
+            self.kind
+                .click_decision(proceed_area, self.engagement, now)
+                .filter(|proceed| !(*proceed && self.clipped))
+                .map(TrustedInput::Answer)
+        };
+        self.with_legend(input)
     }
 
     /// A click on a snapshot row: selects the duration shown there.
     pub(crate) fn row_input(&mut self, row: usize, now: Instant) -> Option<TrustedInput> {
+        let input = self.duration_row_input(row, now);
+        self.with_legend(input)
+    }
+
+    fn duration_row_input(&mut self, row: usize, now: Instant) -> Option<TrustedInput> {
         let access = self.access.as_ref()?;
         let index = access
             .duration_rows
@@ -396,10 +461,9 @@ impl TrustedConsentUi {
         self.consent_input(action, now)
     }
 
-    /// The access consent dialog rendered for its current selection, laid
-    /// out where it was last.
+    /// The dialog rendered again for its current selection and keyboard
+    /// state, laid out where it was last.
     pub(crate) fn render(&mut self, now: Instant) -> Option<TerminalSnapshot> {
-        self.access.as_ref()?;
         let frame = self.frame.or_else(|| self.natural_frame())?;
         self.lay_out(frame, now)
     }
@@ -642,8 +706,8 @@ mod tests {
     use super::*;
     use crate::frontend::{DialogLine, trusted_dialog::UPGRADE_ARMING_DELAY};
 
-    /// Consent text whose fifth line, a duration, wraps onto two rows at
-    /// 40 columns.
+    /// Consent text whose sixth line, a duration, wraps onto two rows in a
+    /// box 40 columns wide (36 inside its frame).
     fn consent_text(selected: usize) -> DialogText {
         let marker = |index| if index == selected { "(•)" } else { "( )" };
         DialogText {
@@ -660,12 +724,14 @@ mod tests {
                 .with_indent(6)
                 .with_duration(1),
                 DialogLine::hint("G or the green area grants."),
+                DialogLine::deny("Deny"),
+                DialogLine::allow("Allow Look once"),
             ],
             minimum_rows: 0,
         }
     }
 
-    /// A frame with room for only five of the consent text's eight rows.
+    /// A frame with room for only five of the consent text's eight body rows.
     fn clipped_frame() -> DialogFrame {
         DialogFrame {
             max_text_rows: 5,
@@ -699,12 +765,20 @@ mod tests {
             .join("\n")
     }
 
+    /// A click inside that answers nothing, as the Window handles it: it
+    /// engages the dialog, which then draws its live legend.
+    fn click_inside(dialog: &mut TrustedConsentUi, now: Instant) {
+        dialog.engage(now);
+        assert_eq!(dialog.row_input(0, now), Some(TrustedInput::Redraw));
+        dialog.render(now).unwrap();
+    }
+
     fn narrow_frame() -> DialogFrame {
         DialogFrame {
-            wrap_columns: 40,
+            wrap_columns: 36,
             grid_columns: 40,
-            grid_rows: 12,
-            max_text_rows: 12,
+            grid_rows: 15,
+            max_text_rows: 15,
         }
     }
 
@@ -723,12 +797,12 @@ mod tests {
             Box::new(consent_text),
         );
         // Laid out narrower than it asked for, the "while open" duration
-        // wraps onto rows 5 and 6.
+        // wraps onto snapshot rows 7 and 8: the body starts below the title.
         let snapshot = dialog.lay_out(narrow_frame(), Instant::now()).unwrap();
         assert_eq!(snapshot.columns, 40);
         assert_eq!(
             dialog.access.as_ref().unwrap().duration_rows,
-            [(4, 0), (5, 1), (6, 1)]
+            [(6, 0), (7, 1), (8, 1)]
         );
         let appeared = Instant::now();
         dialog.note_focus(appeared);
@@ -746,7 +820,8 @@ mod tests {
         // A click on the second row of the wrapped "while open" duration
         // engages the dialog and selects it.
         dialog.engage(later);
-        assert_eq!(dialog.row_input(6, later), Some(TrustedInput::Redraw));
+        assert_eq!(dialog.row_input(8, later), Some(TrustedInput::Redraw));
+        dialog.render(later).unwrap();
         assert_eq!(dialog.key_input(TrustedDialogKey::G, false, later), None);
         let armed = later + UPGRADE_ARMING_DELAY;
         assert_eq!(
@@ -891,22 +966,28 @@ mod tests {
             Box::new(consent_text),
         );
         let natural = dialog.natural_frame().unwrap();
-        assert_eq!(natural.grid_columns, 64);
-        assert_eq!(natural.grid_rows, (7 * 100_usize).div_ceil(72));
+        // The widest row, 63 columns, inside the frame; seven body rows and
+        // the box's.
+        assert_eq!(
+            natural.grid_columns,
+            63 + 2 * dialog_text::FRAME_INSET_COLUMNS
+        );
+        assert_eq!(natural.wrap_columns, 63);
+        assert_eq!(natural.grid_rows, 7 + dialog_text::CHROME_ROWS);
         let options = dialog.into_window_options();
         let snapshot = options.snapshot.as_ref().unwrap();
         assert_eq!(usize::from(options.initial_columns), snapshot.columns);
         assert_eq!(usize::from(options.initial_rows), snapshot.rows);
-        assert_eq!((snapshot.columns, snapshot.rows), (64, natural.grid_rows));
+        assert_eq!((snapshot.columns, snapshot.rows), (67, natural.grid_rows));
         let mut dialog = options.trusted_consent.unwrap();
         assert_eq!(
             dialog.access.as_ref().unwrap().duration_rows,
-            [(4, 0), (5, 1)]
+            [(6, 0), (7, 1)]
         );
         let now = Instant::now();
         dialog.lay_out(narrow_frame(), now).unwrap();
         dialog.engage(now);
-        assert_eq!(dialog.row_input(6, now), Some(TrustedInput::Redraw));
+        assert_eq!(dialog.row_input(8, now), Some(TrustedInput::Redraw));
         let redrawn = dialog.render(now).unwrap();
         assert_eq!(redrawn.columns, 40);
         let row = |index: usize| -> String {
@@ -916,10 +997,10 @@ mod tests {
                 .map(|cell| cell.content.as_str())
                 .collect()
         };
-        assert!(row(5).starts_with("  (•) While"), "{}", row(5));
+        assert!(row(7).starts_with("    (•) While"), "{}", row(7));
         assert_eq!(
             dialog.access.as_ref().unwrap().duration_rows,
-            [(4, 0), (5, 1), (6, 1)]
+            [(6, 0), (7, 1), (8, 1)]
         );
         // The yes/no questions have no layout until they get text.
         let (decision, _answers) = std::sync::mpsc::channel();
@@ -931,7 +1012,7 @@ mod tests {
         let options = TrustedConsentUi::upgrade(decision)
             .with_text(consent_text(0))
             .into_window_options();
-        assert_eq!(options.initial_columns, 64);
+        assert_eq!(options.initial_columns, 67);
     }
 
     /// S1: while part of the request is hidden, `G` and the green area
@@ -947,7 +1028,7 @@ mod tests {
         let shown = snapshot_text(&snapshot);
         assert!(shown.contains("Part of this request is hidden"), "{shown}");
         assert!(!shown.contains("G or the green area grants"), "{shown}");
-        dialog.engage(start);
+        click_inside(&mut dialog, start);
         let armed = start + UPGRADE_ARMING_DELAY;
         assert_eq!(dialog.key_input(TrustedDialogKey::G, false, armed), None);
         assert_eq!(dialog.action_area_input(true, armed), None);
@@ -1027,7 +1108,7 @@ mod tests {
             assert!(dialog.clipped());
             let shown = snapshot_text(&snapshot);
             assert!(shown.contains("Part of this question is hidden"), "{shown}");
-            dialog.engage(start);
+            click_inside(&mut dialog, start);
             let armed = start + UPGRADE_ARMING_DELAY;
             assert_eq!(dialog.key_input(proceed, false, armed), None);
             assert_eq!(dialog.action_area_input(true, armed), None);
@@ -1090,6 +1171,121 @@ mod tests {
         assert_eq!(
             idle.key_input(TrustedDialogKey::G, false, start + Duration::from_secs(60)),
             None
+        );
+    }
+
+    fn snapshot_rows(snapshot: &TerminalSnapshot) -> Vec<String> {
+        snapshot_text(snapshot)
+            .split('\n')
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// The palette slot a snapshot cell's text is drawn from.
+    fn ink_at(snapshot: &TerminalSnapshot, row: usize, column: usize) -> u32 {
+        snapshot.visible_rows[row].cells[column]
+            .attributes
+            .foreground
+    }
+
+    /// The box names both buttons in their halves with the keys that
+    /// answer under them, and the legend says how to engage until a click
+    /// or the shortcut does, then which keys answer. Engaging redraws the
+    /// legend but never arms early.
+    #[test]
+    fn the_box_names_its_buttons_and_its_legend_follows_engagement() {
+        let mut dialog = consent_two_durations().with_shortcut(Some(DialogShortcut::default()));
+        let start = Instant::now();
+        let frame = narrow_frame();
+        let places = dialog_text::chrome_rows(frame.grid_rows);
+        let snapshot = dialog.lay_out(frame, start).unwrap();
+        let rows = snapshot_rows(&snapshot);
+        assert!(rows[2].starts_with("  TRUSTED SPLINTERM"), "{rows:#?}");
+        let labels = &rows[places.label];
+        let deny = labels.find("Deny").unwrap();
+        let allow = labels.find("Allow Look once").unwrap();
+        assert!(2 * (deny + 4) < frame.grid_columns, "{labels:?}");
+        assert!(2 * allow > frame.grid_columns, "{labels:?}");
+        assert_eq!(
+            ink_at(&snapshot, places.label, allow),
+            u32::try_from(dialog_text::DialogInk::AllowLabel.slot().unwrap()).unwrap()
+        );
+        let keys = &rows[places.keys];
+        assert!(
+            keys.contains("esc · d · ↵") && keys.trim_end().ends_with('g'),
+            "{keys:?}"
+        );
+        // The long form does not fit 36 columns; the next one does.
+        assert_eq!(rows[places.legend].trim(), "click or ctrl alt g for keys");
+        // The chord engages, and the legend is drawn again with the keys.
+        assert_eq!(
+            dialog.key_input(TrustedDialogKey::Engage, false, start),
+            Some(TrustedInput::Redraw)
+        );
+        let engaged = dialog.render(start).unwrap();
+        assert_eq!(
+            snapshot_rows(&engaged)[places.legend].trim(),
+            "↑↓ how long · g allow · esc deny"
+        );
+        // Once the legend is live nothing more is drawn, and nothing grants
+        // before the arming delay.
+        assert_eq!(
+            dialog.key_input(TrustedDialogKey::Other, false, start),
+            None
+        );
+        assert_eq!(dialog.key_input(TrustedDialogKey::G, false, start), None);
+        assert_eq!(
+            dialog.key_input(TrustedDialogKey::G, false, start + UPGRADE_ARMING_DELAY),
+            Some(TrustedInput::Answer(true))
+        );
+        // A click that answers nothing engages and redraws the same way.
+        let mut clicked = consent_two_durations();
+        clicked.lay_out(frame, start).unwrap();
+        clicked.engage(start);
+        assert_eq!(clicked.row_input(0, start), Some(TrustedInput::Redraw));
+        clicked.render(start).unwrap();
+        assert_eq!(clicked.row_input(0, start), None);
+    }
+
+    /// While the dialog cannot say yes, its Allow label and key are drawn
+    /// off; the Deny label never is.
+    #[test]
+    fn a_hidden_request_draws_its_allow_button_off() {
+        let mut dialog = consent_two_durations();
+        let frame = clipped_frame();
+        let places = dialog_text::chrome_rows(frame.grid_rows);
+        let snapshot = dialog.lay_out(frame, Instant::now()).unwrap();
+        assert!(dialog.clipped());
+        let rows = snapshot_rows(&snapshot);
+        let labels = &rows[places.label];
+        let off = u32::try_from(dialog_text::DialogInk::AllowOff.slot().unwrap()).unwrap();
+        let allow = labels.find("Allow Look once").unwrap();
+        assert_eq!(ink_at(&snapshot, places.label, allow), off);
+        let deny = labels.find("Deny").unwrap();
+        assert_eq!(
+            ink_at(&snapshot, places.label, deny),
+            u32::try_from(dialog_text::DialogInk::DenyLabel.slot().unwrap()).unwrap()
+        );
+        // A label too long for its button hides text as a cut body would.
+        let (decision, _answers) = std::sync::mpsc::channel();
+        let mut long = TrustedConsentUi::restart(decision).with_text(DialogText {
+            lines: vec![
+                DialogLine::new("Restart?"),
+                DialogLine::deny("Not now"),
+                DialogLine::allow("Restart now, end all running shells"),
+            ],
+            minimum_rows: 0,
+        });
+        let start = Instant::now();
+        long.lay_out(narrow_frame(), start).unwrap();
+        assert!(long.clipped());
+        click_inside(&mut long, start);
+        let armed = start + UPGRADE_ARMING_DELAY;
+        assert_eq!(long.key_input(TrustedDialogKey::R, false, armed), None);
+        assert_eq!(long.action_area_input(true, armed), None);
+        assert_eq!(
+            long.key_input(TrustedDialogKey::Escape, false, armed),
+            Some(TrustedInput::Answer(false))
         );
     }
 }

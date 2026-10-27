@@ -316,9 +316,9 @@ The dialog is titled "Splinterm — Upgrade" and follows the rules of the
 `splinterm upgrade` dialog. It names the running and installed versions, the
 exact number of shells a restart ends, and, when the running daemon reports
 that nothing blocks a live upgrade, says to choose **Not now** and run
-`splinterm upgrade` instead. `Enter`, `Escape`, `D`, or the red left area
-answer **Not now**, the default; only `R` or the green right area chooses
-**Restart now (ends N shells)**. The dialog appears without taking keyboard
+`splinterm upgrade` instead. `Enter`, `Escape`, `D`, or the red left button
+answer **Not now**, the default; only `R` or the green right button chooses
+**Restart now, end N shells**. The dialog appears without taking keyboard
 focus, and its keys stay inert until you click inside it or press Ctrl+Alt+G
 ([Trusted dialogs](usage.md#trusted-dialogs)); keys and the restart click count
 only about 600 ms after that. Once the dialog is armed, `R` acts when it goes

@@ -593,9 +593,16 @@ never answers one: its keys stay inert until you engage it, as described below.
 Under Omarchy with `splinterm integration omarchy enable`, each also appears
 without taking keyboard focus ([Integrations](integrations.md)).
 
+Each dialog is one box: a thin frame with its title set into the top edge,
+its text, and two buttons at the bottom, a red no button on the left and a
+green yes button on the right that names exactly what it does, such as
+**Allow Look once** or **Restart now, end 4 shells**. Under each button's
+label are the keys that give that answer. The frame's bottom edge says how to
+engage the keyboard until you do, then which keys answer.
+
 Each dialog asks for one fixed size: the size at which all of its text fits
-above the red and green action areas, but never larger than the screen space
-the compositor offers. Its minimum and maximum size are the same, so tiling
+above the buttons, but never larger than the screen space the compositor
+offers. Its minimum and maximum size are the same, so tiling
 compositors such as Hyprland and sway float it instead of tiling it; no window
 rule is needed. If a compositor gives the dialog another size anyway, its text
 wraps again to fit, at spaces, never inside a word unless the word is wider
@@ -604,11 +611,13 @@ than the dialog. If the text still does not fit, the font gets smaller, down to
 
 Only below that does the dialog leave out lines. It then shows "…" where text
 is missing, and in place of the key hints it says that part of the request is
-hidden. While any text is hidden, the dialog cannot grant, proceed, or
-restart: `G`, `R`, and the green area (drawn dimmed) do nothing until you make
-the window larger. `Enter`, `Escape`, `D`, and the red area still say no. Once
-all of the text shows again, and whenever the dialog is laid out again for a
-new size, keys and the green area count only after the same short delay.
+hidden. A button label too long for its half of the dialog counts as
+hidden text too. While any text is hidden, the dialog cannot grant, proceed,
+or restart: `G`, `R`, and the green button (drawn dimmed) do nothing until you
+make the window larger. `Enter`, `Escape`, `D`, and the red button still say
+no. Once all of the text shows again, and whenever the dialog is laid out again
+for a new size, keys and the green button count only after the same short
+delay.
 
 A dialog's keyboard stays inert until you engage it, even if your desktop
 gives it focus:
@@ -626,7 +635,8 @@ restarts in the launcher's question) while `D`, `Escape`, or `Enter` deny or
 cancel. Once armed, a key acts when it goes down: a key held down since before
 arming never counts, but one pressed after arming counts as a press even while
 it is held. Key repeats never count, and no key answers while Ctrl, Alt, or
-Super is held. The dialog's last line names the shortcut.
+Super is held. Until you engage it, the dialog's bottom edge names the
+shortcut.
 
 Splinterm enables its Ctrl+Alt+G binding in Hyprland only while a dialog waits
 and disables it when the last one closes, however it closes, so applications
