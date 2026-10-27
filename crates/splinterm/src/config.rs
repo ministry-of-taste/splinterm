@@ -142,6 +142,10 @@ pub struct AppConfig {
     /// one row per Lair, instead of the full tree (`[explorer] collapsed`,
     /// default off).
     pub explorer_collapsed: bool,
+    /// Whether Splint rows in the expanded Lair Explorer, and the agents
+    /// section's rows, take a second, muted line with the agent's detail
+    /// or the working directory (`[explorer] row-lines=2`; default `1`).
+    pub explorer_two_line_rows: bool,
     /// Whether a graphical client under Omarchy may show the one-time hint
     /// that recommends `splinterm integration omarchy enable`
     /// (`[main] omarchy-integration-hint`).
@@ -309,6 +313,7 @@ impl Default for AppConfig {
             tab_strip_border: true,
             explorer_full_height: true,
             explorer_collapsed: false,
+            explorer_two_line_rows: false,
             omarchy_integration_hint: true,
             dialog_shortcut: Some(DialogShortcut::default()),
         }
@@ -1414,6 +1419,14 @@ fn parse_with_base(text: &str, config_dir: &Path) -> Result<ConfigLoad> {
             }
             "explorer.collapsed" => {
                 config.explorer_collapsed = parse_bool(value, index)?;
+                false
+            }
+            "explorer.row-lines" => {
+                config.explorer_two_line_rows = match value {
+                    "1" => false,
+                    "2" => true,
+                    _ => bail!("line {}: row-lines must be 1 or 2", index + 1),
+                };
                 false
             }
             "main.omarchy-integration-hint" | "omarchy-integration-hint" => {
@@ -3540,6 +3553,30 @@ pub(crate) mod tests {
         let misplaced = parse("[main]\ncollapsed=yes\n").unwrap();
         assert!(!misplaced.config.explorer_collapsed);
         assert!(!misplaced.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn explorer_row_lines_defaults_to_one_and_takes_only_one_or_two() {
+        assert!(!AppConfig::default().explorer_two_line_rows);
+        assert!(!parse("[explorer]\n").unwrap().config.explorer_two_line_rows);
+        for (value, expected) in [("1", false), ("2", true), (" 2 ", true)] {
+            let loaded = parse(&format!("[explorer]\nrow-lines={value}\n")).unwrap();
+            assert_eq!(loaded.config.explorer_two_line_rows, expected, "{value}");
+            assert!(loaded.diagnostics.is_empty());
+        }
+        for value in ["0", "3", "two", "yes", ""] {
+            let error = parse(&format!("[explorer]\nrow-lines={value}\n"))
+                .unwrap_err()
+                .to_string();
+            assert_eq!(error, "line 2: row-lines must be 1 or 2", "{value}");
+        }
+        // The key belongs to [explorer]; elsewhere it is an unknown key.
+        let misplaced = parse("[main]\nrow-lines=2\n").unwrap();
+        assert!(!misplaced.config.explorer_two_line_rows);
+        assert!(!misplaced.diagnostics.is_empty());
+        let shipped = parse(include_str!("../../../config/splinterm/config.ini")).unwrap();
+        assert!(shipped.diagnostics.is_empty(), "{:?}", shipped.diagnostics);
+        assert!(!shipped.config.explorer_two_line_rows);
     }
 
     #[test]

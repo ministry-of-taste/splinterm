@@ -137,6 +137,22 @@ pub(crate) struct LairExplorerRow {
     pub(crate) current: bool,
     pub(crate) enabled: bool,
     pub(crate) pending: bool,
+    /// A Splint row's second line with `[explorer] row-lines=2`; `None`
+    /// with one-line rows, for every Lair and Dojo row, and for a Splint with
+    /// nothing to show there.
+    pub(crate) detail: Option<LairExplorerDetail>,
+}
+
+/// What a Splint row's second line shows: the agent's detail while the
+/// Splint reports one, else its working directory.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum LairExplorerDetail {
+    /// The agent's own detail text, e.g. "running tests"; it keeps its start
+    /// when it does not fit.
+    Agent(String),
+    /// The working directory, the home directory written `~`; it keeps its
+    /// start and its last components when it does not fit.
+    Directory(String),
 }
 
 /// One row of the expanded Explorer's agents section: a Splint that reports
@@ -243,6 +259,12 @@ pub(crate) struct LairExplorerUi {
     /// Which workspaces, Dojos, and Splints an agent can reach, is connected
     /// to, or asks for (ADR 0014). Shown in words in each row's status.
     access_marks: AccessMarks,
+    /// `[explorer] row-lines=2`: Splint rows take a second line.
+    two_line_rows: bool,
+    /// The home directory a working directory is written relative to, as
+    /// `~`; `None` in a remote Window, or when `HOME` is unset or not an
+    /// absolute path (see [`explorer_home`]).
+    home: Option<String>,
 }
 
 impl Default for LairExplorerUi {
@@ -268,18 +290,30 @@ impl Default for LairExplorerUi {
             agent_glyphs: AgentGlyphs::default(),
             agent_spinner: AgentSpinner::STATIC,
             access_marks: AccessMarks::default(),
+            two_line_rows: false,
+            home: explorer_home(false),
         }
     }
 }
 
 impl LairExplorerUi {
     /// A hidden Explorer that shows as its rail first when `collapsed`
-    /// (`[explorer] collapsed`).
-    pub(crate) fn new(collapsed: bool) -> Self {
+    /// (`[explorer] collapsed`), with two-line Splint rows when
+    /// `two_line_rows` (`[explorer] row-lines=2`).
+    pub(crate) fn new(collapsed: bool, two_line_rows: bool) -> Self {
         Self {
             collapsed,
+            two_line_rows,
             ..Self::default()
         }
+    }
+
+    /// This Explorer with working directories written relative to `home`, or
+    /// never shortened for `None` (see [`explorer_home`]).
+    #[must_use]
+    pub(crate) fn with_home(mut self, home: Option<String>) -> Self {
+        self.home = home;
+        self
     }
 
     pub(crate) fn can_context(&self, node: NavigationNodeId) -> bool {
@@ -325,6 +359,18 @@ impl LairExplorerUi {
 
     pub(crate) const fn visible(&self) -> bool {
         self.visible
+    }
+
+    /// Whether Splint rows take a second line (`[explorer] row-lines=2`).
+    pub(crate) const fn two_line_rows(&self) -> bool {
+        self.two_line_rows
+    }
+
+    /// Turns two-line Splint rows on or off; whether that changed.
+    pub(crate) fn set_two_line_rows(&mut self, two_line_rows: bool) -> bool {
+        let changed = self.two_line_rows != two_line_rows;
+        self.two_line_rows = two_line_rows;
+        changed
     }
 
     /// Whether the Explorer is collapsed to its rail, shown or not.
@@ -1071,6 +1117,7 @@ impl LairExplorerUi {
                 current: lair.current_here,
                 enabled,
                 pending: rail_pending,
+                detail: None,
             });
             if self.collapsed || (!lair_expanded && !searching) {
                 continue;
@@ -1153,6 +1200,7 @@ impl LairExplorerUi {
             current: dojo.active_here,
             enabled: enabled && !pending,
             pending,
+            detail: None,
         });
         if !dojo_expanded && !searching {
             return;
@@ -1179,10 +1227,17 @@ impl LairExplorerUi {
             .pending
             .is_some_and(|pending| pending.id() == splint.id);
         let reach = self.splint_reach(splint);
-        let accessible_status = with_access_mark(
+        let detail = self.splint_detail(splint);
+        let mut accessible_status = with_access_mark(
             mark_text(reach, AccessReach::None, 0),
             row_status(pending, &state, blocker),
         );
+        // The agent's detail is already in the state words; a directory
+        // on the second line is read with the row too.
+        if let Some(LairExplorerDetail::Directory(directory)) = &detail {
+            accessible_status.push_str(" · in ");
+            accessible_status.push_str(directory);
+        }
         let status = brief_status([
             pending.then(|| "pending".to_owned()),
             self.splint_brief(splint.agent_status.as_ref()),
@@ -1210,7 +1265,30 @@ impl LairExplorerUi {
             current: splint.focused_here,
             enabled: enabled && !pending,
             pending,
+            detail,
         }
+    }
+
+    /// A Splint row's second line with two-line rows: the agent's detail
+    /// while status is shown and the Splint reports one, else its working
+    /// directory with the home directory written `~`, else nothing.
+    fn splint_detail(&self, splint: &NavigationExplorerSplint) -> Option<LairExplorerDetail> {
+        if !self.two_line_rows {
+            return None;
+        }
+        let agent = splint
+            .agent_status
+            .as_ref()
+            .filter(|_| self.agent_status_available())
+            .and_then(|status| status.detail.as_deref())
+            .map(str::trim)
+            .filter(|detail| !detail.is_empty());
+        if let Some(detail) = agent {
+            return Some(LairExplorerDetail::Agent(detail.to_owned()));
+        }
+        let directory = splint.working_directory.trim();
+        (!directory.is_empty())
+            .then(|| LairExplorerDetail::Directory(home_relative(directory, self.home.as_deref())))
     }
 
     /// The expanded Explorer's agents section: every Splint reporting an
@@ -1716,6 +1794,34 @@ const fn is_live(lifecycle: NavigationLifecycle) -> bool {
     )
 }
 
+/// The home directory a Window's Explorer writes as `~`: the local `HOME`
+/// when it is an absolute path other than `/`, and `None` for a `remote`
+/// Window, whose working directories are the remote host's, so the local
+/// home must not shorten them and the remote user's is not known.
+pub(crate) fn explorer_home(remote: bool) -> Option<String> {
+    if remote {
+        return None;
+    }
+    std::env::var("HOME")
+        .ok()
+        .map(|home| home.trim_end_matches('/').to_owned())
+        .filter(|home| home.starts_with('/'))
+}
+
+/// `directory` with the home directory `home` written `~`: `~` for the
+/// home directory itself and `~/…` under it, whole path components only,
+/// so `/home/username` is not shortened by a home of `/home/user`.
+fn home_relative(directory: &str, home: Option<&str>) -> String {
+    match home
+        .filter(|home| !home.is_empty())
+        .and_then(|home| directory.strip_prefix(home))
+    {
+        Some("") => "~".to_owned(),
+        Some(rest) if rest.starts_with('/') => format!("~{rest}"),
+        _ => directory.to_owned(),
+    }
+}
+
 /// The Lair row a node belongs to: the node itself for a Lair.
 const fn lair_node(id: NavigationNodeId) -> NavigationNodeId {
     match id {
@@ -2111,6 +2217,7 @@ pub(super) mod tests {
                                 },
                             },
                             agent_status: None,
+                            working_directory: "/home/user/Projects/splinterm".into(),
                         }],
                     }],
                 },
@@ -3924,5 +4031,109 @@ pub(super) mod tests {
             NavigationNodeId::Splint { splint_id, .. } => splint_id,
             _ => panic!("{id:?} is not a Splint"),
         }
+    }
+
+    /// The home directory is written `~` only for whole path components.
+    #[test]
+    fn home_relative_directories_use_a_tilde() {
+        let home = Some("/home/user");
+        assert_eq!(home_relative("/home/user", home), "~");
+        assert_eq!(
+            home_relative("/home/user/Projects/splinterm", home),
+            "~/Projects/splinterm"
+        );
+        assert_eq!(home_relative("/home/username/x", home), "/home/username/x");
+        assert_eq!(home_relative("/srv/data", home), "/srv/data");
+        assert_eq!(home_relative("/home/user/x", None), "/home/user/x");
+        assert_eq!(home_relative("/home/user/x", Some("")), "/home/user/x");
+    }
+
+    /// A remote Window's working directories are the remote host's, so the
+    /// local home never shortens them.
+    #[test]
+    fn remote_windows_write_working_directories_in_full() {
+        assert_eq!(explorer_home(true), None);
+        let mut explorer = LairExplorerUi::new(false, true).with_home(explorer_home(true));
+        explorer.set_view(agent_view([None, None]));
+        let rows = expanded_rows(&mut explorer);
+        assert_eq!(
+            rows[2].detail,
+            Some(LairExplorerDetail::Directory(
+                "/home/user/Projects/splinterm".into()
+            ))
+        );
+        let mut local = LairExplorerUi::new(false, true).with_home(Some("/home/user".into()));
+        local.set_view(agent_view([None, None]));
+        assert_eq!(
+            expanded_rows(&mut local)[2].detail,
+            Some(LairExplorerDetail::Directory("~/Projects/splinterm".into()))
+        );
+    }
+
+    /// With two-line rows a Splint row's second line is the agent's detail
+    /// while status is shown and it reports one, else its working
+    /// directory with `~` for home; the directory is read with the row by
+    /// assistive technology. Lair and Dojo rows, one-line rows, and a
+    /// Splint with neither have none. Agents rows carry the same line.
+    #[test]
+    fn two_line_rows_show_the_agent_detail_else_the_working_directory() {
+        use splinterm_protocol::AgentState;
+        let detail_of = |explorer: &mut LairExplorerUi| {
+            expanded_rows(explorer)
+                .into_iter()
+                .map(|row| (row.label, row.detail, row.accessible_status))
+                .collect::<Vec<_>>()
+        };
+        let mut explorer = LairExplorerUi::new(false, true);
+        explorer.home = Some("/home/user".into());
+        assert!(explorer.two_line_rows());
+        explorer.set_view(agent_view([None, Some(agent(AgentState::Working, false))]));
+        let rows = detail_of(&mut explorer);
+        let directory = Some(LairExplorerDetail::Directory("~/Projects/splinterm".into()));
+        assert_eq!(rows[0].1, None, "a Lair row");
+        assert_eq!(rows[1].1, None, "a Dojo row");
+        assert_eq!((rows[2].0.as_str(), &rows[2].1), ("shell", &directory));
+        assert!(
+            rows[2].2.ends_with(" · in ~/Projects/splinterm"),
+            "{}",
+            rows[2].2
+        );
+        assert_eq!(
+            (rows[3].0.as_str(), &rows[3].1),
+            (
+                "agent",
+                &Some(LairExplorerDetail::Agent("waiting for approval".into()))
+            )
+        );
+        assert!(!rows[3].2.contains(" · in "), "{}", rows[3].2);
+        let agents = explorer.agent_rows();
+        assert_eq!(agents[0].row.detail, rows[3].1);
+        // With status off or unavailable the directory shows instead.
+        explorer.set_agent_status_enabled(false);
+        assert_eq!(detail_of(&mut explorer)[3].1, directory);
+        explorer.set_agent_status_enabled(true);
+        explorer.mark_disconnected();
+        assert_eq!(detail_of(&mut explorer)[3].1, directory);
+        // A blank detail or directory leaves nothing to show.
+        let mut blank = agent_view([None, None]);
+        blank.lairs[0].dojos[0].splints[0].working_directory = " ".into();
+        let mut status = agent(AgentState::Working, false);
+        status.detail = Some("  ".into());
+        blank.lairs[0].dojos[0].splints[1].agent_status = Some(status);
+        explorer.set_view(blank);
+        let rows = detail_of(&mut explorer);
+        assert_eq!(rows[2].1, None);
+        assert_eq!(rows[3].1, directory);
+        // One-line rows have no second line, and reload switches it.
+        assert!(explorer.set_two_line_rows(false));
+        assert!(!explorer.set_two_line_rows(false));
+        assert!(
+            detail_of(&mut explorer)
+                .iter()
+                .all(|(_, detail, status)| detail.is_none() && !status.contains(" · in "))
+        );
+        assert!(explorer.set_two_line_rows(true));
+        assert_eq!(detail_of(&mut explorer)[3].1, directory);
+        assert!(!LairExplorerUi::new(false, false).two_line_rows());
     }
 }

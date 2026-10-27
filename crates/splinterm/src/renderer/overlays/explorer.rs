@@ -2,7 +2,11 @@
 //!
 //! One line per row: the current-row dot, the disclosure chevron, and the
 //! name on the left, and fixed, right-aligned icon columns for agent access,
-//! agent status, live state, and retention. The footer has two lines: an
+//! agent status, live state, and retention. With `[explorer] row-lines=2`
+//! every row of the expanded tree and of the agents section is two lines
+//! tall: a Splint row shows the agent's detail or its working directory,
+//! muted, under its name, and a Lair or Dojo row centres its one line.
+//! The rail keeps one line per row. The footer has two lines: an
 //! action line, `new · menu · «`, whose clicks leave keyboard input where it
 //! is, then one line for the search field, else a navigation notice, else
 //! the selected row's short status, else who owns keyboard input.
@@ -23,7 +27,10 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::{
     config::ResolvedTheme,
-    frontend::{LairExplorerAccess, LairExplorerAgentRow, LairExplorerFilter, LairExplorerRow},
+    frontend::{
+        LairExplorerAccess, LairExplorerAgentRow, LairExplorerDetail, LairExplorerFilter,
+        LairExplorerRow,
+    },
     geometry::Rect,
     navigation_projection::NavigationNodeId,
     theme::{ChromeTint, ChromeTints},
@@ -161,8 +168,9 @@ const ACTION_CELL_WIDTH: u32 = 14;
 /// Logical px each side of an action word inside its target.
 const ACTION_PADDING: u32 = 4;
 
-/// What the Explorer's layout sizes from the chrome text as it is drawn:
-/// the collapsed rail's width and the footer's action targets.
+/// What the Explorer's layout sizes from the chrome text as it is drawn,
+/// the collapsed rail's width and the footer's action targets, and how
+/// many text lines each expanded row has.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct LairExplorerMetrics {
     /// The collapsed rail's width in logical px.
@@ -171,6 +179,9 @@ pub(crate) struct LairExplorerMetrics {
     /// font could not be measured.
     chrome_cell: u32,
     scale_120: u32,
+    /// Text lines per row of the expanded tree and the agents section: 1,
+    /// or 2 with `[explorer] row-lines=2`. The rail keeps one.
+    row_lines: u32,
 }
 
 impl LairExplorerMetrics {
@@ -181,6 +192,7 @@ impl LairExplorerMetrics {
         rail_width: RAIL_WIDTH,
         chrome_cell: 0,
         scale_120: 120,
+        row_lines: 1,
     };
 
     /// The sizes for a regular chrome cell `chrome_cell` buffer px wide at
@@ -191,7 +203,22 @@ impl LairExplorerMetrics {
             rail_width: lair_explorer_rail_width(chrome_cell, scale_120),
             chrome_cell,
             scale_120: scale_120.max(1),
+            row_lines: 1,
         }
+    }
+
+    /// These sizes with rows of two text lines when `two_line_rows`.
+    #[must_use]
+    pub(crate) const fn with_two_line_rows(self, two_line_rows: bool) -> Self {
+        Self {
+            row_lines: if two_line_rows { 2 } else { 1 },
+            ..self
+        }
+    }
+
+    /// A row's height in logical px: [`ROW_HEIGHT`] per text line.
+    const fn row_height(self) -> u32 {
+        ROW_HEIGHT * self.row_lines
     }
 
     /// `buffer` px in logical px, rounded up, and one px more at a
@@ -377,6 +404,9 @@ pub(crate) struct LairExplorerLayout {
     pub(crate) footer: Rect,
     pub(crate) filters: Vec<(LairExplorerFilter, Rect)>,
     pub(crate) rows: Vec<LairExplorerRowLayout>,
+    /// Each row's height in logical px, of the tree and of the agents
+    /// section: [`ROW_HEIGHT`] per text line. The rail's rows have one line.
+    pub(crate) row_height: u32,
     pub(crate) visible_start: usize,
     pub(crate) visible_capacity: usize,
     pub(crate) mode: LairExplorerPresentationMode,
@@ -437,17 +467,17 @@ fn rail_docks(content: Rect, minimum_terminal_width: u32, rail_width: u32) -> bo
 }
 
 /// The rows in view from `top` logical px below the panel's top through
-/// `height` px: the visible start, how many rows fit, and their rects. The
-/// selected row is kept in view.
+/// `height` px, each `row_height` px tall: the visible start, how many rows
+/// fit, and their rects. The selected row is kept in view.
 fn row_slots(
     panel: Rect,
-    top: u32,
-    height: u32,
+    (top, height): (u32, u32),
+    row_height: u32,
     rows: &[LairExplorerRow],
     selected: Option<NavigationNodeId>,
     requested_start: usize,
 ) -> (usize, usize, Vec<LairExplorerRowLayout>) {
-    let capacity = usize::try_from(height / ROW_HEIGHT).unwrap_or(0);
+    let capacity = usize::try_from(height / row_height.max(1)).unwrap_or(0);
     let selected_index = selected.and_then(|id| rows.iter().position(|row| row.id == id));
     let maximum_start = rows.len().saturating_sub(capacity);
     let mut start = requested_start.min(maximum_start);
@@ -468,10 +498,10 @@ fn row_slots(
             rect: Rect {
                 x: panel.x,
                 y: panel.y.saturating_add(top).saturating_add(
-                    ROW_HEIGHT.saturating_mul(u32::try_from(slot).unwrap_or(u32::MAX)),
+                    row_height.saturating_mul(u32::try_from(slot).unwrap_or(u32::MAX)),
                 ),
                 width: panel.width,
-                height: ROW_HEIGHT,
+                height: row_height,
             },
         })
         .collect();
@@ -546,8 +576,8 @@ fn lair_explorer_rail_layout(
         .min(panel.height);
     let (start, capacity, row_layouts) = row_slots(
         panel,
-        list_top,
-        panel.height - list_top,
+        (list_top, panel.height - list_top),
+        ROW_HEIGHT,
         rows,
         selected,
         requested_start,
@@ -576,6 +606,7 @@ fn lair_explorer_rail_layout(
         },
         filters: Vec::new(),
         rows: row_layouts,
+        row_height: ROW_HEIGHT,
         visible_start: start,
         visible_capacity: capacity,
         mode: if docked {
@@ -653,10 +684,17 @@ fn lair_explorer_layout_with_header(
         .height
         .saturating_sub(list_top)
         .saturating_sub(footer_height);
+    // A list too short for one row of two lines shows rows of one, so the
+    // selection stays in view.
+    let row_height = if (ROW_HEIGHT..metrics.row_height()).contains(&list_height) {
+        ROW_HEIGHT
+    } else {
+        metrics.row_height()
+    };
     let (start, capacity, row_layouts) = row_slots(
         panel,
-        list_top,
-        list_height,
+        (list_top, list_height),
+        row_height,
         rows,
         selected,
         requested_start,
@@ -686,6 +724,7 @@ fn lair_explorer_layout_with_header(
             Vec::new()
         },
         rows: row_layouts,
+        row_height,
         visible_start: start,
         visible_capacity: capacity,
         mode,
@@ -705,32 +744,37 @@ const AGENTS_TEXT: &str = "agents";
 /// room the row shows its name alone.
 const AGENT_LOCATION_MINIMUM_CELLS: usize = 6;
 
-/// How many agent rows the section shows in a list `capacity` rows tall,
-/// for `count` reporting Splints: up to [`AGENTS_MAXIMUM_ROWS`] and a third
-/// of the list, but at least one, below its label line, leaving the tree at
-/// least one row. `None` when nothing reports or the list has fewer than
-/// three rows.
-fn agents_section_rows(capacity: u32, count: usize) -> Option<u32> {
+/// How many agent rows the section shows in a list `lines` text lines
+/// tall, for `count` reporting Splints whose rows are `row_lines` lines
+/// each: up to [`AGENTS_MAXIMUM_ROWS`] and a third of the list's lines, but
+/// at least one row, below its one-line label, leaving the tree at least
+/// one row. `None` when nothing reports or the list has no room for the
+/// label, one agents row, and one tree row.
+fn agents_section_rows(lines: u32, count: usize, row_lines: u32) -> Option<u32> {
     let count = u32::try_from(count).unwrap_or(u32::MAX);
-    if count == 0 || capacity < 3 {
+    let row_lines = row_lines.max(1);
+    let fewest = row_lines.saturating_mul(2).saturating_add(1);
+    if count == 0 || lines < fewest {
         return None;
     }
     Some(
         count
             .min(AGENTS_MAXIMUM_ROWS)
-            .min((capacity / 3).max(1))
-            .min(capacity - 2),
+            .min((lines / 3 / row_lines).max(1))
+            .min((lines - 1 - row_lines) / row_lines),
     )
 }
 
 /// The expanded `layout` with the agents section split off the bottom of
 /// its list, above the footer, for the reporting Splints `agents`, most
-/// urgent first. The split is fixed by [`agents_section_rows`]; the tree
-/// scrolls in the rows left above it from `requested_start`, the start it
-/// was asked for rather than the one clamped to the list before the split,
-/// keeping `selected` in view. The section scrolls from `agent_start`,
-/// keeping `agent_selected` in view. The rail, and a list with nothing
-/// reporting or too short for the section, are returned as they are.
+/// urgent first. The split is fixed by [`agents_section_rows`], counting
+/// text lines: the label is one line and each row has the layout's
+/// lines. The tree scrolls in the rows left above it from
+/// `requested_start`, the start it was asked for rather than the one
+/// clamped to the list before the split, keeping `selected` in view. The
+/// section scrolls from `agent_start`, keeping `agent_selected` in view.
+/// The rail, and a list with nothing reporting or too short for the
+/// section, are returned as they are.
 #[must_use]
 pub(crate) fn lair_explorer_with_agents(
     mut layout: LairExplorerLayout,
@@ -744,6 +788,7 @@ pub(crate) fn lair_explorer_with_agents(
         return layout;
     }
     let panel = layout.panel;
+    let row_height = layout.row_height.max(ROW_HEIGHT);
     let list_bottom = layout.footer.y.saturating_sub(panel.y);
     let list_top = layout
         .header
@@ -751,15 +796,19 @@ pub(crate) fn lair_explorer_with_agents(
         .saturating_add(HEADER_SPACER)
         .min(list_bottom);
     let list_height = list_bottom - list_top;
-    let Some(shown) = agents_section_rows(list_height / ROW_HEIGHT, agents.len()) else {
+    let Some(shown) = agents_section_rows(
+        list_height / ROW_HEIGHT,
+        agents.len(),
+        row_height / ROW_HEIGHT,
+    ) else {
         return layout;
     };
-    let section_height = ROW_HEIGHT.saturating_mul(shown.saturating_add(1));
+    let section_height = ROW_HEIGHT.saturating_add(row_height.saturating_mul(shown));
     let section_top = list_bottom.saturating_sub(section_height);
     let (start, capacity, tree_rows) = row_slots(
         panel,
-        list_top,
-        section_top.saturating_sub(list_top),
+        (list_top, section_top.saturating_sub(list_top)),
+        row_height,
         rows,
         selected,
         requested_start,
@@ -770,8 +819,11 @@ pub(crate) fn lair_explorer_with_agents(
     let agent_rows: Vec<_> = agents.iter().map(|agent| agent.row.clone()).collect();
     let (agent_visible_start, _, agent_layouts) = row_slots(
         panel,
-        section_top.saturating_add(ROW_HEIGHT),
-        ROW_HEIGHT.saturating_mul(shown),
+        (
+            section_top.saturating_add(ROW_HEIGHT),
+            row_height.saturating_mul(shown),
+        ),
+        row_height,
         &agent_rows,
         agent_selected,
         agent_start,
@@ -1569,6 +1621,7 @@ pub(crate) fn paint_lair_explorer(
         let rect = buffer_rect(layout_row.rect, scale_120);
         let is_selected = selected == Some(row.id);
         if is_selected {
+            // The fill and the accent bar cover every line of the row.
             paint_row_highlight(
                 canvas,
                 (canvas_width, canvas_height),
@@ -1577,9 +1630,11 @@ pub(crate) fn paint_lair_explorer(
                 palette,
             );
         }
+        let (first_line, second_line) =
+            row_text_lines(layout_row.rect, row.detail.is_some(), scale_120);
         let (columns_source, first_mark) = row_columns_source(row, columns, icons);
         let (name_clip, columns_clip) = row_text_clips(
-            rect,
+            first_line,
             row.level,
             inset,
             cell_width,
@@ -1587,6 +1642,31 @@ pub(crate) fn paint_lair_explorer(
             first_mark,
         );
         let primary = row_primary(palette, is_selected, row.enabled);
+        if let (Some(detail), Some(line)) = (&row.detail, second_line) {
+            // Under the name, past its dot and disclosure slot, to the
+            // row's right inset: the icon columns are on the first line.
+            let left = name_clip
+                .x
+                .saturating_add(cell_width.saturating_mul(ROW_NAME_PREFIX_CELLS))
+                .min(name_clip.x.saturating_add(name_clip.width));
+            let end = columns_clip.x.saturating_add(columns_clip.width);
+            paint_row_detail(
+                cache,
+                context,
+                &mut used,
+                canvas,
+                (canvas_width, canvas_height),
+                (scale_120, renderer_generation),
+                detail,
+                Rect {
+                    x: left,
+                    y: line.y,
+                    width: end.saturating_sub(left),
+                    height: line.height,
+                },
+                (palette, is_selected, cell_width),
+            )?;
+        }
         paint_picker_source(
             cache,
             context,
@@ -1799,6 +1879,131 @@ fn paint_row_glyphs(
     )
 }
 
+/// The cells of a row's name before its label: the current-row dot, the
+/// two-cell disclosure slot, and a space. A second line starts under the
+/// label.
+const ROW_NAME_PREFIX_CELLS: u32 = 4;
+
+/// A row's text lines in buffer px, from its logical `row`: when it has a
+/// `second` line and is taller than one line, its first [`ROW_HEIGHT`] for
+/// the name and the rest below for the second line; otherwise the whole
+/// row, whose one line is centred in it.
+fn row_text_lines(row: Rect, second: bool, scale_120: u32) -> (Rect, Option<Rect>) {
+    if !second || row.height <= ROW_HEIGHT {
+        return (buffer_rect(row, scale_120), None);
+    }
+    let first = Rect {
+        height: ROW_HEIGHT,
+        ..row
+    };
+    let rest = Rect {
+        y: row.y.saturating_add(ROW_HEIGHT),
+        height: row.height - ROW_HEIGHT,
+        ..row
+    };
+    (
+        buffer_rect(first, scale_120),
+        Some(buffer_rect(rest, scale_120)),
+    )
+}
+
+/// A row's second line fitted to `cells` cells: an agent's detail keeps its
+/// first words, as the footer's status does; a working directory keeps its
+/// start and its tail (see [`fit_directory`]).
+fn row_detail_text(detail: &LairExplorerDetail, cells: usize) -> String {
+    match detail {
+        LairExplorerDetail::Agent(text) => fit_status_line(text, cells),
+        LairExplorerDetail::Directory(path) => fit_directory(path, cells),
+    }
+}
+
+/// Fits a working directory into `cells` cells by eliding its middle, so
+/// where it starts and the directory it is in both stay readable: its root
+/// (`~/` or `/`), then `…`, then as many of its last path components as fit
+/// whole, `~/…/crates/splinterm`. When not even the last component fits
+/// whole, the tail is cut inside it, `~/…linterm`. A path with no root, or
+/// a line with no room for it, is `…` and the path's last cells.
+fn fit_directory(path: &str, cells: usize) -> String {
+    if text_cells(path) <= cells {
+        return path.to_owned();
+    }
+    if cells == 0 {
+        return String::new();
+    }
+    let root = if path.starts_with("~/") {
+        "~/"
+    } else if path.starts_with('/') {
+        "/"
+    } else {
+        ""
+    };
+    let rest = &path[root.len()..];
+    let tail_cells = cells.saturating_sub(text_cells(root).saturating_add(1));
+    if root.is_empty() || tail_cells == 0 {
+        return format!("…{}", trailing_cells(path, cells - 1));
+    }
+    let tail = trailing_cells(rest, tail_cells);
+    // From the first separator in what fits, the tail is whole components.
+    let whole = tail
+        .find('/')
+        .map(|at| &tail[at..])
+        .filter(|whole| whole.len() > 1);
+    format!("{root}…{}", whole.unwrap_or(tail))
+}
+
+/// The longest end of `text` at most `cells` cells wide, starting on a
+/// character that takes a cell.
+fn trailing_cells(text: &str, cells: usize) -> &str {
+    let mut used = 0_usize;
+    let mut start = text.len();
+    for (at, character) in text.char_indices().rev() {
+        let width = character.width().unwrap_or(0).min(2);
+        if used.saturating_add(width) > cells {
+            break;
+        }
+        used = used.saturating_add(width);
+        start = at;
+    }
+    let tail = &text[start..];
+    tail.trim_start_matches(|character: char| character.width().unwrap_or(0) == 0)
+}
+
+/// Paints a row's second line, muted, in `clip`: the agent's detail or
+/// the working directory, fitted to the whole cells it has.
+#[allow(clippy::too_many_arguments)]
+fn paint_row_detail(
+    cache: &mut SessionPickerTextCache,
+    context: &RenderContext,
+    used: &mut HashSet<SessionPickerTextKey>,
+    canvas: &mut [u8],
+    (canvas_width, canvas_height): (u32, u32),
+    (scale_120, renderer_generation): (u32, u64),
+    detail: &LairExplorerDetail,
+    clip: Rect,
+    (palette, is_selected, cell_width): (SessionPickerPalette, bool, u32),
+) -> Result<()> {
+    let cells = usize::try_from(clip.width / cell_width.max(1)).unwrap_or(0);
+    paint_picker_text(
+        cache,
+        context,
+        used,
+        canvas,
+        canvas_width,
+        canvas_height,
+        &row_detail_text(detail, cells),
+        ChromeTextStyle::Regular,
+        scale_120,
+        renderer_generation,
+        clip,
+        PickerTextAlignment::Left,
+        if is_selected {
+            palette.selected_secondary
+        } else {
+            palette.secondary
+        },
+    )
+}
+
 /// A row's text colour: brighter on the selection, muted while disabled.
 const fn row_primary(palette: SessionPickerPalette, is_selected: bool, enabled: bool) -> u32 {
     match (is_selected, enabled) {
@@ -1942,6 +2147,8 @@ fn paint_agents_section(
                 palette,
             );
         }
+        let (first_line, second_line) =
+            row_text_lines(layout_row.rect, agent.row.detail.is_some(), scale_120);
         paint_agent_row(
             cache,
             context,
@@ -1949,7 +2156,10 @@ fn paint_agents_section(
             canvas,
             (canvas_width, canvas_height),
             (scale_120, renderer_generation),
-            agents_text_line(rect, inset, right),
+            (
+                agents_text_line(first_line, inset, right),
+                second_line.map(|line| agents_text_line(line, inset, right)),
+            ),
             agent,
             palette,
             (is_selected, cell_width),
@@ -1960,6 +2170,7 @@ fn paint_agents_section(
 
 /// One agents row's text on its `line`: the Splint's glyph column at the
 /// left, then its name, and its muted location at the right when it fits.
+/// A `second` line shows the row's detail under the name.
 #[allow(clippy::too_many_arguments)]
 fn paint_agent_row(
     cache: &mut SessionPickerTextCache,
@@ -1968,7 +2179,7 @@ fn paint_agent_row(
     canvas: &mut [u8],
     (canvas_width, canvas_height): (u32, u32),
     (scale_120, renderer_generation): (u32, u64),
-    line: Rect,
+    (line, second): (Rect, Option<Rect>),
     agent: &LairExplorerAgentRow,
     palette: SessionPickerPalette,
     (is_selected, cell_width): (bool, u32),
@@ -2037,6 +2248,23 @@ fn paint_agent_row(
             } else {
                 palette.secondary
             },
+        )?;
+    }
+    if let (Some(detail), Some(second)) = (&row.detail, second) {
+        paint_row_detail(
+            cache,
+            context,
+            used,
+            canvas,
+            (canvas_width, canvas_height),
+            (scale_120, renderer_generation),
+            detail,
+            Rect {
+                y: second.y,
+                height: second.height,
+                ..text
+            },
+            (palette, is_selected, cell_width),
         )?;
     }
     Ok(())
@@ -2398,6 +2626,7 @@ mod tests {
             current: false,
             enabled: true,
             pending: false,
+            detail: None,
         }
     }
 
@@ -5153,9 +5382,9 @@ mod tests {
     #[test]
     fn agents_section_takes_a_fixed_share_of_the_list() {
         for capacity in 0..3 {
-            assert_eq!(agents_section_rows(capacity, 4), None, "{capacity}");
+            assert_eq!(agents_section_rows(capacity, 4, 1), None, "{capacity}");
         }
-        assert_eq!(agents_section_rows(20, 0), None);
+        assert_eq!(agents_section_rows(20, 0, 1), None);
         for (capacity, count, shown) in [
             (3, 4, 1),
             (5, 4, 1),
@@ -5169,14 +5398,14 @@ mod tests {
             (4, 1, 1),
         ] {
             assert_eq!(
-                agents_section_rows(capacity, count),
+                agents_section_rows(capacity, count, 1),
                 Some(shown),
                 "{capacity} rows, {count} reporting"
             );
         }
         for capacity in 3..60 {
             for count in 1..12 {
-                let shown = agents_section_rows(capacity, count).unwrap();
+                let shown = agents_section_rows(capacity, count, 1).unwrap();
                 assert!((1..=AGENTS_MAXIMUM_ROWS).contains(&shown));
                 assert!(shown + 2 <= capacity, "the label and one tree row fit");
             }
@@ -5203,7 +5432,7 @@ mod tests {
             let layout = agents_layout(content, &rows, &agents, None);
             let section = layout.agents.as_ref().expect("a section");
             let capacity = u32::try_from(plain.visible_capacity).unwrap();
-            let shown = agents_section_rows(capacity, agents.len()).unwrap();
+            let shown = agents_section_rows(capacity, agents.len(), 1).unwrap();
             assert_eq!(section.rows.len(), shown as usize, "height {height}");
             assert_eq!(section.hidden, agents.len() - shown as usize);
             assert_eq!(
@@ -5563,6 +5792,627 @@ mod tests {
                 let row = buffer_rect(section.rows[0].rect, scale);
                 let at = (((row.y + row.height / 2) * canvas_width + row.x) * 4) as usize;
                 assert_ne!(with[at..at + 4], selected[at..at + 4]);
+            }
+        }
+    }
+
+    /// The metrics of a two-line Explorer whose chrome font is unmeasured.
+    const TWO_LINES: LairExplorerMetrics = UNMEASURED.with_two_line_rows(true);
+
+    /// The expanded layout of `content` with two-line rows.
+    fn two_line_layout(
+        content: Rect,
+        rows: &[LairExplorerRow],
+        selected: Option<NavigationNodeId>,
+    ) -> LairExplorerLayout {
+        lair_explorer_layout_with_header(content, HEADER_HEIGHT, 640, TWO_LINES, rows, selected, 0)
+            .unwrap()
+    }
+
+    /// Splint rows that each show `detail` on their second line.
+    fn splint_rows(count: usize, detail: Option<&LairExplorerDetail>) -> Vec<LairExplorerRow> {
+        let rows: Vec<_> = agent_rows(count)
+            .into_iter()
+            .map(|agent| LairExplorerRow {
+                level: 3,
+                label: "shell".into(),
+                ..agent.row
+            })
+            .collect();
+        redetailed(&rows, detail)
+    }
+
+    /// `rows` with `detail` on every second line.
+    fn redetailed(
+        rows: &[LairExplorerRow],
+        detail: Option<&LairExplorerDetail>,
+    ) -> Vec<LairExplorerRow> {
+        rows.iter()
+            .map(|row| LairExplorerRow {
+                detail: detail.cloned(),
+                ..row.clone()
+            })
+            .collect()
+    }
+
+    /// `rows` as agents rows in "work / editor".
+    fn as_agents(rows: Vec<LairExplorerRow>) -> Vec<LairExplorerAgentRow> {
+        rows.into_iter()
+            .map(|row| LairExplorerAgentRow {
+                row,
+                location: "work / editor".into(),
+            })
+            .collect()
+    }
+
+    /// With two-line rows every row of the expanded tree is two lines tall,
+    /// back to back from the list's top, as many as fit whole above the
+    /// footer, and the selection stays in view. The rail keeps one line.
+    #[test]
+    fn two_line_rows_are_twice_as_tall_and_the_rail_keeps_one_line() {
+        let rows = lair_rows(40);
+        for height in [180, 400, 600, 901] {
+            let content = Rect {
+                x: 0,
+                y: 34,
+                width: 1000,
+                height,
+            };
+            let last = rows[39].id;
+            let two = two_line_layout(content, &rows, Some(last));
+            assert_eq!(two.row_height, ROW_HEIGHT * 2);
+            let list_top = content.y + HEADER_HEIGHT + HEADER_SPACER;
+            let list_height = two.footer.y - list_top;
+            assert_eq!(
+                two.visible_capacity,
+                (list_height / (ROW_HEIGHT * 2)) as usize
+            );
+            assert!(two.visible_capacity >= 1, "{height}");
+            assert_eq!(two.rows.len(), two.visible_capacity);
+            for (index, laid) in two.rows.iter().enumerate() {
+                let index = u32::try_from(index).unwrap();
+                assert_eq!(laid.rect.y, list_top + ROW_HEIGHT * 2 * index);
+                assert_eq!(laid.rect.height, ROW_HEIGHT * 2);
+                assert!(laid.rect.y + laid.rect.height <= two.footer.y);
+            }
+            assert_eq!(two.rows.last().map(|laid| laid.id), Some(last));
+            for collapsed in [false, true] {
+                let shown = |metrics| {
+                    lair_explorer_shown_layout(
+                        content,
+                        None,
+                        640,
+                        metrics,
+                        &rows,
+                        Some(last),
+                        0,
+                        collapsed,
+                    )
+                    .unwrap()
+                };
+                if collapsed {
+                    assert_eq!(shown(TWO_LINES), shown(UNMEASURED), "the rail");
+                } else {
+                    assert_eq!(shown(TWO_LINES), two);
+                }
+            }
+        }
+    }
+
+    /// A list with room for a row of one line but not of two shows rows of
+    /// one line, with the selection in view, rather than none; a list with
+    /// room for a row of two shows rows of two, and one with no room for a
+    /// line shows none.
+    #[test]
+    fn short_lists_fall_back_to_one_line_rows() {
+        let rows = lair_rows(5);
+        let last = rows[4].id;
+        let mut seen = [false; 3];
+        for height in 1..=200 {
+            let content = Rect {
+                x: 0,
+                y: 34,
+                width: 1000,
+                height,
+            };
+            let Some(two) = lair_explorer_layout_with_header(
+                content,
+                HEADER_HEIGHT,
+                640,
+                TWO_LINES,
+                &rows,
+                Some(last),
+                0,
+            ) else {
+                continue;
+            };
+            let list_top = content.y + HEADER_HEIGHT + HEADER_SPACER;
+            let list_height = two.footer.y.saturating_sub(list_top);
+            let expected = if list_height < ROW_HEIGHT {
+                seen[0] = true;
+                0
+            } else if list_height < ROW_HEIGHT * 2 {
+                seen[1] = true;
+                assert_eq!(two.row_height, ROW_HEIGHT, "list {list_height}");
+                1
+            } else {
+                seen[2] = true;
+                assert_eq!(two.row_height, ROW_HEIGHT * 2, "list {list_height}");
+                (list_height / (ROW_HEIGHT * 2)) as usize
+            };
+            assert_eq!(two.visible_capacity, expected, "list {list_height}");
+            assert_eq!(two.rows.len(), expected, "list {list_height}");
+            for laid in &two.rows {
+                assert_eq!(laid.rect.height, two.row_height);
+                assert!(laid.rect.y + laid.rect.height <= two.footer.y);
+            }
+            if expected > 0 {
+                assert_eq!(two.rows.last().map(|laid| laid.id), Some(last));
+            }
+        }
+        assert_eq!(seen, [true; 3], "every kind of list is exercised");
+    }
+
+    /// A press anywhere on either line of a two-line row hits that row,
+    /// and its disclosure slot spans both lines.
+    #[test]
+    fn two_line_rows_hit_test_on_both_lines() {
+        let rows = lair_rows(6);
+        let content = Rect {
+            x: 0,
+            y: 0,
+            width: 1000,
+            height: 600,
+        };
+        let layout = two_line_layout(content, &rows, None);
+        for laid in &layout.rows {
+            let top = f64::from(laid.rect.y);
+            let bottom = f64::from(laid.rect.y + laid.rect.height);
+            for y in [
+                top,
+                top + f64::from(ROW_HEIGHT) - 0.5,
+                top + f64::from(ROW_HEIGHT),
+                bottom - 0.5,
+            ] {
+                assert_eq!(lair_explorer_hit_test(&layout, (20.0, y)), Some(laid.id));
+                assert_eq!(
+                    lair_explorer_disclosure_hit_test(&layout, &rows, (2.0, y)),
+                    Some(laid.id)
+                );
+            }
+            assert_ne!(
+                lair_explorer_hit_test(&layout, (20.0, bottom)),
+                Some(laid.id)
+            );
+        }
+    }
+
+    /// The agents section counts lines: its label is one line and each of
+    /// its rows two, right above the footer, with the tree above it keeping
+    /// at least one two-line row.
+    #[test]
+    fn agents_section_counts_two_line_rows_in_lines() {
+        for lines in 0..5 {
+            assert_eq!(agents_section_rows(lines, 4, 2), None, "{lines}");
+        }
+        for (lines, count, shown) in [(5, 4, 1), (12, 4, 2), (20, 4, 3), (30, 9, 5), (30, 2, 2)] {
+            assert_eq!(
+                agents_section_rows(lines, count, 2),
+                Some(shown),
+                "{lines} lines, {count} reporting"
+            );
+        }
+        for lines in 5..90 {
+            for count in 1..12 {
+                let shown = agents_section_rows(lines, count, 2).unwrap();
+                assert!((1..=AGENTS_MAXIMUM_ROWS).contains(&shown));
+                assert!(1 + shown * 2 + 2 <= lines, "the label and one tree row fit");
+            }
+        }
+        let rows = lair_rows(30);
+        let agents = agent_rows(7);
+        for height in [240, 400, 600, 900] {
+            let content = Rect {
+                x: 0,
+                y: 34,
+                width: 1000,
+                height,
+            };
+            let plain = two_line_layout(content, &rows, None);
+            let layout =
+                lair_explorer_with_agents(plain.clone(), &rows, (None, 0), &agents, None, 0);
+            let section = layout.agents.as_ref().expect("a section");
+            let list_top = content.y + HEADER_HEIGHT + HEADER_SPACER;
+            let lines = (plain.footer.y - list_top) / ROW_HEIGHT;
+            let shown = agents_section_rows(lines, agents.len(), 2).unwrap();
+            assert_eq!(section.rows.len(), shown as usize, "height {height}");
+            assert_eq!(section.label.height, ROW_HEIGHT);
+            assert_eq!(
+                section.label.y + ROW_HEIGHT + ROW_HEIGHT * 2 * shown,
+                layout.footer.y,
+                "height {height}"
+            );
+            for (index, laid) in section.rows.iter().enumerate() {
+                let index = u32::try_from(index).unwrap();
+                assert_eq!(
+                    laid.rect.y,
+                    section.label.y + ROW_HEIGHT + ROW_HEIGHT * 2 * index
+                );
+                assert_eq!(laid.rect.height, ROW_HEIGHT * 2);
+                let second = f64::from(laid.rect.y + ROW_HEIGHT + 2);
+                assert_eq!(
+                    lair_explorer_agent_hit_test(&layout, (20.0, second)),
+                    Some(laid.id)
+                );
+            }
+            assert!(layout.visible_capacity >= 1);
+            for laid in &layout.rows {
+                assert_eq!(laid.rect.height, ROW_HEIGHT * 2);
+                assert!(laid.rect.y + laid.rect.height <= section.label.y);
+            }
+        }
+    }
+
+    /// A row's two lines tile its buffer rect at every scale; a row with no
+    /// second line, or one line tall, keeps its whole rect.
+    #[test]
+    fn row_text_lines_tile_the_row() {
+        let row = Rect {
+            x: 0,
+            y: 33,
+            width: 288,
+            height: ROW_HEIGHT * 2,
+        };
+        for scale in [120, 150, 180, 240] {
+            let whole = buffer_rect(row, scale);
+            assert_eq!(row_text_lines(row, false, scale), (whole, None));
+            let (first, second) = row_text_lines(row, true, scale);
+            let second = second.unwrap();
+            assert_eq!(first.y, whole.y);
+            assert_eq!(first.y + first.height, second.y);
+            assert_eq!(second.y + second.height, whole.y + whole.height);
+            assert_eq!(
+                first.height,
+                buffer_rect(
+                    Rect {
+                        height: ROW_HEIGHT,
+                        ..row
+                    },
+                    scale
+                )
+                .height
+            );
+            let one = Rect {
+                height: ROW_HEIGHT,
+                ..row
+            };
+            assert_eq!(
+                row_text_lines(one, true, scale),
+                (buffer_rect(one, scale), None)
+            );
+        }
+    }
+
+    /// A long working directory keeps its root and its last whole
+    /// components, `~/…/splinterm`; a last component too long is cut at its
+    /// start; a short line keeps its last cells after `…`. Nothing is wider
+    /// than the cells it has.
+    #[test]
+    fn long_directories_keep_their_root_and_tail() {
+        let path = "~/Projects/splinterm-worktrees/explorer-two-line-rows";
+        assert_eq!(fit_directory(path, 80), path);
+        assert_eq!(fit_directory(path, 30), "~/…/explorer-two-line-rows");
+        assert_eq!(fit_directory(path, 20), "~/…rer-two-line-rows");
+        assert_eq!(
+            fit_directory("/usr/local/share/splinterm", 18),
+            "/…/share/splinterm"
+        );
+        assert_eq!(fit_directory("/usr/local/share/splinterm", 3), "/…m");
+        assert_eq!(fit_directory(path, 3), "…ws");
+        assert_eq!(fit_directory(path, 2), "…s");
+        assert_eq!(fit_directory(path, 1), "…");
+        assert_eq!(fit_directory(path, 0), "");
+        assert_eq!(fit_directory("relative/dir/name", 8), "…ir/name");
+        // Wide characters count two cells; the cut never splits one.
+        let wide = "~/文書/プロジェクト/端末";
+        for cells in 0..=text_cells(wide) {
+            let fitted = fit_directory(wide, cells);
+            assert!(text_cells(&fitted) <= cells, "{cells}: {fitted}");
+        }
+        assert_eq!(fit_directory(wide, 8), "~/…/端末");
+        for cells in 0..=60 {
+            let fitted = fit_directory(path, cells);
+            assert!(text_cells(&fitted) <= cells, "{cells}: {fitted}");
+            if cells > 1 && cells < text_cells(path) {
+                assert!(fitted.contains('…'), "{cells}: {fitted}");
+                assert!(fitted.ends_with('s'), "{cells}: {fitted}");
+            }
+        }
+        // An agent's detail keeps its first words instead.
+        let detail = LairExplorerDetail::Agent("running the integration tests".into());
+        assert_eq!(row_detail_text(&detail, 18), "running the…");
+        let directory = LairExplorerDetail::Directory(path.into());
+        assert_eq!(
+            row_detail_text(&directory, 30),
+            "~/…/explorer-two-line-rows"
+        );
+    }
+
+    /// The second line paints only inside its row's lower line, between the
+    /// label's start and the divider, at every scale, in the tree and in
+    /// the agents section; the selection's fill and accent bar cover both
+    /// lines; and a row without a second line keeps its one line.
+    #[test]
+    fn second_lines_paint_inside_their_rows() {
+        use super::super::picker::session_picker_palette;
+        use crate::config::ResolvedTheme;
+
+        let context = RenderContext::new(u16::MAX);
+        let palette = session_picker_palette(ResolvedTheme::default());
+        let detail = Some(LairExplorerDetail::Directory(
+            "~/Projects/splinterm-worktrees/explorer-two-line-rows".into(),
+        ));
+        let surface = Rect {
+            x: 0,
+            y: 0,
+            width: 1000,
+            height: 600,
+        };
+        for scale in [120, 150, 180, 240] {
+            let canvas_width = surface.width * scale / 120 + 1;
+            let canvas_height = surface.height * scale / 120 + 1;
+            let with_rows = splint_rows(3, detail.as_ref());
+            // An empty second line keeps the two-line placement and paints
+            // nothing.
+            let blank = LairExplorerDetail::Directory(String::new());
+            let bare_rows = redetailed(&with_rows, Some(&blank));
+            let agent_base = splint_rows(2, detail.as_ref());
+            let with_agents = as_agents(agent_base.clone());
+            let bare_agents = as_agents(redetailed(&agent_base, Some(&blank)));
+            let layout = lair_explorer_with_agents(
+                two_line_layout(surface, &with_rows, None),
+                &with_rows,
+                (None, 0),
+                &with_agents,
+                None,
+                0,
+            );
+            let section = layout.agents.clone().unwrap();
+            assert_eq!(section.rows.len(), 2, "scale {scale}");
+            let draw = |rows: &[LairExplorerRow],
+                        agents: &[LairExplorerAgentRow],
+                        selected: Option<NavigationNodeId>| {
+                let mut canvas = vec![0; (canvas_width * canvas_height * 4) as usize];
+                paint_lair_explorer(
+                    &mut SessionPickerTextCache::default(),
+                    &context,
+                    &mut canvas,
+                    canvas_width,
+                    canvas_height,
+                    scale,
+                    1,
+                    &layout,
+                    palette,
+                    rows,
+                    selected,
+                    (agents, None),
+                    "",
+                    None,
+                    true,
+                    LairExplorerFilter::All,
+                    false,
+                )
+                .unwrap();
+                canvas
+            };
+            let with = draw(&with_rows, &with_agents, None);
+            let bare = draw(&bare_rows, &bare_agents, None);
+            let bounds = second_line_bounds(&context, &layout, (&with_rows, &with_agents), scale);
+            assert_eq!(bounds.len(), 5, "scale {scale}");
+            let mut inked = vec![false; bounds.len()];
+            for (index, (a, b)) in with.chunks_exact(4).zip(bare.chunks_exact(4)).enumerate() {
+                if a == b {
+                    continue;
+                }
+                let x = u32::try_from(index).unwrap() % canvas_width;
+                let y = u32::try_from(index).unwrap() / canvas_width;
+                let line = bounds
+                    .iter()
+                    .position(|(line, ..)| (line.y..line.y + line.height).contains(&y));
+                let Some(line) = line else {
+                    panic!("scale {scale}: second-line ink at {x},{y} off every second line");
+                };
+                let (_, left, right) = bounds[line];
+                assert!(
+                    (left..right).contains(&x),
+                    "scale {scale}: row {line}'s second-line ink at {x},{y} outside {left}..{right}"
+                );
+                inked[line] = true;
+            }
+            assert!(inked.iter().all(|&inked| inked), "scale {scale}: {inked:?}");
+            // The selection covers both lines.
+            let chosen = &layout.rows[1];
+            let selected = draw(&with_rows, &with_agents, Some(chosen.id));
+            let rect = buffer_rect(chosen.rect, scale);
+            assert_selection_covers_both_lines((&with, &selected), canvas_width, rect, bounds[1].2);
+        }
+    }
+
+    /// Asserts that the selection changes `rect` on both lines: its accent
+    /// bar at the row's left edge, and its fill on the second line in the
+    /// middle and in the row's right inset, past the text ending at
+    /// `text_end`.
+    fn assert_selection_covers_both_lines(
+        (plain, selected): (&[u8], &[u8]),
+        canvas_width: u32,
+        rect: Rect,
+        text_end: u32,
+    ) {
+        let bottom = rect.y + rect.height - 2;
+        assert!(text_end + 1 < rect.x + rect.width, "{rect:?}");
+        for (x, y) in [
+            (rect.x, rect.y + 1),
+            (rect.x, bottom),
+            (rect.x + rect.width / 2, bottom),
+            (text_end + 1, bottom),
+        ] {
+            let at = ((y * canvas_width + x) * 4) as usize;
+            assert_ne!(
+                plain[at..at + 4],
+                selected[at..at + 4],
+                "{rect:?} at {x},{y}"
+            );
+        }
+    }
+
+    /// Each painted row's second line in buffer px, with the left and right
+    /// edges its detail paints between: in the tree from past the name's
+    /// dot and disclosure slot to the row's right inset, and in the agents
+    /// section from past the glyph column and its gap to the divider's
+    /// inset.
+    fn second_line_bounds(
+        context: &RenderContext,
+        layout: &LairExplorerLayout,
+        (rows, agents): (&[LairExplorerRow], &[LairExplorerAgentRow]),
+        scale: u32,
+    ) -> Vec<(Rect, u32, u32)> {
+        let cell = chrome_cell_width(context, scale);
+        let inset = LEVEL_INDENT.saturating_mul(scale).div_ceil(120);
+        let columns = ExplorerColumns::of(rows);
+        let mut bounds = Vec::new();
+        for (laid, row) in layout
+            .rows
+            .iter()
+            .zip(rows.iter().skip(layout.visible_start))
+        {
+            let (first, second) = row_text_lines(laid.rect, true, scale);
+            let (source, first_mark) = row_columns_source(row, columns, chrome_icons_available());
+            let (name, column_clip) =
+                row_text_clips(first, row.level, inset, cell, source.cells(), first_mark);
+            let left = (name.x + cell * ROW_NAME_PREFIX_CELLS).min(name.x + name.width);
+            bounds.push((second.unwrap(), left, column_clip.x + column_clip.width));
+        }
+        if let Some(section) = &layout.agents {
+            let panel = buffer_rect(layout.panel, scale);
+            let divider = panel.x + panel.width - scale.div_ceil(120).max(1);
+            for (laid, agent) in section
+                .rows
+                .iter()
+                .zip(agents.iter().skip(section.visible_start))
+            {
+                let (first, second) = row_text_lines(laid.rect, true, scale);
+                let line = agents_text_line(first, inset, divider);
+                let glyphs = agent
+                    .row
+                    .agent_column
+                    .as_ref()
+                    .map_or(0, |column| cell * u32::try_from(column.cells()).unwrap());
+                let left = line.x + (glyphs + cell).min(line.width);
+                bounds.push((second.unwrap(), left, line.x + line.width));
+            }
+        }
+        bounds
+    }
+
+    /// With two-line rows a Lair, a Dojo, and a Splint with no second line
+    /// keep one line, centred in their two-line row.
+    #[test]
+    fn rows_without_a_second_line_centre_their_one_line() {
+        use super::super::picker::session_picker_palette;
+        use crate::config::ResolvedTheme;
+
+        let context = RenderContext::new(u16::MAX);
+        let lair_id = LairId::new();
+        let dojo_id = splinterm_core::DojoId::new();
+        let lair = row(NavigationNodeId::Lair(lair_id));
+        let dojo = LairExplorerRow {
+            id: NavigationNodeId::Dojo { lair_id, dojo_id },
+            kind: LairExplorerRowKind::Dojo,
+            label: "editor".into(),
+            level: 2,
+            ..lair.clone()
+        };
+        let splint = LairExplorerRow {
+            id: NavigationNodeId::Splint {
+                lair_id,
+                dojo_id,
+                splint_id: splinterm_core::SplintId::new(),
+            },
+            kind: LairExplorerRowKind::Splint,
+            label: "shell".into(),
+            level: 3,
+            expanded: None,
+            ..lair.clone()
+        };
+        let surface = Rect {
+            x: 0,
+            y: 0,
+            width: 1000,
+            height: 400,
+        };
+        for scale in [120, 150, 180, 240] {
+            let canvas_width = surface.width * scale / 120 + 1;
+            let canvas_height = surface.height * scale / 120 + 1;
+            // The top and bottom of a row's ink in its row of a layout of
+            // `metrics`, from the row's top, and the row's height.
+            let ink = |painted: &LairExplorerRow, metrics: LairExplorerMetrics| {
+                let rows = [painted.clone()];
+                let layout = lair_explorer_layout_with_header(
+                    surface,
+                    HEADER_HEIGHT,
+                    640,
+                    metrics,
+                    &rows,
+                    None,
+                    0,
+                )
+                .unwrap();
+                let draw = |rows: &[LairExplorerRow]| {
+                    let mut canvas = vec![0; (canvas_width * canvas_height * 4) as usize];
+                    paint(
+                        &context,
+                        &mut canvas,
+                        canvas_width,
+                        canvas_height,
+                        scale,
+                        &layout,
+                        session_picker_palette(ResolvedTheme::default()),
+                        rows,
+                        None,
+                        false,
+                        LairExplorerFilter::All,
+                    );
+                    canvas
+                };
+                let (with, without) = (draw(&rows), draw(&[]));
+                let rect = buffer_rect(layout.rows[0].rect, scale);
+                let ys: Vec<u32> = with
+                    .chunks_exact(4)
+                    .zip(without.chunks_exact(4))
+                    .enumerate()
+                    .filter(|(_, (a, b))| a != b)
+                    .map(|(index, _)| u32::try_from(index).unwrap())
+                    .map(|index| (index % canvas_width, index / canvas_width))
+                    .filter(|&(x, y)| {
+                        (rect.x..rect.x + rect.width).contains(&x)
+                            && (rect.y..rect.y + rect.height).contains(&y)
+                    })
+                    .map(|(_, y)| y - rect.y)
+                    .collect();
+                let top = *ys.iter().min().expect("the row paints");
+                let bottom = *ys.iter().max().unwrap();
+                (top, bottom, rect.height)
+            };
+            for painted in [&lair, &dojo, &splint] {
+                let (top, bottom, one) = ink(painted, UNMEASURED);
+                let (top_two, bottom_two, two) = ink(painted, TWO_LINES);
+                let shift = (two - one) / 2;
+                let what = format!("scale {scale}, {:?}", painted.kind);
+                assert!(top_two.abs_diff(top + shift) <= 1, "{what}: {top_two}");
+                assert!(
+                    bottom_two.abs_diff(bottom + shift) <= 1,
+                    "{what}: {bottom_two}"
+                );
             }
         }
     }

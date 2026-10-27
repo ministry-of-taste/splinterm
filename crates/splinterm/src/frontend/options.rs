@@ -546,6 +546,8 @@ pub struct WindowOptions {
     pub explorer_full_height: bool,
     /// `[explorer] collapsed`: the docked Explorer first shows as its rail.
     pub explorer_collapsed: bool,
+    /// `[explorer] row-lines=2`: Splint rows take a second, muted line.
+    pub explorer_two_line_rows: bool,
     /// Whether the Window binds the text-input (IME) protocol. The remote
     /// connection status Window turns it off so an input method never sees or
     /// draws a typed password as composing text.
@@ -622,6 +624,7 @@ impl Default for WindowOptions {
             tab_strip_border: true,
             explorer_full_height: true,
             explorer_collapsed: false,
+            explorer_two_line_rows: false,
             input_method: true,
             mapped: None,
             handoff_status: None,

@@ -408,6 +408,10 @@ pub struct NavigationExplorerSplint {
     pub focused_here: bool,
     pub target: NavigationExplorerSplintTarget,
     pub agent_status: Option<NavigationAgentStatus>,
+    /// The Splint's working directory as the topology projection carries
+    /// it, already bounded and sanitized: where the daemon launched or last
+    /// relaunched it, not followed live as its shell changes directory.
+    pub working_directory: String,
 }
 
 /// One Dojo retained by the persistent explorer, including unavailable rows.
@@ -630,6 +634,7 @@ impl NavigationProjection {
                     lifecycle: splint.node.lifecycle,
                     focused_here: splint.focused_here,
                     agent_status: splint.agent_status.clone(),
+                    working_directory: splint.working_directory.clone(),
                     target: NavigationExplorerSplintTarget {
                         topology_revision: self.topology_revision,
                         lair_id: dojo.lair_id,
