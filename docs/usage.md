@@ -365,14 +365,20 @@ state is a static icon.
   rows and at most a third of the list, but at least one, under its label
   line, and the tree scrolls in the rows left above it; a list shorter than
   three rows has no section. When more Splints report than it shows, the
-  section scrolls with its selection and its label reads *+k more*. Clicking a
-  row focuses that Splint, as its row in the tree does, and right-click opens
-  the Splint's menu. With the keyboard, Down from the tree's last row moves
-  into the section and Up from its first row moves back; End goes to its last
-  row, and Left and Right do nothing there. The section is hidden on the rail,
-  with `agent-status=no`, while agent status is unavailable, and when nothing
-  reports. Assistive technology reads it as an *Agents* group after the tree,
-  whose items are its rows.
+  section scrolls with its selection and its label reads *+k more*; while the
+  selection is elsewhere it shows from its top, so the most urgent Splint is
+  in view. Clicking a row focuses that Splint, as its row in the tree does,
+  even when the tree does not show it, under a closed Lair or past a search,
+  and right-click opens the Splint's menu. A click on the *agents* label line
+  leaves the keys where they are. With the keyboard, Down from the tree's last
+  row moves into the section and Up from its first row moves back; End goes
+  to its last row, and Left and Right do nothing there. When a selected row
+  leaves the section, the row now in its place is selected; with none left,
+  the Splint's row in the tree, else its Lair's. The section is hidden on the
+  rail, with `agent-status=no`, while agent status is unavailable, when
+  nothing reports, and in a list too short for it; the keys then skip it.
+  Assistive technology reads it as an *Agents* group after the tree, whose
+  items are its rows, and leaves the group out while the section is hidden.
 - **Dojo tabs** show one badge before the label: the most urgent icon, with a
   count when several Splints share it (the needs-input icon followed by `2`).
   The badge takes space from the label, never from the close control, so on a

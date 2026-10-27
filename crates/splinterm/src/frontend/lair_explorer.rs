@@ -225,6 +225,12 @@ pub(crate) struct LairExplorerUi {
     /// Whether `selected` is a row of the agents section rather than of the
     /// tree: a Splint can be in both.
     agents_selected: bool,
+    /// Whether the agents section is in the layout. A list too short for it
+    /// hides it; the keys and assistive technology then skip its rows.
+    agents_shown: bool,
+    /// The selected agents row's place in the section, kept so a row that
+    /// leaves the section passes the selection to the row now in its place.
+    agent_index: usize,
     pending: Option<LairExplorerPending>,
     view: Option<NavigationExplorerView>,
     load_state: ExplorerLoadState,
@@ -251,6 +257,8 @@ impl Default for LairExplorerUi {
             expanded: HashSet::new(),
             selected: None,
             agents_selected: false,
+            agents_shown: true,
+            agent_index: 0,
             pending: None,
             view: None,
             load_state: ExplorerLoadState::Waiting,
@@ -277,8 +285,7 @@ impl LairExplorerUi {
     pub(crate) fn can_context(&self, node: NavigationNodeId) -> bool {
         self.visible
             && self.load_state == ExplorerLoadState::Ready
-            && (self.rows().iter().any(|row| row.id == node)
-                || self.agent_rows().iter().any(|agent| agent.row.id == node))
+            && (self.rows().iter().any(|row| row.id == node) || self.lists_agent(node))
     }
 
     pub(crate) fn context_press(&mut self, target: Option<NavigationNodeId>) {
@@ -695,7 +702,9 @@ impl LairExplorerUi {
         }) {
             self.pending = None;
         }
-        if !selected_exists {
+        // A selected agents row that goes passes the selection on as
+        // `ensure_selection_visible` decides, below.
+        if !selected_exists && !self.agents_selected {
             self.selected = nearest_surviving.or_else(|| {
                 view.current
                     .and_then(|current| {
@@ -770,10 +779,17 @@ impl LairExplorerUi {
         // Lair's row.
         let row_id = if self.collapsed { lair_node(id) } else { id };
         if self.pending.is_some()
-            || !self
+            || !(self
                 .rows()
                 .iter()
                 .any(|row| row.id == row_id && row.enabled)
+                // An agents row starts its Splint's activation whether or
+                // not the tree shows that Splint, as under a closed Lair or
+                // past a search.
+                || self
+                    .shown_agent_rows()
+                    .iter()
+                    .any(|agent| agent.row.id == id && agent.row.enabled))
         {
             return false;
         }
@@ -1232,6 +1248,37 @@ impl LairExplorerUi {
         agents.into_iter().map(|(_, agent)| agent).collect()
     }
 
+    /// The agents section's rows the keys, the pointer, and assistive
+    /// technology reach: [`Self::agent_rows`] while the layout shows the
+    /// section, none while it is hidden.
+    pub(crate) fn shown_agent_rows(&self) -> Vec<LairExplorerAgentRow> {
+        if self.agents_shown {
+            self.agent_rows()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Whether the shown agents section lists the Splint `id`.
+    fn lists_agent(&self, id: NavigationNodeId) -> bool {
+        self.shown_agent_rows()
+            .iter()
+            .any(|agent| agent.row.id == id)
+    }
+
+    /// Records whether the layout shows the agents section. While it is
+    /// hidden its rows are skipped, and a selected agents row passes the
+    /// selection to the Splint's tree row, else its Lair's. Returns whether
+    /// that changed.
+    pub(crate) fn set_agents_shown(&mut self, shown: bool) -> bool {
+        if self.agents_shown == shown {
+            return false;
+        }
+        self.agents_shown = shown;
+        self.ensure_selection_visible();
+        true
+    }
+
     /// The selected row, of the tree or of the agents section.
     pub(crate) fn selected(&self) -> Option<NavigationNodeId> {
         self.selected
@@ -1262,22 +1309,31 @@ impl LairExplorerUi {
     /// Selects the agents section's row for the Splint `id`, when it is
     /// listed there.
     pub(crate) fn select_agent(&mut self, id: NavigationNodeId) -> bool {
-        if !self.agent_rows().iter().any(|agent| agent.row.id == id) {
+        let Some(index) = self
+            .shown_agent_rows()
+            .iter()
+            .position(|agent| agent.row.id == id)
+        else {
             return false;
-        }
+        };
         let changed = self.selected != Some(id) || !self.agents_selected;
         self.selected = Some(id);
         self.agents_selected = true;
+        self.agent_index = index;
         changed
     }
 
-    /// The order the keys move through: the tree's rows, then the agents
-    /// section's, each with whether it is an agent row.
+    /// The order the keys move through: the tree's rows, then the shown
+    /// agents section's, each with whether it is an agent row.
     fn navigation_order(&self) -> Vec<(NavigationNodeId, bool)> {
         self.rows()
             .iter()
             .map(|row| (row.id, false))
-            .chain(self.agent_rows().iter().map(|agent| (agent.row.id, true)))
+            .chain(
+                self.shown_agent_rows()
+                    .iter()
+                    .map(|agent| (agent.row.id, true)),
+            )
             .collect()
     }
 
@@ -1290,14 +1346,15 @@ impl LairExplorerUi {
             self.agents_selected = false;
             return false;
         }
-        let current = self
-            .selected
-            .and_then(|selected| {
-                order
-                    .iter()
-                    .position(|&entry| entry == (selected, self.agents_selected))
-            })
-            .unwrap_or(0);
+        // With no position in the list, as when a search leaves the tree
+        // empty, the first step lands on the first row, of either list.
+        let Some(current) = self.selected.and_then(|selected| {
+            order
+                .iter()
+                .position(|&entry| entry == (selected, self.agents_selected))
+        }) else {
+            return self.select_entry(Some(order[0]));
+        };
         let next = if delta.is_negative() {
             current.saturating_sub(delta.unsigned_abs())
         } else {
@@ -1321,6 +1378,14 @@ impl LairExplorerUi {
         let changed = self.selected != next || self.agents_selected != agents;
         self.selected = next;
         self.agents_selected = agents;
+        if let Some(id) = next.filter(|_| agents)
+            && let Some(index) = self
+                .shown_agent_rows()
+                .iter()
+                .position(|agent| agent.row.id == id)
+        {
+            self.agent_index = index;
+        }
         changed
     }
 
@@ -1472,12 +1537,7 @@ impl LairExplorerUi {
         &self,
         selected: NavigationNodeId,
     ) -> Option<LairExplorerDecision> {
-        if !self.rows().iter().any(|row| row.id == selected)
-            && !self
-                .agent_rows()
-                .iter()
-                .any(|agent| agent.row.id == selected)
-        {
+        if !self.rows().iter().any(|row| row.id == selected) && !self.lists_agent(selected) {
             return None;
         }
         let view = self.view.as_ref()?;
@@ -1539,17 +1599,31 @@ impl LairExplorerUi {
     }
 
     fn ensure_selection_visible(&mut self) {
-        // A selected agents row stays while the section still lists it;
-        // otherwise the same Splint is looked for in the tree.
+        // A selected agents row stays while the shown section lists it.
+        // When it goes, the row now in its place takes the selection; with
+        // no row left there, the same Splint's tree row does, else its
+        // Lair's, else the first row.
         if self.agents_selected {
-            if self.selected.is_some_and(|selected| {
-                self.agent_rows()
-                    .iter()
-                    .any(|agent| agent.row.id == selected)
-            }) {
+            let agents = self.shown_agent_rows();
+            if let Some(index) = self
+                .selected
+                .and_then(|selected| agents.iter().position(|agent| agent.row.id == selected))
+            {
+                self.agent_index = index;
+                return;
+            }
+            if let Some(agent) = agents.get(self.agent_index.min(agents.len().saturating_sub(1))) {
+                self.agent_index = self.agent_index.min(agents.len() - 1);
+                self.selected = Some(agent.row.id);
                 return;
             }
             self.agents_selected = false;
+            let rows = self.rows();
+            self.selected = self.selected.and_then(|selected| {
+                [selected, lair_node(selected)]
+                    .into_iter()
+                    .find(|id| rows.iter().any(|row| row.id == *id))
+            });
         }
         // The rail keeps the selection on the selected row's Lair.
         if self.collapsed {
@@ -3643,15 +3717,139 @@ pub(super) mod tests {
             panic!("an agents row focuses its Splint");
         };
         assert_eq!(target.splint_id, shell_splint(shell));
-        // A status that clears takes the row away; the tree keeps the Splint.
+        // A status that clears takes the row away; the row now in its place
+        // takes the selection.
         assert!(explorer.apply_agent_status(shell_splint(shell), 3, None));
-        assert_eq!(explorer.agent_selected(), None);
-        assert_eq!(explorer.tree_selected(), Some(shell));
+        assert_eq!(explorer.agent_selected(), Some(agents[0]));
         // Collapsing to the rail leaves the section.
-        assert!(explorer.select_agent(agents[0]));
         explorer.set_collapsed(true);
         assert_eq!(explorer.agent_selected(), None);
         assert!(explorer.tree_selected().is_some());
+    }
+
+    /// A selected agents row that leaves the section passes the selection
+    /// to the row now at its place, clamped to the section's end. With no
+    /// row left there, as while the section is hidden, the Splint's tree row
+    /// takes it, else its Lair's. A hidden section's rows are skipped by the
+    /// keys, cannot be selected, and have no menu.
+    #[test]
+    fn agents_selection_falls_back_to_the_next_row_then_the_tree() {
+        use splinterm_protocol::AgentState;
+        let mut explorer = LairExplorerUi::default();
+        let view = agents_view(
+            [
+                Some(agent(AgentState::Working, false)),
+                Some(agent(AgentState::Done, false)),
+            ],
+            Some(agent(AgentState::NeedsInput, false)),
+        );
+        explorer.focus();
+        explorer.set_view(view.clone());
+        let rows = expanded_rows(&mut explorer);
+        let id = |label: &str| {
+            explorer
+                .agent_rows()
+                .iter()
+                .find(|agent| agent.row.label == label)
+                .unwrap()
+                .row
+                .id
+        };
+        let (scribe, shell, second) = (id("scribe"), id("shell"), id("agent"));
+        assert_eq!(agent_labels(&explorer), ["scribe", "shell", "agent"]);
+        // The next row moves up into the place left.
+        assert!(explorer.select_agent(shell));
+        assert!(explorer.apply_agent_status(shell_splint(shell), 3, None));
+        assert_eq!(explorer.agent_selected(), Some(second));
+        // A Splint that goes from the view entirely: the place is clamped
+        // to the section's last row.
+        let mut gone = view.clone();
+        gone.lairs[0].dojos[0]
+            .splints
+            .retain(|splint| splint.id != second);
+        gone.lairs[0].dojos[0].splints[0].agent_status = None;
+        explorer.set_view(gone);
+        assert_eq!(agent_labels(&explorer), ["scribe"]);
+        assert_eq!(explorer.agent_selected(), Some(scribe));
+        // Hiding the section: the Splint's tree row takes the selection.
+        explorer.set_view(view);
+        assert!(explorer.select_agent(shell));
+        assert!(explorer.set_agents_shown(false));
+        assert!(!explorer.set_agents_shown(false));
+        assert_eq!(explorer.agent_selected(), None);
+        assert_eq!(explorer.tree_selected(), Some(shell));
+        // While hidden its rows are out of reach.
+        assert!(!explorer.select_agent(scribe));
+        assert!(!explorer.can_context(scribe));
+        assert!(explorer.shown_agent_rows().is_empty());
+        assert_eq!(explorer.agent_rows().len(), 3, "the layout still asks");
+        assert!(explorer.select_edge(true));
+        assert_eq!(explorer.tree_selected(), rows.last().map(|row| row.id));
+        assert!(!explorer.move_selection(1));
+        // A Splint the tree does not show passes it to its Lair's row.
+        assert!(explorer.set_agents_shown(true));
+        assert!(explorer.select_agent(scribe));
+        assert!(explorer.set_agents_shown(false));
+        assert_eq!(explorer.tree_selected(), Some(lair_node(scribe)));
+    }
+
+    /// With no position in the list, as when a search leaves the tree
+    /// empty, Down or Up selects the first agents row rather than skipping
+    /// it.
+    #[test]
+    fn a_step_with_no_position_lands_on_the_first_agents_row() {
+        use splinterm_protocol::AgentState;
+        for delta in [1, -1] {
+            let mut explorer = LairExplorerUi::default();
+            explorer.set_view(agents_view(
+                [Some(agent(AgentState::Working, false)), None],
+                Some(agent(AgentState::NeedsInput, false)),
+            ));
+            explorer.set_search("no-such-row".into());
+            assert!(explorer.rows().is_empty());
+            assert_eq!(explorer.selected(), None);
+            let first = explorer.agent_rows()[0].row.id;
+            assert!(explorer.move_selection(delta));
+            assert_eq!(explorer.agent_selected(), Some(first), "{delta}");
+        }
+    }
+
+    /// An agents row starts its Splint's activation though the tree does
+    /// not show that Splint, its Lair being closed: Enter or a click, and
+    /// the Splint's menu's Focus item, all reach pending, which the agents
+    /// row shows.
+    #[test]
+    fn agents_row_activation_reaches_pending_under_a_closed_lair() {
+        use splinterm_protocol::AgentState;
+        for from_menu in [false, true] {
+            let mut explorer = LairExplorerUi::default();
+            explorer.set_view(agents_view(
+                [None, None],
+                Some(agent(AgentState::NeedsInput, false)),
+            ));
+            explorer.focus();
+            let scribe = explorer.agent_rows()[0].row.id;
+            assert!(
+                !explorer.rows().iter().any(|row| row.id == scribe),
+                "its Lair is closed"
+            );
+            let decision = if from_menu {
+                assert!(explorer.can_context(scribe));
+                explorer.activation_decision(scribe)
+            } else {
+                assert!(explorer.select_agent(scribe));
+                explorer.decision()
+            };
+            let Some(decision @ LairExplorerDecision::FocusSplint(target)) = decision else {
+                panic!("an agents row focuses its Splint");
+            };
+            assert_eq!(target.splint_id, shell_splint(scribe));
+            assert!(explorer.set_pending(decision), "menu {from_menu}");
+            let row = explorer.agent_rows()[0].row.clone();
+            assert!(row.pending);
+            assert!(!row.enabled);
+            assert!(row.accessible_status.contains("Pending"));
+        }
     }
 
     fn shell_splint(id: NavigationNodeId) -> SplintId {

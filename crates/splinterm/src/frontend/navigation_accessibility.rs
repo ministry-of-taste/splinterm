@@ -264,7 +264,7 @@ impl NavigationAccessibility {
         enabled: bool,
     ) -> (HashMap<NavigationNodeId, SemanticNodeId>, bool) {
         let mut ids = HashMap::new();
-        let agents = explorer.agent_rows();
+        let agents = explorer.shown_agent_rows();
         if agents.is_empty() {
             return (ids, false);
         }
@@ -1322,5 +1322,53 @@ mod tests {
         let rail = accessibility.refresh(&explorer, context());
         rail.tree_update().unwrap();
         assert!(rail.items.iter().all(|item| item.name != AGENTS_GROUP_NAME));
+    }
+
+    /// While the layout hides the agents section, as in a list too short for
+    /// it, assistive technology has no `Agents` group either, and a
+    /// selected agents row passes the selection to the Splint's tree row.
+    #[test]
+    fn hidden_agents_section_has_no_group() {
+        use crate::navigation_projection::NavigationAgentStatus;
+
+        let mut reporting = view();
+        reporting.lairs[0].dojos[0].splints[0].agent_status = Some(NavigationAgentStatus {
+            state: AgentState::NeedsInput,
+            detail: None,
+            stale: false,
+            stale_minutes: None,
+        });
+        let mut explorer = LairExplorerUi::default();
+        explorer.set_view(reporting);
+        explorer.focus();
+        explorer.reveal_current();
+        let shell = explorer
+            .rows()
+            .iter()
+            .find(|row| row.label == "shell")
+            .unwrap()
+            .id;
+        let mut accessibility = NavigationAccessibility::default();
+        assert!(explorer.select_agent(shell));
+        let shown = accessibility.refresh(&explorer, context());
+        assert!(
+            shown
+                .items
+                .iter()
+                .any(|item| item.name == AGENTS_GROUP_NAME)
+        );
+        assert!(explorer.set_agents_shown(false));
+        let hidden = accessibility.refresh(&explorer, context());
+        hidden.tree_update().unwrap();
+        assert!(
+            hidden
+                .items
+                .iter()
+                .all(|item| item.name != AGENTS_GROUP_NAME)
+        );
+        assert_eq!(explorer.tree_selected(), Some(shell));
+        let selected = hidden.items.iter().find(|item| item.selected).unwrap();
+        assert_eq!(selected.name, "shell");
+        assert_eq!(hidden.focus, SemanticFocus::Item(selected.id));
     }
 }

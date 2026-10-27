@@ -161,7 +161,8 @@ use crate::renderer::{
     TabContextMenuLayout, TextRow, background_bgra, chrome_panel_fill, chrome_panel_palette,
     clear_snapshot_caches, command_palette_hit_test, command_palette_layout, dojo_prompt_hit_test,
     dojo_prompt_layout, explorer_minimum_docked_terminal_width, fill_rect, history_overlay_layout,
-    lair_explorer_action_hit_test, lair_explorer_agent_hit_test, lair_explorer_chrome_cell_width,
+    lair_explorer_action_hit_test, lair_explorer_agent_hit_test,
+    lair_explorer_agents_label_hit_test, lair_explorer_chrome_cell_width,
     lair_explorer_disclosure_hit_test, lair_explorer_filter_hit_test,
     lair_explorer_footer_hit_test, lair_explorer_hit_test, lair_explorer_shown_layout,
     lair_explorer_with_agents, paint, paint_command_palette, paint_dojo_prompt,
@@ -3290,14 +3291,15 @@ fn explorer_released_agent(
 /// What a left press in the Explorer panel starts, and whether it gives the
 /// Explorer the keys. A footer action token (`new`, `menu`, `«`) and the
 /// rail header's `»` leave keyboard focus where it is, and so does a press
-/// anywhere else `on_footer`, between the tokens or on the context line: the
-/// footer is not rows. Every other press in the panel, a row of the tree,
-/// of the agents section, or of the rail alike, gives the Explorer the
-/// keys, as a row click always has. `row` is the tree row pressed and the
-/// row whose disclosure is under the press; `agent`, the agents row.
+/// anywhere else `on_chrome`: on the footer, between the tokens or on the
+/// context line, or on the agents section's label line, which are not
+/// rows. Every other press in the panel, a row of the tree, of the agents
+/// section, or of the rail alike, gives the Explorer the keys, as a row
+/// click always has. `row` is the tree row pressed and the row whose
+/// disclosure is under the press; `agent`, the agents row.
 fn explorer_left_press(
     action: Option<LairExplorerAction>,
-    on_footer: bool,
+    on_chrome: bool,
     filter: Option<LairExplorerFilter>,
     (target, disclosure): (Option<NavigationNodeId>, Option<NavigationNodeId>),
     agent: Option<NavigationNodeId>,
@@ -3305,7 +3307,7 @@ fn explorer_left_press(
     if let Some(action) = action {
         return (Some(ExplorerPointerPress::Action(action)), false);
     }
-    if on_footer {
+    if on_chrome {
         return (None, false);
     }
     let pressed = filter
@@ -4273,14 +4275,39 @@ impl App {
             )
         })?;
         // The agents section splits off the list's bottom, above the footer.
+        // The tree scrolls from where it was asked to, not from the start
+        // clamped to the list before the split. The section shows from its
+        // top while the selection is elsewhere, so a newly urgent agent is
+        // in view.
+        let agent_selected = self.explorer.agent_selected();
         Some(lair_explorer_with_agents(
             layout,
             &rows,
-            selected,
+            (selected, self.presentation.explorer_visible_start),
             &self.explorer.agent_rows(),
-            self.explorer.agent_selected(),
-            self.presentation.explorer_agents_start,
+            agent_selected,
+            if agent_selected.is_some() {
+                self.presentation.explorer_agents_start
+            } else {
+                0
+            },
         ))
+    }
+
+    /// The Explorer's layout, taken as [`Self::current_explorer_layout`]
+    /// does, after telling the Explorer whether it shows the agents
+    /// section: a hidden section's rows are skipped, so a selection there
+    /// moves to the tree, and the layout is taken again for it.
+    fn take_explorer_layout(&mut self) -> Option<LairExplorerLayout> {
+        let layout = self.current_explorer_layout();
+        let shown = layout
+            .as_ref()
+            .is_some_and(|layout| layout.agents.is_some());
+        if self.explorer.set_agents_shown(shown) {
+            self.current_explorer_layout()
+        } else {
+            layout
+        }
     }
 
     /// What the Explorer's layout sizes from its chrome text: the rail's
@@ -6879,7 +6906,7 @@ impl App {
     fn apply_explorer_width_change(&mut self) -> Result<()> {
         // Taken now, not at the next draw, so a quick second click hit-tests
         // the new layout.
-        self.presentation.explorer_layout = self.current_explorer_layout();
+        self.presentation.explorer_layout = self.take_explorer_layout();
         self.presentation.full_redraw = true;
         self.relayout_tab_strip();
         if self.surface.configured {
@@ -8937,7 +8964,8 @@ impl App {
         let target = lair_explorer_hit_test(layout, event.position);
         let filter = lair_explorer_filter_hit_test(layout, event.position);
         let action = lair_explorer_action_hit_test(layout, event.position);
-        let on_footer = lair_explorer_footer_hit_test(layout, event.position);
+        let on_chrome = lair_explorer_footer_hit_test(layout, event.position)
+            || lair_explorer_agents_label_hit_test(layout, event.position);
         let agent = lair_explorer_agent_hit_test(layout, event.position);
         let rail = layout.rail;
         let disclosure =
@@ -8966,7 +8994,7 @@ impl App {
             PointerEventKind::Press { button, .. } if button == BTN_LEFT => {
                 self.explorer.cancel_context_press();
                 let (pressed, takes_focus) =
-                    explorer_left_press(action, on_footer, filter, (target, disclosure), agent);
+                    explorer_left_press(action, on_chrome, filter, (target, disclosure), agent);
                 if takes_focus {
                     self.set_explorer_focus(true, queue_handle);
                 }
@@ -9022,7 +9050,7 @@ impl App {
             return false;
         }
         self.presentation.explorer_visible_start = start;
-        self.presentation.explorer_layout = self.current_explorer_layout();
+        self.presentation.explorer_layout = self.take_explorer_layout();
         true
     }
 
@@ -9890,24 +9918,13 @@ impl App {
                 key if explorer_context_menu_key(key, self.input.modifiers) => {
                     let agents = self.explorer.agent_selected().is_some();
                     if let Some(node) = self.explorer.selected()
-                        && let Some(row) =
-                            self.presentation
-                                .explorer_layout
-                                .as_ref()
-                                .and_then(|layout| {
-                                    if agents {
-                                        layout
-                                            .agents
-                                            .as_ref()?
-                                            .rows
-                                            .iter()
-                                            .find(|row| row.id == node)
-                                    } else {
-                                        layout.rows.iter().find(|row| row.id == node)
-                                    }
-                                })
+                        && let Some(rect) = self
+                            .presentation
+                            .explorer_layout
+                            .as_ref()
+                            .and_then(|layout| layout.row_rect(node, agents))
                     {
-                        let anchor = (f64::from(row.rect.x), f64::from(row.rect.y));
+                        let anchor = (f64::from(rect.x), f64::from(rect.y));
                         if let Err(error) = self.show_explorer_context_menu(node, anchor) {
                             eprintln!("splinterm Explorer menu is unavailable: {error:#}");
                         }
@@ -12361,7 +12378,7 @@ impl App {
                 self.presentation.full_redraw = true;
             }
         }
-        let explorer_layout = self.current_explorer_layout();
+        let explorer_layout = self.take_explorer_layout();
         if let Some(layout) = &explorer_layout {
             self.presentation.explorer_visible_start = layout.visible_start;
             if let Some(agents) = &layout.agents {
@@ -13487,7 +13504,8 @@ mod tests {
             (None, true)
         );
         // A near miss on the footer, between the tokens or on the context
-        // line, leaves the keys where they are too: the footer is not rows.
+        // line, or a press on the agents label line, leaves the keys where
+        // they are too: neither is rows.
         assert_eq!(
             explorer_left_press(None, true, None, (None, None), None),
             (None, false)
