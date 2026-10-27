@@ -2185,6 +2185,15 @@ impl CommandPaletteUi {
         &self.filtered
     }
 
+    /// How many commands the palette lists with no query: its match count's
+    /// total.
+    pub(crate) fn total(&self) -> usize {
+        BUILT_IN_COMMANDS
+            .iter()
+            .filter(|command| lifecycle_command_visible(command.id, self.context.lair_retention))
+            .count()
+    }
+
     pub(crate) const fn selected_index(&self) -> usize {
         self.selected
     }

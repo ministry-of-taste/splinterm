@@ -674,6 +674,11 @@ impl AgentAccessUi {
         &self.rows
     }
 
+    /// How many entries the list shows with no query.
+    pub(crate) fn total(&self) -> usize {
+        self.all_rows.len()
+    }
+
     pub(crate) const fn selected_index(&self) -> usize {
         self.selected
     }
@@ -820,23 +825,28 @@ impl AgentAccessUi {
         self.set_notice("Revoking…");
     }
 
-    /// The palette title: always visible, so it carries the waiting count
-    /// and says when the read stopped at this Window's bound.
-    pub(crate) fn heading(&self) -> String {
-        let mut heading = "AGENT ACCESS".to_owned();
+    /// What the palette's frame says before its entry count, where it
+    /// stays visible: how many requests wait, then that the read stopped at
+    /// this Window's bound. Empty when neither applies.
+    pub(crate) fn status_parts(&self) -> Vec<String> {
         let Some(snapshot) = &self.snapshot else {
-            return heading;
+            return Vec::new();
         };
+        let mut status = Vec::new();
         match snapshot.waiting() {
             0 => {}
-            waiting => {
-                let _ = write!(heading, " · {waiting} WAITING");
-            }
+            waiting => status.push(format!("{waiting} waiting")),
         }
         if snapshot.truncated {
-            let _ = write!(heading, " · FIRST {MAX_WINDOW_ACCESS_ENTRIES} ONLY");
+            status.push(format!("first {MAX_WINDOW_ACCESS_ENTRIES} only"));
         }
-        heading
+        status
+    }
+
+    /// [`Self::status_parts`] joined, as the frame shows them when they fit.
+    #[cfg(test)]
+    pub(crate) fn status_label(&self) -> String {
+        self.status_parts().join(" · ")
     }
 
     /// The text shown when no row is, or `None` when rows are listed.
@@ -1486,7 +1496,7 @@ pub(crate) mod tests {
         );
         assert!(rows[0].detail.contains("never used"));
         assert!(rows[4].detail.contains("remove it from policy.json"));
-        assert_eq!(ui.heading(), "AGENT ACCESS · 1 WAITING");
+        assert_eq!(ui.status_label(), "1 waiting");
     }
 
     #[test]
@@ -1580,7 +1590,7 @@ pub(crate) mod tests {
             ui.empty_label().as_deref(),
             Some("No agent has access to any workspace.")
         );
-        assert_eq!(ui.heading(), "AGENT ACCESS");
+        assert_eq!(ui.status_label(), "");
         let ui = AgentAccessUi::new(None, Some("not authorized"));
         assert_eq!(
             ui.empty_label().as_deref(),
@@ -2097,15 +2107,15 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_truncated_read_says_so_in_the_always_visible_heading() {
+    fn a_truncated_read_says_so_in_the_always_visible_status_label() {
         let lair_id = LairId::new();
         let mut read = snapshot(1, inventory(lair_id));
         read.truncated = true;
         let ui = AgentAccessUi::new(Some(&read), None);
-        assert_eq!(ui.heading(), "AGENT ACCESS · 1 WAITING · FIRST 512 ONLY");
+        assert_eq!(ui.status_label(), "1 waiting · first 512 only");
         read.entries.remove(3);
         let ui = AgentAccessUi::new(Some(&read), None);
-        assert_eq!(ui.heading(), "AGENT ACCESS · FIRST 512 ONLY");
-        assert_eq!(AgentAccessUi::new(None, None).heading(), "AGENT ACCESS");
+        assert_eq!(ui.status_label(), "first 512 only");
+        assert_eq!(AgentAccessUi::new(None, None).status_label(), "");
     }
 }

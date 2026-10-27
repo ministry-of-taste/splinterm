@@ -1,7 +1,5 @@
 //! Trusted command-palette layout and CPU composition.
 
-use std::collections::HashMap;
-
 use anyhow::Result;
 use unicode_width::UnicodeWidthChar;
 
@@ -18,22 +16,47 @@ use crate::{
 };
 
 use super::{
-    super::{ChromeText, ChromeTextStyle, RenderContext, blend_rect, fill_rect},
+    super::{ChromeTextStyle, RenderContext},
+    chrome_box::{
+        BOX_CLEARANCE, BOX_EDGE, ChromeBox, ChromePainter, opaque, paint_outline, paint_scrim,
+        shadow_rect,
+    },
     picker::{
-        ROW_HOVER_ALPHA, ROW_PRESS_ALPHA, SessionPickerPalette, editable_text, truncate_picker_text,
+        PickerTextAlignment, ROW_HOVER_ALPHA, ROW_PRESS_ALPHA, SessionPickerPalette,
+        SessionPickerTextCache, editable_text,
     },
 };
 
-const HEADER_HEIGHT: u32 = 52;
+/// The palette's input line, inside the frame.
+const INPUT_HEIGHT: u32 = 28;
+/// Logical px above and below the rule under the input line.
+const RULE_GAP: u32 = 4;
+/// Logical px from the inside of the frame to the input line's `›`.
+const INPUT_INSET: u32 = 10;
+/// Everything above the list: the frame and its clearance, the input line
+/// and the rule under it.
+const HEADER_HEIGHT: u32 = BOX_EDGE + BOX_CLEARANCE + INPUT_HEIGHT + RULE_GAP * 2 + 1;
+/// Everything below the list: the clearance and the frame.
+const FOOTER_HEIGHT: u32 = BOX_CLEARANCE + BOX_EDGE;
+/// Agent access's line under its list: what the selected entry is, or a
+/// notice.
+const DETAIL_HEIGHT: u32 = 28;
 const ROW_HEIGHT: u32 = 48;
-const FOOTER_HEIGHT: u32 = 36;
-const PANEL_MAX_WIDTH: u32 = 680;
+/// The command palette's and Agent access's width at most.
+const COMMAND_PALETTE_WIDTH: u32 = 560;
+/// The key bindings list's width at most: its rows carry a source column.
+const BINDING_HELP_WIDTH: u32 = 640;
 const PANEL_HORIZONTAL_MARGIN: u32 = 24;
 const PANEL_VERTICAL_MARGIN: u32 = 16;
+/// Lists sit at this share of the content height from its top, and at
+/// least [`PANEL_MINIMUM_TOP`] below it.
+const PANEL_TOP_PERCENT: u32 = 15;
+const PANEL_MINIMUM_TOP: u32 = 48;
+/// The shortcut column's width at most; a longer shortcut keeps its key
+/// behind `…`.
+const SHORTCUT_COLUMN_WIDTH: u32 = 136;
 const CONTENT_INSET: u32 = 24;
-const ROW_GUTTER_X: u32 = 8;
 const ROW_GUTTER_Y: u32 = 2;
-const PANEL_TOP_OFFSET: u32 = 48;
 const TAB_MENU_WIDTH: u32 = 156;
 const TAB_MENU_ROW_HEIGHT: u32 = 28;
 const TAB_MENU_PADDING: u32 = 2;
@@ -181,15 +204,48 @@ pub(crate) struct CommandPaletteRowLayout {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CommandPaletteLayout {
+    /// The panel fill; its frame is inset inside it.
     pub(crate) panel: Rect,
-    pub(crate) header: Rect,
+    /// The input line, inside the frame.
+    pub(crate) input: Rect,
+    /// The 1 px rule under the input line.
+    pub(crate) rule: Rect,
     pub(crate) list: Rect,
-    pub(crate) footer: Rect,
+    /// Agent access's line under the list.
+    pub(crate) detail: Option<Rect>,
     pub(crate) rows: Vec<CommandPaletteRowLayout>,
     pub(crate) visible_start: usize,
     pub(crate) compact: bool,
 }
 
+/// Which list the palette's panel holds: the key bindings list is wider,
+/// and Agent access has a detail line under its rows.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PaletteShape {
+    Commands,
+    BindingHelp,
+    AgentAccess,
+}
+
+impl PaletteShape {
+    const fn maximum_width(self) -> u32 {
+        match self {
+            Self::BindingHelp => BINDING_HELP_WIDTH,
+            Self::Commands | Self::AgentAccess => COMMAND_PALETTE_WIDTH,
+        }
+    }
+
+    const fn detail_height(self) -> u32 {
+        match self {
+            Self::AgentAccess => DETAIL_HEIGHT,
+            Self::Commands | Self::BindingHelp => 0,
+        }
+    }
+}
+
+/// The palette's panel in `content`: top-anchored at 15% of its height (at
+/// least 48 px down), as wide as its shape allows but 24 px clear of each
+/// side, moved up when its rows would not fit below.
 #[must_use]
 #[allow(
     clippy::too_many_lines,
@@ -200,6 +256,7 @@ pub(crate) fn command_palette_layout(
     filtered: &[BuiltInCommandId],
     selected: usize,
     requested_start: usize,
+    shape: PaletteShape,
 ) -> Option<CommandPaletteLayout> {
     if content.width == 0 || content.height == 0 {
         return None;
@@ -212,12 +269,14 @@ pub(crate) fn command_palette_layout(
     let available_height = content
         .height
         .saturating_sub(vertical_margin.saturating_mul(2));
-    if available_width == 0 || available_height < HEADER_HEIGHT.saturating_add(FOOTER_HEIGHT) {
+    let chrome_height = HEADER_HEIGHT
+        .saturating_add(FOOTER_HEIGHT)
+        .saturating_add(shape.detail_height());
+    if available_width == 0 || available_height < chrome_height {
         return None;
     }
-    let panel_width = available_width.min(PANEL_MAX_WIDTH);
-    let available_list_height =
-        available_height.saturating_sub(HEADER_HEIGHT.saturating_add(FOOTER_HEIGHT));
+    let panel_width = available_width.min(shape.maximum_width());
+    let available_list_height = available_height.saturating_sub(chrome_height);
     let capacity = usize::try_from(available_list_height / ROW_HEIGHT)
         .unwrap_or(0)
         .min(COMMAND_PALETTE_PAGE_ITEMS);
@@ -231,50 +290,64 @@ pub(crate) fn command_palette_layout(
             visible_start = selected.saturating_add(1).saturating_sub(visible_count);
         }
     }
-    let list_height = if filtered.is_empty() || visible_count == 0 {
-        available_list_height.min(ROW_HEIGHT)
+    // No partial row: when not even one row fits, the list is empty.
+    let list_height = if capacity == 0 {
+        0
+    } else if filtered.is_empty() {
+        ROW_HEIGHT
     } else {
         ROW_HEIGHT.saturating_mul(u32::try_from(visible_count).unwrap_or(u32::MAX))
     };
-    let panel_height = HEADER_HEIGHT
-        .saturating_add(list_height)
-        .saturating_add(FOOTER_HEIGHT)
-        .min(available_height);
+    let panel_height = chrome_height.saturating_add(list_height);
     let x = content
         .x
         .saturating_add(content.width.saturating_sub(panel_width) / 2);
-    let maximum_y = content
+    let top = (content.height.saturating_mul(PANEL_TOP_PERCENT) / 100).max(PANEL_MINIMUM_TOP);
+    let lowest = content
         .y
-        .saturating_add(content.height.saturating_sub(panel_height));
-    let y = content
-        .y
-        .saturating_add(PANEL_TOP_OFFSET.min(content.height.saturating_sub(panel_height)))
-        .min(maximum_y);
+        .saturating_add(content.height)
+        .saturating_sub(vertical_margin)
+        .saturating_sub(panel_height);
+    let y = content.y.saturating_add(top).min(lowest);
     let panel = Rect {
         x,
         y,
         width: panel_width,
         height: panel_height,
     };
-    let header = Rect {
-        x,
-        y,
-        width: panel_width,
-        height: HEADER_HEIGHT,
+    let inner_x = x.saturating_add(BOX_EDGE);
+    let inner_width = panel_width.saturating_sub(BOX_EDGE.saturating_mul(2));
+    let input = Rect {
+        x: inner_x,
+        y: y.saturating_add(BOX_EDGE).saturating_add(BOX_CLEARANCE),
+        width: inner_width,
+        height: INPUT_HEIGHT,
+    };
+    let rule = Rect {
+        x: inner_x,
+        y: input
+            .y
+            .saturating_add(input.height)
+            .saturating_add(RULE_GAP),
+        width: inner_width,
+        height: 1,
     };
     let list = Rect {
-        x,
+        x: inner_x,
         y: y.saturating_add(HEADER_HEIGHT),
-        width: panel_width,
+        width: inner_width,
         height: list_height,
     };
-    let footer = Rect {
-        x,
+    let detail = (shape.detail_height() > 0).then(|| Rect {
+        x: inner_x,
         y: list.y.saturating_add(list.height),
-        width: panel_width,
-        height: panel_height.saturating_sub(HEADER_HEIGHT.saturating_add(list_height)),
-    };
+        width: inner_width,
+        height: shape.detail_height(),
+    });
     let compact = panel_width < 420;
+    // The category column costs a command title its room in a 560 px
+    // palette; Agent access keeps it, as its kind is a word only there.
+    let show_category = !compact && (shape != PaletteShape::Commands || panel_width >= 600);
     let rows = filtered
         .iter()
         .copied()
@@ -285,22 +358,25 @@ pub(crate) fn command_palette_layout(
             let slot_y = list
                 .y
                 .saturating_add(ROW_HEIGHT.saturating_mul(u32::try_from(slot).unwrap_or(u32::MAX)));
-            let horizontal_gutter = ROW_GUTTER_X.min(panel_width / 6);
             let vertical_gutter = ROW_GUTTER_Y.min(ROW_HEIGHT / 4);
             let rect = Rect {
-                x: x.saturating_add(horizontal_gutter),
+                x: list.x,
                 y: slot_y.saturating_add(vertical_gutter),
-                width: panel_width.saturating_sub(horizontal_gutter.saturating_mul(2)),
+                width: list.width,
                 height: ROW_HEIGHT.saturating_sub(vertical_gutter.saturating_mul(2)),
             };
             let inset = CONTENT_INSET.min(rect.width / 6);
             let shortcut_width = if compact {
                 0
             } else {
-                (rect.width / 3).min(180)
+                (rect.width / 4).min(SHORTCUT_COLUMN_WIDTH)
             };
             let content_x = rect.x.saturating_add(inset).saturating_add(20);
-            let category_width = if compact { 0 } else { 72.min(rect.width / 5) };
+            let category_width = if show_category {
+                72.min(rect.width / 5)
+            } else {
+                0
+            };
             let category_gap = if category_width == 0 { 0 } else { 12 };
             let title_x = content_x
                 .saturating_add(category_width)
@@ -340,9 +416,10 @@ pub(crate) fn command_palette_layout(
         .collect();
     Some(CommandPaletteLayout {
         panel,
-        header,
+        input,
+        rule,
         list,
-        footer,
+        detail,
         rows,
         visible_start,
         compact,
@@ -382,234 +459,53 @@ pub(crate) fn command_palette_row_hit_test(
         .map(|offset| layout.visible_start.saturating_add(offset))
 }
 
-#[derive(Default)]
-pub(crate) struct CommandPaletteTextCache {
-    scale_120: u32,
-    renderer_generation: u64,
-    entries: HashMap<(String, ChromeTextStyle), ChromeText>,
-}
-
-impl CommandPaletteTextCache {
-    pub(crate) fn clear(&mut self) {
-        self.entries.clear();
-        self.scale_120 = 0;
-        self.renderer_generation = 0;
-    }
-
-    fn text<'a>(
-        &'a mut self,
-        context: &RenderContext,
-        source: &str,
-        style: ChromeTextStyle,
-        scale_120: u32,
-        renderer_generation: u64,
-    ) -> Result<&'a ChromeText> {
-        if self.scale_120 != scale_120 || self.renderer_generation != renderer_generation {
-            self.entries.clear();
-            self.scale_120 = scale_120;
-            self.renderer_generation = renderer_generation;
-        }
-        let key = (source.to_owned(), style);
-        if !self.entries.contains_key(&key) {
-            self.entries.insert(
-                key.clone(),
-                ChromeText::load_styled_with_context(source, scale_120, style, context)?,
-            );
-        }
-        Ok(self
-            .entries
-            .get(&key)
-            .expect("inserted command text remains"))
-    }
-
-    pub(crate) fn tab_menu_label_width(
-        &mut self,
-        context: &RenderContext,
-        actions: &[crate::frontend::TabMenuActionDescriptor],
-        scale_120: u32,
-        renderer_generation: u64,
-    ) -> Result<u32> {
-        let mut width = 0;
-        for action in actions {
-            for style in [ChromeTextStyle::Regular, ChromeTextStyle::Bold] {
-                width = width.max(
-                    self.text(context, action.title, style, scale_120, renderer_generation)?
-                        .pixel_width(),
-                );
-            }
-        }
-        Ok(width.saturating_mul(120).div_ceil(scale_120.max(1)))
-    }
-
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    #[cfg(test)]
-    fn contains_source(&self, source: &str) -> bool {
-        self.entries.keys().any(|(text, _)| text == source)
-    }
-}
-
-fn buffer_rect(rect: Rect, scale_120: u32) -> Rect {
-    let scale = |value: u32| value.saturating_mul(scale_120).div_ceil(120);
-    Rect {
-        x: scale(rect.x),
-        y: scale(rect.y),
-        width: scale(rect.width),
-        height: scale(rect.height),
-    }
-}
-
-fn tuple(rect: Rect) -> (i32, i32, u32, u32) {
-    (
-        i32::try_from(rect.x).unwrap_or(i32::MAX),
-        i32::try_from(rect.y).unwrap_or(i32::MAX),
-        rect.width,
-        rect.height,
-    )
-}
-
-fn rgba(color: u32) -> [u8; 4] {
-    [
-        u8::try_from((color >> 16) & 0xff).unwrap_or(0),
-        u8::try_from((color >> 8) & 0xff).unwrap_or(0),
-        u8::try_from(color & 0xff).unwrap_or(0),
-        u8::MAX,
-    ]
-}
-
-/// `source` truncated to its last `maximum_cells` cells behind a leading `…`.
-fn truncate_text_start(source: &str, maximum_cells: usize) -> String {
-    let cells = |character: char| character.width().unwrap_or(0).min(2);
-    if source.chars().map(cells).sum::<usize>() <= maximum_cells {
-        return source.to_owned();
-    }
-    if maximum_cells == 0 {
-        return String::new();
-    }
-    let mut used = 0_usize;
-    let mut reversed = Vec::new();
-    for character in source.chars().rev() {
-        if used.saturating_add(cells(character)) > maximum_cells - 1 {
-            break;
-        }
-        used = used.saturating_add(cells(character));
-        reversed.push(character);
-    }
-    let tail = reversed
-        .into_iter()
-        .rev()
-        .skip_while(|character| cells(*character) == 0)
-        .collect::<String>();
-    format!("…{tail}")
-}
-
-/// `source` as chrome text bounded by `clip_width` buffer pixels, so a long
-/// label is never cut off silently: it ends with `…`, or with `keep_end` it
-/// starts with `…` and keeps its end (a right-aligned shortcut keeps its key).
-#[allow(clippy::too_many_arguments)]
-fn fitted_text<'a>(
-    cache: &'a mut CommandPaletteTextCache,
+/// The widest of `actions`' labels in logical px, regular or bold: chrome
+/// text is monospaced, so it is the most cells times the wider cell.
+pub(crate) fn tab_menu_label_width(
+    cache: &mut SessionPickerTextCache,
     context: &RenderContext,
-    source: &str,
-    style: ChromeTextStyle,
+    actions: &[crate::frontend::TabMenuActionDescriptor],
     scale_120: u32,
     renderer_generation: u64,
-    clip_width: u32,
-    keep_end: bool,
-) -> Result<&'a ChromeText> {
-    let (fits, cell_width) = {
-        let text = cache.text(context, source, style, scale_120, renderer_generation)?;
-        (
-            text.pixel_width() <= clip_width,
-            text.frame.cell_width.max(1),
-        )
-    };
-    if fits {
-        return cache.text(context, source, style, scale_120, renderer_generation);
+) -> Result<u32> {
+    let mut cell_width = 0;
+    for style in [ChromeTextStyle::Regular, ChromeTextStyle::Bold] {
+        cell_width = cell_width.max(
+            cache
+                .cell_metrics(context, style, scale_120, renderer_generation)?
+                .0,
+        );
     }
-    let maximum_cells = usize::try_from(clip_width / cell_width).unwrap_or(usize::MAX);
-    let truncated = if keep_end {
-        truncate_text_start(source, maximum_cells)
-    } else {
-        truncate_picker_text(source, maximum_cells)
-    };
-    cache.text(context, &truncated, style, scale_120, renderer_generation)
+    let cells = actions
+        .iter()
+        .map(|action| preview_text_width(action.title))
+        .max()
+        .unwrap_or(0);
+    Ok(u32::try_from(cells)
+        .unwrap_or(u32::MAX)
+        .saturating_mul(cell_width)
+        .saturating_mul(120)
+        .div_ceil(scale_120.max(1)))
 }
 
 /// An editable `value` after `prefix` with its caret, fitted to `clip_width`
 /// buffer pixels by keeping its end: the caret and the latest input stay
 /// visible and the start gives way behind `…`.
 fn editable_field_text(
-    cache: &mut CommandPaletteTextCache,
-    context: &RenderContext,
+    painter: &mut ChromePainter<'_>,
     prefix: &str,
     value: &str,
-    scale_120: u32,
-    renderer_generation: u64,
     clip_width: u32,
 ) -> Result<String> {
-    let cell_width = cache
-        .text(
-            context,
-            "_",
-            ChromeTextStyle::Regular,
-            scale_120,
-            renderer_generation,
-        )?
-        .frame
-        .cell_width
-        .max(1);
+    let (cell_width, _) = painter.cell(ChromeTextStyle::Regular)?;
     let maximum_cells = usize::try_from(clip_width / cell_width).unwrap_or(usize::MAX);
     Ok(editable_text(prefix, value, maximum_cells))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn paint_text(
-    cache: &mut CommandPaletteTextCache,
-    context: &RenderContext,
-    canvas: &mut [u8],
-    width: u32,
-    height: u32,
-    source: &str,
-    style: ChromeTextStyle,
-    scale_120: u32,
-    renderer_generation: u64,
-    clip: Rect,
-    color: u32,
-    right_aligned: bool,
-) -> Result<()> {
-    let text = fitted_text(
-        cache,
-        context,
-        source,
-        style,
-        scale_120,
-        renderer_generation,
-        clip.width,
-        right_aligned,
-    )?;
-    let x = if right_aligned {
-        clip.x
-            .saturating_add(clip.width.saturating_sub(text.pixel_width()))
-    } else {
-        clip.x
-    };
-    let y = clip
-        .y
-        .saturating_add(clip.height.saturating_sub(text.pixel_height()) / 2);
-    text.paint(canvas, width, height, (x, y), clip, color);
-    Ok(())
-}
-
-const fn palette_title(binding_help: bool) -> &'static str {
-    if binding_help {
-        "KEY BINDINGS"
-    } else {
-        "COMMANDS"
-    }
+/// `color` at `alpha` out of 255, to blend.
+fn translucent(color: u32, alpha: u8) -> [u8; 4] {
+    let [red, green, blue, _] = opaque(color);
+    [red, green, blue, alpha]
 }
 
 /// What the palette's list shows: its commands, the key bindings, or the
@@ -621,6 +517,78 @@ pub(crate) enum PaletteBody<'a> {
     AgentAccess(&'a AgentAccessUi),
 }
 
+impl<'a> PaletteBody<'a> {
+    /// The title set into the frame.
+    const fn title(self) -> &'static str {
+        match self {
+            Self::Commands => "commands",
+            Self::BindingHelp(_) => "key bindings",
+            Self::AgentAccess(_) => "agent access",
+        }
+    }
+
+    /// The input line's text when nothing is typed.
+    const fn placeholder(self) -> &'static str {
+        match self {
+            Self::Commands => "type a command",
+            Self::BindingHelp(_) => "filter by key or name",
+            Self::AgentAccess(_) => "search agent access",
+        }
+    }
+
+    /// The keys the list answers, set into the bottom frame.
+    const fn legend(self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            Self::Commands => &[("↑↓", "move"), ("↵", "run"), ("esc", "close")],
+            Self::BindingHelp(_) => &[
+                ("↑↓", "move"),
+                ("pgup pgdn", "page"),
+                ("ctrl u", "clear"),
+                ("esc", "close"),
+            ],
+            // The detail line says what Enter does for the selected entry.
+            Self::AgentAccess(_) => &[("↑↓", "move"), ("esc", "close")],
+        }
+    }
+
+    fn query<'s>(self, state: &'s CommandPaletteUi) -> &'s str
+    where
+        'a: 's,
+    {
+        match self {
+            Self::Commands => state.query(),
+            Self::BindingHelp(help) => help.query(),
+            Self::AgentAccess(access) => access.query(),
+        }
+    }
+
+    /// The frame's right label, most important first: for Agent access
+    /// what waits and whether the read stopped short, then how many rows
+    /// match of how many while a query filters, the total otherwise.
+    fn count_parts(self, state: &CommandPaletteUi) -> Vec<String> {
+        let (shown, total) = match self {
+            Self::Commands => (state.filtered().len(), state.total()),
+            Self::BindingHelp(help) => (help.rows().len(), help.total()),
+            Self::AgentAccess(access) => (access.rows().len(), access.total()),
+        };
+        let mut parts = match self {
+            Self::AgentAccess(access) => access.status_parts(),
+            Self::Commands | Self::BindingHelp(_) => Vec::new(),
+        };
+        parts.push(match_count_label(shown, total, self.query(state)));
+        parts
+    }
+}
+
+/// `shown/total` while `query` filters; `total` otherwise.
+fn match_count_label(shown: usize, total: usize, query: &str) -> String {
+    if query.is_empty() {
+        total.to_string()
+    } else {
+        format!("{shown}/{total}")
+    }
+}
+
 /// One read-only list row: category, title, one-line form, and the text in
 /// the shortcut column.
 struct ListRowText<'a> {
@@ -630,17 +598,119 @@ struct ListRowText<'a> {
     trailing: &'a str,
 }
 
-/// The header title slot, in buffer pixels: the 98 logical px the palette has
-/// always reserved, widened to fit a longer title and a gap before the query,
-/// but by no more than half of `available`, so the query keeps room.
-fn palette_title_width(title_width: u32, available: u32, scale_120: u32) -> u32 {
-    let scaled = |value: u32| value.saturating_mul(scale_120).div_ceil(120);
-    scaled(98).max(title_width.saturating_add(scaled(12)).min(available / 2))
+/// Where the input line's parts go, in buffer px: the `›`, the text, and
+/// the block cursor after it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct InputLineLayout {
+    marker: Rect,
+    text_x: u32,
+    /// The text's end, where the placeholder stops.
+    end: u32,
+    cell: (u32, u32),
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+impl InputLineLayout {
+    fn new(input: Rect, inset: u32, cell: (u32, u32)) -> Self {
+        let inset = inset.min(input.width / 2);
+        let marker = Rect {
+            x: input.x.saturating_add(inset),
+            width: cell.0.min(input.width.saturating_sub(inset)),
+            ..input
+        };
+        Self {
+            marker,
+            // `›`, then one cell of space.
+            text_x: marker.x.saturating_add(cell.0.saturating_mul(2)),
+            end: input.x.saturating_add(input.width).saturating_sub(inset),
+            cell,
+        }
+    }
+
+    /// The typed text that fits with the cursor's cell after it, keeping
+    /// its end, and the cursor; `None` when not even the cursor fits.
+    fn fitted(&self, input: Rect, query: &str) -> Option<(String, Rect)> {
+        let (cell_width, cell_height) = self.cell;
+        let room = self.end.saturating_sub(self.text_x) / cell_width.max(1);
+        let fitted = editable_text("", query, usize::try_from(room).unwrap_or(usize::MAX));
+        let shown = fitted.strip_suffix('_')?.to_owned();
+        let cursor_x = self.text_x.saturating_add(
+            u32::try_from(preview_text_width(&shown))
+                .unwrap_or(u32::MAX)
+                .saturating_mul(cell_width),
+        );
+        let cursor_height = cell_height.min(input.height);
+        Some((
+            shown,
+            Rect {
+                x: cursor_x,
+                y: input
+                    .y
+                    .saturating_add(input.height.saturating_sub(cursor_height) / 2),
+                width: cell_width,
+                height: cursor_height,
+            },
+        ))
+    }
+}
+
+/// The input line: the accent `›`, the query, and a block cursor (an
+/// accent cell) where typing goes; with nothing typed, the placeholder in
+/// secondary text after the cursor.
+fn paint_palette_input(
+    painter: &mut ChromePainter<'_>,
+    layout: &CommandPaletteLayout,
+    palette: &SessionPickerPalette,
+    query: &str,
+    placeholder: &str,
+) -> Result<()> {
+    let input = painter.buffer_rect(layout.input);
+    let cell = painter.cell(ChromeTextStyle::Regular)?;
+    let line = InputLineLayout::new(input, painter.scaled(INPUT_INSET), cell);
+    painter.text(
+        "›",
+        ChromeTextStyle::Regular,
+        line.marker,
+        PickerTextAlignment::Left,
+        palette.accent_text,
+    )?;
+    let Some((shown, cursor)) = line.fitted(input, query) else {
+        return Ok(());
+    };
+    painter.text(
+        &shown,
+        ChromeTextStyle::Regular,
+        Rect {
+            x: line.text_x,
+            width: cursor.x.saturating_sub(line.text_x),
+            ..input
+        },
+        PickerTextAlignment::Left,
+        palette.primary,
+    )?;
+    painter.fill(cursor, opaque(palette.selected_rail));
+    if query.is_empty() {
+        let after = cursor.x.saturating_add(cursor.width);
+        painter.text(
+            placeholder,
+            ChromeTextStyle::Regular,
+            Rect {
+                x: after,
+                width: line.end.saturating_sub(after),
+                ..input
+            },
+            PickerTextAlignment::Left,
+            palette.secondary,
+        )?;
+    }
+    Ok(())
+}
+
+/// The command palette, the key bindings list or the Agent access list in
+/// one box: the title and match count in the frame, the input line and its
+/// rule, the rows, and the keys in the bottom frame.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn paint_command_palette(
-    cache: &mut CommandPaletteTextCache,
+    cache: &mut SessionPickerTextCache,
     context: &RenderContext,
     canvas: &mut [u8],
     width: u32,
@@ -656,180 +726,76 @@ pub(crate) fn paint_command_palette(
     keyboard_focused: bool,
     body: PaletteBody<'_>,
 ) -> Result<()> {
-    blend_rect(
-        canvas,
-        width,
-        height,
-        tuple(buffer_rect(content_rect, scale_120)),
-        [palette.scrim[0], palette.scrim[1], palette.scrim[2], 96],
-    );
-    let panel = buffer_rect(layout.panel, scale_120);
-    let shadow_offset = 6_u32.saturating_mul(scale_120).div_ceil(120);
-    blend_rect(
-        canvas,
-        width,
-        height,
-        (
-            i32::try_from(panel.x.saturating_add(shadow_offset)).unwrap_or(i32::MAX),
-            i32::try_from(panel.y.saturating_add(shadow_offset)).unwrap_or(i32::MAX),
-            panel.width,
-            panel.height,
-        ),
-        palette.shadow,
-    );
-    fill_rect(canvas, width, height, tuple(panel), palette.panel_fill);
-    let border = scale_120.div_ceil(120).max(1);
-    let frame = if keyboard_focused {
-        palette.focused_frame
-    } else {
-        palette.frame
-    };
-    for edge in [
-        (panel.x, panel.y, panel.width, border),
-        (
-            panel.x,
-            panel.y.saturating_add(panel.height.saturating_sub(border)),
-            panel.width,
-            border,
-        ),
-        (panel.x, panel.y, border, panel.height),
-        (
-            panel.x.saturating_add(panel.width.saturating_sub(border)),
-            panel.y,
-            border,
-            panel.height,
-        ),
-    ] {
-        fill_rect(
-            canvas,
-            width,
-            height,
-            (
-                i32::try_from(edge.0).unwrap_or(i32::MAX),
-                i32::try_from(edge.1).unwrap_or(i32::MAX),
-                edge.2,
-                edge.3,
-            ),
-            rgba(frame),
-        );
-    }
-    for y in [
-        layout.header.y.saturating_add(layout.header.height),
-        layout.footer.y,
-    ] {
-        let divider_inset = CONTENT_INSET.min(layout.panel.width / 4);
-        fill_rect(
-            canvas,
-            width,
-            height,
-            tuple(buffer_rect(
-                Rect {
-                    x: layout.panel.x.saturating_add(divider_inset),
-                    y,
-                    width: layout
-                        .panel
-                        .width
-                        .saturating_sub(divider_inset.saturating_mul(2)),
-                    height: 1,
-                },
-                scale_120,
-            )),
-            rgba(palette.frame),
-        );
-    }
-
-    let header = buffer_rect(layout.header, scale_120);
-    let inset = CONTENT_INSET.saturating_mul(scale_120).div_ceil(120);
-    let title = match body {
-        PaletteBody::AgentAccess(access) => access.heading(),
-        PaletteBody::BindingHelp(_) => palette_title(true).to_owned(),
-        PaletteBody::Commands => palette_title(false).to_owned(),
-    };
-    let title = title.as_str();
-    let title_width = palette_title_width(
-        cache
-            .text(
-                context,
-                title,
-                ChromeTextStyle::Bold,
-                scale_120,
-                renderer_generation,
-            )?
-            .pixel_width(),
-        header.width.saturating_sub(inset.saturating_mul(2)),
-        scale_120,
-    );
-    paint_text(
+    let mut painter = ChromePainter::new(
         cache,
         context,
         canvas,
         width,
         height,
-        title,
-        ChromeTextStyle::Bold,
         scale_120,
         renderer_generation,
-        Rect {
-            x: header.x.saturating_add(inset),
-            y: header.y,
-            width: title_width,
-            height: header.height,
-        },
-        palette.primary,
-        false,
+    );
+    let scrim = painter.buffer_rect(content_rect);
+    paint_scrim(&mut painter, scrim, &palette);
+    let cell = painter.box_cell()?;
+    let count = body.count_parts(state);
+    let count = count.iter().map(String::as_str).collect::<Vec<_>>();
+    let chrome = ChromeBox {
+        title: body.title(),
+        right_label: &count,
+        legend: body.legend(),
+    }
+    .layout(painter.buffer_rect(layout.panel), scale_120, cell);
+    chrome.paint_surface(&mut painter, &palette);
+    paint_palette_input(
+        &mut painter,
+        layout,
+        &palette,
+        body.query(state),
+        body.placeholder(),
     )?;
-    let query_clip = Rect {
-        x: header.x.saturating_add(inset).saturating_add(title_width),
-        y: header.y,
-        width: header
-            .width
-            .saturating_sub(inset.saturating_mul(2))
-            .saturating_sub(title_width),
-        height: header.height,
-    };
-    let typed = match body {
-        PaletteBody::Commands => state.query(),
-        PaletteBody::BindingHelp(help) => help.query(),
-        PaletteBody::AgentAccess(access) => access.query(),
-    };
-    let query_is_placeholder = typed.is_empty();
-    let query = if query_is_placeholder {
-        match body {
-            PaletteBody::BindingHelp(_) => "> Search keybindings",
-            PaletteBody::AgentAccess(_) => "> Search agent access",
-            PaletteBody::Commands => "> Type a command",
-        }
-        .to_owned()
-    } else {
-        editable_field_text(
-            cache,
-            context,
-            "> ",
-            typed,
-            scale_120,
-            renderer_generation,
-            query_clip.width,
-        )?
-    };
-    paint_text(
-        cache,
-        context,
-        canvas,
-        width,
-        height,
-        &query,
-        ChromeTextStyle::Regular,
-        scale_120,
-        renderer_generation,
-        query_clip,
-        if query_is_placeholder {
-            palette.secondary
+    let rule = painter.buffer_rect(layout.rule);
+    painter.fill(rule, opaque(palette.frame));
+    paint_palette_list(&mut painter, layout, &palette, state, keymap, pressed, body)?;
+    if let (Some(detail), PaletteBody::AgentAccess(access)) = (layout.detail, body) {
+        let detail = painter.buffer_rect(detail);
+        let inset = painter.scaled(INPUT_INSET).min(detail.width / 4);
+        painter.text(
+            &access.footer(),
+            ChromeTextStyle::Regular,
+            Rect {
+                x: detail.x.saturating_add(inset),
+                width: detail.width.saturating_sub(inset.saturating_mul(2)),
+                ..detail
+            },
+            PickerTextAlignment::Left,
+            palette.secondary,
+        )?;
+    }
+    chrome.paint_frame(
+        &mut painter,
+        &palette,
+        if keyboard_focused {
+            palette.focused_frame
         } else {
-            palette.primary
+            palette.frame
         },
-        false,
     )?;
+    painter.finish();
+    Ok(())
+}
 
+/// The palette's rows, or the line that says none match.
+fn paint_palette_list(
+    painter: &mut ChromePainter<'_>,
+    layout: &CommandPaletteLayout,
+    palette: &SessionPickerPalette,
+    state: &CommandPaletteUi,
+    keymap: &ResolvedKeymap,
+    pressed: Option<BuiltInCommandId>,
+    body: PaletteBody<'_>,
+) -> Result<()> {
+    let inset = painter.scaled(CONTENT_INSET);
     let empty_label = match body {
         PaletteBody::BindingHelp(help) if help.rows().is_empty() => {
             Some("No matching keybindings".to_owned())
@@ -840,30 +806,24 @@ pub(crate) fn paint_command_palette(
         PaletteBody::AgentAccess(access) => access.empty_label(),
         _ => None,
     };
-    if let Some(empty_label) = empty_label.as_deref() {
-        let empty = buffer_rect(layout.list, scale_120);
-        paint_text(
-            cache,
-            context,
-            canvas,
-            width,
-            height,
+    if let Some(empty_label) = empty_label.as_deref().filter(|_| layout.list.height > 0) {
+        let empty = painter.buffer_rect(layout.list);
+        painter.text(
             empty_label,
             ChromeTextStyle::Regular,
-            scale_120,
-            renderer_generation,
             Rect {
                 x: empty.x.saturating_add(inset),
                 width: empty.width.saturating_sub(inset.saturating_mul(2)),
                 ..empty
             },
+            PickerTextAlignment::Left,
             palette.secondary,
-            false,
         )?;
     }
-    let list_rows: Option<(Vec<ListRowText<'_>>, usize)> = match body {
-        PaletteBody::BindingHelp(help) => Some((
-            help.rows()
+    match body {
+        PaletteBody::BindingHelp(help) => {
+            let rows = help
+                .rows()
                 .iter()
                 .map(|row| ListRowText {
                     category: &row.source,
@@ -871,11 +831,11 @@ pub(crate) fn paint_command_palette(
                     compact: &row.compact,
                     trailing: &row.shortcut,
                 })
-                .collect(),
-            help.selected_index(),
-        )),
-        PaletteBody::AgentAccess(access) => Some((
-            access
+                .collect::<Vec<_>>();
+            paint_list_rows(painter, layout, palette, &rows, help.selected_index())
+        }
+        PaletteBody::AgentAccess(access) => {
+            let rows = access
                 .rows()
                 .iter()
                 .map(|row| ListRowText {
@@ -884,280 +844,170 @@ pub(crate) fn paint_command_palette(
                     compact: &row.compact,
                     trailing: &row.status,
                 })
-                .collect(),
-            access.selected_index(),
-        )),
-        PaletteBody::Commands => None,
-    };
-    if let Some((list_rows, selected_index)) = list_rows {
-        for (offset, row) in layout.rows.iter().enumerate() {
-            let index = layout.visible_start.saturating_add(offset);
-            let Some(help_row) = list_rows.get(index) else {
-                continue;
-            };
-            let rect = buffer_rect(row.rect, scale_120);
-            let is_selected = index == selected_index;
-            if is_selected {
-                fill_rect(
-                    canvas,
-                    width,
-                    height,
-                    tuple(rect),
-                    rgba(palette.selected_fill),
-                );
-                fill_rect(
-                    canvas,
-                    width,
-                    height,
-                    (
-                        i32::try_from(rect.x).unwrap_or(i32::MAX),
-                        i32::try_from(rect.y).unwrap_or(i32::MAX),
-                        3_u32.saturating_mul(scale_120).div_ceil(120).max(1),
-                        rect.height,
-                    ),
-                    rgba(palette.selected_rail),
-                );
-            }
-            let primary = if is_selected {
-                palette.selected_primary
-            } else {
-                palette.primary
-            };
-            if row.category.width > 0 {
-                paint_text(
-                    cache,
-                    context,
-                    canvas,
-                    width,
-                    height,
-                    help_row.category,
-                    ChromeTextStyle::Regular,
-                    scale_120,
-                    renderer_generation,
-                    buffer_rect(row.category, scale_120),
-                    if is_selected {
-                        palette.selected_secondary
-                    } else {
-                        palette.secondary
-                    },
-                    false,
-                )?;
-            }
-            paint_text(
-                cache,
-                context,
-                canvas,
-                width,
-                height,
-                if layout.compact {
-                    help_row.compact
-                } else {
-                    help_row.title
-                },
-                if is_selected {
-                    ChromeTextStyle::Bold
-                } else {
-                    ChromeTextStyle::Regular
-                },
-                scale_120,
-                renderer_generation,
-                buffer_rect(row.title, scale_120),
-                primary,
-                false,
-            )?;
-            if !layout.compact {
-                paint_text(
-                    cache,
-                    context,
-                    canvas,
-                    width,
-                    height,
-                    help_row.trailing,
-                    ChromeTextStyle::Regular,
-                    scale_120,
-                    renderer_generation,
-                    buffer_rect(row.shortcut, scale_120),
-                    if is_selected {
-                        palette.selected_secondary
-                    } else {
-                        palette.secondary
-                    },
-                    true,
-                )?;
-            }
+                .collect::<Vec<_>>();
+            paint_list_rows(painter, layout, palette, &rows, access.selected_index())
         }
-    } else {
-        let selected = state.selected_command();
-        for row in &layout.rows {
-            let rect = buffer_rect(row.rect, scale_120);
-            let enabled = state.command_enabled(row.command);
-            let is_selected = enabled && selected == Some(row.command);
-            if is_selected {
-                fill_rect(
-                    canvas,
-                    width,
-                    height,
-                    tuple(rect),
-                    rgba(palette.selected_fill),
-                );
-                fill_rect(
-                    canvas,
-                    width,
-                    height,
-                    (
-                        i32::try_from(rect.x).unwrap_or(i32::MAX),
-                        i32::try_from(rect.y).unwrap_or(i32::MAX),
-                        3_u32.saturating_mul(scale_120).div_ceil(120).max(1),
-                        rect.height,
-                    ),
-                    rgba(palette.selected_rail),
-                );
-            } else if enabled && state.hovered() == Some(row.command) {
-                blend_rect(
-                    canvas,
-                    width,
-                    height,
-                    tuple(rect),
-                    [
-                        u8::try_from((palette.selected_fill >> 16) & 0xff).unwrap_or(0),
-                        u8::try_from((palette.selected_fill >> 8) & 0xff).unwrap_or(0),
-                        u8::try_from(palette.selected_fill & 0xff).unwrap_or(0),
-                        ROW_HOVER_ALPHA,
-                    ],
-                );
-            }
-            if enabled && pressed == Some(row.command) {
-                blend_rect(
-                    canvas,
-                    width,
-                    height,
-                    tuple(rect),
-                    [
-                        u8::try_from((palette.selected_rail >> 16) & 0xff).unwrap_or(0),
-                        u8::try_from((palette.selected_rail >> 8) & 0xff).unwrap_or(0),
-                        u8::try_from(palette.selected_rail & 0xff).unwrap_or(0),
-                        ROW_PRESS_ALPHA,
-                    ],
-                );
-            }
-            let highlighted = enabled
-                && !is_selected
-                && (state.hovered() == Some(row.command) || pressed == Some(row.command));
-            let (row_primary, row_secondary) = palette.row_text(is_selected, highlighted);
-            let primary = if enabled {
-                row_primary
-            } else {
-                palette.secondary
-            };
-            if is_selected {
-                paint_text(
-                    cache,
-                    context,
-                    canvas,
-                    width,
-                    height,
-                    "›",
-                    ChromeTextStyle::Bold,
-                    scale_120,
-                    renderer_generation,
-                    Rect {
-                        x: rect.x.saturating_add(inset / 2),
-                        y: rect.y,
-                        width: 20_u32.saturating_mul(scale_120).div_ceil(120),
-                        height: rect.height,
-                    },
-                    primary,
-                    false,
-                )?;
-            }
-            let descriptor = command_descriptor(row.command);
-            if row.category.width > 0 {
-                paint_text(
-                    cache,
-                    context,
-                    canvas,
-                    width,
-                    height,
-                    descriptor.category.label(),
-                    ChromeTextStyle::Regular,
-                    scale_120,
-                    renderer_generation,
-                    buffer_rect(row.category, scale_120),
-                    row_secondary,
-                    false,
-                )?;
-            }
-            paint_text(
-                cache,
-                context,
-                canvas,
-                width,
-                height,
-                descriptor.title,
-                if is_selected {
-                    ChromeTextStyle::Bold
-                } else {
-                    ChromeTextStyle::Regular
-                },
-                scale_120,
-                renderer_generation,
-                buffer_rect(row.title, scale_120),
-                row_label_color(
-                    &palette,
-                    enabled && row.command.destructive(),
-                    is_selected,
-                    highlighted,
-                    primary,
-                ),
-                false,
-            )?;
-            if !layout.compact {
-                paint_text(
-                    cache,
-                    context,
-                    canvas,
-                    width,
-                    height,
-                    state
-                        .badge(row.command)
-                        .as_deref()
-                        .unwrap_or_else(|| descriptor.shortcut(keymap)),
-                    ChromeTextStyle::Regular,
-                    scale_120,
-                    renderer_generation,
-                    buffer_rect(row.shortcut, scale_120),
-                    row_secondary,
-                    true,
-                )?;
-            }
+        PaletteBody::Commands => {
+            paint_command_rows(painter, layout, palette, state, keymap, pressed)
         }
     }
-    let footer = buffer_rect(layout.footer, scale_120);
-    let footer_text = match body {
-        PaletteBody::BindingHelp(_) => {
-            "Type to search · ↑↓/Pg navigate · Ctrl+U clear · Esc clear/close".to_owned()
-        }
-        PaletteBody::AgentAccess(access) => access.footer(),
-        PaletteBody::Commands => "↑↓ navigate   Enter run   Esc close".to_owned(),
-    };
-    paint_text(
-        cache,
-        context,
-        canvas,
-        width,
-        height,
-        &footer_text,
-        ChromeTextStyle::Regular,
-        scale_120,
-        renderer_generation,
+}
+
+/// The selected row's fill and accent rail.
+fn paint_selected_row(painter: &mut ChromePainter<'_>, rect: Rect, palette: &SessionPickerPalette) {
+    painter.fill(rect, opaque(palette.selected_fill));
+    let rail = painter.scaled(3).max(1);
+    painter.fill(
         Rect {
-            x: footer.x.saturating_add(inset),
-            width: footer.width.saturating_sub(inset.saturating_mul(2)),
-            ..footer
+            width: rail.min(rect.width),
+            ..rect
         },
-        palette.secondary,
-        false,
-    )?;
+        opaque(palette.selected_rail),
+    );
+}
+
+/// The key bindings' or Agent access's read-only rows.
+fn paint_list_rows(
+    painter: &mut ChromePainter<'_>,
+    layout: &CommandPaletteLayout,
+    palette: &SessionPickerPalette,
+    list_rows: &[ListRowText<'_>],
+    selected_index: usize,
+) -> Result<()> {
+    for (offset, row) in layout.rows.iter().enumerate() {
+        let index = layout.visible_start.saturating_add(offset);
+        let Some(list_row) = list_rows.get(index) else {
+            continue;
+        };
+        let rect = painter.buffer_rect(row.rect);
+        let is_selected = index == selected_index;
+        if is_selected {
+            paint_selected_row(painter, rect, palette);
+        }
+        let (primary, secondary) = palette.row_text(is_selected, false);
+        if row.category.width > 0 {
+            let clip = painter.buffer_rect(row.category);
+            painter.text(
+                list_row.category,
+                ChromeTextStyle::Regular,
+                clip,
+                PickerTextAlignment::Left,
+                secondary,
+            )?;
+        }
+        let clip = painter.buffer_rect(row.title);
+        painter.text(
+            if layout.compact {
+                list_row.compact
+            } else {
+                list_row.title
+            },
+            if is_selected {
+                ChromeTextStyle::Bold
+            } else {
+                ChromeTextStyle::Regular
+            },
+            clip,
+            PickerTextAlignment::Left,
+            primary,
+        )?;
+        if !layout.compact {
+            let clip = painter.buffer_rect(row.shortcut);
+            painter.text_keep_end(list_row.trailing, ChromeTextStyle::Regular, clip, secondary)?;
+        }
+    }
+    Ok(())
+}
+
+/// The command rows: selected, hovered, pressed, disabled, and Terminate in
+/// danger.
+fn paint_command_rows(
+    painter: &mut ChromePainter<'_>,
+    layout: &CommandPaletteLayout,
+    palette: &SessionPickerPalette,
+    state: &CommandPaletteUi,
+    keymap: &ResolvedKeymap,
+    pressed: Option<BuiltInCommandId>,
+) -> Result<()> {
+    let inset = painter.scaled(CONTENT_INSET);
+    let selected = state.selected_command();
+    for row in &layout.rows {
+        let rect = painter.buffer_rect(row.rect);
+        let enabled = state.command_enabled(row.command);
+        let is_selected = enabled && selected == Some(row.command);
+        if is_selected {
+            paint_selected_row(painter, rect, palette);
+        } else if enabled && state.hovered() == Some(row.command) {
+            painter.blend(rect, translucent(palette.selected_fill, ROW_HOVER_ALPHA));
+        }
+        if enabled && pressed == Some(row.command) {
+            painter.blend(rect, translucent(palette.selected_rail, ROW_PRESS_ALPHA));
+        }
+        let highlighted = enabled
+            && !is_selected
+            && (state.hovered() == Some(row.command) || pressed == Some(row.command));
+        let (row_primary, row_secondary) = palette.row_text(is_selected, highlighted);
+        let primary = if enabled {
+            row_primary
+        } else {
+            palette.secondary
+        };
+        if is_selected {
+            let marker = Rect {
+                x: rect.x.saturating_add(inset / 2),
+                width: painter.scaled(20),
+                ..rect
+            };
+            painter.text(
+                "›",
+                ChromeTextStyle::Bold,
+                marker,
+                PickerTextAlignment::Left,
+                primary,
+            )?;
+        }
+        let descriptor = command_descriptor(row.command);
+        if row.category.width > 0 {
+            let clip = painter.buffer_rect(row.category);
+            painter.text(
+                descriptor.category.label(),
+                ChromeTextStyle::Regular,
+                clip,
+                PickerTextAlignment::Left,
+                row_secondary,
+            )?;
+        }
+        let clip = painter.buffer_rect(row.title);
+        painter.text(
+            descriptor.title,
+            if is_selected {
+                ChromeTextStyle::Bold
+            } else {
+                ChromeTextStyle::Regular
+            },
+            clip,
+            PickerTextAlignment::Left,
+            row_label_color(
+                palette,
+                enabled && row.command.destructive(),
+                is_selected,
+                highlighted,
+                primary,
+            ),
+        )?;
+        if !layout.compact {
+            let clip = painter.buffer_rect(row.shortcut);
+            let badge = state.badge(row.command);
+            painter.text_keep_end(
+                badge
+                    .as_deref()
+                    .unwrap_or_else(|| descriptor.shortcut(keymap)),
+                ChromeTextStyle::Regular,
+                clip,
+                row_secondary,
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -1279,7 +1129,7 @@ pub(crate) fn tab_context_menu_hit_test(
     reason = "one specialized painter keeps tab-menu composition and selection treatment coherent"
 )]
 pub(crate) fn paint_tab_context_menu(
-    cache: &mut CommandPaletteTextCache,
+    cache: &mut SessionPickerTextCache,
     context: &RenderContext,
     canvas: &mut [u8],
     width: u32,
@@ -1292,107 +1142,36 @@ pub(crate) fn paint_tab_context_menu(
     pressed: Option<TabMenuActionId>,
     keyboard_focused: bool,
 ) -> Result<()> {
-    let panel = buffer_rect(layout.panel, scale_120);
-    let shadow_offset = TAB_MENU_SHADOW.saturating_mul(scale_120).div_ceil(120);
-    blend_rect(
+    let mut painter = ChromePainter::new(
+        cache,
+        context,
         canvas,
         width,
         height,
-        (
-            i32::try_from(panel.x.saturating_add(shadow_offset)).unwrap_or(i32::MAX),
-            i32::try_from(panel.y.saturating_add(shadow_offset)).unwrap_or(i32::MAX),
-            panel.width,
-            panel.height,
-        ),
-        palette.shadow,
+        scale_120,
+        renderer_generation,
     );
-    fill_rect(canvas, width, height, tuple(panel), palette.panel_fill);
-    let border = scale_120.div_ceil(120).max(1);
+    let panel = painter.buffer_rect(layout.panel);
+    painter.blend(shadow_rect(panel, scale_120), palette.shadow);
+    painter.fill(panel, palette.panel_fill);
+    let border = painter.border();
     let frame = if keyboard_focused {
         palette.focused_frame
     } else {
         palette.frame
     };
-    for edge in [
-        (panel.x, panel.y, panel.width, border),
-        (
-            panel.x,
-            panel.y.saturating_add(panel.height.saturating_sub(border)),
-            panel.width,
-            border,
-        ),
-        (panel.x, panel.y, border, panel.height),
-        (
-            panel.x.saturating_add(panel.width.saturating_sub(border)),
-            panel.y,
-            border,
-            panel.height,
-        ),
-    ] {
-        fill_rect(
-            canvas,
-            width,
-            height,
-            (
-                i32::try_from(edge.0).unwrap_or(i32::MAX),
-                i32::try_from(edge.1).unwrap_or(i32::MAX),
-                edge.2,
-                edge.3,
-            ),
-            rgba(frame),
-        );
-    }
+    paint_outline(&mut painter, panel, border, frame);
     for row in &layout.rows {
-        let rect = buffer_rect(row.rect, scale_120);
+        let rect = painter.buffer_rect(row.rect);
         let enabled = state.action_enabled(row.action);
         let selected = enabled && state.selected_action() == row.action;
         if selected {
-            fill_rect(
-                canvas,
-                width,
-                height,
-                tuple(rect),
-                rgba(palette.selected_fill),
-            );
-            fill_rect(
-                canvas,
-                width,
-                height,
-                (
-                    i32::try_from(rect.x).unwrap_or(i32::MAX),
-                    i32::try_from(rect.y).unwrap_or(i32::MAX),
-                    3_u32.saturating_mul(scale_120).div_ceil(120).max(1),
-                    rect.height,
-                ),
-                rgba(palette.selected_rail),
-            );
+            paint_selected_row(&mut painter, rect, &palette);
         } else if enabled && state.hovered() == Some(row.action) {
-            blend_rect(
-                canvas,
-                width,
-                height,
-                tuple(rect),
-                [
-                    u8::try_from((palette.selected_fill >> 16) & 0xff).unwrap_or(0),
-                    u8::try_from((palette.selected_fill >> 8) & 0xff).unwrap_or(0),
-                    u8::try_from(palette.selected_fill & 0xff).unwrap_or(0),
-                    ROW_HOVER_ALPHA,
-                ],
-            );
+            painter.blend(rect, translucent(palette.selected_fill, ROW_HOVER_ALPHA));
         }
         if enabled && pressed == Some(row.action) {
-            blend_rect(
-                canvas,
-                width,
-                height,
-                tuple(rect),
-                [
-                    u8::try_from((palette.selected_rail >> 16) & 0xff).unwrap_or(0),
-                    u8::try_from((palette.selected_rail >> 8) & 0xff).unwrap_or(0),
-                    u8::try_from(palette.selected_rail & 0xff).unwrap_or(0),
-                    ROW_PRESS_ALPHA,
-                ],
-            );
+            painter.blend(rect, translucent(palette.selected_rail, ROW_PRESS_ALPHA));
         }
         let highlighted = enabled
             && !selected
@@ -1411,66 +1190,45 @@ pub(crate) fn paint_tab_context_menu(
             primary,
         );
         if selected {
-            let inset = 3_u32
-                .saturating_mul(scale_120)
-                .div_ceil(120)
-                .min(rect.width);
+            let inset = painter.scaled(3).min(rect.width);
             let indicator = Rect {
                 x: rect.x.saturating_add(inset),
-                y: rect.y,
-                width: TAB_MENU_INDICATOR_WIDTH
-                    .saturating_mul(scale_120)
-                    .div_ceil(120)
+                width: painter
+                    .scaled(TAB_MENU_INDICATOR_WIDTH)
                     .min(rect.width.saturating_sub(inset)),
-                height: rect.height,
+                ..rect
             };
-            paint_text(
-                cache,
-                context,
-                canvas,
-                width,
-                height,
+            painter.text(
                 "›",
                 ChromeTextStyle::Bold,
-                scale_120,
-                renderer_generation,
                 indicator,
+                PickerTextAlignment::Left,
                 primary,
-                false,
             )?;
         }
-        paint_text(
-            cache,
-            context,
-            canvas,
-            width,
-            height,
+        let clip = painter.buffer_rect(row.title);
+        painter.text(
             row.label,
             if selected {
                 ChromeTextStyle::Bold
             } else {
                 ChromeTextStyle::Regular
             },
-            scale_120,
-            renderer_generation,
-            buffer_rect(row.title, scale_120),
+            clip,
+            PickerTextAlignment::Left,
             label_color,
-            false,
         )?;
     }
-    fill_rect(
-        canvas,
-        width,
-        height,
-        (
-            i32::try_from(panel.x.saturating_add(panel.width.saturating_sub(border)))
-                .unwrap_or(i32::MAX),
-            i32::try_from(panel.y).unwrap_or(i32::MAX),
-            border,
-            panel.height,
-        ),
-        rgba(frame),
+    // Rows reach the panel's right edge; draw it over them.
+    painter.fill(
+        Rect {
+            x: panel.x.saturating_add(panel.width.saturating_sub(border)),
+            width: border,
+            ..panel
+        },
+        opaque(frame),
     );
+    painter.finish();
     Ok(())
 }
 
@@ -1650,7 +1408,7 @@ fn dojo_prompt_choice_color(
     reason = "trusted Dojo prompts share one bounded painter and composition transaction"
 )]
 pub(crate) fn paint_dojo_prompt(
-    cache: &mut CommandPaletteTextCache,
+    cache: &mut SessionPickerTextCache,
     context: &RenderContext,
     canvas: &mut [u8],
     width: u32,
@@ -1663,172 +1421,93 @@ pub(crate) fn paint_dojo_prompt(
     state: &DojoPromptUi,
     keyboard_focused: bool,
 ) -> Result<()> {
-    blend_rect(
-        canvas,
-        width,
-        height,
-        tuple(buffer_rect(content_rect, scale_120)),
-        [palette.scrim[0], palette.scrim[1], palette.scrim[2], 112],
-    );
-    let panel = buffer_rect(layout.panel, scale_120);
-    fill_rect(canvas, width, height, tuple(panel), palette.panel_fill);
-    let border = scale_120.div_ceil(120).max(1);
-    let frame = if keyboard_focused {
-        palette.focused_frame
-    } else {
-        palette.frame
-    };
-    for edge in [
-        (panel.x, panel.y, panel.width, border),
-        (
-            panel.x,
-            panel.y.saturating_add(panel.height.saturating_sub(border)),
-            panel.width,
-            border,
-        ),
-        (panel.x, panel.y, border, panel.height),
-        (
-            panel.x.saturating_add(panel.width.saturating_sub(border)),
-            panel.y,
-            border,
-            panel.height,
-        ),
-    ] {
-        fill_rect(
-            canvas,
-            width,
-            height,
-            (
-                i32::try_from(edge.0).unwrap_or(i32::MAX),
-                i32::try_from(edge.1).unwrap_or(i32::MAX),
-                edge.2,
-                edge.3,
-            ),
-            rgba(frame),
-        );
-    }
-    let (title, body) = state.title_and_body();
-    paint_text(
+    let mut painter = ChromePainter::new(
         cache,
         context,
         canvas,
         width,
         height,
-        title,
-        ChromeTextStyle::Bold,
         scale_120,
         renderer_generation,
-        buffer_rect(layout.title, scale_120),
+    );
+    let scrim = painter.buffer_rect(content_rect);
+    paint_scrim(&mut painter, scrim, &palette);
+    let panel = painter.buffer_rect(layout.panel);
+    painter.fill(panel, palette.panel_fill);
+    let border = painter.border();
+    paint_outline(
+        &mut painter,
+        panel,
+        border,
+        if keyboard_focused {
+            palette.focused_frame
+        } else {
+            palette.frame
+        },
+    );
+    let (title, body) = state.title_and_body();
+    let title_rect = painter.buffer_rect(layout.title);
+    painter.text(
+        title,
+        ChromeTextStyle::Bold,
+        title_rect,
+        PickerTextAlignment::Left,
         palette.primary,
-        false,
     )?;
+    let body_rect = painter.buffer_rect(layout.body);
     if state.uses_layout_summary() {
-        let body_rect = buffer_rect(layout.body, scale_120);
-        let line_height = PREVIEW_LINE_HEIGHT.saturating_mul(scale_120).div_ceil(120);
-        let metrics = ChromeText::load_styled_with_context(
-            "M",
-            scale_120,
-            ChromeTextStyle::Regular,
-            context,
-        )?;
-        let maximum_cells = usize::try_from(body_rect.width / metrics.frame.cell_width.max(1))
+        let line_height = painter.scaled(PREVIEW_LINE_HEIGHT);
+        let (cell_width, _) = painter.cell(ChromeTextStyle::Regular)?;
+        let maximum_cells = usize::try_from(body_rect.width / cell_width)
             .unwrap_or(MAX_PREVIEW_LINE_SCALARS)
             .min(MAX_PREVIEW_LINE_SCALARS);
         for (index, line) in wrap_preview_body(&body, maximum_cells).iter().enumerate() {
             let Some(line_rect) = preview_line_rect(body_rect, index, line_height) else {
                 break;
             };
-            paint_text(
-                cache,
-                context,
-                canvas,
-                width,
-                height,
+            painter.text(
                 line,
                 ChromeTextStyle::Regular,
-                scale_120,
-                renderer_generation,
                 line_rect,
+                PickerTextAlignment::Left,
                 palette.secondary,
-                false,
             )?;
         }
     } else {
-        paint_text(
-            cache,
-            context,
-            canvas,
-            width,
-            height,
+        painter.text(
             &body,
             ChromeTextStyle::Regular,
-            scale_120,
-            renderer_generation,
-            buffer_rect(layout.body, scale_120),
+            body_rect,
+            PickerTextAlignment::Left,
             palette.secondary,
-            false,
         )?;
     }
     if let Some(prompt_input) = state.input() {
-        let input = buffer_rect(layout.input.expect("rename input exists"), scale_120);
-        fill_rect(
-            canvas,
-            width,
-            height,
-            tuple(input),
-            rgba(palette.selected_fill),
-        );
-        let inset = 12_u32.saturating_mul(scale_120).div_ceil(120);
+        let input = painter.buffer_rect(layout.input.expect("rename input exists"));
+        painter.fill(input, opaque(palette.selected_fill));
+        let inset = painter.scaled(12);
         let input_clip = Rect {
             x: input.x.saturating_add(inset),
             width: input.width.saturating_sub(inset.saturating_mul(2)),
             ..input
         };
-        let field = editable_field_text(
-            cache,
-            context,
-            "> ",
-            prompt_input,
-            scale_120,
-            renderer_generation,
-            input_clip.width,
-        )?;
-        paint_text(
-            cache,
-            context,
-            canvas,
-            width,
-            height,
+        let field = editable_field_text(&mut painter, "> ", prompt_input, input_clip.width)?;
+        painter.text(
             &field,
             ChromeTextStyle::Regular,
-            scale_120,
-            renderer_generation,
             input_clip,
+            PickerTextAlignment::Left,
             palette.selected_primary,
-            false,
         )?;
     } else if state.is_preview() {
-        let rect = buffer_rect(layout.cancel.expect("preview close exists"), scale_120);
-        fill_rect(
-            canvas,
-            width,
-            height,
-            tuple(rect),
-            rgba(palette.selected_fill),
-        );
-        paint_text(
-            cache,
-            context,
-            canvas,
-            width,
-            height,
+        let rect = painter.buffer_rect(layout.cancel.expect("preview close exists"));
+        painter.fill(rect, opaque(palette.selected_fill));
+        painter.text(
             "Close",
             ChromeTextStyle::Bold,
-            scale_120,
-            renderer_generation,
             rect,
+            PickerTextAlignment::Left,
             palette.selected_primary,
-            false,
         )?;
     } else {
         let selected_decision = state.decision().expect("confirmation decision exists");
@@ -1847,51 +1526,118 @@ pub(crate) fn paint_dojo_prompt(
                 confirmation_label,
             ),
         ] {
-            let rect = buffer_rect(rect, scale_120);
+            let rect = painter.buffer_rect(rect);
             let selected = selected_decision == decision;
-            fill_rect(
-                canvas,
-                width,
-                height,
-                tuple(rect),
+            painter.fill(
+                rect,
                 if selected {
-                    rgba(palette.selected_fill)
+                    opaque(palette.selected_fill)
                 } else {
                     palette.panel_fill
                 },
             );
-            paint_text(
-                cache,
-                context,
-                canvas,
-                width,
-                height,
+            painter.text(
                 label,
                 if selected {
                     ChromeTextStyle::Bold
                 } else {
                     ChromeTextStyle::Regular
                 },
-                scale_120,
-                renderer_generation,
                 rect,
+                PickerTextAlignment::Left,
                 dojo_prompt_choice_color(&palette, state, decision, selected),
-                false,
             )?;
         }
     }
+    painter.finish();
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        super::{
+            super::{ChromeText, text::chrome_maximum_cell_height},
+            chrome_box::{BOX_LABEL_INSET, truncate_text_start},
+            picker::picker_buffer_rect as buffer_rect,
+        },
+        *,
+    };
     use crate::{
         config::ResolvedTheme,
         frontend::{CommandPaletteContext, CommandTabMoveAvailability},
         renderer::session_picker_palette,
     };
     use splinterm_core::{DojoId, LairId, SplintId};
+
+    fn palette_context() -> CommandPaletteContext {
+        CommandPaletteContext {
+            lair_id: LairId::new(),
+            lair_retention: splinterm_core::LairRetention::Disposable,
+            dojo_id: DojoId::new(),
+            dojo_name: "test".to_owned(),
+            pane_count: 1,
+            splint_id: SplintId::new(),
+            dojo_splints: vec![(SplintId::new(), 1)],
+            other_dojo_ids: Vec::new(),
+            previous_dojo_id: None,
+            next_dojo_id: None,
+            tab_move: CommandTabMoveAvailability::Neither,
+            focus_left: None,
+            focus_right: None,
+            focus_up: None,
+            focus_down: None,
+            clipboard_image_available: false,
+            viewport_detached: false,
+            controller_active: false,
+            forced_control_transfer: true,
+            revoke_all_available: false,
+            access_waiting: 0,
+            pending_transfer_id: None,
+            agent_status_incarnation: None,
+        }
+    }
+
+    /// Paints `source` into a scratch canvas through the one chrome text
+    /// painter, as the popups do.
+    fn paint_label(
+        cache: &mut SessionPickerTextCache,
+        context: &RenderContext,
+        source: &str,
+        style: ChromeTextStyle,
+        scale: u32,
+        clip_width: u32,
+        keep_end: bool,
+    ) {
+        let mut canvas = vec![0_u8; 4];
+        let mut painter = ChromePainter::new(cache, context, &mut canvas, 1, 1, scale, 1);
+        let clip = Rect {
+            x: 0,
+            y: 0,
+            width: clip_width,
+            height: 1,
+        };
+        if keep_end {
+            painter.text_keep_end(source, style, clip, 0).unwrap();
+        } else {
+            painter
+                .text(source, style, clip, PickerTextAlignment::Left, 0)
+                .unwrap();
+        }
+        painter.finish();
+    }
+
+    /// The width of `source` as chrome text.
+    fn text_width(
+        context: &RenderContext,
+        source: &str,
+        style: ChromeTextStyle,
+        scale: u32,
+    ) -> u32 {
+        ChromeText::load_styled_with_context(source, scale, style, context)
+            .unwrap()
+            .pixel_width()
+    }
 
     #[test]
     fn preview_body_wraps_to_available_cells_and_marks_bounded_overflow() {
@@ -1954,20 +1700,30 @@ mod tests {
                 height: 240,
             },
         ] {
-            let layout = command_palette_layout(content, &commands, 2, 0).unwrap();
+            let layout =
+                command_palette_layout(content, &commands, 2, 0, PaletteShape::Commands).unwrap();
             assert!(layout.panel.x >= content.x && layout.panel.y >= content.y);
             assert!(layout.panel.x + layout.panel.width <= content.x + content.width);
             assert!(layout.panel.y + layout.panel.height <= content.y + content.height);
             assert!(layout.rows.iter().any(|row| row.command == commands[2]));
             for row in &layout.rows {
                 assert_eq!(row.rect.height, ROW_HEIGHT - ROW_GUTTER_Y * 2);
-                assert!(row.rect.x > layout.panel.x);
-                assert!(row.rect.x + row.rect.width < layout.panel.x + layout.panel.width);
+                // Rows fill the inside of the frame.
+                assert_eq!(row.rect.x, layout.panel.x + BOX_EDGE);
+                assert_eq!(
+                    row.rect.x + row.rect.width + BOX_EDGE,
+                    layout.panel.x + layout.panel.width
+                );
+                assert!(row.rect.y >= layout.rule.y + layout.rule.height);
                 assert!(row.title.x >= row.rect.x + CONTENT_INSET);
-                assert_eq!(row.category.width == 0, layout.compact);
+                // A 560 px palette gives its titles the category's room.
+                assert_eq!(row.category.width, 0);
                 if !layout.compact {
-                    assert!(row.title.x > row.category.x + row.category.width);
-                    assert_eq!(row.shortcut.width, (row.rect.width / 3).min(180));
+                    assert!(row.title.x >= row.category.x + row.category.width);
+                    assert_eq!(
+                        row.shortcut.width,
+                        (row.rect.width / 4).min(SHORTCUT_COLUMN_WIDTH)
+                    );
                     assert!(row.shortcut.width > 60);
                 }
                 assert_eq!(
@@ -1991,6 +1747,101 @@ mod tests {
         }
     }
 
+    /// Every command's title fits its slot whole in the 560 px palette with
+    /// the default chrome cell, bold as when it is selected.
+    #[test]
+    fn every_command_title_fits_the_560_px_palette() {
+        let content = Rect {
+            x: 0,
+            y: 0,
+            width: 1280,
+            height: 800,
+        };
+        let layout =
+            command_palette_layout(content, BuiltInCommandId::ALL, 0, 0, PaletteShape::Commands)
+                .unwrap();
+        assert_eq!(layout.panel.width, 560);
+        let slot = buffer_rect(layout.rows[0].title, 120);
+        let render_context = RenderContext::new(u16::MAX);
+        for descriptor in BuiltInCommandId::ALL
+            .iter()
+            .map(|id| command_descriptor(*id))
+        {
+            for style in [ChromeTextStyle::Regular, ChromeTextStyle::Bold] {
+                let width = text_width(&render_context, descriptor.title, style, 120);
+                assert!(
+                    width <= slot.width,
+                    "{:?} ({width} px) does not fit {} px",
+                    descriptor.title,
+                    slot.width
+                );
+            }
+        }
+    }
+
+    /// Each list paints in a small Window at every scale.
+    #[test]
+    fn the_palette_paints_in_a_small_window_at_every_scale() {
+        let content = Rect {
+            x: 0,
+            y: 20,
+            width: 360,
+            height: 240,
+        };
+        let state = CommandPaletteUi::new(palette_context());
+        let keymap = ResolvedKeymap::default();
+        let help = BindingHelpUi::new(&keymap);
+        let access = AgentAccessUi::new(None, None);
+        for scale in [120, 150, 180, 240] {
+            let width = 360 * scale / 120;
+            let height = 260 * scale / 120;
+            for (body, shape, rows) in [
+                (
+                    PaletteBody::Commands,
+                    PaletteShape::Commands,
+                    state.filtered().len(),
+                ),
+                (
+                    PaletteBody::BindingHelp(&help),
+                    PaletteShape::BindingHelp,
+                    help.rows().len(),
+                ),
+                (
+                    PaletteBody::AgentAccess(&access),
+                    PaletteShape::AgentAccess,
+                    0,
+                ),
+            ] {
+                let filtered = match body {
+                    PaletteBody::Commands => state.filtered().to_vec(),
+                    _ => vec![BuiltInCommandId::RecentSessions; rows],
+                };
+                let Some(layout) = command_palette_layout(content, &filtered, 0, 0, shape) else {
+                    continue;
+                };
+                let mut canvas = vec![0_u8; usize::try_from(width * height * 4).unwrap()];
+                paint_command_palette(
+                    &mut SessionPickerTextCache::default(),
+                    &RenderContext::new(u16::MAX),
+                    &mut canvas,
+                    width,
+                    height,
+                    content,
+                    scale,
+                    1,
+                    &layout,
+                    session_picker_palette(ResolvedTheme::default()),
+                    &state,
+                    &keymap,
+                    None,
+                    true,
+                    body,
+                )
+                .unwrap();
+            }
+        }
+    }
+
     #[test]
     fn ultra_short_layout_is_rowless_and_keeps_children_inside_panel() {
         let content = Rect {
@@ -2000,15 +1851,192 @@ mod tests {
             height: 120,
         };
         let commands = [BuiltInCommandId::NewDojo];
-        let layout = command_palette_layout(content, &commands, 0, 0).unwrap();
+        let layout =
+            command_palette_layout(content, &commands, 0, 0, PaletteShape::Commands).unwrap();
         assert!(layout.rows.is_empty());
         assert_eq!(layout.list.height, 0);
         assert_eq!(
-            layout.footer.y + layout.footer.height,
+            layout.list.y + layout.list.height + FOOTER_HEIGHT,
             layout.panel.y + layout.panel.height
         );
-        assert!(layout.header.y + layout.header.height <= layout.panel.y + layout.panel.height);
+        assert!(layout.input.y >= layout.panel.y + BOX_EDGE);
+        assert!(layout.rule.y + layout.rule.height <= layout.list.y);
         assert!(layout.list.y + layout.list.height <= layout.panel.y + layout.panel.height);
+        // Agent access's detail line needs more than this.
+        assert!(
+            command_palette_layout(content, &commands, 0, 0, PaletteShape::AgentAccess).is_none()
+        );
+    }
+
+    /// Lists sit at 15% of the content height (at least 48 px down), as
+    /// wide as 560 px (key bindings 640) and 24 px clear of each side, and
+    /// move up only when their rows would not fit below.
+    #[test]
+    fn the_palette_is_top_anchored_and_sized_by_its_list() {
+        let commands = BuiltInCommandId::ALL;
+        for (width, height) in [(1280, 800), (960, 566), (640, 400), (420, 1000), (360, 240)] {
+            let content = Rect {
+                x: 17,
+                y: 34,
+                width,
+                height,
+            };
+            for (shape, maximum) in [
+                (PaletteShape::Commands, 560),
+                (PaletteShape::BindingHelp, 640),
+                (PaletteShape::AgentAccess, 560),
+            ] {
+                let layout = command_palette_layout(content, commands, 0, 0, shape).unwrap();
+                let panel = layout.panel;
+                assert_eq!(panel.width, (width - 48).min(maximum), "{width}x{height}");
+                assert_eq!(panel.x - content.x, (width - panel.width) / 2);
+                let top = (height * 15 / 100).max(48);
+                let lowest = content.y + height - 16 - panel.height;
+                assert_eq!(panel.y, (content.y + top).min(lowest), "{width}x{height}");
+                assert!(panel.y >= content.y + 16);
+                assert_eq!(layout.compact, panel.width < 420);
+                assert_eq!(layout.detail.is_some(), shape == PaletteShape::AgentAccess);
+                if let Some(detail) = layout.detail {
+                    assert_eq!(detail.y, layout.list.y + layout.list.height);
+                    assert_eq!(
+                        detail.y + detail.height + FOOTER_HEIGHT,
+                        panel.y + panel.height
+                    );
+                }
+            }
+        }
+        // A tall Window shows a full page at 15% down.
+        let content = Rect {
+            x: 0,
+            y: 0,
+            width: 1280,
+            height: 1000,
+        };
+        let layout =
+            command_palette_layout(content, commands, 0, 0, PaletteShape::Commands).unwrap();
+        assert_eq!(layout.panel.y, 150);
+        assert_eq!(layout.rows.len(), COMMAND_PALETTE_PAGE_ITEMS);
+    }
+
+    /// The input line sits inside the frame below the title, whatever the
+    /// scale or UI text size: the title's knockout never reaches it, and
+    /// the cursor follows the typed text with the start giving way.
+    #[test]
+    fn the_input_line_clears_the_title_and_its_cursor_follows_the_text() {
+        let content = Rect {
+            x: 0,
+            y: 34,
+            width: 960,
+            height: 566,
+        };
+        let layout =
+            command_palette_layout(content, BuiltInCommandId::ALL, 0, 0, PaletteShape::Commands)
+                .unwrap();
+        for scale in [120, 150, 180, 240] {
+            for context in [
+                RenderContext::new(u16::MAX),
+                RenderContext::new(u16::MAX).at_maximum_chrome_font_size(),
+            ] {
+                let mut cache = SessionPickerTextCache::default();
+                let regular = cache
+                    .cell_metrics(&context, ChromeTextStyle::Regular, scale, 1)
+                    .unwrap();
+                let bold = cache
+                    .cell_metrics(&context, ChromeTextStyle::Bold, scale, 1)
+                    .unwrap();
+                let cell = (regular.0.max(bold.0), regular.1.max(bold.1));
+                assert!(cell.1 <= chrome_maximum_cell_height(scale));
+                let chrome = ChromeBox {
+                    title: "commands",
+                    right_label: &["3/62"],
+                    legend: PaletteBody::Commands.legend(),
+                }
+                .layout(buffer_rect(layout.panel, scale), scale, cell);
+                let input = buffer_rect(layout.input, scale);
+                let title = chrome.title.unwrap();
+                assert!(
+                    title.knockout.y + title.knockout.height <= input.y,
+                    "scale {scale}"
+                );
+                assert!(input.y >= chrome.frame.y + chrome.border);
+                let list = buffer_rect(layout.list, scale);
+                let legend = chrome.legend.unwrap();
+                assert!(list.y + list.height <= legend.knockout.y, "scale {scale}");
+                assert_eq!(legend.pairs.len(), 3);
+
+                let line = InputLineLayout::new(input, INPUT_INSET * scale / 120, regular);
+                let (shown, cursor) = line.fitted(input, "split").unwrap();
+                assert_eq!(shown, "split");
+                assert_eq!(cursor.x, line.text_x + 5 * regular.0);
+                assert_eq!(cursor.width, regular.0);
+                assert!(cursor.y >= input.y && cursor.y + cursor.height <= input.y + input.height);
+                // An empty query puts the cursor where typing goes.
+                let (shown, cursor) = line.fitted(input, "").unwrap();
+                assert!(shown.is_empty());
+                assert_eq!(cursor.x, line.text_x);
+                // A long query keeps its end and the cursor stays inside.
+                let long = "x".repeat(400);
+                let (shown, cursor) = line.fitted(input, &long).unwrap();
+                assert!(shown.starts_with('…') && shown.ends_with('x'));
+                assert!(cursor.x + cursor.width <= line.end, "scale {scale}");
+                assert!(line.marker.x >= chrome.frame.x + chrome.border);
+            }
+        }
+    }
+    #[test]
+    fn the_count_label_says_how_many_match_of_how_many() {
+        assert_eq!(match_count_label(62, 62, ""), "62");
+        assert_eq!(match_count_label(3, 62, "split"), "3/62");
+        assert_eq!(match_count_label(0, 62, "zzz"), "0/62");
+        let mut state = CommandPaletteUi::new(palette_context());
+        let total = state.total();
+        assert_eq!(total, state.filtered().len());
+        assert_eq!(
+            PaletteBody::Commands.count_parts(&state),
+            vec![total.to_string()]
+        );
+        assert!(state.append_text("split"));
+        let shown = state.filtered().len();
+        assert!(shown > 0 && shown < total);
+        assert_eq!(
+            PaletteBody::Commands.count_parts(&state),
+            vec![format!("{shown}/{total}")]
+        );
+        let keymap = ResolvedKeymap::default();
+        let help = BindingHelpUi::new(&keymap);
+        assert_eq!(
+            PaletteBody::BindingHelp(&help).count_parts(&state),
+            vec![help.total().to_string()]
+        );
+        // Agent access puts what waits and a short read first, so they
+        // are the last to drop.
+        let lair_id = LairId::new();
+        let mut pending = crate::frontend::agent_access_test_entry(lair_id);
+        pending.kind = splinterm_protocol::AccessEntryKind::Pending;
+        pending.state = splinterm_protocol::AccessEntryState::Prompting;
+        let mut snapshot = crate::frontend::AccessSnapshot::new(
+            3,
+            splinterm_protocol::RememberedStoreStatus::Available,
+        );
+        snapshot.entries = vec![crate::frontend::agent_access_test_entry(lair_id), pending];
+        snapshot.truncated = true;
+        let access = AgentAccessUi::new(Some(&snapshot), None);
+        assert_eq!(access.total(), 2);
+        assert_eq!(
+            PaletteBody::AgentAccess(&access).count_parts(&state),
+            vec![
+                "1 waiting".to_owned(),
+                "first 512 only".to_owned(),
+                "2".to_owned()
+            ]
+        );
+        snapshot.truncated = false;
+        snapshot.entries.pop();
+        let access = AgentAccessUi::new(Some(&snapshot), None);
+        assert_eq!(
+            PaletteBody::AgentAccess(&access).count_parts(&state),
+            vec!["1".to_owned()]
+        );
     }
 
     #[test]
@@ -2019,7 +2047,7 @@ mod tests {
             width: 640,
             height: 400,
         };
-        let layout = command_palette_layout(content, &[], 0, 0).unwrap();
+        let layout = command_palette_layout(content, &[], 0, 0, PaletteShape::Commands).unwrap();
         assert!(layout.rows.is_empty());
         assert_eq!(layout.list.height, ROW_HEIGHT);
         assert_eq!(command_palette_hit_test(&layout, (10.0, 100.0)), None);
@@ -2082,7 +2110,7 @@ mod tests {
     #[test]
     fn context_menu_full_action_labels_fit_at_supported_scales() {
         let context = RenderContext::new(u16::MAX);
-        let mut cache = CommandPaletteTextCache::default();
+        let mut cache = SessionPickerTextCache::default();
         let actions = TAB_MENU_ACTIONS.into_iter().chain(
             [
                 TabMenuActionId::RenameLair,
@@ -2108,9 +2136,8 @@ mod tests {
                     height: 400,
                 };
                 for scale in [120, 150, 180, 240] {
-                    let label_width = cache
-                        .tab_menu_label_width(&context, &[action], scale, 1)
-                        .unwrap();
+                    let label_width =
+                        tab_menu_label_width(&mut cache, &context, &[action], scale, 1).unwrap();
                     let layout = tab_context_menu_layout(
                         bounds,
                         (bounds.x + width, 400),
@@ -2120,12 +2147,11 @@ mod tests {
                     .unwrap();
                     let clip = buffer_rect(layout.rows[0].title, scale);
                     for style in [ChromeTextStyle::Regular, ChromeTextStyle::Bold] {
-                        let text = cache.text(&context, action.title, style, scale, 1).unwrap();
+                        let text_width = text_width(&context, action.title, style, scale);
                         assert!(
-                            text.pixel_width() <= clip.width,
-                            "{} at width {width}, scale {scale}: {} > {}",
+                            text_width <= clip.width,
+                            "{} at width {width}, scale {scale}: {text_width} > {}",
                             action.title,
-                            text.pixel_width(),
                             clip.width
                         );
                     }
@@ -2135,102 +2161,79 @@ mod tests {
     }
 
     #[test]
-    fn key_binding_help_titles_itself_and_ellipsizes_its_source_column() {
+    fn list_titles_are_lowercase_and_the_source_column_ellipsizes() {
+        assert_eq!(PaletteBody::Commands.title(), "commands");
+        let keymap = ResolvedKeymap::default();
+        let help = BindingHelpUi::new(&keymap);
+        assert_eq!(PaletteBody::BindingHelp(&help).title(), "key bindings");
+        let access = AgentAccessUi::new(None, None);
+        assert_eq!(PaletteBody::AgentAccess(&access).title(), "agent access");
+        assert_eq!(
+            PaletteBody::Commands.legend(),
+            &[("↑↓", "move"), ("↵", "run"), ("esc", "close")]
+        );
+        assert_eq!(
+            PaletteBody::BindingHelp(&help).legend(),
+            &[
+                ("↑↓", "move"),
+                ("pgup pgdn", "page"),
+                ("ctrl u", "clear"),
+                ("esc", "close"),
+            ]
+        );
         let context = RenderContext::new(u16::MAX);
-        let mut cache = CommandPaletteTextCache::default();
-        assert_eq!(palette_title(true), "KEY BINDINGS");
-        assert_eq!(palette_title(false), "COMMANDS");
+        let mut cache = SessionPickerTextCache::default();
         for scale in [120, 150, 180, 240] {
-            let available = buffer_rect(
-                Rect {
-                    x: 0,
-                    y: 0,
-                    width: PANEL_MAX_WIDTH - CONTENT_INSET * 2,
-                    height: 1,
-                },
-                scale,
-            )
-            .width;
-            for title in [palette_title(true), palette_title(false)] {
-                let text_width = cache
-                    .text(&context, title, ChromeTextStyle::Bold, scale, 1)
-                    .unwrap()
-                    .pixel_width();
-                let slot = palette_title_width(text_width, available, scale);
-                assert!(text_width < slot, "{title} at scale {scale}");
-                assert!(slot <= available / 2);
-            }
-            // A narrow header keeps the original slot rather than none.
-            assert_eq!(
-                palette_title_width(u32::MAX, 0, scale),
-                98_u32.saturating_mul(scale).div_ceil(120)
-            );
             let source = "built-in profile splinterm";
             let clip = 72_u32.saturating_mul(scale).div_ceil(120);
-            let text = fitted_text(
+            paint_label(
                 &mut cache,
                 &context,
                 source,
                 ChromeTextStyle::Regular,
                 scale,
-                1,
                 clip,
                 false,
-            )
-            .unwrap();
-            assert!(text.pixel_width() <= clip);
+            );
             assert!(
-                cache.entries.keys().any(|(text, _)| text.ends_with('…')
-                    && source.starts_with(text.trim_end_matches('…')))
+                cache.drawn().any(|(text, _)| text.ends_with('…')
+                    && source.starts_with(text.trim_end_matches('…'))
+                    && text_width(&context, text, ChromeTextStyle::Regular, scale) <= clip),
+                "scale {scale}"
             );
         }
     }
 
     #[test]
     fn editable_fields_keep_their_caret_and_shortcuts_keep_their_key() {
-        assert_eq!(truncate_text_start("Ctrl+Shift+P", 12), "Ctrl+Shift+P");
         assert_eq!(truncate_text_start("Ctrl+Shift+P", 7), "…hift+P");
-        assert_eq!(truncate_text_start("Ctrl+界", 3), "…界");
-        assert_eq!(truncate_text_start("abc", 0), "");
         assert_eq!(editable_text("> ", "dojo", 20), "> dojo_");
         assert_eq!(editable_text("> ", "my-long-dojo-name", 12), "> …ojo-name_");
 
         let context = RenderContext::new(u16::MAX);
-        let mut cache = CommandPaletteTextCache::default();
+        let mut cache = SessionPickerTextCache::default();
         for scale in [120, 150, 180, 240] {
-            let cell = cache
-                .text(&context, "_", ChromeTextStyle::Regular, scale, 1)
-                .unwrap()
-                .frame
-                .cell_width;
+            let (cell, _) = cache
+                .cell_metrics(&context, ChromeTextStyle::Regular, scale, 1)
+                .unwrap();
             let clip = cell * 12;
-            let field = editable_field_text(
-                &mut cache,
-                &context,
-                "> ",
-                "my-long-dojo-name",
-                scale,
-                1,
-                clip,
-            )
-            .unwrap();
+            let mut canvas = vec![0_u8; 4];
+            let mut painter = ChromePainter::new(&mut cache, &context, &mut canvas, 1, 1, scale, 1);
+            let field = editable_field_text(&mut painter, "> ", "my-long-dojo-name", clip).unwrap();
             assert_eq!(field, "> …ojo-name_", "scale {scale}");
-            let short =
-                editable_field_text(&mut cache, &context, "> ", "dojo", scale, 1, clip).unwrap();
+            let short = editable_field_text(&mut painter, "> ", "dojo", clip).unwrap();
             assert_eq!(short, "> dojo_");
+            painter.finish();
             let shortcut = "Ctrl+Shift+PageDown";
-            let text = fitted_text(
+            paint_label(
                 &mut cache,
                 &context,
                 shortcut,
                 ChromeTextStyle::Regular,
                 scale,
-                1,
                 cell * 10,
                 true,
-            )
-            .unwrap();
-            assert!(text.pixel_width() <= cell * 10);
+            );
             assert!(cache.contains_source("…+PageDown"), "scale {scale}");
         }
     }
@@ -2241,17 +2244,17 @@ mod tests {
     /// stands in for it.
     #[test]
     fn maximum_zoom_menu_labels_fit_their_rows_or_end_in_an_ellipsis() {
-        use super::super::super::text::{CHROME_MAXIMUM_LINE_HEIGHT, chrome_maximum_cell_height};
+        use super::super::super::text::CHROME_MAXIMUM_LINE_HEIGHT;
 
         for height in [
             TAB_MENU_ROW_HEIGHT,
             ROW_HEIGHT - ROW_GUTTER_Y * 2,
-            HEADER_HEIGHT,
+            INPUT_HEIGHT,
+            DETAIL_HEIGHT,
             PREVIEW_LINE_HEIGHT,
             PROMPT_TITLE_HEIGHT,
             PROMPT_INPUT_HEIGHT,
             PROMPT_BUTTON_HEIGHT,
-            FOOTER_HEIGHT,
         ] {
             assert!(height >= CHROME_MAXIMUM_LINE_HEIGHT);
         }
@@ -2260,7 +2263,7 @@ mod tests {
             let context = RenderContext::new(u16::MAX)
                 .at_maximum_zoom(scale)
                 .at_maximum_chrome_font_size();
-            let mut cache = CommandPaletteTextCache::default();
+            let mut cache = SessionPickerTextCache::default();
             for width in [120, 160, 240, 640, 1268] {
                 let bounds = Rect {
                     x: 0,
@@ -2268,47 +2271,47 @@ mod tests {
                     width,
                     height: 754,
                 };
-                let label_width = cache
-                    .tab_menu_label_width(&context, &[action], scale, 1)
-                    .unwrap();
+                let label_width =
+                    tab_menu_label_width(&mut cache, &context, &[action], scale, 1).unwrap();
                 let layout =
                     tab_context_menu_layout(bounds, (width / 2, 300), &[action], label_width)
                         .unwrap();
                 let row = buffer_rect(layout.rows[0].rect, scale);
                 let clip = buffer_rect(layout.rows[0].title, scale);
                 for style in [ChromeTextStyle::Regular, ChromeTextStyle::Bold] {
-                    let full_width = cache
-                        .text(&context, action.title, style, scale, 1)
-                        .unwrap()
-                        .pixel_width();
-                    let text = fitted_text(
+                    let full_width = text_width(&context, action.title, style, scale);
+                    paint_label(
                         &mut cache,
                         &context,
                         action.title,
                         style,
                         scale,
-                        1,
                         clip.width,
                         false,
-                    )
-                    .unwrap();
-                    assert!(text.pixel_height() <= chrome_maximum_cell_height(scale));
-                    assert!(
-                        text.pixel_height() <= row.height,
-                        "scale {scale}, width {width}: {} > {}",
-                        text.pixel_height(),
-                        row.height
                     );
+                    let (drawn, _) = cache
+                        .drawn()
+                        .find(|(text, drawn_style)| {
+                            *drawn_style == style
+                                && action.title.starts_with(text.trim_end_matches('…'))
+                                && text_width(&context, text, style, scale) <= clip.width
+                        })
+                        .unwrap_or_else(|| panic!("scale {scale}, width {width}: no label"));
+                    let drawn = ChromeText::load_styled_with_context(drawn, scale, style, &context)
+                        .unwrap();
+                    assert!(drawn.pixel_height() <= chrome_maximum_cell_height(scale));
                     assert!(
-                        text.pixel_width() <= clip.width,
-                        "scale {scale}, width {width}"
+                        drawn.pixel_height() <= row.height,
+                        "scale {scale}, width {width}: {} > {}",
+                        drawn.pixel_height(),
+                        row.height
                     );
                     if full_width > clip.width {
                         assert!(
-                            cache.entries.keys().any(|(source, entry_style)| {
-                                *entry_style == style
-                                    && source.ends_with('…')
-                                    && action.title.starts_with(source.trim_end_matches('…'))
+                            cache.drawn().any(|(text, drawn_style)| {
+                                drawn_style == style
+                                    && text.ends_with('…')
+                                    && action.title.starts_with(text.trim_end_matches('…'))
                             }),
                             "scale {scale}, width {width}: no ellipsized label"
                         );
@@ -2316,9 +2319,8 @@ mod tests {
                 }
             }
             // A wide Window shows the whole label at the largest size.
-            let label_width = cache
-                .tab_menu_label_width(&context, &[action], scale, 1)
-                .unwrap();
+            let label_width =
+                tab_menu_label_width(&mut cache, &context, &[action], scale, 1).unwrap();
             let bounds = Rect {
                 x: 0,
                 y: 0,
@@ -2328,10 +2330,10 @@ mod tests {
             let layout =
                 tab_context_menu_layout(bounds, (600, 300), &[action], label_width).unwrap();
             let clip = buffer_rect(layout.rows[0].title, scale);
-            let full = cache
-                .text(&context, action.title, ChromeTextStyle::Bold, scale, 1)
-                .unwrap();
-            assert!(full.pixel_width() <= clip.width, "scale {scale}");
+            assert!(
+                text_width(&context, action.title, ChromeTextStyle::Bold, scale) <= clip.width,
+                "scale {scale}"
+            );
         }
     }
 
@@ -2481,7 +2483,7 @@ mod tests {
             None
         );
         let mut canvas = vec![0_u8; 640 * 400 * 4];
-        let mut cache = CommandPaletteTextCache::default();
+        let mut cache = SessionPickerTextCache::default();
         paint_dojo_prompt(
             &mut cache,
             &RenderContext::new(u16::MAX),
@@ -2594,7 +2596,7 @@ mod tests {
             other_dojo_ids: vec![DojoId::new()],
         });
         let mut canvas = vec![0_u8; 640 * 400 * 4];
-        let mut cache = CommandPaletteTextCache::default();
+        let mut cache = SessionPickerTextCache::default();
         let right_x = layout.panel.x + layout.panel.width - 1;
         let top_edge = usize::try_from((layout.panel.y * 640 + right_x) * 4).unwrap();
         let close_row = layout
@@ -2681,104 +2683,74 @@ mod tests {
             width: 640,
             height: 366,
         };
-        let state = CommandPaletteUi::new(CommandPaletteContext {
-            lair_id: LairId::new(),
-            lair_retention: splinterm_core::LairRetention::Disposable,
-            dojo_id: DojoId::new(),
-            dojo_name: "test".to_owned(),
-            pane_count: 1,
-            splint_id: SplintId::new(),
-            dojo_splints: vec![(SplintId::new(), 1)],
-            other_dojo_ids: Vec::new(),
-            previous_dojo_id: None,
-            next_dojo_id: None,
-            tab_move: CommandTabMoveAvailability::Neither,
-            focus_left: None,
-            focus_right: None,
-            focus_up: None,
-            focus_down: None,
-            clipboard_image_available: false,
-            viewport_detached: false,
-            controller_active: false,
-            forced_control_transfer: true,
-            revoke_all_available: false,
-            access_waiting: 0,
-            pending_transfer_id: None,
-            agent_status_incarnation: None,
-        });
+        let state = CommandPaletteUi::new(palette_context());
         let layout = command_palette_layout(
             content,
             state.filtered(),
             state.selected_index(),
             state.visible_start(),
+            PaletteShape::Commands,
         )
         .unwrap();
         let theme = ResolvedTheme::default();
         let mut canvas = vec![0_u8; 640 * 400 * 4];
         let before = canvas.clone();
-        let mut cache = CommandPaletteTextCache::default();
+        let mut cache = SessionPickerTextCache::default();
         let keymap = ResolvedKeymap::default();
-        paint_command_palette(
-            &mut cache,
-            &RenderContext::new(u16::MAX),
-            &mut canvas,
-            640,
-            400,
-            content,
-            120,
-            1,
-            &layout,
-            session_picker_palette(theme),
-            &state,
-            &keymap,
-            None,
-            true,
-            PaletteBody::Commands,
-        )
-        .unwrap();
+        let paint = |cache: &mut SessionPickerTextCache,
+                     canvas: &mut [u8],
+                     layout: &CommandPaletteLayout,
+                     body: PaletteBody<'_>| {
+            paint_command_palette(
+                cache,
+                &RenderContext::new(u16::MAX),
+                canvas,
+                640,
+                400,
+                content,
+                120,
+                1,
+                layout,
+                session_picker_palette(theme),
+                &state,
+                &keymap,
+                None,
+                true,
+                body,
+            )
+            .unwrap();
+        };
+        paint(&mut cache, &mut canvas, &layout, PaletteBody::Commands);
         let shaped = cache.len();
         assert!(shaped > 0);
         assert_ne!(canvas, before);
-        paint_command_palette(
-            &mut cache,
-            &RenderContext::new(u16::MAX),
-            &mut canvas,
-            640,
-            400,
-            content,
-            120,
-            1,
-            &layout,
-            session_picker_palette(theme),
-            &state,
-            &keymap,
-            None,
-            true,
-            PaletteBody::Commands,
-        )
-        .unwrap();
+        assert!(cache.contains_source("commands"));
+        assert!(cache.contains_source(&state.total().to_string()));
+        assert!(cache.contains_source("type a command"));
+        assert!(cache.contains_source("›"));
+        for (key, verb) in PaletteBody::Commands.legend() {
+            assert!(cache.contains_source(key) && cache.contains_source(verb));
+        }
+        paint(&mut cache, &mut canvas, &layout, PaletteBody::Commands);
         assert_eq!(cache.len(), shaped);
         let mut help = BindingHelpUi::new(&keymap);
-        paint_command_palette(
-            &mut cache,
-            &RenderContext::new(u16::MAX),
-            &mut canvas,
-            640,
-            400,
+        let help_layout = command_palette_layout(
             content,
-            120,
-            1,
-            &layout,
-            session_picker_palette(theme),
-            &state,
-            &keymap,
-            None,
-            true,
-            PaletteBody::BindingHelp(&help),
+            &vec![BuiltInCommandId::RecentSessions; help.rows().len()],
+            0,
+            0,
+            PaletteShape::BindingHelp,
         )
         .unwrap();
-        assert!(cache.len() > shaped);
-        assert!(cache.contains_source("> Search keybindings"));
+        paint(
+            &mut cache,
+            &mut canvas,
+            &help_layout,
+            PaletteBody::BindingHelp(&help),
+        );
+        assert!(cache.contains_source("filter by key or name"));
+        assert!(cache.contains_source("key bindings"));
+        assert!(cache.contains_source("pgup pgdn"));
 
         // The access list paints its rows as words, never colour alone.
         let lair_id = LairId::new();
@@ -2793,54 +2765,132 @@ mod tests {
             &vec![BuiltInCommandId::RecentSessions; access.rows().len()],
             0,
             0,
+            PaletteShape::AgentAccess,
         )
         .unwrap();
-        paint_command_palette(
+        paint(
             &mut cache,
-            &RenderContext::new(u16::MAX),
             &mut canvas,
-            640,
-            400,
-            content,
-            120,
-            1,
             &access_layout,
-            session_picker_palette(theme),
-            &state,
-            &keymap,
-            None,
-            true,
             PaletteBody::AgentAccess(&access),
-        )
-        .unwrap();
-        assert!(cache.contains_source("> Search agent access"));
-        assert!(cache.contains_source("AGENT ACCESS"));
+        );
+        assert!(cache.contains_source("search agent access"));
+        assert!(cache.contains_source("agent access"));
         assert!(cache.contains_source("ALWAYS"));
         assert!(cache.contains_source("not connected"));
-        assert!(cache.contains_source(&access.footer()));
+        // The detail line, whole or ending in `…`.
+        let footer = access.footer();
+        assert!(cache.drawn().any(|(text, _)| text == footer
+            || (text.ends_with('…') && footer.starts_with(text.trim_end_matches('…')))));
+        assert!(
+            cache.contains_source(
+                &PaletteBody::AgentAccess(&access)
+                    .count_parts(&state)
+                    .join(" · ")
+            )
+        );
 
         assert!(help.append_text("definitely absent xyz"));
-        let empty_layout = command_palette_layout(content, &[], 0, 0).unwrap();
+        let empty_layout =
+            command_palette_layout(content, &[], 0, 0, PaletteShape::BindingHelp).unwrap();
+        // The cache keeps three frames; repaint until the help list's
+        // placeholder has aged out.
+        for _ in 0..3 {
+            paint(
+                &mut cache,
+                &mut canvas,
+                &empty_layout,
+                PaletteBody::BindingHelp(&help),
+            );
+        }
+        assert!(cache.contains_source("definitely absent xyz"));
+        assert!(!cache.contains_source("filter by key or name"));
+        assert!(cache.contains_source(&format!("0/{}", help.total())));
+        assert!(cache.contains_source("No matching keybindings"));
+    }
+
+    /// The input line ends in a block cursor, an accent cell right after
+    /// the typed text, and the rule under it is drawn in the divider.
+    #[test]
+    fn the_input_line_draws_a_block_cursor_after_the_query() {
+        let content = Rect {
+            x: 0,
+            y: 34,
+            width: 640,
+            height: 366,
+        };
+        let mut state = CommandPaletteUi::new(palette_context());
+        assert!(state.append_text("split"));
+        let layout = command_palette_layout(
+            content,
+            state.filtered(),
+            state.selected_index(),
+            state.visible_start(),
+            PaletteShape::Commands,
+        )
+        .unwrap();
+        let theme = ResolvedTheme::default();
+        let palette = session_picker_palette(theme);
+        let render_context = RenderContext::new(u16::MAX);
+        let mut cache = SessionPickerTextCache::default();
+        let mut canvas = vec![0_u8; 640 * 400 * 4];
         paint_command_palette(
             &mut cache,
-            &RenderContext::new(u16::MAX),
+            &render_context,
             &mut canvas,
             640,
             400,
             content,
             120,
             1,
-            &empty_layout,
-            session_picker_palette(theme),
+            &layout,
+            palette,
             &state,
-            &keymap,
+            &ResolvedKeymap::default(),
             None,
             true,
-            PaletteBody::BindingHelp(&help),
+            PaletteBody::Commands,
         )
         .unwrap();
-        assert!(cache.contains_source("> definitely absent xyz_"));
-        assert!(cache.contains_source("No matching keybindings"));
+        assert!(cache.contains_source("split"));
+        assert!(!cache.contains_source("type a command"));
+        let pixel = |x: u32, y: u32| {
+            let index = usize::try_from((y * 640 + x) * 4).unwrap();
+            <[u8; 4]>::try_from(&canvas[index..index + 4]).unwrap()
+        };
+        let bgra = |color: u32| {
+            let [_, red, green, blue] = color.to_be_bytes();
+            [blue, green, red, u8::MAX]
+        };
+        let cell = cache
+            .cell_metrics(&render_context, ChromeTextStyle::Regular, 120, 1)
+            .unwrap();
+        let line = InputLineLayout::new(layout.input, INPUT_INSET, cell);
+        let (_, cursor) = line.fitted(layout.input, "split").unwrap();
+        assert_eq!(
+            cursor.x,
+            layout.input.x + INPUT_INSET + 2 * cell.0 + 5 * cell.0
+        );
+        let accent = bgra(palette.selected_rail);
+        for (x, y) in [
+            (cursor.x, cursor.y),
+            (cursor.x + cursor.width - 1, cursor.y + cursor.height - 1),
+        ] {
+            assert_eq!(pixel(x, y), accent, "({x}, {y})");
+        }
+        assert_ne!(pixel(cursor.x + cursor.width, cursor.y), accent);
+        assert_eq!(
+            pixel(layout.rule.x + layout.rule.width / 2, layout.rule.y),
+            bgra(palette.frame)
+        );
+        // The title's knockout breaks the focused frame.
+        let frame_y = layout.panel.y + 9;
+        assert_eq!(
+            pixel(layout.panel.x + 9, frame_y),
+            bgra(palette.focused_frame)
+        );
+        let knockout_x = layout.panel.x + 9 + BOX_LABEL_INSET;
+        assert_ne!(pixel(knockout_x, frame_y), bgra(palette.focused_frame));
     }
 
     #[test]
@@ -2856,36 +2906,13 @@ mod tests {
             width: 640,
             height: 366,
         };
-        let state = CommandPaletteUi::new(CommandPaletteContext {
-            lair_id: LairId::new(),
-            lair_retention: splinterm_core::LairRetention::Disposable,
-            dojo_id: DojoId::new(),
-            dojo_name: "test".to_owned(),
-            pane_count: 1,
-            splint_id: SplintId::new(),
-            dojo_splints: vec![(SplintId::new(), 1)],
-            other_dojo_ids: Vec::new(),
-            previous_dojo_id: None,
-            next_dojo_id: None,
-            tab_move: CommandTabMoveAvailability::Neither,
-            focus_left: None,
-            focus_right: None,
-            focus_up: None,
-            focus_down: None,
-            clipboard_image_available: false,
-            viewport_detached: false,
-            controller_active: false,
-            forced_control_transfer: true,
-            revoke_all_available: false,
-            access_waiting: 0,
-            pending_transfer_id: None,
-            agent_status_incarnation: None,
-        });
+        let state = CommandPaletteUi::new(palette_context());
         let layout = command_palette_layout(
             content,
             state.filtered(),
             state.selected_index(),
             state.visible_start(),
+            PaletteShape::Commands,
         )
         .unwrap();
         // Glassy Windows (0.65) with [menu] background-alpha 0.9.
@@ -2909,7 +2936,7 @@ mod tests {
         assert_eq!(palette.panel_fill[3], 247);
         let mut canvas = vec![0_u8; 640 * 400 * 4];
         paint_command_palette(
-            &mut CommandPaletteTextCache::default(),
+            &mut SessionPickerTextCache::default(),
             &RenderContext::new(theme.background_alpha),
             &mut canvas,
             640,

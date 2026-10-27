@@ -155,9 +155,9 @@ use crate::pane::{
 };
 use crate::renderer::{
     ChromeSource, ChromeSurface, ChromeText, ChromeTextStyle, CommandPaletteLayout,
-    CommandPaletteTextCache, CursorPresentation, DojoPromptLayout, HistoryOverlayStatus,
-    LairExplorerAction, LairExplorerLayout, LairExplorerMetrics, LairExplorerPresentationMode,
-    PaletteBody, PickerHitTarget, RenderContext, SessionPickerOverlayLayout, SessionPickerPurpose,
+    CursorPresentation, DojoPromptLayout, HistoryOverlayStatus, LairExplorerAction,
+    LairExplorerLayout, LairExplorerMetrics, LairExplorerPresentationMode, PaletteBody,
+    PaletteShape, PickerHitTarget, RenderContext, SessionPickerOverlayLayout, SessionPickerPurpose,
     SessionPickerTextCache, SessionPickerTextItem, SnapshotFrame, SnapshotOverlays,
     TabContextMenuLayout, TextRow, background_bgra, chrome_panel_fill, chrome_panel_palette,
     clear_snapshot_caches, command_palette_hit_test, command_palette_layout, dojo_prompt_hit_test,
@@ -172,7 +172,7 @@ use crate::renderer::{
     paint_snapshot_region_presented, paint_snapshot_rows_presented, paint_tab_context_menu,
     premultiplied_theme_rgba, scroll_snapshot_pixels, search_overlay_panel,
     session_picker_hit_test, session_picker_overlay_layout, snapshot_row_rect,
-    tab_context_menu_hit_test, tab_context_menu_layout, write_ppm,
+    tab_context_menu_hit_test, tab_context_menu_layout, tab_menu_label_width, write_ppm,
 };
 #[cfg(test)]
 use crate::renderer::{lair_explorer_layout, paint_box_drawing_cell};
@@ -1274,20 +1274,20 @@ fn assemble_app(
             command_palette: None,
             command_palette_layout: None,
             command_palette_pressed: None,
-            command_palette_text_cache: CommandPaletteTextCache::default(),
+            command_palette_text_cache: SessionPickerTextCache::default(),
             command_palette_open_focus: None,
             command_palette_reconcile_pending: false,
             dojo_prompt: None,
             dojo_prompt_explorer_target: None,
             dojo_prompt_layout: None,
             dojo_prompt_pressed: None,
-            dojo_prompt_text_cache: CommandPaletteTextCache::default(),
+            dojo_prompt_text_cache: SessionPickerTextCache::default(),
             tab_context_menu: None,
             tab_context_menu_anchor: (0, 0),
             tab_context_menu_layout: None,
             tab_context_menu_pressed: None,
             tab_context_menu_retarget: None,
-            tab_context_menu_text_cache: CommandPaletteTextCache::default(),
+            tab_context_menu_text_cache: SessionPickerTextCache::default(),
             session_picker,
             selector_kind: None,
             session_picker_targets: Vec::new(),
@@ -2557,20 +2557,20 @@ struct ModalState {
     command_palette: Option<CommandPaletteUi>,
     command_palette_layout: Option<CommandPaletteLayout>,
     command_palette_pressed: Option<BuiltInCommandId>,
-    command_palette_text_cache: CommandPaletteTextCache,
+    command_palette_text_cache: SessionPickerTextCache,
     command_palette_open_focus: Option<bool>,
     command_palette_reconcile_pending: bool,
     dojo_prompt: Option<DojoPromptUi>,
     dojo_prompt_explorer_target: Option<crate::ExplorerContextTarget>,
     dojo_prompt_layout: Option<DojoPromptLayout>,
     dojo_prompt_pressed: Option<TerminationDecision>,
-    dojo_prompt_text_cache: CommandPaletteTextCache,
+    dojo_prompt_text_cache: SessionPickerTextCache,
     tab_context_menu: Option<TabContextMenuUi>,
     tab_context_menu_anchor: (u32, u32),
     tab_context_menu_layout: Option<TabContextMenuLayout>,
     tab_context_menu_pressed: Option<TabMenuActionId>,
     tab_context_menu_retarget: Option<TabMenuRightPress>,
-    tab_context_menu_text_cache: CommandPaletteTextCache,
+    tab_context_menu_text_cache: SessionPickerTextCache,
     session_picker: Option<SessionPickerUi>,
     selector_kind: Option<SelectorKind>,
     session_picker_targets: Vec<SessionPickerTarget>,
@@ -12501,6 +12501,7 @@ impl App {
                 &placeholders,
                 access.selected_index(),
                 access.visible_start(),
+                PaletteShape::AgentAccess,
             )
         } else if let Some(help) = self.modal.binding_help.as_ref() {
             let placeholders = vec![BuiltInCommandId::RecentSessions; help.rows().len()];
@@ -12509,6 +12510,7 @@ impl App {
                 &placeholders,
                 help.selected_index(),
                 help.visible_start(),
+                PaletteShape::BindingHelp,
             )
         } else {
             self.modal.command_palette.as_ref().and_then(|palette| {
@@ -12517,6 +12519,7 @@ impl App {
                     palette.filtered(),
                     palette.selected_index(),
                     palette.visible_start(),
+                    PaletteShape::Commands,
                 )
             })
         };
@@ -12526,15 +12529,13 @@ impl App {
             .as_ref()
             .and_then(|prompt| dojo_prompt_layout(self.content_rect(), prompt));
         let tab_context_menu_layout = if let Some(menu) = self.modal.tab_context_menu.as_ref() {
-            let label_width = self
-                .modal
-                .tab_context_menu_text_cache
-                .tab_menu_label_width(
-                    &self.presentation.render_context,
-                    menu.actions(),
-                    self.surface.scale_120,
-                    self.presentation.renderer_generation,
-                )?;
+            let label_width = tab_menu_label_width(
+                &mut self.modal.tab_context_menu_text_cache,
+                &self.presentation.render_context,
+                menu.actions(),
+                self.surface.scale_120,
+                self.presentation.renderer_generation,
+            )?;
             tab_context_menu_layout(
                 Rect {
                     x: 0,
