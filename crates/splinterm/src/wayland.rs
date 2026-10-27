@@ -9888,6 +9888,9 @@ impl App {
                         Keysym::Left | Keysym::Right | Keysym::Up | Keysym::Down | Keysym::Tab => {
                             changed = confirmation.move_selection();
                         }
+                        Keysym::Return | Keysym::KP_Enter if confirmation.is_notice() => {
+                            close = true;
+                        }
                         Keysym::Return | Keysym::KP_Enter => execute = true,
                         Keysym::Escape => close = true,
                         _ => {}

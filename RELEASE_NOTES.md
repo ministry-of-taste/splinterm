@@ -589,8 +589,11 @@ a hostile program running as your account.
   what it renames in its frame, and no longer looks like a selected row. A
   saved-layout preview is an aligned table of each pane's Dojo, launch
   recipe and directory (keeping the directory's end, `~` for home) instead
-  of a wrapped paragraph, and no longer lists split ratios; a Dojo's
-  Restore lists that Dojo only. A prompt is as tall as its text, so a long
+  of a wrapped paragraph, names the Lair as the Explorer does ("Lair 1",
+  not its internal name), and no longer lists split ratios. Restore lists
+  only the exited panes it would start, so its count matches its rows, and
+  when every pane is still running it says there is nothing to restore,
+  with only Close. A prompt is as tall as its text, so a long
   name no longer cuts off the question; a name is shown on one line, its
   control and invisible characters removed. Terminate says "Running
   programs are stopped." A Window too small for a prompt, or too narrow

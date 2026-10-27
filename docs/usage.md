@@ -746,8 +746,11 @@ Retention state has a narrow meaning:
 Preview is body-free. It lists each pane as a row: its Dojo, its launch recipe
 (the application's file name and arguments, `shell` for a shell, or
 `not restorable` when it has none) and its working directory, with `~` for your
-home directory. A Dojo's Restore lists that Dojo's panes only. The recipe comes
-from the saved layout, never from the title a program set.
+home directory, and names the Lair and its Dojos as the Explorer does. Restore
+lists only the exited panes it would start, so its count matches its rows; when
+every pane is still running, it says there is nothing to restore and offers
+only Close. The recipe comes from the saved layout, never from the title a
+program set.
 Splinterm does not infer foreground applications from `/proc`, titles, prompts,
 or terminal output and does not save process memory, PTYs, editor state, shell
 state, environment values, secrets, terminal bodies, scrollback, clipboard, or

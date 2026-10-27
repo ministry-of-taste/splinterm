@@ -869,10 +869,12 @@ mod tests {
         )
     }
 
+    /// A saved Lair whose three listed Splints a restore would launch.
     fn lair_target() -> LairPromptTarget {
+        let lair_id = LairId::new();
         LairPromptTarget {
             topology_revision: TopologyRevision::new(9),
-            lair_id: LairId::new(),
+            lair_id,
             dojo_id: None,
             name: "m5a".to_owned(),
             retention: LairRetention::Saved,
@@ -884,7 +886,14 @@ mod tests {
                 "Not restored: scrollback, running programs' state, shell state, environment, clipboard, images.",
             ]
             .join("\n"),
-            targets: Vec::new(),
+            targets: (0..3)
+                .map(|incarnation| splinterm_protocol::MutationTarget {
+                    lair_id,
+                    dojo_id: DojoId::new(),
+                    splint_id: SplintId::new(),
+                    incarnation,
+                })
+                .collect(),
         }
     }
 
@@ -1301,12 +1310,12 @@ mod tests {
         let restore = DojoPromptUi::restore_lair(lair_target());
         let (title, body) = restore.title_and_body();
         assert_eq!(title, "restore saved lair");
-        assert!(body.starts_with("Restore 0 captured Splints into ‘m5a’?\nDojo 1\t"));
+        assert!(body.starts_with("Restore 3 captured Splints into ‘m5a’?\nDojo 1\t"));
         let lines = body_lines(&body, 48, SUMMARY_LINES);
         assert_eq!(
             lines[0],
             BodyLine::Text {
-                text: "Restore 0 captured Splints into ‘m5a’?".to_owned(),
+                text: "Restore 3 captured Splints into ‘m5a’?".to_owned(),
                 primary: true
             }
         );

@@ -223,7 +223,16 @@ impl RestoreLairUi {
         self.decision
     }
 
+    /// Whether nothing would be restored, every Splint of the target still
+    /// running: the prompt then says so and offers only Close.
+    pub(crate) const fn is_notice(&self) -> bool {
+        self.target.targets.is_empty()
+    }
+
     pub(crate) fn move_selection(&mut self) -> bool {
+        if self.is_notice() {
+            return false;
+        }
         self.decision = match self.decision {
             TerminationDecision::Cancel => TerminationDecision::Terminate,
             TerminationDecision::Terminate => TerminationDecision::Cancel,
@@ -232,7 +241,7 @@ impl RestoreLairUi {
     }
 
     pub(crate) fn select(&mut self, decision: TerminationDecision) -> bool {
-        if self.decision == decision {
+        if self.is_notice() || self.decision == decision {
             return false;
         }
         self.decision = decision;
@@ -240,16 +249,18 @@ impl RestoreLairUi {
     }
 
     pub(crate) fn command(&self) -> Option<WindowTopologyCommand> {
-        (self.decision == TerminationDecision::Terminate).then_some(self.target.dojo_id.map_or(
-            WindowTopologyCommand::RestoreLair {
-                expected_topology_revision: self.target.topology_revision,
-                lair_id: self.target.lair_id,
-            },
-            |dojo_id| WindowTopologyCommand::RestoreDojo {
-                expected_topology_revision: self.target.topology_revision,
-                dojo_id,
-            },
-        ))
+        (self.decision == TerminationDecision::Terminate && !self.is_notice()).then_some(
+            self.target.dojo_id.map_or(
+                WindowTopologyCommand::RestoreLair {
+                    expected_topology_revision: self.target.topology_revision,
+                    lair_id: self.target.lair_id,
+                },
+                |dojo_id| WindowTopologyCommand::RestoreDojo {
+                    expected_topology_revision: self.target.topology_revision,
+                    dojo_id,
+                },
+            ),
+        )
     }
 }
 
@@ -321,6 +332,7 @@ impl DojoPromptUi {
     pub(crate) const fn is_preview(&self) -> bool {
         match self {
             Self::PreviewLair(_) => true,
+            Self::RestoreLair(prompt) => prompt.is_notice(),
             Self::RevokeAccess(prompt) => prompt.is_notice(),
             _ => false,
         }
@@ -356,8 +368,20 @@ impl DojoPromptUi {
             ),
             Self::RenameLair(_) => ("rename lair", String::new()),
             Self::PreviewLair(target) => ("saved lair preview", target.preview.clone()),
+            Self::RestoreLair(prompt) if prompt.is_notice() => (
+                if prompt.target().dojo_id.is_some() {
+                    "restore dojo"
+                } else {
+                    "restore saved lair"
+                },
+                format!(
+                    "Nothing to restore: every Splint in ‘{}’ is running.",
+                    prompt_name(&prompt.target().name, QUESTION_NAME_CELLS)
+                ),
+            ),
             // The question names the count and the target, so the preview's
-            // summary line, which names them again, is left out.
+            // summary line, which names them again, is left out. Its rows are
+            // the Splints the restore launches, so they match the count.
             Self::RestoreLair(prompt) => (
                 if prompt.target().dojo_id.is_some() {
                     "restore dojo"
@@ -444,6 +468,7 @@ impl DojoPromptUi {
 
     pub(crate) const fn confirmation_label(&self) -> Option<&'static str> {
         match self {
+            Self::RestoreLair(prompt) if prompt.is_notice() => None,
             Self::RestoreLair(_) => Some("Restore"),
             Self::Terminate(_) | Self::TerminateLair(_) => Some("Terminate"),
             Self::RevokeAccess(prompt) => prompt.confirmation_label(),
@@ -461,6 +486,7 @@ impl DojoPromptUi {
     pub(crate) const fn decision(&self) -> Option<TerminationDecision> {
         match self {
             Self::Terminate(prompt) => Some(prompt.decision()),
+            Self::RestoreLair(prompt) if prompt.is_notice() => None,
             Self::RestoreLair(prompt) => Some(prompt.decision()),
             Self::TerminateLair(prompt) => Some(prompt.decision()),
             Self::RevokeAccess(prompt) => prompt.decision(),
@@ -3056,6 +3082,57 @@ mod tests {
                 targets: target.targets,
             })
         );
+    }
+
+    #[test]
+    fn restore_counts_what_it_lists_and_says_when_nothing_would_be_restored() {
+        let lair_id = LairId::new();
+        let dojo_id = DojoId::new();
+        let restorable = splinterm_protocol::MutationTarget {
+            lair_id,
+            dojo_id,
+            splint_id: SplintId::new(),
+            incarnation: 3,
+        };
+        let target = LairPromptTarget {
+            topology_revision: splinterm_core::TopologyRevision::new(7),
+            lair_id,
+            dojo_id: Some(dojo_id),
+            name: "Dojo 1".to_owned(),
+            retention: LairRetention::Saved,
+            preview: "Lair 1 · saved · 1 Dojo\nDojo 1\tshell\t~".to_owned(),
+            targets: vec![restorable],
+        };
+        let restore = DojoPromptUi::restore_lair(target.clone());
+        let (title, body) = restore.title_and_body();
+        assert_eq!(title, "restore dojo");
+        assert_eq!(
+            body,
+            "Restore 1 captured Splint into ‘Dojo 1’?\nDojo 1\tshell\t~"
+        );
+        assert!(!restore.is_preview());
+        assert_eq!(restore.confirmation_label(), Some("Restore"));
+
+        // Every Splint is running: no Restore, a notice and Close only.
+        let mut notice = DojoPromptUi::restore_lair(LairPromptTarget {
+            targets: Vec::new(),
+            ..target
+        });
+        let (title, body) = notice.title_and_body();
+        assert_eq!(title, "restore dojo");
+        assert_eq!(
+            body,
+            "Nothing to restore: every Splint in ‘Dojo 1’ is running."
+        );
+        assert!(notice.is_preview());
+        assert_eq!(notice.confirmation_label(), None);
+        assert_eq!(notice.decision(), None);
+        let DojoPromptUi::RestoreLair(prompt) = &mut notice else {
+            unreachable!("a restore prompt");
+        };
+        assert!(!prompt.move_selection());
+        assert!(!prompt.select(TerminationDecision::Terminate));
+        assert_eq!(prompt.command(), None);
     }
 
     #[test]

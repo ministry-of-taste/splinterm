@@ -21,7 +21,7 @@ use splinterm::{
         NavigationAvailability, NavigationExplorerSplintTarget, NavigationExplorerView,
         NavigationNodeId, NavigationPermission, NavigationPickerKind, NavigationPickerView,
         NavigationProjection, NavigationProjectionContext, NavigationWindowState,
-        WindowAgentStatus,
+        WindowAgentStatus, dojo_labels, lair_display_label,
     },
     session_picker::{SessionEntry, collect_sessions, dojo_has_fully_running_pane_layout},
     tab::{DojoTab, OpenTabOutcome, WindowTabSet},
@@ -1229,15 +1229,40 @@ fn collect_scoped_lair_targets(
     Ok(targets)
 }
 
-/// A saved Lair's preview for its prompts: a summary line, then one
-/// tab-separated row per Splint (its Dojo, what it launches, its directory),
-/// which the prompt lines up as a table, then where it came from and what a
-/// restore leaves out. `dojo` keeps only that Dojo's rows, for a Dojo's
-/// restore. Every name and path is made one line, so none can add a line or
-/// a cell, and a directory under `home` starts with `~`.
+/// The name a prompt shows for `lair`: its Explorer label ("Lair N" for a
+/// generated name) from the whole catalog `lairs`, else its stored name, else
+/// its ID when it has no name. Callers make it one line before showing it.
+fn lair_prompt_label(lairs: &[splinterm_core::Lair], lair: &splinterm_core::Lair) -> String {
+    lair_display_label(lairs, lair.id).unwrap_or_else(|| {
+        if lair.name.trim().is_empty() {
+            lair.id.to_string()
+        } else {
+            lair.name.clone()
+        }
+    })
+}
+
+/// The name a prompt shows for the Dojo `dojo_id` of `lair`: its Explorer
+/// label ("Dojo N" for a generated name).
+fn dojo_prompt_label(lair: &splinterm_core::Lair, dojo_id: DojoId) -> Option<String> {
+    lair.dojos
+        .iter()
+        .zip(dojo_labels(lair))
+        .find_map(|(dojo, label)| (dojo.id == dojo_id).then_some(label))
+}
+
+/// A saved Lair's preview for its prompts: a summary line naming the Lair as
+/// the Explorer does (from the whole catalog `lairs`), then one tab-separated
+/// row per Splint (its Dojo, what it launches, its directory), which the
+/// prompt lines up as a table, then where it came from and what a restore
+/// leaves out. `restoring` keeps only the rows of the Splints a restore
+/// launches, so its count and its rows agree. Every name and path is made one
+/// line, so none can add a line or a cell, and a directory under `home`
+/// starts with `~`.
 fn saved_layout_preview(
+    lairs: &[splinterm_core::Lair],
     lair: &splinterm_core::Lair,
-    dojo: Option<DojoId>,
+    restoring: Option<&[MutationTarget]>,
     home: Option<&std::path::Path>,
 ) -> String {
     /// What a restore launches, from the trusted recipe rather than the
@@ -1264,10 +1289,14 @@ fn saved_layout_preview(
     fn leaves(
         dojo: &str,
         node: &LayoutNode,
+        restoring: Option<&[MutationTarget]>,
         home: Option<&std::path::Path>,
         output: &mut Vec<String>,
     ) {
         match node {
+            LayoutNode::Leaf(splint)
+                if restoring
+                    .is_some_and(|targets| !targets.iter().any(|t| t.splint_id == splint.id)) => {}
             LayoutNode::Leaf(splint) => output.push(format!(
                 "{}\t{}\t{}",
                 single_line(dojo),
@@ -1275,8 +1304,8 @@ fn saved_layout_preview(
                 single_line(&home_relative(&splint.cwd, home))
             )),
             LayoutNode::Branch { first, second, .. } => {
-                leaves(dojo, first, home, output);
-                leaves(dojo, second, home, output);
+                leaves(dojo, first, restoring, home, output);
+                leaves(dojo, second, restoring, home, output);
             }
         }
     }
@@ -1284,15 +1313,11 @@ fn saved_layout_preview(
     let retention = format!("{:?}", lair.retention).to_lowercase();
     let mut lines = vec![format!(
         "{} · {retention} · {dojos} Dojo{}",
-        single_line(&lair.name),
+        single_line(&lair_prompt_label(lairs, lair)),
         if dojos == 1 { "" } else { "s" }
     )];
-    for shown in lair
-        .dojos
-        .iter()
-        .filter(|candidate| dojo.is_none_or(|id| candidate.id == id))
-    {
-        leaves(&shown.name, &shown.root, home, &mut lines);
+    for (shown, label) in lair.dojos.iter().zip(dojo_labels(lair)) {
+        leaves(&label, &shown.root, restoring, home, &mut lines);
     }
     if let Some(provenance) = &lair.provenance {
         lines.push(format!("Origin: {}", single_line(&provenance.to_string())));
@@ -1323,6 +1348,7 @@ fn preview_home() -> Option<std::path::PathBuf> {
 
 fn build_lair_prompt_target(
     topology_revision: TopologyRevision,
+    lairs: &[splinterm_core::Lair],
     lair: &splinterm_core::Lair,
     kind: LairPromptKind,
     expected_retention: Option<splinterm_core::LairRetention>,
@@ -1351,9 +1377,20 @@ fn build_lair_prompt_target(
         topology_revision,
         lair_id: lair.id,
         dojo_id: None,
-        name: lair.name.clone(),
+        // A rename edits the stored name; every other prompt names the Lair
+        // as the Explorer does.
+        name: if kind == LairPromptKind::Rename {
+            lair.name.clone()
+        } else {
+            lair_prompt_label(lairs, lair)
+        },
         retention: lair.retention,
-        preview: saved_layout_preview(lair, None, preview_home().as_deref()),
+        preview: saved_layout_preview(
+            lairs,
+            lair,
+            (kind == LairPromptKind::Restore).then_some(targets.as_slice()),
+            preview_home().as_deref(),
+        ),
         targets,
     })
 }
@@ -1375,7 +1412,7 @@ async fn lair_prompt_target(
         .iter()
         .find(|lair| lair.id == lair_id)
         .context("captured Lair is absent")?;
-    build_lair_prompt_target(topology_revision, lair, kind, expected_retention)
+    build_lair_prompt_target(topology_revision, &lairs, lair, kind, expected_retention)
 }
 
 fn validate_lair_retention_target(
@@ -1895,17 +1932,17 @@ async fn show_dojo_restore_prompt(
                 .map(|dojo| (lair, dojo))
         })
         .context("captured Dojo is absent")?;
+    // Only the exited Splints are restored. When none is, the prompt says
+    // there is nothing to restore rather than offering Restore.
+    let targets = collect_scoped_lair_targets(lair, LairTargetState::Exited, Some(dojo_id))?;
     let target = LairPromptTarget {
         topology_revision,
         lair_id: lair.id,
         dojo_id: Some(dojo_id),
-        name: dojo.name.clone(),
+        name: dojo_prompt_label(lair, dojo_id).unwrap_or_else(|| dojo.name.clone()),
         retention: lair.retention,
-        preview: saved_layout_preview(lair, Some(dojo_id), preview_home().as_deref()),
-        targets: collect_lair_targets(lair, LairTargetState::Exited)?
-            .into_iter()
-            .filter(|target| target.dojo_id == dojo_id)
-            .collect(),
+        preview: saved_layout_preview(&lairs, lair, Some(&targets), preview_home().as_deref()),
+        targets,
     };
     if let Some((expected_revision, splint_id, last_incarnation)) = expected_splint {
         anyhow::ensure!(
@@ -2093,6 +2130,25 @@ async fn explorer_prompt(
     explorer_prompt_from_catalog(&lairs, topology_revision, guard, kind)
 }
 
+/// The live Splints of `dojo` with their incarnations, which a Dojo's
+/// rename carries.
+fn live_dojo_targets(lair_id: LairId, dojo: &splinterm_core::Dojo) -> Vec<MutationTarget> {
+    let mut ids = Vec::new();
+    layout_splint_ids(&dojo.root, &mut ids);
+    ids.into_iter()
+        .filter_map(|id| {
+            let pane = dojo.root.find_splint(id)?;
+            matches!(pane.state, SplintState::Starting | SplintState::Running).then_some(())?;
+            Some(MutationTarget {
+                lair_id,
+                dojo_id: dojo.id,
+                splint_id: id,
+                incarnation: pane.last_incarnation?,
+            })
+        })
+        .collect()
+}
+
 fn explorer_prompt_from_catalog(
     lairs: &[splinterm_core::Lair],
     topology_revision: TopologyRevision,
@@ -2112,17 +2168,19 @@ fn explorer_prompt_from_catalog(
         .iter()
         .find(|lair| lair.id == lair_id && lair.lifetime.is_persistent())
         .context("captured Lair is absent")?;
+    // A rename edits the stored name; every other prompt names its target as
+    // the Explorer does.
     let mut target = LairPromptTarget {
         topology_revision,
         lair_id,
         dojo_id,
-        name: lair.name.clone(),
+        name: if kind == LairPromptKind::Rename {
+            lair.name.clone()
+        } else {
+            lair_prompt_label(lairs, lair)
+        },
         retention: lair.retention,
-        preview: saved_layout_preview(
-            lair,
-            dojo_id.filter(|_| kind == LairPromptKind::Restore),
-            preview_home().as_deref(),
-        ),
+        preview: String::new(),
         targets: Vec::new(),
     };
     if let Some(dojo_id) = dojo_id {
@@ -2131,24 +2189,13 @@ fn explorer_prompt_from_catalog(
             .iter()
             .find(|dojo| dojo.id == dojo_id)
             .context("captured Dojo is absent")?;
-        target.name.clone_from(&dojo.name);
+        target.name = if kind == LairPromptKind::Rename {
+            dojo.name.clone()
+        } else {
+            dojo_prompt_label(lair, dojo_id).unwrap_or_else(|| dojo.name.clone())
+        };
         if kind == LairPromptKind::Rename {
-            let mut ids = Vec::new();
-            layout_splint_ids(&dojo.root, &mut ids);
-            target.targets = ids
-                .into_iter()
-                .filter_map(|id| {
-                    let pane = dojo.root.find_splint(id)?;
-                    matches!(pane.state, SplintState::Starting | SplintState::Running)
-                        .then_some(())?;
-                    Some(MutationTarget {
-                        lair_id,
-                        dojo_id,
-                        splint_id: id,
-                        incarnation: pane.last_incarnation?,
-                    })
-                })
-                .collect();
+            target.targets = live_dojo_targets(lair_id, dojo);
         }
         if kind == LairPromptKind::Terminate {
             let mut ids = Vec::new();
@@ -2189,6 +2236,12 @@ fn explorer_prompt_from_catalog(
     if kind == LairPromptKind::Terminate && dojo_id.is_none() {
         validate_explorer_lair_termination_capture(lair, &target.targets)?;
     }
+    target.preview = saved_layout_preview(
+        lairs,
+        lair,
+        (kind == LairPromptKind::Restore).then_some(target.targets.as_slice()),
+        preview_home().as_deref(),
+    );
     Ok(target)
 }
 
@@ -4135,7 +4188,10 @@ mod tests {
         topology_identity_diff, validate_exited_close_target, validate_lair_retention_target,
         window_has_tab_capacity,
     };
-    use super::{ExplorerContextTarget, LairPromptKind, NavigationNodeId};
+    use super::{
+        ExplorerContextTarget, LairPromptKind, MutationTarget, NavigationNodeId, dojo_labels,
+        dojo_prompt_label, lair_prompt_label,
+    };
     use crate::app::pane_bridge::{PaneTask, pane_claims_initial_control};
     use splinterm::navigation_projection::{
         NavigationAction, NavigationAvailability, NavigationCapability,
@@ -4411,6 +4467,21 @@ mod tests {
         assert_eq!(restore_targets.len(), 1);
         assert_eq!(restore_targets[0].splint_id, exited_id);
         assert_eq!(restore_targets[0].incarnation, 7);
+        // The restore's preview lists the Splints it launches and no
+        // running one, so its count and its rows agree.
+        let preview = saved_layout_preview(
+            std::slice::from_ref(&lair),
+            &lair,
+            Some(&restore_targets),
+            None,
+        );
+        assert_eq!(
+            preview.lines().filter(|line| line.contains('\t')).count(),
+            restore_targets.len()
+        );
+        // With every Splint running there is nothing to restore and no row.
+        let none = saved_layout_preview(std::slice::from_ref(&lair), &lair, Some(&[]), None);
+        assert!(!none.contains('\t'));
 
         let terminate_targets = collect_lair_targets(&lair, LairTargetState::Live).unwrap();
         assert_eq!(terminate_targets.len(), 2);
@@ -4433,14 +4504,22 @@ mod tests {
         splint.command = vec![String::new()];
         lair.dojos.push(second);
         let home = PathBuf::from("/home/user");
-        let lines = saved_layout_preview(&lair, None, Some(&home));
+        let catalog = std::slice::from_ref(&lair);
+        let lines = saved_layout_preview(catalog, &lair, None, Some(&home));
         let lines = lines.lines().collect::<Vec<_>>();
         assert_eq!(lines[0], "saved · disposable · 2 Dojos");
-        assert_eq!(lines[1], format!("{}\tshell\t~/src", lair.dojos[0].name));
+        // Dojos are named as the Explorer names them.
+        assert_eq!(lines[1], format!("{}\tshell\t~/src", dojo_labels(&lair)[0]));
         assert_eq!(lines[2], format!("build\t{NOT_RESTORABLE}\t~"));
         assert_eq!(lines[3], "Origin: from elsewhere");
-        // A Dojo's restore lists that Dojo's rows only.
-        let only = saved_layout_preview(&lair, Some(lair.dojos[1].id), None);
+        // A restore lists the rows of the Splints it launches only.
+        let restoring = [MutationTarget {
+            lair_id: lair.id,
+            dojo_id: lair.dojos[1].id,
+            splint_id: lair.dojos[1].default_focus,
+            incarnation: 1,
+        }];
+        let only = saved_layout_preview(catalog, &lair, Some(&restoring), None);
         let rows = only
             .lines()
             .filter(|line| line.contains('\t'))
@@ -4449,6 +4528,42 @@ mod tests {
         assert_eq!(
             home_relative(&PathBuf::from("/home/username"), Some(&home)),
             "/home/username"
+        );
+    }
+
+    #[test]
+    fn saved_layout_preview_names_the_lair_as_the_explorer_does() {
+        // A generated name is the Explorer's "Lair N", never the internal
+        // name; the numbers count the persistent Lairs before it.
+        let first =
+            splinterm_core::Lair::new("terminal-1793144588160264270-1363414", "/tmp".into());
+        let second =
+            splinterm_core::Lair::new("terminal-1793144588160264271-1363415", "/tmp".into());
+        let catalog = [first, second];
+        let summary = |lairs: &[splinterm_core::Lair], lair: &splinterm_core::Lair| {
+            saved_layout_preview(lairs, lair, None, None)
+                .lines()
+                .next()
+                .unwrap()
+                .to_owned()
+        };
+        assert_eq!(
+            summary(&catalog, &catalog[1]),
+            "Lair 2 · disposable · 1 Dojo"
+        );
+        // A chosen name is kept, made one line.
+        let named = splinterm_core::Lair::new("work\nnotes", "/tmp".into());
+        assert_eq!(
+            summary(std::slice::from_ref(&named), &named),
+            "work notes · disposable · 1 Dojo"
+        );
+        // With no name and no Explorer label, the ID stands in.
+        let unnamed = splinterm_core::Lair::transient("", "/tmp".into());
+        assert_eq!(lair_prompt_label(&[], &unnamed), unnamed.id.to_string());
+        // A Dojo's prompt names it as the Explorer does too.
+        assert_eq!(
+            dojo_prompt_label(&catalog[0], catalog[0].dojos[0].id).as_deref(),
+            Some(dojo_labels(&catalog[0])[0].as_str())
         );
     }
 
@@ -4465,6 +4580,7 @@ mod tests {
         assert!(
             build_lair_prompt_target(
                 revision,
+                std::slice::from_ref(&lair),
                 &lair,
                 LairPromptKind::Restore,
                 Some(LairRetention::Saved),
@@ -4474,6 +4590,7 @@ mod tests {
         assert!(
             build_lair_prompt_target(
                 revision,
+                std::slice::from_ref(&lair),
                 &lair,
                 LairPromptKind::Preview,
                 Some(LairRetention::Pinned),
@@ -4490,6 +4607,7 @@ mod tests {
         lair.dojos[0].name = "Dojo\n1\tx".to_owned();
         let target = build_lair_prompt_target(
             revision,
+            std::slice::from_ref(&lair),
             &lair,
             LairPromptKind::Restore,
             Some(LairRetention::Saved),
@@ -4537,6 +4655,7 @@ mod tests {
         assert!(
             build_lair_prompt_target(
                 revision,
+                std::slice::from_ref(&lair),
                 &lair,
                 LairPromptKind::Preview,
                 Some(LairRetention::Disposable),
