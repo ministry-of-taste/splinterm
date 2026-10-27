@@ -1,0 +1,34 @@
+# A synthetic Omarchy 4 theme shaped like one that names semantic colors:
+# warning, success, signal, border and dark_background. Its ANSI yellow slot
+# is ultraviolet on purpose, so only the warning key carries a warning hue.
+mode = "dark"
+
+accent = "#5ec4ff"
+selection = "#2a2540"
+muted = "#6a6488"
+border = "#3d3654"
+signal = "#ff5fd2"
+warning = "#ffb347"
+success = "#5fd78f"
+
+background = "#14111f"
+dark_background = "#0d0b15"
+lighter_background = "#1f1a30"
+
+foreground = "#d8d4ea"
+dark_foreground = "#6a6488"
+bright_foreground = "#f2efff"
+
+red = "#ff5f6d"
+yellow = "#9b6bff"
+green = "#5fd78f"
+cyan = "#4fd1c5"
+blue = "#5ec4ff"
+magenta = "#ff5fd2"
+
+bright_red = "#ff8a94"
+bright_yellow = "#b794ff"
+bright_green = "#8ae6ae"
+bright_cyan = "#7ee0d6"
+bright_blue = "#8ad4ff"
+bright_magenta = "#ff8ade"

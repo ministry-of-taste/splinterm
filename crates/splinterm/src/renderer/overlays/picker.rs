@@ -9,6 +9,10 @@ use anyhow::Result;
 use unicode_width::UnicodeWidthChar;
 
 use crate::{
+    color::{
+        TEXT_MIN_CONTRAST, contrast_corrected, contrast_corrected_toward, contrast_ratio,
+        mix_linear, packed_channels, relative_luminance, rgb_channels,
+    },
     config::{OmarchyShellSettings, ResolvedTheme},
     frontend::PickerHitTarget,
     geometry::Rect,
@@ -377,85 +381,6 @@ pub(crate) fn session_picker_hit_test(
     })
 }
 
-fn linear_channel(channel: u8) -> f64 {
-    let value = f64::from(channel) / 255.0;
-    if value <= 0.04045 {
-        value / 12.92
-    } else {
-        ((value + 0.055) / 1.055).powf(2.4)
-    }
-}
-
-fn srgb_channel(channel: f64) -> u8 {
-    let value = if channel <= 0.003_130_8 {
-        channel * 12.92
-    } else {
-        1.055 * channel.powf(1.0 / 2.4) - 0.055
-    };
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let encoded = (value.clamp(0.0, 1.0) * 255.0).round() as u8;
-    encoded
-}
-
-fn rgb_channels(color: u32) -> [u8; 3] {
-    let [_, red, green, blue] = color.to_be_bytes();
-    [red, green, blue]
-}
-
-fn packed_channels([red, green, blue]: [u8; 3]) -> u32 {
-    u32::from_be_bytes([0, red, green, blue])
-}
-
-fn mix_linear(left: u32, right: u32, right_weight: f64) -> u32 {
-    let left = rgb_channels(left);
-    let right = rgb_channels(right);
-    let weight = right_weight.clamp(0.0, 1.0);
-    packed_channels(std::array::from_fn(|index| {
-        srgb_channel(
-            linear_channel(left[index]) * (1.0 - weight) + linear_channel(right[index]) * weight,
-        )
-    }))
-}
-
-fn relative_luminance(color: u32) -> f64 {
-    let [red, green, blue] = rgb_channels(color).map(linear_channel);
-    red * 0.2126 + green * 0.7152 + blue * 0.0722
-}
-
-fn contrast_ratio(left: u32, right: u32) -> f64 {
-    let left = relative_luminance(left);
-    let right = relative_luminance(right);
-    (left.max(right) + 0.05) / (left.min(right) + 0.05)
-}
-
-fn strongest_contrast_endpoint(background: u32) -> u32 {
-    if contrast_ratio(0x00ff_ffff, background) >= contrast_ratio(0, background) {
-        0x00ff_ffff
-    } else {
-        0
-    }
-}
-
-fn contrast_corrected_toward(foreground: u32, target: u32, background: u32) -> u32 {
-    if contrast_ratio(foreground, background) >= 4.5 {
-        return foreground;
-    }
-    if contrast_ratio(target, background) < 4.5 {
-        return strongest_contrast_endpoint(background);
-    }
-    let mut failing = 0.0_f64;
-    let mut passing = 1.0_f64;
-    for _ in 0..24 {
-        let weight = f64::midpoint(failing, passing);
-        if contrast_ratio(mix_linear(foreground, target, weight), background) >= 4.5 {
-            passing = weight;
-        } else {
-            failing = weight;
-        }
-    }
-    mix_linear(foreground, target, passing)
-}
-
 /// Corrects `foreground` toward the strongest endpoint until it keeps the floor
 /// against every one of `backgrounds`. `None` when a few passes cannot satisfy
 /// them all, as when they pull toward opposite endpoints.
@@ -477,16 +402,8 @@ fn contrast_corrected_against_all(foreground: u32, backgrounds: &[u32]) -> Optio
     readable(corrected).then_some(corrected)
 }
 
-fn contrast_corrected(foreground: u32, background: u32) -> u32 {
-    contrast_corrected_toward(
-        foreground,
-        strongest_contrast_endpoint(background),
-        background,
-    )
-}
-
 /// WCAG AA for normal text, held for panel text over any backdrop.
-const PANEL_TEXT_MIN_CONTRAST: f64 = 4.5;
+const PANEL_TEXT_MIN_CONTRAST: f64 = TEXT_MIN_CONTRAST;
 
 /// The Omarchy shell surface whose `background-alpha` a panel follows.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -741,49 +658,50 @@ impl SessionPickerPalette {
 
 #[must_use]
 pub(crate) fn session_picker_palette(theme: ResolvedTheme) -> SessionPickerPalette {
-    let primary = contrast_corrected(theme.foreground, theme.background);
+    let roles = theme.roles;
+    let primary = contrast_corrected(roles.text, roles.surface);
     let secondary = contrast_corrected_toward(
-        mix_linear(primary, theme.background, 0.30),
+        mix_linear(primary, roles.surface, 0.30),
         primary,
-        theme.background,
+        roles.surface,
     );
-    let selected_fill = mix_linear(theme.background, theme.selection, 0.24);
+    let selected_fill = mix_linear(roles.surface, roles.selection, 0.24);
     let selected_primary = contrast_corrected(primary, selected_fill);
     let selected_secondary = contrast_corrected_toward(
         mix_linear(selected_primary, selected_fill, 0.30),
         selected_primary,
         selected_fill,
     );
-    let focused_frame = if contrast_ratio(theme.pane_border_active, theme.pane_border) >= 1.2 {
-        theme.pane_border_active
+    let focused_frame = if contrast_ratio(roles.focus_ring, roles.divider) >= 1.2 {
+        roles.focus_ring
     } else {
-        theme.ui_accent
+        roles.accent
     };
-    let [red, green, blue] = rgb_channels(mix_linear(theme.background, 0, 0.80));
+    let [red, green, blue] = rgb_channels(mix_linear(roles.surface, 0, 0.80));
     // Every opaque state an unselected highlighted row can be in.
     let highlight_states = [
         vec![(selected_fill, ROW_HOVER_ALPHA)],
-        vec![(theme.ui_accent, ROW_PRESS_ALPHA)],
+        vec![(roles.accent, ROW_PRESS_ALPHA)],
         vec![
             (selected_fill, ROW_HOVER_ALPHA),
-            (theme.ui_accent, ROW_PRESS_ALPHA),
+            (roles.accent, ROW_PRESS_ALPHA),
         ],
     ]
-    .map(|overlays| visible_panel_color(theme.background, 1.0, &overlays, 0));
+    .map(|overlays| visible_panel_color(roles.surface, 1.0, &overlays, 0));
     let highlight_primary =
         contrast_corrected_against_all(primary, &highlight_states).unwrap_or(primary);
     let highlight_secondary =
         contrast_corrected_against_all(secondary, &highlight_states).unwrap_or(secondary);
-    let [panel_red, panel_green, panel_blue] = rgb_channels(theme.background);
+    let [panel_red, panel_green, panel_blue] = rgb_channels(roles.surface);
     SessionPickerPalette {
         scrim: [red, green, blue, 140],
-        panel: theme.background,
+        panel: roles.surface,
         panel_fill: [panel_red, panel_green, panel_blue, u8::MAX],
         primary,
         secondary,
-        frame: theme.pane_border,
+        frame: roles.divider,
         focused_frame,
-        selected_rail: theme.ui_accent,
+        selected_rail: roles.accent,
         selected_fill,
         selected_primary,
         selected_secondary,
@@ -1874,6 +1792,7 @@ pub(crate) fn paint_session_picker_overlay(
 mod tests {
     use super::super::super::pixel_index;
     use super::*;
+    use crate::theme::ChromeRoles;
 
     #[test]
     fn scrollback_search_paints_query_inside_terminal_when_explorer_is_open() {
@@ -2263,21 +2182,27 @@ mod tests {
         for theme in [
             ResolvedTheme::default(),
             ResolvedTheme {
-                background: 0x77_77_77,
-                foreground: 0x78_78_78,
-                selection: 0x79_79_79,
-                pane_border: 0x77_77_77,
-                pane_border_active: 0x77_77_77,
-                ui_accent: 0xee_55_44,
+                roles: ChromeRoles {
+                    surface: 0x77_77_77,
+                    text: 0x78_78_78,
+                    selection: 0x79_79_79,
+                    divider: 0x77_77_77,
+                    focus_ring: 0x77_77_77,
+                    accent: 0xee_55_44,
+                    ..ChromeRoles::default()
+                },
                 ..ResolvedTheme::default()
             },
             ResolvedTheme {
-                background: 0xf5_f1_e8,
-                foreground: 0x22_24_28,
-                selection: 0xb8_d8_f0,
-                pane_border: 0x76_78_7c,
-                pane_border_active: 0x18_62_9f,
-                ui_accent: 0x18_62_9f,
+                roles: ChromeRoles {
+                    surface: 0xf5_f1_e8,
+                    text: 0x22_24_28,
+                    selection: 0xb8_d8_f0,
+                    divider: 0x76_78_7c,
+                    focus_ring: 0x18_62_9f,
+                    accent: 0x18_62_9f,
+                    ..ChromeRoles::default()
+                },
                 ..ResolvedTheme::default()
             },
         ] {
@@ -2290,9 +2215,12 @@ mod tests {
             assert_eq!(palette.shadow[3], 89);
         }
         let blue_theme = ResolvedTheme {
-            background: 0xff_ff_ff,
-            foreground: 0x00_66_cc,
-            selection: 0xd8_ea_f8,
+            roles: ChromeRoles {
+                surface: 0xff_ff_ff,
+                text: 0x00_66_cc,
+                selection: 0xd8_ea_f8,
+                ..ChromeRoles::default()
+            },
             ..ResolvedTheme::default()
         };
         let blue_palette = session_picker_palette(blue_theme);
@@ -2386,7 +2314,7 @@ mod tests {
             i32::try_from(layout.rows[0].surface.y + layout.rows[0].surface.height / 2).unwrap(),
         )
         .unwrap();
-        let [_, accent_red, accent_green, accent_blue] = theme.ui_accent.to_be_bytes();
+        let [_, accent_red, accent_green, accent_blue] = theme.roles.accent.to_be_bytes();
         assert_eq!(
             &canvas[rail..rail + 4],
             &[accent_blue, accent_green, accent_red, 0xff]
@@ -2545,9 +2473,12 @@ mod tests {
             alpha
         };
         ResolvedTheme {
-            background: 0x1a_1b_26,
-            foreground: 0xc0_ca_f5,
-            selection: 0x7a_a2_f7,
+            roles: ChromeRoles {
+                surface: 0x1a_1b_26,
+                text: 0xc0_ca_f5,
+                selection: 0x7a_a2_f7,
+                ..ChromeRoles::default()
+            },
             background_alpha: foot_alpha(0.65),
             shell: OmarchyShellSettings {
                 menu_alpha: foot_alpha(menu_alpha),
@@ -2635,8 +2566,8 @@ mod tests {
         // A palette whose secondary text was corrected to exactly the floor on
         // the opaque panel has no headroom, so its panel stays opaque.
         let mut floored = theme;
-        floored.background = 0xf5_f1_e8;
-        floored.foreground = 0x22_24_28;
+        floored.roles.surface = 0xf5_f1_e8;
+        floored.roles.text = 0x22_24_28;
         let floored = chrome_panel_palette(floored, ChromeSurface::Popup);
         assert!(contrast_ratio(floored.secondary, floored.panel) < 4.6);
         assert_eq!(floored.panel_fill[3], u8::MAX);
@@ -2664,7 +2595,7 @@ mod tests {
 
         // An accent too dim to read even on the opaque panel keeps popups
         // opaque, while menus, which draw no accent text, stay translucent.
-        theme.ui_accent = 0x20_22_30;
+        theme.roles.accent = 0x20_22_30;
         let menu = chrome_panel_palette(theme, ChromeSurface::Menu);
         let popup = chrome_panel_palette(theme, ChromeSurface::Popup);
         assert!(menu.panel_fill[3] < u8::MAX);
@@ -2677,9 +2608,12 @@ mod tests {
         // where the hover highlight dropped secondary text to about 4.15:1, and
         // the press highlight left row text below 4.5:1 even on an opaque panel.
         let theme = ResolvedTheme {
-            background: 0x63_05_86,
-            foreground: 0x6e_dc_dd,
-            selection: 0x9c_c3_58,
+            roles: ChromeRoles {
+                surface: 0x63_05_86,
+                text: 0x6e_dc_dd,
+                selection: 0x9c_c3_58,
+                ..ChromeRoles::default()
+            },
             background_alpha: 42_597,
             shell: OmarchyShellSettings {
                 menu_alpha: 0,

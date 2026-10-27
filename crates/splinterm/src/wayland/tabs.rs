@@ -340,7 +340,7 @@ const fn tab_foreground(theme: ResolvedTheme, active: bool) -> u32 {
     if active {
         theme.active_tab_foreground
     } else {
-        theme.inactive_tab_foreground
+        theme.roles.text_muted
     }
 }
 
@@ -354,7 +354,7 @@ const fn opaque_rgba(color: u32) -> [u8; 4] {
 }
 
 fn tab_strip_background_rgba(theme: ResolvedTheme) -> [u8; 4] {
-    premultiplied_theme_rgba(theme.background, theme.tab_strip_alpha())
+    premultiplied_theme_rgba(theme.roles.surface, theme.tab_strip_alpha())
 }
 
 /// The selected Dojo tab's body: opaque by default, so it stands apart from
@@ -383,7 +383,7 @@ fn paint_inactive_tab_divider(
             divider.min(rect.width),
             rect.height,
         ),
-        opaque_rgba(theme.pane_border),
+        opaque_rgba(theme.roles.divider),
     );
     Ok(())
 }
@@ -1045,7 +1045,7 @@ impl App {
                     strip.width,
                     border,
                 ),
-                opaque_rgba(theme.pane_border),
+                opaque_rgba(theme.roles.divider),
             );
         }
         for tab in &layout.tabs {
@@ -1068,7 +1068,7 @@ impl App {
                         rect.width,
                         underline,
                     ),
-                    opaque_rgba(theme.ui_accent),
+                    opaque_rgba(theme.roles.accent),
                 );
             }
             let label_rect = Self::buffer_rect(tab.label_rect, scale_120)?;
@@ -1119,7 +1119,7 @@ impl App {
                         .saturating_add(new_rect.height.saturating_sub(text.pixel_height()) / 2),
                 ),
                 new_rect,
-                theme.ui_accent,
+                theme.roles.accent,
             );
         }
         paint_remote_host(
@@ -1127,7 +1127,7 @@ impl App {
             (width, height),
             layout.host_rect,
             scale_120,
-            theme.foreground,
+            theme.roles.text,
             host_text,
         )?;
         Ok(())
@@ -1285,9 +1285,12 @@ mod tests {
             let label = ChromeText::load("Remote: node", scale).unwrap();
             for foreground in [0xff_00_00, 0x00_ff_00] {
                 let theme = ResolvedTheme {
-                    background: 0,
                     background_alpha: u16::MAX,
-                    foreground,
+                    roles: crate::theme::ChromeRoles {
+                        surface: 0,
+                        text: foreground,
+                        ..crate::theme::ChromeRoles::default()
+                    },
                     ..ResolvedTheme::default()
                 };
                 let mut without = vec![0x41; (width * height * 4) as usize];
@@ -1357,20 +1360,23 @@ mod tests {
         use crate::config::ChromeColorOverrides;
 
         let theme = ResolvedTheme {
-            background: 0x80_40_20,
             background_alpha: u16::MAX / 2,
-            foreground: 0xaa_bb_cc,
             selection_foreground: 0x11_22_33,
             active_tab_background: 0x44_55_66,
             active_tab_foreground: 0xdd_ee_ff,
-            inactive_tab_foreground: 0x99_88_77,
-            ui_accent: 0x77_88_99,
+            roles: crate::theme::ChromeRoles {
+                surface: 0x80_40_20,
+                text: 0xaa_bb_cc,
+                text_muted: 0x99_88_77,
+                accent: 0x77_88_99,
+                ..crate::theme::ChromeRoles::default()
+            },
             ..ResolvedTheme::default()
         };
         assert_eq!(tab_foreground(theme, false), 0x99_88_77);
         assert_eq!(tab_foreground(theme, true), 0xdd_ee_ff);
         assert_eq!(theme.selection_foreground, 0x11_22_33);
-        assert_eq!(opaque_rgba(theme.ui_accent), [0x77, 0x88, 0x99, 0xff]);
+        assert_eq!(opaque_rgba(theme.roles.accent), [0x77, 0x88, 0x99, 0xff]);
 
         let active_dojo = DojoId::new();
         let layout =
@@ -1541,8 +1547,11 @@ mod tests {
         )
         .unwrap();
         let theme = ResolvedTheme {
-            background: 0x10_20_30,
-            pane_border: 0x44_55_66,
+            roles: crate::theme::ChromeRoles {
+                surface: 0x10_20_30,
+                divider: 0x44_55_66,
+                ..crate::theme::ChromeRoles::default()
+            },
             ..ResolvedTheme::default()
         };
         let mut canvas =
@@ -1648,11 +1657,14 @@ mod tests {
                     assert!(border >= 1 && border < indicator, "{case}");
                     for alpha in [u16::MAX, u16::MAX / 2] {
                         let theme = ResolvedTheme {
-                            background: 0x10_20_30,
                             background_alpha: alpha,
-                            pane_border: 0x44_55_66,
-                            ui_accent: 0x77_88_99,
                             active_tab_background: 0x22_22_22,
+                            roles: crate::theme::ChromeRoles {
+                                surface: 0x10_20_30,
+                                divider: 0x44_55_66,
+                                accent: 0x77_88_99,
+                                ..crate::theme::ChromeRoles::default()
+                            },
                             ..ResolvedTheme::default()
                         };
                         let paint = |border_cell| {

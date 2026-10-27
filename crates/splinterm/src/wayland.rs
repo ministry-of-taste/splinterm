@@ -12359,7 +12359,7 @@ impl App {
                     selection_color: self.presentation.theme.selection,
                     selection_foreground: self.presentation.theme.selection_foreground,
                     url_color: self.presentation.theme.url,
-                    accent_color: self.presentation.theme.ui_accent,
+                    accent_color: self.presentation.theme.roles.accent,
                 },
             );
             if let Some(layout) = pane_layout.as_ref() {
@@ -12388,12 +12388,12 @@ impl App {
                     self.surface.scale_120,
                     status,
                     chrome_panel_fill(
-                        self.presentation.theme.background,
+                        self.presentation.theme.roles.surface,
                         ChromeSurface::Popup.shell_alpha(self.presentation.theme.shell),
                         self.presentation.theme.background_alpha,
-                        &[self.presentation.theme.ui_accent],
+                        &[self.presentation.theme.roles.accent],
                     ),
-                    self.presentation.theme.ui_accent,
+                    self.presentation.theme.roles.accent,
                 );
             }
             if let Some(button_top) = trusted_action_top {
@@ -12402,7 +12402,7 @@ impl App {
                     width,
                     height,
                     button_top,
-                    self.presentation.theme.background,
+                    self.presentation.theme.roles.surface,
                     proceed_enabled,
                 );
             }
@@ -15499,7 +15499,7 @@ mod tests {
             '┌',
             corner,
             corner,
-            theme.pane_border_active,
+            theme.roles.focus_ring,
             120,
         );
         let region = |canvas: &[u8]| {
