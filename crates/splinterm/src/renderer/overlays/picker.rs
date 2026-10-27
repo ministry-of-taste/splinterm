@@ -430,8 +430,9 @@ impl ChromeSurface {
     /// unselected row under the translucent hover highlight, the press
     /// highlight, or both. Panels draw primary and secondary text and the
     /// danger label of a destructive action, such as Terminate, there; the
-    /// accent rail only marks rows. Popups also draw the accent as text: the
-    /// Dojo prompt's unselected Restore or Revoke. The action palette, the
+    /// accent rail only marks rows. Every panel can draw the text accent, the
+    /// input line's `›`; popups also draw the raw accent as text: the Dojo
+    /// prompt's unselected Restore or Revoke. The action palette, the
     /// session picker and the tab context menu blend those highlights before
     /// painting row text; selected rows sit on the opaque selected fill.
     fn panel_text_layers(self, palette: &SessionPickerPalette) -> Vec<PanelTextLayer> {
@@ -443,11 +444,17 @@ impl ChromeSurface {
         let mut layers = vec![PanelTextLayer {
             overlays: Vec::new(),
             text: match self {
-                Self::Menu => vec![palette.primary, palette.secondary, palette.danger],
+                Self::Menu => vec![
+                    palette.primary,
+                    palette.secondary,
+                    palette.danger,
+                    palette.accent_text,
+                ],
                 Self::Popup => vec![
                     palette.primary,
                     palette.secondary,
                     palette.danger,
+                    palette.accent_text,
                     palette.selected_rail,
                 ],
             },
@@ -645,6 +652,10 @@ pub(crate) struct SessionPickerPalette {
     pub(crate) danger: u32,
     pub(crate) selected_danger: u32,
     pub(crate) highlight_danger: u32,
+    /// The accent as text straight on the panel, such as the input line's
+    /// `›`: mixed toward the primary text until it keeps 4.5:1 there, and on
+    /// a translucent panel until it reads at the primary text's coverage.
+    pub(crate) accent_text: u32,
     pub(crate) shadow: [u8; 4],
     /// Status tints on the opaque panel and on the selected fill;
     /// `None` when `[explorer] status-colors=no`.
@@ -737,6 +748,7 @@ fn panel_palette(theme: ResolvedTheme, panel: u32) -> SessionPickerPalette {
         selected_fill,
         TEXT_MIN_CONTRAST,
     );
+    let accent_text = contrast_floor_toward(roles.accent, primary, panel, TEXT_MIN_CONTRAST);
     // A focus ring too close to the frame colour reads as no focus, so the
     // accent takes its place, unless `[colors] focus-ring` chose it.
     let focused_frame = if roles.verbatim.contains(Role::FocusRing)
@@ -781,14 +793,19 @@ fn panel_palette(theme: ResolvedTheme, panel: u32) -> SessionPickerPalette {
         danger,
         selected_danger,
         highlight_danger,
+        accent_text,
         shadow: [0, 0, 0, 89],
         status_tints: Some(ChromeTints::on(&roles, panel)),
         selected_status_tints: Some(ChromeTints::on(&roles, selected_fill)),
     }
 }
 
-/// How much of the scrim behind a modal panel covers the Window.
-pub(crate) const MODAL_SCRIM_ALPHA: u8 = 140;
+/// How much of the scrim behind a modal panel covers the Window: one level
+/// for every modal list and prompt (the command palette, key bindings,
+/// Agent access, the pickers and the Dojo prompt), half the Window, as
+/// Omarchy's own `[menu] scrim-alpha` of 0.5 dims the desktop behind its
+/// menus. It replaces the 96, 112 and 140 those surfaces once used.
+pub(crate) const MODAL_SCRIM_ALPHA: u8 = 128;
 
 /// The scrim behind a modal panel: the `surface` darkened 80% toward black,
 /// so it dims the Window in the theme's own hue, dark or light.
@@ -855,8 +872,8 @@ pub(crate) fn chrome_panel_palette_on(
     palette
 }
 
-/// Muted and danger text start from their roles, often right at the floor
-/// on the opaque panel, so over a backdrop they would need a far more
+/// Muted, danger and accent text start from their roles, often right at the
+/// floor on the opaque panel, so over a backdrop they would need a far more
 /// opaque panel than the primary text does. On a translucent panel they are
 /// mixed toward the primary text, plain or highlighted, only as far as they
 /// need to read at the coverage the primary text needs: they never make the
@@ -886,6 +903,7 @@ fn keep_secondary_text_within_primary_coverage(
     };
     palette.secondary = mixed_until_readable(palette.secondary, palette.primary, plain);
     palette.danger = mixed_until_readable(palette.danger, palette.primary, plain);
+    palette.accent_text = mixed_until_readable(palette.accent_text, palette.primary, plain);
     palette.highlight_secondary = mixed_until_readable(
         palette.highlight_secondary,
         palette.highlight_primary,
@@ -953,6 +971,9 @@ pub(crate) struct SessionPickerTextCache {
     /// key's own source: its tints are the ones that were drawn.
     truncated: HashMap<SessionPickerTextKey, ChromeSource>,
     recent_frames: VecDeque<HashSet<SessionPickerTextKey>>,
+    /// One cell's width and height per style, at the latest scale and
+    /// renderer generation only: what layouts measure before they paint.
+    cell_metrics: HashMap<(ChromeTextStyle, u32, u64), (u32, u32)>,
 }
 
 impl SessionPickerTextCache {
@@ -960,6 +981,30 @@ impl SessionPickerTextCache {
         self.entries.clear();
         self.truncated.clear();
         self.recent_frames.clear();
+        self.cell_metrics.clear();
+    }
+
+    /// The width and height, in buffer pixels, of one chrome cell in
+    /// `style`, as [`paint_picker_source`] lays text out. Chrome text is
+    /// monospaced, so a label's width is its cells times this width.
+    pub(crate) fn cell_metrics(
+        &mut self,
+        context: &RenderContext,
+        style: ChromeTextStyle,
+        scale_120: u32,
+        renderer_generation: u64,
+    ) -> Result<(u32, u32)> {
+        let key = (style, scale_120, renderer_generation);
+        if let Some(metrics) = self.cell_metrics.get(&key) {
+            return Ok(*metrics);
+        }
+        let text = ChromeText::load_styled_with_context(" ", scale_120, style, context)?;
+        let metrics = (text.frame.cell_width.max(1), text.pixel_height());
+        self.cell_metrics.retain(|(_, scale, generation), _| {
+            *scale == scale_120 && *generation == renderer_generation
+        });
+        self.cell_metrics.insert(key, metrics);
+        Ok(metrics)
     }
 
     pub(super) fn finish_frame(&mut self, used: HashSet<SessionPickerTextKey>) {
@@ -977,8 +1022,25 @@ impl SessionPickerTextCache {
     }
 
     #[cfg(test)]
-    fn len(&self) -> usize {
+    pub(super) fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    /// The text each cached entry draws, truncated where it was, with its
+    /// style.
+    #[cfg(test)]
+    pub(super) fn drawn(&self) -> impl Iterator<Item = (&str, ChromeTextStyle)> {
+        self.entries.keys().map(|key| {
+            (
+                self.truncated.get(key).unwrap_or(&key.source).text(),
+                key.style,
+            )
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn contains_source(&self, text: &str) -> bool {
+        self.drawn().any(|(drawn, _)| drawn == text)
     }
 }
 
@@ -986,7 +1048,7 @@ fn logical_coordinate_to_buffer(value: u32, scale_120: u32) -> u32 {
     value.saturating_mul(scale_120).div_ceil(120)
 }
 
-fn picker_buffer_rect(rect: Rect, scale_120: u32) -> Rect {
+pub(super) fn picker_buffer_rect(rect: Rect, scale_120: u32) -> Rect {
     let left = logical_coordinate_to_buffer(rect.x, scale_120);
     let top = logical_coordinate_to_buffer(rect.y, scale_120);
     let right = rect
@@ -2540,7 +2602,8 @@ mod tests {
             assert!(contrast_ratio(palette.secondary, palette.panel) >= 4.5);
             assert!(contrast_ratio(palette.selected_primary, palette.selected_fill) >= 4.5);
             assert!(contrast_ratio(palette.selected_secondary, palette.selected_fill) >= 4.5);
-            assert_eq!(palette.scrim[3], 140);
+            // One scrim level for every modal surface (Plan 0065).
+            assert_eq!(palette.scrim[3], 128);
             assert_eq!(palette.shadow[3], 89);
         }
         let blue_theme = ResolvedTheme {

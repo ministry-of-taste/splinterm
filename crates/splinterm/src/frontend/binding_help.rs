@@ -143,6 +143,11 @@ impl BindingHelpUi {
         &self.rows
     }
 
+    /// How many bindings the list shows with no query.
+    pub(crate) fn total(&self) -> usize {
+        self.all_rows.len()
+    }
+
     pub(crate) const fn selected_index(&self) -> usize {
         self.selected
     }
