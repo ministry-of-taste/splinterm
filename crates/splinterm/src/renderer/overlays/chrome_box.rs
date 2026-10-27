@@ -324,8 +324,9 @@ pub(super) struct ChromeBoxLayout {
 pub(super) struct ChromeBox<'a> {
     /// Lowercase, bold, primary text at the left of the top frame.
     pub(super) title: &'a str,
-    /// Secondary text at the right of the top frame; may be empty.
-    pub(super) right_label: &'a str,
+    /// Secondary text at the right of the top frame, in parts, most
+    /// important first, joined by ` · `; may be empty.
+    pub(super) right_label: &'a [&'a str],
     /// `(key, verb)` pairs in the bottom frame, most important first.
     pub(super) legend: &'a [(&'a str, &'a str)],
 }
@@ -385,9 +386,9 @@ impl ChromeBox<'_> {
     /// Lays the box out over `panel` (the fill, buffer px) for chrome cells
     /// of `cell` (width, height) buffer px.
     ///
-    /// The right label keeps its whole text while the title keeps at least
-    /// one character and its `…`; the title truncates first, and the right
-    /// label goes only when even that does not fit. Legend pairs drop from
+    /// The title truncates first, down to one character and its `…`; then
+    /// the right label drops parts from its end, and its first part ends in
+    /// `…`, so what matters most stays visible. Legend pairs drop from
     /// the end until the rest fits inside the frame.
     #[must_use]
     pub(super) fn layout(&self, panel: Rect, scale_120: u32, cell: (u32, u32)) -> ChromeBoxLayout {
@@ -434,20 +435,18 @@ impl ChromeBox<'_> {
     }
 
     fn top_labels(&self, span: FrameSpan, y: u32) -> (Option<BoxLabel>, Option<BoxLabel>) {
-        let right_need = if self.right_label.is_empty() {
-            0
-        } else {
-            span.padded(cells_u32(self.right_label))
-        };
         let gap = span.cell_width;
         let title_floor = if self.title.is_empty() {
             0
         } else {
             span.padded(cells_u32(self.title).min(2))
+                .saturating_add(gap)
         };
-        let show_right = right_need > 0
-            && right_need.saturating_add(gap).saturating_add(title_floor) <= span.width;
-        let title_room = if show_right {
+        let right_text = self.right_label_text(span, span.width.saturating_sub(title_floor));
+        let right_need = right_text
+            .as_deref()
+            .map_or(0, |text| span.padded(cells_u32(text)));
+        let title_room = if right_need > 0 {
             span.width.saturating_sub(right_need.saturating_add(gap))
         } else {
             span.width
@@ -459,9 +458,32 @@ impl ChromeBox<'_> {
             usize::try_from(title_cells).unwrap_or(usize::MAX),
         );
         let title = (!title_text.is_empty()).then(|| span.label(&title_text, span.left, y));
-        let right_label = show_right
-            .then(|| span.label(self.right_label, span.right().saturating_sub(right_need), y));
+        let right_label =
+            right_text.map(|text| span.label(&text, span.right().saturating_sub(right_need), y));
         (title, right_label)
+    }
+
+    /// The right label's parts that fit in `room` with their padding,
+    /// joined by ` · `: later parts drop first, and when even the first
+    /// alone does not fit it ends in `…`. `None` only when not one
+    /// character and its `…` fit.
+    fn right_label_text(&self, span: FrameSpan, room: u32) -> Option<String> {
+        let parts = self
+            .right_label
+            .iter()
+            .copied()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>();
+        let first = parts.first()?;
+        for shown in (1..=parts.len()).rev() {
+            let text = parts[..shown].join(" · ");
+            if span.padded(cells_u32(&text)) <= room {
+                return Some(text);
+            }
+        }
+        let cells = (room / span.cell_width).saturating_sub(2);
+        (cells >= 2)
+            .then(|| truncate_picker_text(first, usize::try_from(cells).unwrap_or(usize::MAX)))
     }
 
     fn legend_layout(&self, span: FrameSpan, y: u32) -> Option<BoxLegend> {
@@ -637,7 +659,7 @@ mod tests {
                 let panel = panel(scale, 560);
                 let layout = ChromeBox {
                     title: "commands",
-                    right_label: "62",
+                    right_label: &["62"],
                     legend: &LEGEND,
                 }
                 .layout(panel, scale, cell);
@@ -669,15 +691,15 @@ mod tests {
                 let panel = panel(scale, 560);
                 let layout = ChromeBox {
                     title: "key bindings",
-                    right_label: "3/62",
+                    right_label: &["3/62"],
                     legend: &LEGEND,
                 }
                 .layout(panel, scale, cell);
                 let title = layout.title.as_ref().unwrap();
                 assert_eq!(title.text.text, "key bindings");
-                let corner = BOX_LABEL_INSET * scale / 120;
+                let corner = (BOX_LABEL_INSET * scale).div_ceil(120);
                 // Clear of the corners, inside the fill, across the line.
-                assert!(title.knockout.x >= layout.frame.x + corner, "scale {scale}");
+                assert_eq!(title.knockout.x, layout.frame.x + corner, "scale {scale}");
                 assert!(inside(title.knockout, panel), "scale {scale} {cell:?}");
                 assert!(title.knockout.y <= layout.frame.y);
                 assert!(bottom(title.knockout) >= layout.frame.y + layout.border);
@@ -702,13 +724,15 @@ mod tests {
 
     #[test]
     fn the_title_truncates_before_the_right_label_and_never_overlaps_it() {
+        const PARTS: [&str; 3] = ["2 waiting", "first 512 only", "12/40"];
+        let whole = PARTS.join(" · ");
         for scale in SCALES {
             for cell in cells_at(scale) {
-                for logical_width in [40, 80, 120, 160, 200, 240, 320, 560] {
+                for logical_width in [40, 80, 120, 160, 200, 240, 320, 352, 440, 560] {
                     let panel = panel(scale, logical_width);
                     let layout = ChromeBox {
                         title: "agent access",
-                        right_label: "12/40 · 2 waiting",
+                        right_label: &PARTS,
                         legend: &LEGEND,
                     }
                     .layout(panel, scale, cell);
@@ -722,18 +746,39 @@ mod tests {
                             right(title.knockout) < right_label.knockout.x,
                             "scale {scale}, width {logical_width}"
                         );
-                        assert_eq!(right_label.text.text, "12/40 · 2 waiting");
                         assert!(cells(&title.text.text) >= 2);
                     }
-                    // The right label goes only when the title could not
-                    // keep a character and its `…` beside it.
-                    if layout.right_label.is_none() {
-                        let corner = (BOX_LABEL_INSET * scale)
-                            .div_ceil(120)
-                            .min(layout.frame.width / 2);
-                        let span = layout.frame.width - 2 * corner;
-                        let needed = (17 + 2) * cell.0 + cell.0 + (2 + 2) * cell.0;
-                        assert!(needed > span, "scale {scale}, width {logical_width}");
+                    let corner = (BOX_LABEL_INSET * scale)
+                        .div_ceil(120)
+                        .min(layout.frame.width / 2);
+                    let span = layout.frame.width - 2 * corner;
+                    // Title floor (`a…` padded) and the gap after it.
+                    let room = span.saturating_sub((2 + 2) * cell.0 + cell.0);
+                    match &layout.right_label {
+                        // Whole parts from the first, or the first cut.
+                        Some(right_label) => {
+                            let text = &right_label.text.text;
+                            let kept = (1..=PARTS.len())
+                                .map(|shown| PARTS[..shown].join(" · "))
+                                .any(|parts| &parts == text);
+                            assert!(
+                                kept || (text.ends_with('…')
+                                    && PARTS[0].starts_with(text.trim_end_matches('…'))),
+                                "scale {scale}, width {logical_width}: {text}"
+                            );
+                            assert!(right_label.knockout.width <= room);
+                            // A whole part drops only when it would not fit.
+                            if let Some(shown) =
+                                (1..PARTS.len()).find(|shown| &PARTS[..*shown].join(" · ") == text)
+                            {
+                                let next = PARTS[..=shown].join(" · ");
+                                let next = u32::try_from(cells(&next)).unwrap();
+                                assert!((next + 2) * cell.0 > room, "{logical_width}");
+                            }
+                        }
+                        // It goes only when not one character and its `…`
+                        // fit beside the title's own.
+                        None => assert!((2 + 2) * cell.0 > room, "scale {scale}, {logical_width}"),
                     }
                     if let Some(title) = &layout.title
                         && title.text.text != "agent access"
@@ -742,15 +787,29 @@ mod tests {
                         assert!("agent access".starts_with(title.text.text.trim_end_matches('…')));
                     }
                 }
+                // In a ~400 px Window (a 352 px panel) what waits stays.
+                let layout = ChromeBox {
+                    title: "agent access",
+                    right_label: &["1 waiting", "first 512 only", "3"],
+                    legend: &LEGEND,
+                }
+                .layout(panel(scale, 352), scale, cell);
+                let right_label = layout.right_label.unwrap();
+                assert!(
+                    right_label.text.text.starts_with("1 waiting"),
+                    "scale {scale}: {}",
+                    right_label.text.text
+                );
+                assert!(layout.title.is_some());
                 // Wide enough, both whole.
                 let layout = ChromeBox {
                     title: "agent access",
-                    right_label: "12/40 · 2 waiting",
+                    right_label: &PARTS,
                     legend: &[],
                 }
-                .layout(panel(scale, 560), scale, cell);
+                .layout(panel(scale, 900), scale, cell);
                 assert_eq!(layout.title.unwrap().text.text, "agent access");
-                assert!(layout.right_label.is_some());
+                assert_eq!(layout.right_label.unwrap().text.text, whole);
                 assert!(layout.legend.is_none());
             }
         }
@@ -771,7 +830,7 @@ mod tests {
                     let panel = panel(scale, logical_width);
                     let layout = ChromeBox {
                         title: "key bindings",
-                        right_label: "",
+                        right_label: &[],
                         legend: &legend,
                     }
                     .layout(panel, scale, cell);
@@ -819,7 +878,7 @@ mod tests {
                 }
                 let wide = ChromeBox {
                     title: "key bindings",
-                    right_label: "",
+                    right_label: &[],
                     legend: &legend,
                 }
                 .layout(panel(scale, 1600), scale, cell);
@@ -869,7 +928,7 @@ mod tests {
         let cell = painter.box_cell().unwrap();
         let layout = ChromeBox {
             title: "commands",
-            right_label: "62",
+            right_label: &["62"],
             legend: &LEGEND,
         }
         .layout(panel, scale, cell);

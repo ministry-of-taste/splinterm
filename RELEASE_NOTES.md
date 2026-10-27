@@ -499,10 +499,12 @@ a hostile program running as your account.
 - The command palette, the key bindings list and Agent access are one
   TUI-style box: a thin frame inside the raised surface with a lowercase
   title and the match count (such as `3/62`) set into its top edge, an input
-  line with an accent `›` and a block cursor, and the keys (`↑↓ move`,
-  `↵ run`, `esc close`) set into its bottom edge. They open 15% down the
-  Window, at most 560 px wide (key bindings 640), and keep the hard offset
-  shadow. Every modal list and prompt now dims the Window by the same
+  line with an accent `›` and a block cursor, and its keys, such as
+  `↑↓ move  ↵ run  esc close`, set into its bottom edge. They open 15% down
+  the Window, at most 560 px wide (key bindings 640), and keep the hard
+  offset shadow. Agent access's waiting count and its "first 512 only" note
+  moved into the top edge, ahead of the count, and stay there as the Window
+  narrows. Every modal list and prompt now dims the Window by the same
   half-strength scrim.
 - Trusted dialogs (access consent, upgrade, restart) take your theme and its
   `[colors]` keys as they open, always opaque: the frame in `warning`, the

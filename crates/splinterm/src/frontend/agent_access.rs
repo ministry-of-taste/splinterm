@@ -825,12 +825,12 @@ impl AgentAccessUi {
         self.set_notice("Revoking…");
     }
 
-    /// What the palette's frame says after its entry count, where it is
-    /// always visible: how many requests wait, and that the read stopped at
+    /// What the palette's frame says before its entry count, where it
+    /// stays visible: how many requests wait, then that the read stopped at
     /// this Window's bound. Empty when neither applies.
-    pub(crate) fn status_label(&self) -> String {
+    pub(crate) fn status_parts(&self) -> Vec<String> {
         let Some(snapshot) = &self.snapshot else {
-            return String::new();
+            return Vec::new();
         };
         let mut status = Vec::new();
         match snapshot.waiting() {
@@ -840,7 +840,13 @@ impl AgentAccessUi {
         if snapshot.truncated {
             status.push(format!("first {MAX_WINDOW_ACCESS_ENTRIES} only"));
         }
-        status.join(" · ")
+        status
+    }
+
+    /// [`Self::status_parts`] joined, as the frame shows them when they fit.
+    #[cfg(test)]
+    pub(crate) fn status_label(&self) -> String {
+        self.status_parts().join(" · ")
     }
 
     /// The text shown when no row is, or `None` when rows are listed.

@@ -52,6 +52,9 @@ const PANEL_VERTICAL_MARGIN: u32 = 16;
 /// least [`PANEL_MINIMUM_TOP`] below it.
 const PANEL_TOP_PERCENT: u32 = 15;
 const PANEL_MINIMUM_TOP: u32 = 48;
+/// The shortcut column's width at most; a longer shortcut keeps its key
+/// behind `…`.
+const SHORTCUT_COLUMN_WIDTH: u32 = 136;
 const CONTENT_INSET: u32 = 24;
 const ROW_GUTTER_Y: u32 = 2;
 const TAB_MENU_WIDTH: u32 = 156;
@@ -342,6 +345,9 @@ pub(crate) fn command_palette_layout(
         height: shape.detail_height(),
     });
     let compact = panel_width < 420;
+    // The category column costs a command title its room in a 560 px
+    // palette; Agent access keeps it, as its kind is a word only there.
+    let show_category = !compact && (shape != PaletteShape::Commands || panel_width >= 600);
     let rows = filtered
         .iter()
         .copied()
@@ -363,10 +369,14 @@ pub(crate) fn command_palette_layout(
             let shortcut_width = if compact {
                 0
             } else {
-                (rect.width / 3).min(180)
+                (rect.width / 4).min(SHORTCUT_COLUMN_WIDTH)
             };
             let content_x = rect.x.saturating_add(inset).saturating_add(20);
-            let category_width = if compact { 0 } else { 72.min(rect.width / 5) };
+            let category_width = if show_category {
+                72.min(rect.width / 5)
+            } else {
+                0
+            };
             let category_gap = if category_width == 0 { 0 } else { 12 };
             let title_x = content_x
                 .saturating_add(category_width)
@@ -521,7 +531,7 @@ impl<'a> PaletteBody<'a> {
     const fn placeholder(self) -> &'static str {
         match self {
             Self::Commands => "type a command",
-            Self::BindingHelp(_) => "search key bindings",
+            Self::BindingHelp(_) => "filter by key or name",
             Self::AgentAccess(_) => "search agent access",
         }
     }
@@ -552,26 +562,21 @@ impl<'a> PaletteBody<'a> {
         }
     }
 
-    /// The frame's right label: how many rows match of how many while a
-    /// query filters, the total otherwise. Agent access adds what waits.
-    fn count_label(self, state: &CommandPaletteUi) -> String {
+    /// The frame's right label, most important first: for Agent access
+    /// what waits and whether the read stopped short, then how many rows
+    /// match of how many while a query filters, the total otherwise.
+    fn count_parts(self, state: &CommandPaletteUi) -> Vec<String> {
         let (shown, total) = match self {
             Self::Commands => (state.filtered().len(), state.total()),
             Self::BindingHelp(help) => (help.rows().len(), help.total()),
             Self::AgentAccess(access) => (access.rows().len(), access.total()),
         };
-        let count = match_count_label(shown, total, self.query(state));
-        match self {
-            Self::AgentAccess(access) => {
-                let status = access.status_label();
-                if status.is_empty() {
-                    count
-                } else {
-                    format!("{count} · {status}")
-                }
-            }
-            Self::Commands | Self::BindingHelp(_) => count,
-        }
+        let mut parts = match self {
+            Self::AgentAccess(access) => access.status_parts(),
+            Self::Commands | Self::BindingHelp(_) => Vec::new(),
+        };
+        parts.push(match_count_label(shown, total, self.query(state)));
+        parts
     }
 }
 
@@ -733,7 +738,8 @@ pub(crate) fn paint_command_palette(
     let scrim = painter.buffer_rect(content_rect);
     paint_scrim(&mut painter, scrim, &palette);
     let cell = painter.box_cell()?;
-    let count = body.count_label(state);
+    let count = body.count_parts(state);
+    let count = count.iter().map(String::as_str).collect::<Vec<_>>();
     let chrome = ChromeBox {
         title: body.title(),
         right_label: &count,
@@ -1710,10 +1716,14 @@ mod tests {
                 );
                 assert!(row.rect.y >= layout.rule.y + layout.rule.height);
                 assert!(row.title.x >= row.rect.x + CONTENT_INSET);
-                assert_eq!(row.category.width == 0, layout.compact);
+                // A 560 px palette gives its titles the category's room.
+                assert_eq!(row.category.width, 0);
                 if !layout.compact {
-                    assert!(row.title.x > row.category.x + row.category.width);
-                    assert_eq!(row.shortcut.width, (row.rect.width / 3).min(180));
+                    assert!(row.title.x >= row.category.x + row.category.width);
+                    assert_eq!(
+                        row.shortcut.width,
+                        (row.rect.width / 4).min(SHORTCUT_COLUMN_WIDTH)
+                    );
                     assert!(row.shortcut.width > 60);
                 }
                 assert_eq!(
@@ -1733,6 +1743,101 @@ mod tests {
                     ),
                     Some(row.command)
                 );
+            }
+        }
+    }
+
+    /// Every command's title fits its slot whole in the 560 px palette with
+    /// the default chrome cell, bold as when it is selected.
+    #[test]
+    fn every_command_title_fits_the_560_px_palette() {
+        let content = Rect {
+            x: 0,
+            y: 0,
+            width: 1280,
+            height: 800,
+        };
+        let layout =
+            command_palette_layout(content, BuiltInCommandId::ALL, 0, 0, PaletteShape::Commands)
+                .unwrap();
+        assert_eq!(layout.panel.width, 560);
+        let slot = buffer_rect(layout.rows[0].title, 120);
+        let render_context = RenderContext::new(u16::MAX);
+        for descriptor in BuiltInCommandId::ALL
+            .iter()
+            .map(|id| command_descriptor(*id))
+        {
+            for style in [ChromeTextStyle::Regular, ChromeTextStyle::Bold] {
+                let width = text_width(&render_context, descriptor.title, style, 120);
+                assert!(
+                    width <= slot.width,
+                    "{:?} ({width} px) does not fit {} px",
+                    descriptor.title,
+                    slot.width
+                );
+            }
+        }
+    }
+
+    /// Each list paints in a small Window at every scale.
+    #[test]
+    fn the_palette_paints_in_a_small_window_at_every_scale() {
+        let content = Rect {
+            x: 0,
+            y: 20,
+            width: 360,
+            height: 240,
+        };
+        let state = CommandPaletteUi::new(palette_context());
+        let keymap = ResolvedKeymap::default();
+        let help = BindingHelpUi::new(&keymap);
+        let access = AgentAccessUi::new(None, None);
+        for scale in [120, 150, 180, 240] {
+            let width = 360 * scale / 120;
+            let height = 260 * scale / 120;
+            for (body, shape, rows) in [
+                (
+                    PaletteBody::Commands,
+                    PaletteShape::Commands,
+                    state.filtered().len(),
+                ),
+                (
+                    PaletteBody::BindingHelp(&help),
+                    PaletteShape::BindingHelp,
+                    help.rows().len(),
+                ),
+                (
+                    PaletteBody::AgentAccess(&access),
+                    PaletteShape::AgentAccess,
+                    0,
+                ),
+            ] {
+                let filtered = match body {
+                    PaletteBody::Commands => state.filtered().to_vec(),
+                    _ => vec![BuiltInCommandId::RecentSessions; rows],
+                };
+                let Some(layout) = command_palette_layout(content, &filtered, 0, 0, shape) else {
+                    continue;
+                };
+                let mut canvas = vec![0_u8; usize::try_from(width * height * 4).unwrap()];
+                paint_command_palette(
+                    &mut SessionPickerTextCache::default(),
+                    &RenderContext::new(u16::MAX),
+                    &mut canvas,
+                    width,
+                    height,
+                    content,
+                    scale,
+                    1,
+                    &layout,
+                    session_picker_palette(ResolvedTheme::default()),
+                    &state,
+                    &keymap,
+                    None,
+                    true,
+                    body,
+                )
+                .unwrap();
             }
         }
     }
@@ -1843,7 +1948,7 @@ mod tests {
                 assert!(cell.1 <= chrome_maximum_cell_height(scale));
                 let chrome = ChromeBox {
                     title: "commands",
-                    right_label: "3/62",
+                    right_label: &["3/62"],
                     legend: PaletteBody::Commands.legend(),
                 }
                 .layout(buffer_rect(layout.panel, scale), scale, cell);
@@ -1878,7 +1983,6 @@ mod tests {
             }
         }
     }
-
     #[test]
     fn the_count_label_says_how_many_match_of_how_many() {
         assert_eq!(match_count_label(62, 62, ""), "62");
@@ -1887,31 +1991,52 @@ mod tests {
         let mut state = CommandPaletteUi::new(palette_context());
         let total = state.total();
         assert_eq!(total, state.filtered().len());
-        assert_eq!(PaletteBody::Commands.count_label(&state), total.to_string());
+        assert_eq!(
+            PaletteBody::Commands.count_parts(&state),
+            vec![total.to_string()]
+        );
         assert!(state.append_text("split"));
         let shown = state.filtered().len();
         assert!(shown > 0 && shown < total);
         assert_eq!(
-            PaletteBody::Commands.count_label(&state),
-            format!("{shown}/{total}")
+            PaletteBody::Commands.count_parts(&state),
+            vec![format!("{shown}/{total}")]
         );
         let keymap = ResolvedKeymap::default();
         let help = BindingHelpUi::new(&keymap);
         assert_eq!(
-            PaletteBody::BindingHelp(&help).count_label(&state),
-            help.total().to_string()
+            PaletteBody::BindingHelp(&help).count_parts(&state),
+            vec![help.total().to_string()]
         );
+        // Agent access puts what waits and a short read first, so they
+        // are the last to drop.
+        let lair_id = LairId::new();
+        let mut pending = crate::frontend::agent_access_test_entry(lair_id);
+        pending.kind = splinterm_protocol::AccessEntryKind::Pending;
+        pending.state = splinterm_protocol::AccessEntryState::Prompting;
         let mut snapshot = crate::frontend::AccessSnapshot::new(
             3,
             splinterm_protocol::RememberedStoreStatus::Available,
         );
-        snapshot.entries = vec![crate::frontend::agent_access_test_entry(LairId::new())];
+        snapshot.entries = vec![crate::frontend::agent_access_test_entry(lair_id), pending];
+        snapshot.truncated = true;
         let access = AgentAccessUi::new(Some(&snapshot), None);
-        let label = PaletteBody::AgentAccess(&access).count_label(&state);
-        assert!(label.starts_with(&access.total().to_string()), "{label}");
-        if !access.status_label().is_empty() {
-            assert!(label.ends_with(&format!(" · {}", access.status_label())));
-        }
+        assert_eq!(access.total(), 2);
+        assert_eq!(
+            PaletteBody::AgentAccess(&access).count_parts(&state),
+            vec![
+                "1 waiting".to_owned(),
+                "first 512 only".to_owned(),
+                "2".to_owned()
+            ]
+        );
+        snapshot.truncated = false;
+        snapshot.entries.pop();
+        let access = AgentAccessUi::new(Some(&snapshot), None);
+        assert_eq!(
+            PaletteBody::AgentAccess(&access).count_parts(&state),
+            vec!["1".to_owned()]
+        );
     }
 
     #[test]
@@ -2623,7 +2748,7 @@ mod tests {
             &help_layout,
             PaletteBody::BindingHelp(&help),
         );
-        assert!(cache.contains_source("search key bindings"));
+        assert!(cache.contains_source("filter by key or name"));
         assert!(cache.contains_source("key bindings"));
         assert!(cache.contains_source("pgup pgdn"));
 
@@ -2657,7 +2782,13 @@ mod tests {
         let footer = access.footer();
         assert!(cache.drawn().any(|(text, _)| text == footer
             || (text.ends_with('…') && footer.starts_with(text.trim_end_matches('…')))));
-        assert!(cache.contains_source(&PaletteBody::AgentAccess(&access).count_label(&state)));
+        assert!(
+            cache.contains_source(
+                &PaletteBody::AgentAccess(&access)
+                    .count_parts(&state)
+                    .join(" · ")
+            )
+        );
 
         assert!(help.append_text("definitely absent xyz"));
         let empty_layout =
@@ -2673,7 +2804,7 @@ mod tests {
             );
         }
         assert!(cache.contains_source("definitely absent xyz"));
-        assert!(!cache.contains_source("search key bindings"));
+        assert!(!cache.contains_source("filter by key or name"));
         assert!(cache.contains_source(&format!("0/{}", help.total())));
         assert!(cache.contains_source("No matching keybindings"));
     }
