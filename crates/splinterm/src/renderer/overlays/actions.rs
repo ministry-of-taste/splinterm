@@ -2846,12 +2846,15 @@ mod tests {
         .unwrap();
         // Glassy Windows (0.65) with [menu] background-alpha 0.9.
         let theme = ResolvedTheme {
-            background: 0x1a_1b_26,
-            foreground: 0xc0_ca_f5,
             background_alpha: 42_597,
             shell: OmarchyShellSettings {
                 menu_alpha: 58_981,
                 ..OmarchyShellSettings::default()
+            },
+            roles: crate::theme::ChromeRoles {
+                surface: 0x1a_1b_26,
+                text: 0xc0_ca_f5,
+                ..crate::theme::ChromeRoles::default()
             },
             ..ResolvedTheme::default()
         };

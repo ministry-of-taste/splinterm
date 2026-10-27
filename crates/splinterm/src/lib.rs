@@ -13,6 +13,7 @@ pub mod background_effect;
 mod box_drawing;
 pub mod child_spawn;
 pub mod clipboard_image;
+mod color;
 pub mod config;
 pub mod diagnostics;
 pub mod endpoint;
@@ -35,6 +36,7 @@ pub mod renderer;
 pub mod session_picker;
 #[doc(hidden)]
 pub mod tab;
+pub mod theme;
 pub mod viewport;
 pub mod wayland;
 pub mod window_continuation;

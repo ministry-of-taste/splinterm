@@ -882,7 +882,7 @@ pub(super) fn paint_pane_chrome(
                     clip,
                     cell_width,
                     cell_height,
-                    theme.pane_border,
+                    theme.roles.divider,
                     scale,
                     horizontal,
                 );
@@ -905,7 +905,7 @@ pub(super) fn paint_pane_chrome(
                             height: cell_height,
                         },
                         clip,
-                        theme.pane_border,
+                        theme.roles.divider,
                         scale,
                     );
                 }
@@ -927,7 +927,7 @@ pub(super) fn paint_pane_chrome(
                         clip,
                         cell_width,
                         cell_height,
-                        theme.pane_border_active,
+                        theme.roles.focus_ring,
                         scale,
                         horizontal,
                     );
@@ -963,7 +963,7 @@ pub(super) fn paint_pane_chrome(
                                         height: cell_height,
                                     },
                                     clip,
-                                    theme.pane_border_active,
+                                    theme.roles.focus_ring,
                                     scale,
                                 );
                             }
@@ -981,9 +981,9 @@ pub(super) fn paint_pane_chrome(
                 let content_right = content.x.saturating_add(content.width);
                 let content_bottom = content.y.saturating_add(content.height);
                 let color = if Some(pane.splint_id) == active_splint {
-                    theme.pane_border_active
+                    theme.roles.focus_ring
                 } else {
-                    theme.pane_border
+                    theme.roles.divider
                 };
                 let top = Rect {
                     x: allocation.x.saturating_add(cell_width),
@@ -1108,7 +1108,7 @@ pub(super) fn paint_pane_chrome(
                         width,
                         height,
                         clear,
-                        theme.background,
+                        theme.roles.surface,
                         theme.background_alpha,
                     );
                     title
@@ -1764,8 +1764,11 @@ mod tests {
         let height = 125;
         let mut canvas = vec![0; usize::try_from(width * height * 4).unwrap()];
         let theme = ResolvedTheme {
-            pane_border: 0x11_22_33,
-            pane_border_active: 0xcc_88_44,
+            roles: crate::theme::ChromeRoles {
+                divider: 0x11_22_33,
+                focus_ring: 0xcc_88_44,
+                ..crate::theme::ChromeRoles::default()
+            },
             ..ResolvedTheme::default()
         };
         paint_pane_chrome(
@@ -1878,8 +1881,11 @@ mod tests {
 
         let mut canvas = vec![0; usize::try_from(width * height * 4).unwrap()];
         let theme = ResolvedTheme {
-            pane_border: 0x11_22_33,
-            pane_border_active: 0xcc_88_44,
+            roles: crate::theme::ChromeRoles {
+                divider: 0x11_22_33,
+                focus_ring: 0xcc_88_44,
+                ..crate::theme::ChromeRoles::default()
+            },
             ..ResolvedTheme::default()
         };
         paint_pane_chrome(

@@ -28,6 +28,10 @@ use crate::{
     geometry::{FontSize, FontSizingPolicy, TerminalPadding},
     keymap::{KeymapProfile, ResolvedKeymap, resolve_keymap},
     preset::PresetCatalog,
+    theme::{
+        BuiltinThemeProvider, ChromeRoles, RoleHints, TerminalPalette, ThemeComponents, ThemeInput,
+        ThemeProvider, ThemeShellInput, active_tab_foreground_fallback, derive,
+    },
 };
 
 pub const APP_ID: &str = "com.oldjobobo.splinterm";
@@ -1507,6 +1511,8 @@ pub struct ThemePalette {
     pub active_tab_background: Option<String>,
     #[serde(default)]
     pub active_tab_foreground: Option<String>,
+    /// Inactive tab labels. When given it pins the `text_muted` role
+    /// verbatim, with no ramp and no contrast floor.
     #[serde(default)]
     pub inactive_tab_foreground: Option<String>,
     pub url: String,
@@ -1522,128 +1528,47 @@ pub struct ThemePalette {
     pub ansi: [String; 16],
 }
 
+/// A resolved theme: the terminal palette, the chrome roles and components
+/// derived from it, and the shell settings. See `crate::theme` for how a
+/// theme source becomes one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResolvedTheme {
+    /// The terminal palette. Chrome paints from `roles` instead.
     pub background: u32,
     pub foreground: u32,
     pub cursor: u32,
     pub selection: u32,
     pub selection_foreground: u32,
-    pub active_tab_background: u32,
-    pub active_tab_foreground: u32,
-    pub inactive_tab_foreground: u32,
     pub url: u32,
-    pub ui_accent: u32,
-    pub pane_border: u32,
-    pub pane_border_active: u32,
+    pub ansi: [u32; 16],
+    /// The semantic chrome colors.
+    pub roles: ChromeRoles,
+    /// The selected Dojo tab's body: a JSON theme's own color, the
+    /// `surface_raised` role a theme names (Omarchy `lighter_background`),
+    /// else ANSI 8. `[colors] active-tab-background` replaces it.
+    pub active_tab_background: u32,
+    /// The selected Dojo tab's label: a JSON theme's own color, else the
+    /// surface or text role, whichever contrasts more with the body.
+    pub active_tab_foreground: u32,
     pub background_alpha: u16,
     pub background_blur: bool,
     /// Coverage of Splinterm's own chrome backgrounds, and the Explorer's
     /// panel colour. Splinterm owns these; themes do not set them.
     pub chrome: ChromeBackgrounds,
-    pub ansi: [u32; 16],
     /// Omarchy shell settings layered from `shell.toml`; Omarchy's defaults
     /// for other theme sources.
     pub shell: OmarchyShellSettings,
 }
 
 impl Default for ResolvedTheme {
+    /// The built-in palette.
     fn default() -> Self {
-        Self {
-            background: 0x0e1216,
-            foreground: 0xebebeb,
-            cursor: 0xebebeb,
-            selection: 0x354a60,
-            selection_foreground: 0xebebeb,
-            active_tab_background: 0x928374,
-            active_tab_foreground: 0x0e1216,
-            // ANSI 8 already meets the inactive-tab floor on the default background.
-            inactive_tab_foreground: 0x928374,
-            url: 0x78beff,
-            ui_accent: 0x78d2ff,
-            pane_border: 0x7c7e80,
-            pane_border_active: 0x78d2ff,
-            background_alpha: u16::MAX,
-            background_blur: false,
-            chrome: ChromeBackgrounds::default(),
-            ansi: [
-                0x1d2021, 0xcc241d, 0x98971a, 0xd79921, 0x458588, 0xb16286, 0x689d6a, 0xa89984,
-                0x928374, 0xfb4934, 0xb8bb26, 0xfabd2f, 0x83a598, 0xd3869b, 0x8ec07c, 0xebdbb2,
-            ],
-            shell: OmarchyShellSettings::default(),
-        }
+        Self::from_input(&ThemeInput::builtin())
     }
 }
 
 const fn opaque_alpha() -> f32 {
     1.0
-}
-
-fn srgb_channel_luminance(channel: u8) -> f64 {
-    let channel = f64::from(channel) / 255.0;
-    if channel <= 0.04045 {
-        channel / 12.92
-    } else {
-        ((channel + 0.055) / 1.055).powf(2.4)
-    }
-}
-
-fn relative_luminance(color: u32) -> f64 {
-    let red = srgb_channel_luminance(((color >> 16) & 0xff) as u8);
-    let green = srgb_channel_luminance(((color >> 8) & 0xff) as u8);
-    let blue = srgb_channel_luminance((color & 0xff) as u8);
-    0.2126 * red + 0.7152 * green + 0.0722 * blue
-}
-
-fn contrast_ratio(first: u32, second: u32) -> f64 {
-    let first = relative_luminance(first);
-    let second = relative_luminance(second);
-    let (lighter, darker) = if first >= second {
-        (first, second)
-    } else {
-        (second, first)
-    };
-    (lighter + 0.05) / (darker + 0.05)
-}
-
-fn active_tab_foreground_fallback(background: u32, foreground: u32, active_tab: u32) -> u32 {
-    if contrast_ratio(background, active_tab) > contrast_ratio(foreground, active_tab) {
-        background
-    } else {
-        foreground
-    }
-}
-
-/// WCAG AA contrast for normal-size text, against the opaque tab-strip background.
-const INACTIVE_TAB_MIN_CONTRAST: f64 = 4.5;
-
-/// Mixes `second` into `first` in quarters: 0 keeps `first`, 4 gives `second`.
-fn mix_rgb_quarters(first: u32, second: u32, second_quarters: u32) -> u32 {
-    let channel = |shift: u32| {
-        let first = first >> shift & 0xff;
-        let second = second >> shift & 0xff;
-        (first * (4 - second_quarters) + second * second_quarters + 2) / 4
-    };
-    channel(16) << 16 | channel(8) << 8 | channel(0)
-}
-
-/// Picks muted inactive-tab label text. Tries the theme's muted color, then
-/// mixes of it with 25, 50, and 75 % foreground, and takes the first that is
-/// readable on the strip background and not louder than the foreground itself.
-/// Otherwise, including when the foreground is below the floor, it keeps the
-/// plain foreground.
-fn inactive_tab_foreground_fallback(background: u32, foreground: u32, muted: u32) -> u32 {
-    let foreground_contrast = contrast_ratio(foreground, background);
-    if foreground_contrast < INACTIVE_TAB_MIN_CONTRAST {
-        return foreground;
-    }
-    (0..4)
-        .map(|quarters| mix_rgb_quarters(muted, foreground, quarters))
-        .find(|candidate| {
-            let contrast = contrast_ratio(*candidate, background);
-            (INACTIVE_TAB_MIN_CONTRAST..=foreground_contrast).contains(&contrast)
-        })
-        .unwrap_or(foreground)
 }
 
 /// How Splinterm draws its own chrome backgrounds over the Window's glass.
@@ -1701,6 +1626,65 @@ impl ChromeColorOverrides {
 }
 
 impl ResolvedTheme {
+    /// Derives the roles of `input` and the chrome components that follow
+    /// from them, before any `config.ini` override.
+    #[must_use]
+    pub fn from_input(input: &ThemeInput) -> Self {
+        let terminal = input.terminal;
+        let roles = derive(input);
+        let active_tab_background = input.components.active_tab_background.unwrap_or(
+            // Without a theme's raised surface, the selected tab keeps the
+            // Foot `bright0` ramp rather than the derived `surface_raised`.
+            if input.hints.surface_raised.is_some() {
+                roles.surface_raised
+            } else {
+                terminal.ansi[8]
+            },
+        );
+        Self {
+            background: terminal.background,
+            foreground: terminal.foreground,
+            cursor: terminal.cursor,
+            selection: terminal.selection,
+            selection_foreground: terminal.selection_foreground,
+            url: terminal.url,
+            ansi: terminal.ansi,
+            roles,
+            active_tab_background,
+            active_tab_foreground: input.components.active_tab_foreground.unwrap_or_else(|| {
+                active_tab_foreground_fallback(roles.surface, roles.text, active_tab_background)
+            }),
+            background_alpha: input.shell.background_alpha,
+            background_blur: input.shell.background_blur,
+            chrome: ChromeBackgrounds::default(),
+            shell: input.shell.settings,
+        }
+    }
+
+    /// The application accent: the `accent` role.
+    #[must_use]
+    pub const fn ui_accent(&self) -> u32 {
+        self.roles.accent
+    }
+
+    /// Inactive pane borders and frames: the `divider` role.
+    #[must_use]
+    pub const fn pane_border(&self) -> u32 {
+        self.roles.divider
+    }
+
+    /// The active pane border: the `focus_ring` role.
+    #[must_use]
+    pub const fn pane_border_active(&self) -> u32 {
+        self.roles.focus_ring
+    }
+
+    /// Inactive tab labels: the `text_muted` role.
+    #[must_use]
+    pub const fn inactive_tab_foreground(&self) -> u32 {
+        self.roles.text_muted
+    }
+
     /// Applies the `config.ini` chrome keys. A replaced selected-tab colour
     /// gets its label colour chosen again for contrast, as a theme without an
     /// explicit `active_tab_foreground` does.
@@ -1709,7 +1693,7 @@ impl ResolvedTheme {
         if let Some(color) = overrides.active_tab_background {
             self.active_tab_background = color;
             self.active_tab_foreground =
-                active_tab_foreground_fallback(self.background, self.foreground, color);
+                active_tab_foreground_fallback(self.roles.surface, self.roles.text, color);
         }
         if let Some(alpha) = overrides.active_tab_alpha {
             self.chrome.active_tab_alpha = alpha;
@@ -1735,12 +1719,13 @@ impl ResolvedTheme {
         }
     }
 
-    /// The docked Lair Explorer's panel colour.
+    /// The docked Lair Explorer's panel colour: the `surface` role unless
+    /// `[colors] explorer-background` replaces it.
     #[must_use]
     pub const fn explorer_background(&self) -> u32 {
         match self.chrome.explorer_background {
             Some(color) => color,
-            None => self.background,
+            None => self.roles.surface,
         }
     }
 
@@ -1770,7 +1755,18 @@ impl ThemePalette {
     ///
     /// # Errors
     /// Returns an error when any required role is not a six-digit RGB color.
+    #[cfg(test)]
     pub fn resolve(&self) -> Result<ResolvedTheme> {
+        self.input().map(|input| ResolvedTheme::from_input(&input))
+    }
+
+    /// Reads the palette as theme input. `pane_border` and
+    /// `pane_border_active` hint the `divider` and `focus_ring` roles; the
+    /// tab keys are components used as given.
+    ///
+    /// # Errors
+    /// Returns an error when any required role is not a six-digit RGB color.
+    pub fn input(&self) -> Result<ThemeInput> {
         let mut ansi = [0; 16];
         for (out, value) in ansi.iter_mut().zip(&self.ansi) {
             *out = parse_color(value)?;
@@ -1778,63 +1774,50 @@ impl ThemePalette {
         if !self.alpha.is_finite() || !(0.0..=1.0).contains(&self.alpha) {
             bail!("theme alpha must be between 0.0 and 1.0");
         }
+        let optional =
+            |value: Option<&str>, parse: fn(&str) -> Result<u32>| value.map(parse).transpose();
         let background = parse_color(&self.background)?;
         let foreground = parse_color(&self.foreground)?;
         let selection = parse_color(&self.selection)?;
-        let active_tab_background = self
-            .active_tab_background
-            .as_deref()
-            .map(parse_color)
-            .transpose()?
-            .unwrap_or(ansi[8]);
-        let active_tab_foreground = self
-            .active_tab_foreground
-            .as_deref()
-            .map(parse_json_color)
-            .transpose()?
-            .unwrap_or_else(|| {
-                active_tab_foreground_fallback(background, foreground, active_tab_background)
-            });
-        let inactive_tab_foreground = self
-            .inactive_tab_foreground
-            .as_deref()
-            .map(parse_json_color)
-            .transpose()?
-            .unwrap_or_else(|| inactive_tab_foreground_fallback(background, foreground, ansi[8]));
-        let ui_accent = parse_color(&self.ui_accent)?;
-        Ok(ResolvedTheme {
-            background,
-            foreground,
-            cursor: parse_color(&self.cursor)?,
-            selection,
-            selection_foreground: self
-                .selection_foreground
-                .as_deref()
-                .map(parse_color)
-                .transpose()?
-                .unwrap_or(foreground),
-            active_tab_background,
-            active_tab_foreground,
-            inactive_tab_foreground,
-            url: parse_color(&self.url)?,
-            ui_accent,
-            pane_border: self
-                .pane_border
-                .as_deref()
-                .map(parse_color)
-                .transpose()?
-                .unwrap_or_else(|| blend_rgb(background, foreground)),
-            pane_border_active: self
-                .pane_border_active
-                .as_deref()
-                .map(parse_color)
-                .transpose()?
-                .unwrap_or(ui_accent),
-            background_alpha: foot_alpha(self.alpha),
-            background_blur: self.blur,
-            chrome: ChromeBackgrounds::default(),
-            ansi,
-            shell: OmarchyShellSettings::default(),
+        let components = ThemeComponents {
+            active_tab_background: optional(self.active_tab_background.as_deref(), parse_color)?,
+            active_tab_foreground: optional(
+                self.active_tab_foreground.as_deref(),
+                parse_json_color,
+            )?,
+            inactive_tab_foreground: optional(
+                self.inactive_tab_foreground.as_deref(),
+                parse_json_color,
+            )?,
+        };
+        let accent = parse_color(&self.ui_accent)?;
+        let cursor = parse_color(&self.cursor)?;
+        let selection_foreground =
+            optional(self.selection_foreground.as_deref(), parse_color)?.unwrap_or(foreground);
+        let url = parse_color(&self.url)?;
+        let hints = RoleHints {
+            accent: Some(accent),
+            divider: optional(self.pane_border.as_deref(), parse_color)?,
+            focus_ring: optional(self.pane_border_active.as_deref(), parse_color)?,
+            ..RoleHints::default()
+        };
+        Ok(ThemeInput {
+            terminal: TerminalPalette {
+                background,
+                foreground,
+                cursor,
+                selection,
+                selection_foreground,
+                url,
+                ansi,
+            },
+            hints,
+            components,
+            shell: ThemeShellInput {
+                background_alpha: foot_alpha(self.alpha),
+                background_blur: self.blur,
+                settings: OmarchyShellSettings::default(),
+            },
         })
     }
 }
@@ -1943,7 +1926,19 @@ fn foot_theme_color(values: &HashMap<String, String>, key: &str) -> Result<u32> 
     .with_context(|| format!("active Omarchy foot.ini has invalid {key}"))
 }
 
+#[cfg(test)]
 fn resolve_omarchy_theme(colors_raw: &str, foot_raw: &str) -> Result<ResolvedTheme> {
+    omarchy_theme_input(colors_raw, foot_raw).map(|input| ResolvedTheme::from_input(&input))
+}
+
+/// Reads an Omarchy theme: the terminal palette, alpha and blur from the
+/// generated `foot.ini`, and role hints from `colors.toml`.
+///
+/// Only the keys Splinterm read before roles existed are hints so far
+/// (`lighter_background`, `muted`, `accent` and their aliases). The pane
+/// border keeps Foot `bright0` (ANSI 8) through the `divider` hint, where a
+/// JSON or built-in theme derives it from surface and text.
+fn omarchy_theme_input(colors_raw: &str, foot_raw: &str) -> Result<ThemeInput> {
     let colors = omarchy_color_values(colors_raw);
     let foot = foot_color_values(foot_raw)?;
     if foot.is_empty() {
@@ -1979,13 +1974,13 @@ fn resolve_omarchy_theme(colors_raw: &str, foot_raw: &str) -> Result<ResolvedThe
         .transpose()
         .context("active Omarchy foot.ini has invalid cursor")?
         .unwrap_or(foreground);
-    let active_tab_background =
-        omarchy_role(&colors, &OMARCHY_LIGHTER_BACKGROUND_KEYS)?.unwrap_or(ansi[8]);
-    let active_tab_foreground =
-        active_tab_foreground_fallback(background, foreground, active_tab_background);
-    let muted = omarchy_role(&colors, &OMARCHY_MUTED_KEYS)?.unwrap_or(ansi[8]);
-    let inactive_tab_foreground = inactive_tab_foreground_fallback(background, foreground, muted);
-    let ui_accent = omarchy_role(&colors, &OMARCHY_ACCENT_KEYS)?.unwrap_or(cursor);
+    let hints = RoleHints {
+        surface_raised: omarchy_role(&colors, &OMARCHY_LIGHTER_BACKGROUND_KEYS)?,
+        text_muted: omarchy_role(&colors, &OMARCHY_MUTED_KEYS)?,
+        accent: Some(omarchy_role(&colors, &OMARCHY_ACCENT_KEYS)?.unwrap_or(cursor)),
+        divider: Some(ansi[8]),
+        ..RoleHints::default()
+    };
     let alpha = foot.get("alpha").map_or(Ok(1.0), |value| {
         value
             .parse::<f32>()
@@ -2002,24 +1997,23 @@ fn resolve_omarchy_theme(colors_raw: &str, foot_raw: &str) -> Result<ResolvedThe
         }
     })?;
 
-    Ok(ResolvedTheme {
-        background,
-        foreground,
-        cursor,
-        selection,
-        selection_foreground,
-        active_tab_background,
-        active_tab_foreground,
-        inactive_tab_foreground,
-        url: ansi[4],
-        ui_accent,
-        pane_border: ansi[8],
-        pane_border_active: ui_accent,
-        background_alpha: foot_alpha(alpha),
-        background_blur: blur,
-        chrome: ChromeBackgrounds::default(),
-        ansi,
-        shell: OmarchyShellSettings::default(),
+    Ok(ThemeInput {
+        terminal: TerminalPalette {
+            background,
+            foreground,
+            cursor,
+            selection,
+            selection_foreground,
+            url: ansi[4],
+            ansi,
+        },
+        hints,
+        components: ThemeComponents::default(),
+        shell: ThemeShellInput {
+            background_alpha: foot_alpha(alpha),
+            background_blur: blur,
+            settings: OmarchyShellSettings::default(),
+        },
     })
 }
 
@@ -2066,22 +2060,29 @@ pub struct ThemeSourceLoad {
     pub used_omarchy_fallback: bool,
 }
 
+/// Theme input and the startup read decision that produced it.
+struct ThemeInputLoad {
+    input: ThemeInput,
+    used_omarchy_fallback: bool,
+}
+
+#[cfg(test)]
 fn load_omarchy_theme_with(
     theme_dir: &Path,
     missing: MissingOmarchyTheme,
     after_identity: impl FnOnce(),
     between_reads: impl FnOnce(),
 ) -> Result<ResolvedTheme> {
-    load_omarchy_theme_with_status(theme_dir, missing, after_identity, between_reads)
-        .map(|loaded| loaded.theme)
+    load_omarchy_input_with_status(theme_dir, missing, after_identity, between_reads)
+        .map(|loaded| ResolvedTheme::from_input(&loaded.input))
 }
 
-fn load_omarchy_theme_with_status(
+fn load_omarchy_input_with_status(
     theme_dir: &Path,
     missing: MissingOmarchyTheme,
     after_identity: impl FnOnce(),
     between_reads: impl FnOnce(),
-) -> Result<ThemeSourceLoad> {
+) -> Result<ThemeInputLoad> {
     let colors_path = theme_dir.join("colors.toml");
     let foot_path = theme_dir.join("foot.ini");
     let before = omarchy_theme_identity(theme_dir);
@@ -2090,8 +2091,8 @@ fn load_omarchy_theme_with_status(
         && before.1.is_none()
         && before.2.is_none()
     {
-        return Ok(ThemeSourceLoad {
-            theme: ResolvedTheme::default(),
+        return Ok(ThemeInputLoad {
+            input: ThemeInput::builtin(),
             used_omarchy_fallback: true,
         });
     }
@@ -2105,10 +2106,90 @@ fn load_omarchy_theme_with_status(
         omarchy_theme_identity(theme_dir) == before,
         "active Omarchy theme changed while its palette was loading"
     );
-    resolve_omarchy_theme(&colors, &foot).map(|theme| ThemeSourceLoad {
-        theme,
+    omarchy_theme_input(&colors, &foot).map(|input| ThemeInputLoad {
+        input,
         used_omarchy_fallback: false,
     })
+}
+
+/// One Omarchy theme directory as a theme provider: its `colors.toml` and
+/// the `foot.ini` Omarchy generates from it, read as one generation.
+#[derive(Clone, Copy, Debug)]
+pub struct OmarchyThemeProvider<'a> {
+    theme_dir: &'a Path,
+    missing: MissingOmarchyTheme,
+}
+
+impl<'a> OmarchyThemeProvider<'a> {
+    /// For a startup read: a theme directory that does not exist at all
+    /// gives the built-in palette.
+    #[must_use]
+    pub const fn startup(theme_dir: &'a Path) -> Self {
+        Self {
+            theme_dir,
+            missing: MissingOmarchyTheme::UseFallback,
+        }
+    }
+
+    /// For a live reload: transient absence is an error, never the fallback.
+    #[must_use]
+    pub const fn live(theme_dir: &'a Path) -> Self {
+        Self {
+            theme_dir,
+            missing: MissingOmarchyTheme::Reject,
+        }
+    }
+
+    fn load_with_status(&self) -> Result<ThemeInputLoad> {
+        load_omarchy_input_with_status(self.theme_dir, self.missing, || {}, || {})
+    }
+}
+
+impl ThemeProvider for OmarchyThemeProvider<'_> {
+    fn load(&self) -> Result<ThemeInput> {
+        self.load_with_status().map(|loaded| loaded.input)
+    }
+
+    /// The directory itself, so a theme switch that swaps it is seen, and
+    /// the two files read from it.
+    fn watched_paths(&self) -> Vec<PathBuf> {
+        vec![
+            self.theme_dir.to_path_buf(),
+            self.theme_dir.join("colors.toml"),
+            self.theme_dir.join("foot.ini"),
+        ]
+    }
+}
+
+/// An explicit JSON theme file (`[main] theme`) as a theme provider. An
+/// absent file gives the built-in palette.
+#[derive(Clone, Copy, Debug)]
+pub struct JsonThemeProvider<'a> {
+    path: &'a Path,
+}
+
+impl<'a> JsonThemeProvider<'a> {
+    #[must_use]
+    pub const fn new(path: &'a Path) -> Self {
+        Self { path }
+    }
+}
+
+impl ThemeProvider for JsonThemeProvider<'_> {
+    fn load(&self) -> Result<ThemeInput> {
+        if !self.path.exists() {
+            return BuiltinThemeProvider.load();
+        }
+        let raw = fs::read_to_string(self.path)
+            .with_context(|| format!("read {}", self.path.display()))?;
+        serde_json::from_str::<ThemePalette>(&raw)
+            .context("parse explicit Splinterm theme JSON")?
+            .input()
+    }
+
+    fn watched_paths(&self) -> Vec<PathBuf> {
+        vec![self.path.to_path_buf()]
+    }
 }
 
 /// Loads the effective active Omarchy terminal palette directly.
@@ -2117,7 +2198,7 @@ fn load_omarchy_theme_with_status(
 /// Returns an error when an active theme exists but its `colors.toml` or
 /// generated `foot.ini` cannot be read as one coherent theme generation.
 pub fn load_omarchy_theme(theme_dir: &Path) -> Result<ResolvedTheme> {
-    load_omarchy_theme_with(theme_dir, MissingOmarchyTheme::UseFallback, || {}, || {})
+    load_provider_theme(&OmarchyThemeProvider::startup(theme_dir))
 }
 
 /// Loads one live Omarchy theme directory without converting transient
@@ -2126,22 +2207,20 @@ pub fn load_omarchy_theme(theme_dir: &Path) -> Result<ResolvedTheme> {
 /// # Errors
 /// Returns an error when the theme is absent, incomplete, changing, or
 /// malformed.
+#[cfg(test)]
 pub fn load_live_omarchy_theme(theme_dir: &Path) -> Result<ResolvedTheme> {
-    load_omarchy_theme_with(theme_dir, MissingOmarchyTheme::Reject, || {}, || {})
+    load_provider_theme(&OmarchyThemeProvider::live(theme_dir))
 }
 
-/// Loads an explicit project JSON role map, or the safe fallback when absent.
+/// Loads a provider's input and derives its theme, before `config.ini`
+/// overrides.
 ///
 /// # Errors
-/// Returns an error when an existing theme file is unreadable or invalid.
-pub fn load_theme(path: &Path) -> Result<ResolvedTheme> {
-    if !path.exists() {
-        return Ok(ResolvedTheme::default());
-    }
-    let raw = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    serde_json::from_str::<ThemePalette>(&raw)
-        .context("parse explicit Splinterm theme JSON")?
-        .resolve()
+/// Returns the provider's load error.
+pub fn load_provider_theme(provider: &dyn ThemeProvider) -> Result<ResolvedTheme> {
+    provider
+        .load()
+        .map(|input| ResolvedTheme::from_input(&input))
 }
 
 /// Resolves either native Omarchy state or an explicit JSON override.
@@ -2158,18 +2237,19 @@ pub fn load_theme_source(source: &ThemeSource) -> Result<ResolvedTheme> {
 /// # Errors
 /// Returns an error when the selected source exists but is malformed.
 pub fn load_theme_source_for_startup(source: &ThemeSource) -> Result<ThemeSourceLoad> {
-    match source {
-        ThemeSource::Omarchy(roots) => load_omarchy_theme_with_status(
-            roots.select(),
-            MissingOmarchyTheme::UseFallback,
-            || {},
-            || {},
-        ),
-        ThemeSource::Json { path, .. } => load_theme(path).map(|theme| ThemeSourceLoad {
-            theme,
+    let loaded = match source {
+        ThemeSource::Omarchy(roots) => {
+            OmarchyThemeProvider::startup(roots.select()).load_with_status()?
+        }
+        ThemeSource::Json { path, .. } => ThemeInputLoad {
+            input: JsonThemeProvider::new(path).load()?,
             used_omarchy_fallback: false,
-        }),
-    }
+        },
+    };
+    Ok(ThemeSourceLoad {
+        theme: ResolvedTheme::from_input(&loaded.input),
+        used_omarchy_fallback: loaded.used_omarchy_fallback,
+    })
 }
 
 #[allow(
@@ -2209,16 +2289,11 @@ fn parse_color(value: &str) -> Result<u32> {
     u32::from_str_radix(hex, 16).with_context(|| format!("invalid color {value:?}"))
 }
 
-fn blend_rgb(first: u32, second: u32) -> u32 {
-    let red = u32::midpoint(first >> 16 & 0xff, second >> 16 & 0xff);
-    let green = u32::midpoint(first >> 8 & 0xff, second >> 8 & 0xff);
-    let blue = u32::midpoint(first & 0xff, second & 0xff);
-    red << 16 | green << 8 | blue
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::color::{contrast_ratio, legacy_srgb::mix_quarters as mix_rgb_quarters};
+    use crate::theme::{INACTIVE_TAB_MIN_CONTRAST, inactive_tab_foreground_fallback};
 
     #[test]
     fn colors_reject_non_hexadecimal_and_multibyte_input_without_panicking() {
@@ -2959,9 +3034,9 @@ mod tests {
         assert_eq!(theme.active_tab_background, 0x07_08_09);
         assert_eq!(theme.active_tab_foreground, theme.background);
         assert_eq!(theme.url, 4);
-        assert_eq!(theme.ui_accent, 0x01_02_03);
-        assert_eq!(theme.pane_border, 8);
-        assert_eq!(theme.pane_border_active, 0x01_02_03);
+        assert_eq!(theme.ui_accent(), 0x01_02_03);
+        assert_eq!(theme.pane_border(), 8);
+        assert_eq!(theme.pane_border_active(), 0x01_02_03);
         assert_eq!(
             theme.ansi,
             std::array::from_fn(|index| u32::try_from(index).unwrap())
@@ -3081,11 +3156,11 @@ mod tests {
             assert_eq!(*name, expected_name);
             let theme = resolve_omarchy_theme(colors, foot).unwrap();
             assert_eq!(theme.active_tab_background, tab, "{name} selected tab");
-            assert_eq!(theme.ui_accent, accent, "{name} accent");
-            assert_eq!(theme.pane_border_active, accent, "{name} active border");
+            assert_eq!(theme.ui_accent(), accent, "{name} accent");
+            assert_eq!(theme.pane_border_active(), accent, "{name} active border");
             assert_eq!(theme.background, background, "{name} background");
             assert_eq!(
-                theme.inactive_tab_foreground,
+                theme.inactive_tab_foreground(),
                 inactive_tab_foreground_fallback(theme.background, theme.foreground, muted),
                 "{name} inactive tab"
             );
@@ -3116,19 +3191,19 @@ mod tests {
         .unwrap();
         assert_eq!(both.active_tab_background, 0x22_22_22);
         assert_eq!(
-            both.inactive_tab_foreground,
+            both.inactive_tab_foreground(),
             inactive_tab_foreground_fallback(both.background, both.foreground, 0x33_33_33)
         );
-        assert_eq!(both.ui_accent, 0x44_44_44);
+        assert_eq!(both.ui_accent(), 0x44_44_44);
 
         let legacy =
             resolve_omarchy_theme("lighter_bg=\"#111111\"\ndark_fg=\"#666666\"\n", &foot).unwrap();
         assert_eq!(legacy.active_tab_background, 0x11_11_11);
         assert_eq!(
-            legacy.inactive_tab_foreground,
+            legacy.inactive_tab_foreground(),
             inactive_tab_foreground_fallback(legacy.background, legacy.foreground, 0x66_66_66)
         );
-        assert_eq!(legacy.ui_accent, legacy.cursor);
+        assert_eq!(legacy.ui_accent(), legacy.cursor);
 
         let error = resolve_omarchy_theme("lighter_background=\"rgba(1,2,3)\"\n", &foot)
             .unwrap_err()
@@ -3398,9 +3473,9 @@ mod tests {
         assert_eq!(resolved.active_tab_background, resolved.ansi[8]);
         assert_eq!(resolved.active_tab_foreground, resolved.background);
         assert_ne!(resolved.active_tab_background, resolved.selection);
-        assert_eq!(resolved.ui_accent, 6);
-        assert_eq!(resolved.pane_border, 2);
-        assert_eq!(resolved.pane_border_active, 6);
+        assert_eq!(resolved.ui_accent(), 6);
+        assert_eq!(resolved.pane_border(), 2);
+        assert_eq!(resolved.pane_border_active(), 6);
         assert_eq!(resolved.background_alpha, u16::MAX);
         assert!(!resolved.background_blur);
         assert_eq!(resolved.ansi[15], 15);
@@ -3416,8 +3491,8 @@ mod tests {
         assert_eq!(resolved.selection_foreground, 2);
         assert_eq!(resolved.active_tab_background, 9);
         assert_eq!(resolved.active_tab_foreground, 10);
-        assert_eq!(resolved.pane_border, 7);
-        assert_eq!(resolved.pane_border_active, 8);
+        assert_eq!(resolved.pane_border(), 7);
+        assert_eq!(resolved.pane_border_active(), 8);
 
         let themed = json.replace(
             "\"ui_accent\"",
@@ -3505,16 +3580,16 @@ mod tests {
     }
 
     fn inactive_contrast(theme: &ResolvedTheme) -> f64 {
-        contrast_ratio(theme.inactive_tab_foreground, theme.background)
+        contrast_ratio(theme.inactive_tab_foreground(), theme.background)
     }
 
     #[test]
     fn default_inactive_tab_foreground_is_its_resolved_ansi_8() {
         let theme = ResolvedTheme::default();
-        assert_eq!(theme.inactive_tab_foreground, 0x92_83_74);
+        assert_eq!(theme.inactive_tab_foreground(), 0x92_83_74);
         assert_eq!(
             inactive_tab_foreground_fallback(theme.background, theme.foreground, theme.ansi[8]),
-            theme.inactive_tab_foreground
+            theme.inactive_tab_foreground()
         );
         assert!((inactive_contrast(&theme) - 5.13).abs() < 0.01);
     }
@@ -3572,7 +3647,7 @@ mod tests {
             .unwrap()
             .resolve()
             .unwrap();
-        assert_eq!(derived.inactive_tab_foreground, 0x92_83_74);
+        assert_eq!(derived.inactive_tab_foreground(), 0x92_83_74);
 
         // An explicit role is used verbatim, even below the floor.
         let explicit = json.replace(
@@ -3583,7 +3658,7 @@ mod tests {
             .unwrap()
             .resolve()
             .unwrap();
-        assert_eq!(explicit.inactive_tab_foreground, 0x1a_1e_22);
+        assert_eq!(explicit.inactive_tab_foreground(), 0x1a_1e_22);
         assert!(inactive_contrast(&explicit) < INACTIVE_TAB_MIN_CONTRAST);
 
         for invalid in ["invalid", "1a1e22", "0x1a1e22"] {
@@ -3606,18 +3681,18 @@ mod tests {
         let foot = complete_foot_palette("0e1216", "ebebeb", "354a60", "ebebeb")
             .replace("bright0=000008", "bright0=7c7e80");
         let muted = resolve_omarchy_theme("muted=\"#928374\"\n", &foot).unwrap();
-        assert_eq!(muted.inactive_tab_foreground, 0x92_83_74);
+        assert_eq!(muted.inactive_tab_foreground(), 0x92_83_74);
 
         let bright0 = resolve_omarchy_theme("accent=\"#00aaff\"\n", &foot).unwrap();
         assert_eq!(bright0.ansi[8], 0x7c_7e_80);
-        assert_eq!(bright0.inactive_tab_foreground, 0x7c_7e_80);
+        assert_eq!(bright0.inactive_tab_foreground(), 0x7c_7e_80);
         assert!(inactive_contrast(&bright0) >= INACTIVE_TAB_MIN_CONTRAST);
 
         // The near-black helper bright0 fails the floor and is mixed toward the
         // foreground rather than used.
         let faint = complete_foot_palette("0e1216", "ebebeb", "354a60", "ebebeb");
         let faint = resolve_omarchy_theme("", &faint).unwrap();
-        assert_ne!(faint.inactive_tab_foreground, faint.ansi[8]);
+        assert_ne!(faint.inactive_tab_foreground(), faint.ansi[8]);
         assert!(inactive_contrast(&faint) >= INACTIVE_TAB_MIN_CONTRAST);
 
         assert!(resolve_omarchy_theme("muted=\"nope\"\n", &foot).is_err());
@@ -4200,5 +4275,298 @@ mod tests {
             FontSize::Pixels(DEFAULT_UI_FONT_PIXELSIZE)
         );
         assert_eq!(DEFAULT_UI_FONT_PIXELSIZE.to_bits(), 14.0_f32.to_bits());
+    }
+
+    /// Shaped like a theme that names semantic colors; see its `colors.toml`.
+    const SEMANTIC_KEYS_FIXTURE: (&str, &str) = (
+        include_str!("../tests/fixtures/omarchy4/semantic-keys/colors.toml"),
+        include_str!("../tests/fixtures/omarchy4/semantic-keys/foot.ini"),
+    );
+
+    /// A JSON theme naming only its required keys, and one naming every
+    /// optional key as well.
+    const JSON_THEME: &str = r##"{"background":"#101820","foreground":"#e0e4ea","cursor":"#f0f0f0","selection":"#2a3a4a","url":"#5599ff","ui_accent":"#33bbee","ansi":["#101820","#cc3344","#44aa55","#ccaa33","#3377cc","#aa55bb","#33aaaa","#c0c4ca","#56606a","#ee5566","#66cc77","#eecc55","#5599ee","#cc77dd","#55cccc","#f0f4fa"]}"##;
+    const JSON_THEME_OPTIONAL_KEYS: &str = "\"selection_foreground\":\"#fafafa\",\"active_tab_background\":\"#203040\",\"active_tab_foreground\":\"#ffeedd\",\"inactive_tab_foreground\":\"#8899aa\",\"pane_border\":\"#445566\",\"pane_border_active\":\"#ddaa33\",\"alpha\":0.8,\"blur\":true,\"ansi\"";
+
+    fn json_theme(json: &str) -> ResolvedTheme {
+        serde_json::from_str::<ThemePalette>(json)
+            .unwrap()
+            .resolve()
+            .unwrap()
+    }
+
+    /// Every theme source the pins below cover: built-in, JSON, and the
+    /// stock Omarchy 4 and semantic-key fixtures.
+    fn provider_themes() -> Vec<(&'static str, ResolvedTheme)> {
+        let mut themes = vec![
+            ("builtin", ResolvedTheme::default()),
+            ("json", json_theme(JSON_THEME)),
+            (
+                "json-explicit",
+                json_theme(&JSON_THEME.replace("\"ansi\"", JSON_THEME_OPTIONAL_KEYS)),
+            ),
+        ];
+        for (name, colors, foot) in OMARCHY4_FIXTURES {
+            themes.push((name, resolve_omarchy_theme(colors, foot).unwrap()));
+        }
+        let (colors, foot) = SEMANTIC_KEYS_FIXTURE;
+        themes.push((
+            "semantic-keys",
+            resolve_omarchy_theme(colors, foot).unwrap(),
+        ));
+        themes
+    }
+
+    /// The colors each source paints: background, foreground, cursor,
+    /// selection, selection text, URL, selected tab body and label, inactive
+    /// tab label, accent, pane border, active pane border, then alpha and
+    /// blur. Every row but `semantic-keys` was recorded from the resolver
+    /// before chrome roles existed (Plan 0064 milestone 2); the
+    /// `semantic-keys` fixture is new with roles, and its row records what
+    /// the role resolver gives it.
+    #[allow(clippy::type_complexity)]
+    const PROVIDER_PINS: [(&str, [u32; 12], u16, bool); 9] = [
+        (
+            "builtin",
+            [
+                0x0e1216, 0xebebeb, 0xebebeb, 0x354a60, 0xebebeb, 0x78beff, 0x928374, 0x0e1216,
+                0x928374, 0x78d2ff, 0x7c7e80, 0x78d2ff,
+            ],
+            u16::MAX,
+            false,
+        ),
+        (
+            "json",
+            [
+                0x101820, 0xe0e4ea, 0xf0f0f0, 0x2a3a4a, 0xe0e4ea, 0x5599ff, 0x56606a, 0xe0e4ea,
+                0x79818a, 0x33bbee, 0x787e85, 0x33bbee,
+            ],
+            u16::MAX,
+            false,
+        ),
+        (
+            "json-explicit",
+            [
+                0x101820, 0xe0e4ea, 0xf0f0f0, 0x2a3a4a, 0xfafafa, 0x5599ff, 0x203040, 0xffeedd,
+                0x8899aa, 0x33bbee, 0x445566, 0xddaa33,
+            ],
+            52428,
+            true,
+        ),
+        (
+            "tokyo-night",
+            [
+                0x1a1b26, 0xa9b1d6, 0xc0caf5, 0x292e42, 0xc0caf5, 0x7aa2f7, 0x24283b, 0xa9b1d6,
+                0x8f97bb, 0x7aa2f7, 0x414868, 0x7aa2f7,
+            ],
+            u16::MAX,
+            true,
+        ),
+        (
+            "flexoki-light",
+            [
+                0xfffcf0, 0x100f0f, 0x100f0f, 0xcecdc3, 0x100f0f, 0x205ea6, 0xe6e4d9, 0x100f0f,
+                0x64625e, 0x205ea6, 0xb7b5ac, 0x205ea6,
+            ],
+            u16::MAX,
+            true,
+        ),
+        (
+            "last-horizon",
+            [
+                0x0c0b0c, 0xfafcfb, 0xe2dddc, 0x584e51, 0xe2dddc, 0xb59790, 0x0c0b0c, 0xfafcfb,
+                0x817a7c, 0xb59790, 0x584e51, 0xb59790,
+            ],
+            u16::MAX,
+            true,
+        ),
+        (
+            "legacy-gruvbox",
+            [
+                0x282828, 0xd4be98, 0xd4be98, 0x504945, 0xd4be98, 0x7daea3, 0x3c3836, 0xd4be98,
+                0x9d8d76, 0x7daea3, 0x665c54, 0x7daea3,
+            ],
+            u16::MAX,
+            true,
+        ),
+        (
+            "alacritty-kanagawa",
+            [
+                0x1f1f28, 0xdcd7ba, 0xdcd7ba, 0x2d4f67, 0xdcd7ba, 0x7e9cd8, 0x727169, 0xdcd7ba,
+                0x8d8b7d, 0x7e9cd8, 0x727169, 0x7e9cd8,
+            ],
+            u16::MAX,
+            true,
+        ),
+        (
+            "semantic-keys",
+            [
+                0x14111f, 0xd8d4ea, 0xf2efff, 0x2a2540, 0xf2efff, 0x5ec4ff, 0x1f1a30, 0xd8d4ea,
+                0x8680a1, 0x5ec4ff, 0x6a6488, 0x5ec4ff,
+            ],
+            u16::MAX,
+            true,
+        ),
+    ];
+
+    #[test]
+    fn provider_themes_keep_the_colors_they_painted_before_roles() {
+        let themes = provider_themes();
+        assert_eq!(themes.len(), PROVIDER_PINS.len());
+        for ((name, theme), (pinned, colors, alpha, blur)) in themes.into_iter().zip(PROVIDER_PINS)
+        {
+            assert_eq!(name, pinned);
+            assert_eq!(
+                [
+                    theme.background,
+                    theme.foreground,
+                    theme.cursor,
+                    theme.selection,
+                    theme.selection_foreground,
+                    theme.url,
+                    theme.active_tab_background,
+                    theme.active_tab_foreground,
+                    theme.roles.text_muted,
+                    theme.roles.accent,
+                    theme.roles.divider,
+                    theme.roles.focus_ring,
+                ],
+                colors,
+                "{name}"
+            );
+            assert_eq!(
+                (theme.background_alpha, theme.background_blur),
+                (alpha, blur),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn builtin_theme_keeps_its_exact_palette() {
+        let theme = ResolvedTheme::default();
+        assert_eq!(
+            (
+                theme.background,
+                theme.foreground,
+                theme.cursor,
+                theme.selection,
+                theme.selection_foreground,
+                theme.url,
+            ),
+            (0x0e1216, 0xebebeb, 0xebebeb, 0x354a60, 0xebebeb, 0x78beff)
+        );
+        assert_eq!(
+            theme.ansi,
+            [
+                0x1d2021, 0xcc241d, 0x98971a, 0xd79921, 0x458588, 0xb16286, 0x689d6a, 0xa89984,
+                0x928374, 0xfb4934, 0xb8bb26, 0xfabd2f, 0x83a598, 0xd3869b, 0x8ec07c, 0xebdbb2,
+            ]
+        );
+        assert_eq!(theme.background_alpha, u16::MAX);
+        assert!(!theme.background_blur);
+        assert_eq!(theme.chrome, ChromeBackgrounds::default());
+        assert_eq!(theme.shell, OmarchyShellSettings::default());
+        assert_eq!(theme.roles, ChromeRoles::default());
+    }
+
+    #[test]
+    fn chrome_color_accessors_alias_their_roles() {
+        let mut themes = provider_themes();
+        let overridden: Vec<_> = themes
+            .iter()
+            .map(|(name, theme)| {
+                let theme = theme.with_chrome_overrides(ChromeColorOverrides {
+                    active_tab_background: Some(0xf0_e0_d0),
+                    ..ChromeColorOverrides::NONE
+                });
+                (
+                    *name,
+                    theme.with_color_overrides(Some(foot_alpha(0.5)), Some(true)),
+                )
+            })
+            .collect();
+        themes.extend(overridden);
+        for (name, theme) in themes {
+            let roles = theme.roles;
+            assert_eq!(theme.ui_accent(), roles.accent, "{name}");
+            assert_eq!(theme.pane_border(), roles.divider, "{name}");
+            assert_eq!(theme.pane_border_active(), roles.focus_ring, "{name}");
+            assert_eq!(theme.inactive_tab_foreground(), roles.text_muted, "{name}");
+            assert_eq!(theme.explorer_background(), roles.surface, "{name}");
+            // Chrome's surface, text and selection are still the terminal's.
+            assert_eq!(roles.surface, theme.background, "{name}");
+            assert_eq!(roles.text, theme.foreground, "{name}");
+            assert_eq!(roles.selection, theme.selection, "{name}");
+        }
+    }
+
+    #[test]
+    fn omarchy_semantic_keys_do_not_change_painted_colors_yet() {
+        let (colors, foot) = SEMANTIC_KEYS_FIXTURE;
+        let semantic_keys = ["warning", "success", "signal", "border", "dark_background"];
+        for key in semantic_keys {
+            assert!(colors.contains(&format!("\n{key} = ")), "{key}");
+        }
+        let without = colors
+            .lines()
+            .filter(|line| {
+                !semantic_keys
+                    .iter()
+                    .any(|key| line.starts_with(&format!("{key} = ")))
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let theme = resolve_omarchy_theme(colors, foot).unwrap();
+        assert_eq!(theme, resolve_omarchy_theme(&without, foot).unwrap());
+        // Until semantic keys are read, warning follows the ANSI yellow slot,
+        // which this theme makes ultraviolet.
+        assert_eq!(theme.ansi[3], 0x9b_6b_ff);
+        assert_eq!(theme.roles.warning, theme.ansi[3]);
+        assert_eq!(theme.roles.surface_raised, 0x1f_1a_30);
+    }
+
+    #[test]
+    fn providers_report_the_files_the_watcher_fingerprints() {
+        let theme_dir = Path::new("/theme");
+        assert_eq!(
+            OmarchyThemeProvider::live(theme_dir).watched_paths(),
+            [
+                PathBuf::from("/theme"),
+                PathBuf::from("/theme/colors.toml"),
+                PathBuf::from("/theme/foot.ini"),
+            ]
+        );
+        assert_eq!(
+            OmarchyThemeProvider::startup(theme_dir).watched_paths(),
+            OmarchyThemeProvider::live(theme_dir).watched_paths()
+        );
+        let json = Path::new("/config/theme.json");
+        assert_eq!(
+            JsonThemeProvider::new(json).watched_paths(),
+            [json.to_path_buf()]
+        );
+
+        // Absence: the startup Omarchy read and a missing JSON file give the
+        // built-in input, and a live Omarchy read refuses it.
+        let root =
+            std::env::temp_dir().join(format!("splinterm-theme-providers-{}", std::process::id()));
+        assert!(!root.exists());
+        let builtin = BuiltinThemeProvider.load().unwrap();
+        assert_eq!(
+            OmarchyThemeProvider::startup(&root).load().unwrap(),
+            builtin
+        );
+        assert!(OmarchyThemeProvider::live(&root).load().is_err());
+        assert_eq!(
+            JsonThemeProvider::new(&root.join("theme.json"))
+                .load()
+                .unwrap(),
+            builtin
+        );
+        assert_eq!(
+            load_provider_theme(&BuiltinThemeProvider).unwrap(),
+            ResolvedTheme::default()
+        );
     }
 }

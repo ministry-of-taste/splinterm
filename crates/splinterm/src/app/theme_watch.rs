@@ -8,11 +8,12 @@ use anyhow::Result;
 use splinterm::{
     ThemeUpdate, WindowTopologyUpdate, WindowUpdate,
     config::{
-        AppConfig, ChromeColorOverrides, OmarchyShellConcern, OmarchyShellSettings,
-        OmarchyTextSizeFallback, OmarchyThemeRoots, OmarchyThemeSelection, ResolvedTheme,
-        ThemeSource, ThemeSourceLoad, load_live_omarchy_theme, load_omarchy_shell, load_theme,
-        load_theme_source_for_startup,
+        AppConfig, ChromeColorOverrides, JsonThemeProvider, OmarchyShellConcern,
+        OmarchyShellSettings, OmarchyTextSizeFallback, OmarchyThemeProvider, OmarchyThemeRoots,
+        OmarchyThemeSelection, ResolvedTheme, ThemeSource, ThemeSourceLoad, load_omarchy_shell,
+        load_provider_theme, load_theme_source_for_startup,
     },
+    theme::ThemeProvider,
 };
 use tokio::sync::mpsc;
 
@@ -115,6 +116,15 @@ struct JsonShellRoot<'a> {
 }
 
 impl<'a> ActiveThemeSource<'a> {
+    /// The palette provider a live poll fingerprints and reloads. A live
+    /// Omarchy read never turns absence into the fallback palette.
+    fn provider(self) -> Box<dyn ThemeProvider + 'a> {
+        match self {
+            Self::Omarchy { theme_dir, .. } => Box::new(OmarchyThemeProvider::live(theme_dir)),
+            Self::Json { path, .. } => Box::new(JsonThemeProvider::new(path)),
+        }
+    }
+
     fn shell(self) -> Option<ShellLayers<'a>> {
         match self {
             Self::Omarchy {
@@ -185,15 +195,29 @@ fn theme_file_fingerprint(path: &Path) -> Option<ThemeFileFingerprint> {
     ))
 }
 
+/// Each of the active provider's watched paths and its file identity. For
+/// Omarchy the paths name the selected root, so a root change is observed.
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum PaletteFingerprint {
-    Omarchy {
-        root: PathBuf,
-        directory: Option<ThemeFileFingerprint>,
-        colors: Option<ThemeFileFingerprint>,
-        foot: Option<ThemeFileFingerprint>,
-    },
-    Json(Option<ThemeFileFingerprint>),
+struct PaletteFingerprint(Vec<(PathBuf, Option<ThemeFileFingerprint>)>);
+
+impl PaletteFingerprint {
+    fn of(provider: &dyn ThemeProvider) -> Self {
+        Self(
+            provider
+                .watched_paths()
+                .into_iter()
+                .map(|path| {
+                    let fingerprint = theme_file_fingerprint(&path);
+                    (path, fingerprint)
+                })
+                .collect(),
+        )
+    }
+
+    /// No watched path exists.
+    fn absent(&self) -> bool {
+        self.0.iter().all(|(_, fingerprint)| fingerprint.is_none())
+    }
 }
 
 /// Everything a shell load depends on: the selected theme directory, like the
@@ -228,19 +252,8 @@ struct ThemeSourceFingerprint {
 }
 
 fn theme_source_fingerprint(source: ActiveThemeSource<'_>) -> ThemeSourceFingerprint {
-    let palette = match source {
-        ActiveThemeSource::Omarchy { theme_dir, .. } => PaletteFingerprint::Omarchy {
-            root: theme_dir.to_path_buf(),
-            directory: theme_file_fingerprint(theme_dir),
-            colors: theme_file_fingerprint(&theme_dir.join("colors.toml")),
-            foot: theme_file_fingerprint(&theme_dir.join("foot.ini")),
-        },
-        ActiveThemeSource::Json { path, .. } => {
-            PaletteFingerprint::Json(theme_file_fingerprint(path))
-        }
-    };
     ThemeSourceFingerprint {
-        palette,
+        palette: PaletteFingerprint::of(source.provider().as_ref()),
         shell: match source {
             ActiveThemeSource::Omarchy { .. } => source
                 .shell()
@@ -279,16 +292,7 @@ fn absent_startup_observation(source: &ThemeSource) -> Option<ThemeSourceFingerp
         &mut OmarchyThemeSelection::default(),
     ));
     // A source may have appeared between the absence check and fingerprint.
-    matches!(
-        &observed.palette,
-        PaletteFingerprint::Omarchy {
-            directory: None,
-            colors: None,
-            foot: None,
-            ..
-        }
-    )
-    .then_some(observed)
+    observed.palette.absent().then_some(observed)
 }
 
 /// Layers the Omarchy shell settings onto a resolved palette. The bar height,
@@ -449,16 +453,10 @@ fn resolve_live_theme_update(
     current: ResolvedTheme,
     shell_diagnostics: &mut Vec<String>,
 ) -> Result<Option<ResolvedTheme>> {
-    let palette = match source {
-        ActiveThemeSource::Omarchy {
-            index, theme_dir, ..
-        } => {
-            let theme = load_live_omarchy_theme(theme_dir)?;
-            selection.accepted(index);
-            theme
-        }
-        ActiveThemeSource::Json { path, .. } => load_theme(path)?,
-    };
+    let palette = load_provider_theme(source.provider().as_ref())?;
+    if let ActiveThemeSource::Omarchy { index, .. } = source {
+        selection.accepted(index);
+    }
     if let ActiveThemeSource::Json {
         shell: Some(root), ..
     } = source

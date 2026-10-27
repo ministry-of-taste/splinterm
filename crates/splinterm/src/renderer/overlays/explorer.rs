@@ -643,10 +643,8 @@ fn footer_lines(footer: Rect, scale_120: u32, inset: u32) -> Vec<Rect> {
 /// colour and coverage; its text colours are then chosen against that colour.
 #[must_use]
 pub(crate) fn lair_explorer_palette(theme: ResolvedTheme) -> SessionPickerPalette {
-    let panel_theme = ResolvedTheme {
-        background: theme.explorer_background(),
-        ..theme
-    };
+    let mut panel_theme = theme;
+    panel_theme.roles.surface = theme.explorer_background();
     let mut palette = chrome_panel_palette(panel_theme, ChromeSurface::Menu);
     palette.panel_fill = premultiplied_theme_rgba(palette.panel, theme.explorer_alpha());
     palette
@@ -2582,9 +2580,12 @@ mod tests {
     fn explorer_background_and_alpha_overrides_replace_the_panel() {
         use crate::config::ChromeColorOverrides;
         let theme = ResolvedTheme {
-            background: 0x80_40_20,
             background_alpha: u16::MAX / 2,
-            foreground: 0xee_ee_ee,
+            roles: crate::theme::ChromeRoles {
+                surface: 0x80_40_20,
+                text: 0xee_ee_ee,
+                ..crate::theme::ChromeRoles::default()
+            },
             ..ResolvedTheme::default()
         };
         let light = theme.with_chrome_overrides(ChromeColorOverrides {
@@ -2596,7 +2597,10 @@ mod tests {
         assert_eq!(palette.panel_fill, [0xf0, 0xf0, 0xf0, 0xff]);
         let expected = chrome_panel_palette(
             ResolvedTheme {
-                background: 0xf0_f0_f0,
+                roles: crate::theme::ChromeRoles {
+                    surface: 0xf0_f0_f0,
+                    ..light.roles
+                },
                 ..light
             },
             ChromeSurface::Menu,
@@ -2617,16 +2621,19 @@ mod tests {
     #[test]
     fn explorer_respects_background_alpha_with_opaque_text_and_lines() {
         let theme = ResolvedTheme {
-            background: 0x80_40_20,
             background_alpha: u16::MAX / 2,
-            foreground: 0xee_ee_ee,
+            roles: crate::theme::ChromeRoles {
+                surface: 0x80_40_20,
+                text: 0xee_ee_ee,
+                ..crate::theme::ChromeRoles::default()
+            },
             ..ResolvedTheme::default()
         };
         let palette = lair_explorer_palette(theme);
         // The same premultiplied glass as the tab strip and the terminal.
         assert_eq!(
             palette.panel_fill,
-            premultiplied_theme_rgba(theme.background, theme.background_alpha)
+            premultiplied_theme_rgba(theme.roles.surface, theme.background_alpha)
         );
         assert_eq!(palette.panel_fill, [0x40, 0x20, 0x10, 0x7f]);
         let opaque = lair_explorer_palette(ResolvedTheme::default());
