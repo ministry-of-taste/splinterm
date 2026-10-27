@@ -6,7 +6,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use splinterd::dialog_shortcut::{BackgroundRegistration, DialogShortcut};
 use splinterm::{
-    DialogIdentity, DialogLine, DialogText, TrustedConsentUi, WindowOptions,
+    DialogIdentity, DialogLine, DialogStyle, DialogText, TrustedConsentUi, WindowOptions,
     config::{AppConfig, OmarchyShellSettings, ResolvedTheme},
     run_window,
 };
@@ -96,8 +96,8 @@ const PROMPT_LINE_CHARS: usize = 100;
 /// workspace name) as one line of display text, escaped exactly as the
 /// **Agent access** list escapes it, so the name approved here reads the
 /// same there later: every unsafe character, tabs and newlines among them,
-/// the list's quotes and separator, and the prompt's own `'` quote are shown
-/// as `\u{…}`, and spaces stay as they are. At most `maximum` characters,
+/// every quote and quote look-alike, and the list's separator are shown as
+/// `\u{…}`, and a run of spaces as one space. At most `maximum` characters,
 /// the last an ellipsis when it was cut; an escape is never cut in two.
 fn display_name(value: &str, maximum: usize) -> String {
     let shown = splinterm::frontend::shown_prompt_name(value, maximum);
@@ -117,19 +117,39 @@ fn prompt_line(text: impl Into<String>, indent: usize) -> DialogLine {
         .with_wrap_at(PROMPT_LINE_CHARS)
 }
 
-fn consent_target_line(target: &ConsentTarget) -> String {
+/// The columns a key in the prompt's key/value table takes, its padding
+/// included; every value starts there, and wraps back to it.
+const KEY_COLUMNS: usize = 10;
+
+/// One row of the prompt's key/value table: `key` in secondary text, then
+/// `value`, wrapped under itself.
+fn table_line(key: &str, value: impl AsRef<str>) -> DialogLine {
+    prompt_line(
+        format!("{key:<KEY_COLUMNS$}{}", value.as_ref()),
+        KEY_COLUMNS,
+    )
+    .with_lead(KEY_COLUMNS)
+}
+
+/// The target's row of the table. A workspace's name is user data any
+/// agent with Manage can change, so its short ID always comes first.
+fn consent_target_line(target: &ConsentTarget) -> DialogLine {
     match target {
         ConsentTarget::Splint {
             splint_id,
             incarnation,
-        } => format!("Splint: {splint_id:?} · incarnation {incarnation}"),
-        // The name is user data any agent with Manage can change, so the
-        // short ID is always shown, before it.
+        } => table_line(
+            "splint",
+            format!("{splint_id:?} · incarnation {incarnation}"),
+        ),
         ConsentTarget::Lair { lair_id, lair_name } => {
             let short_id: String = lair_id.to_string().chars().take(8).collect();
-            format!(
-                "Workspace {short_id}: '{}'",
-                display_name(lair_name, DISPLAY_NAME_CHARS)
+            table_line(
+                "workspace",
+                format!(
+                    "{short_id} '{}'",
+                    display_name(lair_name, DISPLAY_NAME_CHARS)
+                ),
             )
         }
     }
@@ -153,13 +173,24 @@ fn access_label(level: Option<AccessLevel>, target: &ConsentTarget) -> &'static 
     }
 }
 
-/// The grant button's exact words for one duration (ADR 0014), for example
+/// A grant's exact words for one duration (ADR 0014), for example
 /// "Always allow Manage for 'Workspace'".
 fn grant_label(access: &str, duration: GrantDuration, workspace: &str) -> String {
     match duration {
         GrantDuration::Once => format!("Allow {access} once"),
         GrantDuration::WorkspaceSession => format!("Allow {access} while '{workspace}' is open"),
         GrantDuration::Remembered => format!("Always allow {access} for '{workspace}'"),
+    }
+}
+
+/// The green button's label for one duration: the grant without the
+/// workspace's name, which the request sentence, the table and the chosen
+/// duration's row all show, so it always fits half the box.
+fn button_label(access: &str, duration: GrantDuration) -> String {
+    match duration {
+        GrantDuration::Once => format!("Allow {access} once"),
+        GrantDuration::WorkspaceSession => format!("Allow {access} while open"),
+        GrantDuration::Remembered => format!("Always allow {access}"),
     }
 }
 
@@ -190,21 +221,32 @@ fn replacement_line(
     )
 }
 
-/// The scope labels, wrapped under their heading.
-fn scope_line(prompt: &ConsentPrompt) -> DialogLine {
-    let labels: Vec<_> = prompt.scopes.iter().map(|scope| scope.label()).collect();
-    prompt_line(format!("Scopes: {}", labels.join(", ")), 8)
+/// The request as one sentence: who asks, for what, where. The agent's
+/// name is its own report, escaped and quoted; the note below says so.
+fn request_sentence(prompt: &ConsentPrompt, workspace: &str) -> String {
+    let who = prompt.agent_name.as_ref().map_or_else(
+        || "An agent".to_owned(),
+        |name| format!("'{}'", display_name(name, DISPLAY_NAME_CHARS)),
+    );
+    match (&prompt.target, prompt.level) {
+        (ConsentTarget::Lair { .. }, Some(level)) => {
+            format!("{who} wants {} access to '{workspace}'", level.label())
+        }
+        (ConsentTarget::Lair { .. }, None) => {
+            format!("{who} wants Custom access to '{workspace}'")
+        }
+        (ConsentTarget::Splint { .. }, _) => format!("{who} wants access to one Splint"),
+    }
 }
 
 /// The lines one chosen duration adds below the duration list.
 struct ChosenLines {
     shared: Option<DialogLine>,
     replaced: Option<DialogLine>,
-    grant: DialogLine,
 }
 
-/// The lines a chosen duration adds below the list: who shares it, what it
-/// replaces, and the grant action that names it exactly.
+/// The lines a chosen duration adds below the list: who shares it and what
+/// it replaces.
 fn chosen_lines(prompt: &ConsentPrompt, selected: usize, workspace: &str) -> ChosenLines {
     let chosen = prompt.durations.get(selected);
     let shared = chosen
@@ -221,112 +263,99 @@ fn chosen_lines(prompt: &ConsentPrompt, selected: usize, workspace: &str) -> Cho
             .as_ref()
             .map(|replaced| prompt_line(replacement_line(replaced, offer.duration, workspace), 4))
     });
-    let label = grant_label(
-        access_label(prompt.level, &prompt.target),
-        chosen.map_or(GrantDuration::Once, |offer| offer.duration),
-        workspace,
-    );
-    ChosenLines {
-        shared,
-        replaced,
-        grant: prompt_line(format!("Grant: {label}"), 7),
-    }
+    ChosenLines { shared, replaced }
 }
 
-/// The prompt's text with the duration at `selected` chosen. The chosen
+/// The prompt's text with the duration at `selected` chosen: the request
+/// sentence, the note that the agent names itself, the table of who asks
+/// and for what, how long, and the answer hint; the frame's title and the
+/// two buttons' labels, the green one naming the chosen grant. The chosen
 /// duration's lines sit in slots, so every selection has the same rows in
 /// the same places at any width, and choosing a duration never moves the
 /// rows the pointer selects.
-fn consent_text(
-    prompt: &ConsentPrompt,
-    selected: usize,
-    shortcut: Option<DialogShortcut>,
-) -> DialogText {
+fn consent_text(prompt: &ConsentPrompt, selected: usize) -> DialogText {
     let workspace = workspace_label(&prompt.target);
     let mut lines = vec![
-        DialogLine::new("TRUSTED SPLINTERM ACCESS REQUEST"),
-        DialogLine::blank(),
+        DialogLine::title("agent access request"),
+        prompt_line(request_sentence(prompt, &workspace), 4).with_style(DialogStyle::Strong),
     ];
-    if let Some(name) = &prompt.agent_name {
-        lines.push(prompt_line(
-            format!(
-                "Agent (reported by the agent, not verified): {}",
-                display_name(name, DISPLAY_NAME_CHARS)
-            ),
-            4,
-        ));
+    if prompt.agent_name.is_some() {
+        lines.push(
+            prompt_line(
+                "The agent names itself; Splinterm can't verify that name.",
+                4,
+            )
+            .with_style(DialogStyle::Secondary),
+        );
     }
-    lines.push(prompt_line(
-        format!(
-            "Program: {}",
-            display_name(&prompt.requester, MAX_CONSENT_PATH_CHARS)
-        ),
-        9,
+    lines.push(DialogLine::blank());
+    lines.push(table_line(
+        "program",
+        display_name(&prompt.requester, MAX_CONSENT_PATH_CHARS),
     ));
-    lines.push(prompt_line(
+    lines.push(table_line(
+        "process",
         format!(
-            "Process: PID {} · UID {}",
+            "PID {} · UID {}",
             prompt.requester_pid, prompt.requester_uid
         ),
-        4,
     ));
-    lines.push(prompt_line(consent_target_line(&prompt.target), 4));
-    lines.push(DialogLine::blank());
-    lines.push(prompt_line(
+    lines.push(consent_target_line(&prompt.target));
+    lines.push(table_line(
+        "access",
         match prompt.level {
-            Some(level) => format!("Access: {} ({})", level.label(), level.summary()),
+            Some(level) => format!("{} ({})", level.label(), level.summary()),
             None if matches!(prompt.target, ConsentTarget::Lair { .. }) => {
-                "Access: Custom, exactly these scopes and nothing more".to_owned()
+                "Custom, exactly these scopes and nothing more".to_owned()
             }
-            None => "Access: exactly these scopes, once".to_owned(),
+            None => "exactly these scopes, once".to_owned(),
         },
-        4,
     ));
-    lines.push(scope_line(prompt));
+    let labels: Vec<_> = prompt.scopes.iter().map(|scope| scope.label()).collect();
+    lines.push(table_line("scopes", labels.join(", ")));
     lines.push(DialogLine::blank());
-    lines.push(prompt_line(
-        "How long (choose with the arrow keys or a click):",
-        4,
-    ));
+    lines.push(DialogLine::new("how long").with_style(DialogStyle::Group));
     for (index, offer) in prompt.durations.iter().enumerate() {
-        let marker = match (offer.withheld, index == selected) {
-            (Some(_), _) => "(-)",
-            (None, true) => "(•)",
-            (None, false) => "( )",
+        let (marker, style) = match (offer.withheld, index == selected) {
+            (Some(_), _) => ("(-)", DialogStyle::Secondary),
+            (None, true) => ("(•)", DialogStyle::Selected),
+            (None, false) => ("( )", DialogStyle::Text),
         };
         lines.push(
             prompt_line(
-                format!("  {marker} {}", duration_row(offer.duration, &workspace)),
-                6,
+                format!("{marker} {}", duration_row(offer.duration, &workspace)),
+                4,
             )
+            .with_style(style)
             .with_duration(index),
         );
         if let Some(withheld) = offer.withheld {
-            lines.push(prompt_line(
-                format!("      Unavailable: {}", withheld.reason()),
-                8,
-            ));
+            lines.push(
+                prompt_line(format!("    Unavailable: {}", withheld.reason()), 6)
+                    .with_style(DialogStyle::Secondary),
+            );
         }
     }
     lines.push(DialogLine::blank());
     // Each slot takes the rows of its tallest selection, blank when it does
     // not apply; an empty line only marks where the slot is.
-    let ChosenLines {
-        shared,
-        replaced,
-        grant,
-    } = chosen_lines(prompt, selected, &workspace);
+    let ChosenLines { shared, replaced } = chosen_lines(prompt, selected, &workspace);
     lines.push(shared.unwrap_or_default().in_slot(0));
     lines.push(replaced.unwrap_or_default().in_slot(1));
-    lines.push(DialogLine::blank());
-    lines.push(grant.in_slot(2));
     lines.push(
         DialogLine::hint(
-            "G or the green area (right) grants. Enter, Escape, D, or the red area (left) deny.",
+            "G or the green Allow button (right) grants. Enter, Escape, D, or the red Deny button (left) deny.",
         )
         .with_wrap_at(PROMPT_LINE_CHARS),
     );
-    lines.push(DialogLine::hint(keyboard_hint("prompt", shortcut)).with_wrap_at(PROMPT_LINE_CHARS));
+    lines.push(DialogLine::deny("Deny"));
+    lines.push(DialogLine::allow(button_label(
+        access_label(prompt.level, &prompt.target),
+        prompt
+            .durations
+            .get(selected)
+            .map_or(GrantDuration::Once, |offer| offer.duration),
+    )));
     DialogText {
         lines,
         minimum_rows: 0,
@@ -335,11 +364,8 @@ fn consent_text(
 
 /// Renders the prompt's text for each selection; the Window lays it out at
 /// one size for all of them.
-fn consent_renderer(
-    prompt: ConsentPrompt,
-    shortcut: Option<DialogShortcut>,
-) -> splinterm::AccessConsentRenderer {
-    Box::new(move |selected| consent_text(&prompt, selected, shortcut))
+fn consent_renderer(prompt: ConsentPrompt) -> splinterm::AccessConsentRenderer {
+    Box::new(move |selected| consent_text(&prompt, selected))
 }
 
 /// The snapshot identity every rendering of the prompt carries.
@@ -356,20 +382,6 @@ fn consent_identity(target: &ConsentTarget) -> DialogIdentity {
         splint_id,
         incarnation,
     }
-}
-
-/// The line that tells the person how to engage a trusted dialog's keyboard:
-/// a click inside, or the dialog shortcut when it is on.
-pub(in crate::app) fn keyboard_hint(noun: &str, shortcut: Option<DialogShortcut>) -> String {
-    shortcut.map_or_else(
-        || format!("Click inside this {noun} first to answer with the keyboard."),
-        |shortcut| {
-            format!(
-                "Click inside this {noun} or press {} first to answer with the keyboard.",
-                shortcut.label()
-            )
-        },
-    )
 }
 
 /// Shows a trusted dialog Window and returns once it closes.
@@ -412,8 +424,20 @@ fn global_dialog_shortcut() -> bool {
 /// theme as of opening, with its `[colors]` keys ([`dialog_theme`]).
 pub(in crate::app) fn configure_dialog_renderer(config: &AppConfig) -> Result<ResolvedTheme> {
     let theme = dialog_theme(super::theme_watch::load_dialog_theme(config));
-    super::sessions::configure_picker_renderer(config, theme)?;
+    super::sessions::configure_picker_renderer(&dialog_config(config), theme)?;
     Ok(theme)
+}
+
+/// The configuration a trusted dialog draws with: the person's, but with
+/// the default, even padding whatever `[main] padding-*` says. Lopsided
+/// padding would move the grid, and the button labels on it, away from
+/// the middle of the Window, which no answer depends on but which a person
+/// reads as the line between no and yes.
+fn dialog_config(config: &AppConfig) -> AppConfig {
+    AppConfig {
+        padding: splinterm::geometry::TerminalPadding::DEFAULT,
+        ..config.clone()
+    }
 }
 
 /// What a trusted dialog keeps of the person's theme: its colors only. It is
@@ -442,7 +466,7 @@ fn consent_window_options(
         .map(|offer| (offer.duration, offer.withheld.is_none()))
         .collect();
     let identity = consent_identity(&prompt.target);
-    TrustedConsentUi::access_consent(decision, durations, consent_renderer(prompt, shortcut))
+    TrustedConsentUi::access_consent(decision, durations, consent_renderer(prompt))
         .with_shortcut(shortcut)
         .with_identity(identity)
         .into_window_options()
@@ -483,18 +507,19 @@ mod tests {
 
     use splinterd::dialog_shortcut::DialogShortcut;
 
+    use splinterm::DialogStyle;
     use splinterm::frontend::dialog_text::{
-        DialogLayout, natural_columns, natural_layout, natural_rows,
+        CHROME_ROWS, DialogLayout, natural_columns, natural_layout, natural_rows,
     };
 
     use super::{
-        DISPLAY_NAME_CHARS, consent_renderer, consent_window_options, display_name, grant_label,
-        keyboard_hint, read_private_frame_bounded, trusted_label, write_private_frame_bounded,
+        DISPLAY_NAME_CHARS, button_label, consent_renderer, consent_window_options, display_name,
+        grant_label, read_private_frame_bounded, trusted_label, write_private_frame_bounded,
     };
 
     /// Every selection's text, as the Window lays it out.
     fn variants(prompt: &ConsentPrompt) -> Vec<splinterm::DialogText> {
-        let render = consent_renderer(prompt.clone(), shortcut());
+        let render = consent_renderer(prompt.clone());
         (0..prompt.durations.len()).map(render).collect()
     }
 
@@ -510,25 +535,6 @@ mod tests {
     )]
     fn shortcut() -> Option<DialogShortcut> {
         Some(DialogShortcut::default())
-    }
-
-    #[test]
-    fn the_keyboard_hint_names_the_dialog_shortcut_only_when_it_is_on() {
-        assert_eq!(
-            keyboard_hint("prompt", shortcut()),
-            "Click inside this prompt or press Ctrl+Alt+G first to answer with the keyboard."
-        );
-        assert_eq!(
-            keyboard_hint(
-                "dialog",
-                DialogShortcut::parse_setting("ctrl+alt+7").unwrap()
-            ),
-            "Click inside this dialog or press Ctrl+Alt+7 first to answer with the keyboard."
-        );
-        assert_eq!(
-            keyboard_hint("dialog", None),
-            "Click inside this dialog first to answer with the keyboard."
-        );
     }
 
     fn offer(duration: GrantDuration, withheld: Option<DurationWithheld>) -> ConsentDurationOffer {
@@ -580,6 +586,17 @@ mod tests {
             grant_label("Manage", GrantDuration::Remembered, "Workspace"),
             "Always allow Manage for 'Workspace'"
         );
+        // The green button names the grant without the workspace, which
+        // the sentence, the table and the chosen row show.
+        assert_eq!(button_label("Look", GrantDuration::Once), "Allow Look once");
+        assert_eq!(
+            button_label("Look", GrantDuration::WorkspaceSession),
+            "Allow Look while open"
+        );
+        assert_eq!(
+            button_label("Manage", GrantDuration::Remembered),
+            "Always allow Manage"
+        );
     }
 
     #[test]
@@ -588,19 +605,60 @@ mod tests {
         let ConsentTarget::Lair { lair_id, .. } = &prompt.target else {
             unreachable!()
         };
-        let text = laid_out(&prompt, 0).rows.join("\n");
-        assert!(text.contains("Agent (reported by the agent, not verified): Claude Code"));
-        assert!(text.contains("Program: /usr/bin/splinterm-mcp"));
+        let layout = laid_out(&prompt, 0);
+        let text = layout.rows.join("\n");
         let short_id: String = lair_id.to_string().chars().take(8).collect();
-        assert!(text.contains(&format!("Workspace {short_id}: 'Workspace'")));
-        assert!(text.contains(
-            "Access: Manage (Read terminals, type commands, and create or close sessions)"
-        ));
-        assert!(text.contains("start processes in this Lair"));
+        // The request first, then the note on the agent's name, then the
+        // table, then how long, in that order.
+        let order = [
+            "'Claude Code' wants Manage access to 'Workspace'".to_owned(),
+            "The agent names itself; Splinterm can't verify that name.".to_owned(),
+            "program   /usr/bin/splinterm-mcp".to_owned(),
+            "process   PID 42 · UID 1000".to_owned(),
+            format!("workspace {short_id} 'Workspace'"),
+            "access    Manage (Read terminals, type commands, and create or close sessions)"
+                .to_owned(),
+            "scopes    ".to_owned(),
+            "how long".to_owned(),
+            "(•) Just this once".to_owned(),
+        ];
+        let rows: Vec<usize> = order
+            .iter()
+            .map(|wanted| {
+                layout
+                    .rows
+                    .iter()
+                    .position(|row| row.starts_with(wanted.as_str()))
+                    .unwrap_or_else(|| panic!("{wanted:?} in {text}"))
+            })
+            .collect();
+        assert!(rows.is_sorted(), "{rows:?}: {text}");
+        assert_eq!(layout.styles[rows[0]].style, DialogStyle::Strong);
+        assert_eq!(layout.styles[rows[1]].style, DialogStyle::Secondary);
+        // Each key is a label, its value aligned after it.
+        assert_eq!(layout.styles[rows[2]].lead, 10);
+        assert_eq!(layout.styles[rows[7]].style, DialogStyle::Group);
+        assert_eq!(layout.styles[rows[8]].style, DialogStyle::Selected);
+        // The scopes wrap under their key, every label whole in its words.
+        let words = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(words.contains("start processes in this Lair"), "{text}");
         // Just this once is preselected and needs no shared-identity line.
-        assert!(text.contains("(•) Just this once"));
-        assert!(text.contains("Grant: Allow Manage once"));
         assert!(!text.contains("shares this access"));
+        // The frame's title and the buttons, which are not body rows.
+        let variant = &variants(&prompt)[0];
+        assert_eq!(variant.title(), "agent access request");
+        assert_eq!(variant.deny_label(), "Deny");
+        assert_eq!(variant.allow_label(), "Allow Manage once");
+        assert!(!text.contains("Allow Manage once"));
+        assert!(text.contains("the red Deny button (left) deny"));
+        assert!(text.contains("G or the green Allow button (right) grants"));
+        // Without a reported name the request names no one, and needs no
+        // note.
+        let mut anonymous = manage_prompt();
+        anonymous.agent_name = None;
+        let text = laid_out(&anonymous, 0).rows.join("\n");
+        assert!(text.starts_with("An agent wants Manage access to 'Workspace'"));
+        assert!(!text.contains("names itself"));
     }
 
     #[test]
@@ -612,13 +670,17 @@ mod tests {
         });
         let text = laid_out(&prompt, 2).rows.join("\n");
         assert!(text.contains("(•) Always for 'Workspace'"));
-        assert!(text.contains("Grant: Always allow Manage for 'Workspace'"));
+        assert_eq!(variants(&prompt)[2].allow_label(), "Always allow Manage");
         assert!(text.contains("Any program that runs /usr/bin/splinterm-mcp shares this access."));
         assert!(
             text.contains("This replaces the earlier answer: Always allow Look for 'Workspace'.")
         );
         let session = laid_out(&prompt, 1).rows.join("\n");
-        assert!(session.contains("Grant: Allow Manage while 'Workspace' is open"));
+        assert!(session.contains("(•) While 'Workspace' is open"));
+        assert_eq!(
+            variants(&prompt)[1].allow_label(),
+            "Allow Manage while open"
+        );
         assert!(!session.contains("replaces"));
     }
 
@@ -641,7 +703,8 @@ mod tests {
         assert_eq!(prompt.validate(), Ok(()));
         let layout = laid_out(&prompt, 0);
         let text = layout.rows.join("\n");
-        assert!(text.contains("Access: Custom, exactly these scopes and nothing more"));
+        assert!(text.contains("access    Custom, exactly these scopes and nothing more"));
+        assert!(text.contains("'Claude Code' wants Custom access to 'Workspace'"));
         assert!(text.contains("observe visible terminal, take over terminal control"));
         assert!(text.contains("(-) While 'Workspace' is open"));
         assert_eq!(
@@ -649,7 +712,18 @@ mod tests {
                 .count(),
             2
         );
-        assert!(text.contains("Grant: Allow Custom access once"));
+        assert_eq!(
+            variants(&prompt)[0].allow_label(),
+            "Allow Custom access once"
+        );
+        // A duration that is not offered, and why, are secondary text.
+        let withheld = layout
+            .rows
+            .iter()
+            .position(|row| row.starts_with("(-) While"))
+            .unwrap();
+        assert_eq!(layout.styles[withheld].style, DialogStyle::Secondary);
+        assert_eq!(layout.styles[withheld + 1].style, DialogStyle::Secondary);
         // Each duration's first row is where the layout says it is.
         for (index, duration) in ["Just this once", "While", "Always"]
             .into_iter()
@@ -778,15 +852,11 @@ mod tests {
                 assert!(joined.contains(&shared));
             }
             let text = layout.rows.join("\n");
-            // The tab is escaped as the list shows it; spaces stay.
-            assert!(
-                text.contains("Agent (reported by the agent, not verified): Agent  \\u{0009} name")
-            );
+            // The tab is escaped as the list shows it, and the run of spaces
+            // shows as one.
+            assert!(text.contains("'Agent \\u{0009} name"), "{text}");
             assert!(text.contains(&format!("{}…", "a".repeat(10))));
             assert!(text.contains(&format!("'{}…'", "n".repeat(59))));
-            assert!(text.contains(
-                "Click inside this prompt or press Ctrl+Alt+G first to answer with the keyboard."
-            ));
             // The natural size keeps every row of the text.
             assert!(!layout.clipped);
             assert!(layout.rows.len() <= natural_rows(&variants(&prompt)));
@@ -820,9 +890,10 @@ mod tests {
                 assert!(layout.rows.iter().all(|row| row.chars().count() <= columns));
             }
         }
-        // The text stays above the action areas in the bottom 22%.
-        let last_text_row = laid_out(&prompt, 2).rows.len();
-        assert!(last_text_row * 100 <= natural_rows(&variants) * 72);
+        // The natural size holds the text and the box around it: the
+        // title, the buttons and the legend.
+        let text_rows = laid_out(&prompt, 2).rows.len();
+        assert_eq!(text_rows + CHROME_ROWS, natural_rows(&variants));
         // A Splint prompt's snapshots carry that Splint's identity.
         let splint = splint_prompt();
         let (decision, _receiver) = std::sync::mpsc::channel();
@@ -850,7 +921,8 @@ mod tests {
             lair_name: format!("{}\u{202e}", "w".repeat(60)),
         };
         let text = laid_out(&prompt, 2).rows.join("\n");
-        assert!(text.contains(&format!("Always allow Manage for '{}…'", "w".repeat(59))));
+        assert!(text.contains(&format!("(•) Always for '{}…'", "w".repeat(59))));
+        assert!(text.contains(&format!("wants Manage access to '{}…'", "w".repeat(59))));
         assert!(!text.contains('\u{202e}'));
         // A shorter name shows the override escaped, as the list does.
         prompt.target = ConsentTarget::Lair {
@@ -858,10 +930,7 @@ mod tests {
             lair_name: "w\u{202e}v".to_owned(),
         };
         let text = laid_out(&prompt, 2).rows.join("\n");
-        assert!(
-            text.contains("Always allow Manage for 'w\\u{202e}v'"),
-            "{text}"
-        );
+        assert!(text.contains("(•) Always for 'w\\u{202e}v'"), "{text}");
         // The bound never cuts an escape in two.
         assert_eq!(
             display_name(&format!("{}\u{202e}", "a".repeat(55)), 60),
@@ -922,13 +991,21 @@ mod tests {
             }
             let text = layout.rows.join("\n");
             assert!(
-                text.contains(&format!(
-                    "Agent (reported by the agent, not verified): {escaped}"
-                )),
+                text.contains(&format!("'{escaped}' wants Manage access to")),
                 "{text}"
             );
-            assert!(text.contains(&format!("Program: /opt/{escaped}")), "{text}");
-            assert!(text.contains(&format!(": '{escaped}'")), "{text}");
+            assert!(
+                text.contains(&format!("program   /opt/{escaped}")),
+                "{text}"
+            );
+            assert!(
+                layout
+                    .rows
+                    .iter()
+                    .any(|row| row.starts_with("workspace ")
+                        && row.ends_with(&format!(" '{escaped}'"))),
+                "{text}"
+            );
             if selected == 2 {
                 assert!(
                     text.contains(&format!("Any program that runs /opt/{escaped}")),
@@ -978,5 +1055,37 @@ mod tests {
         assert!(!dialog.background_blur);
         assert_eq!(dialog.background, 0x10_20_30);
         assert_eq!(dialog.roles, theme.roles);
+    }
+
+    /// A trusted dialog keeps the person's font but never their padding:
+    /// lopsided `[main] padding-*` cannot move its grid off the middle.
+    #[test]
+    fn trusted_dialogs_draw_with_even_padding() {
+        for padding in [
+            splinterm::geometry::TerminalPadding {
+                left: 400,
+                right: 12,
+                top: 0,
+                bottom: 900,
+            },
+            splinterm::geometry::TerminalPadding {
+                left: 12,
+                right: 400,
+                top: 30,
+                bottom: 0,
+            },
+        ] {
+            let config = splinterm::config::AppConfig {
+                padding,
+                font: "Lopsided Mono".to_owned(),
+                ..splinterm::config::AppConfig::default()
+            };
+            let dialog = super::dialog_config(&config);
+            assert_eq!(
+                dialog.padding,
+                splinterm::geometry::TerminalPadding::DEFAULT
+            );
+            assert_eq!(dialog.font, config.font);
+        }
     }
 }

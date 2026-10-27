@@ -50,12 +50,12 @@ use serde::{Deserialize, Serialize};
 use splinterd::dialog_shortcut::DialogShortcut;
 use splinterm::automation::{Connection, protocol_error, socket_path};
 use splinterm::frontend::dialog_text::text_rows;
-use splinterm::{DialogLine, DialogText, TrustedConsentUi, WindowOptions};
+use splinterm::{DialogLine, DialogStyle, DialogText, TrustedConsentUi, WindowOptions};
 use splinterm_protocol::{ErrorCode, HandoffReport};
 use tokio::net::UnixStream;
 
 use super::{
-    consent::{keyboard_hint, trusted_label},
+    consent::trusted_label,
     local_service::user_systemctl_output,
     upgrade::reason_line,
     upgrade_dialog::{
@@ -429,14 +429,14 @@ pub(in crate::app) fn shells_phrase(count: ShellCount) -> String {
     }
 }
 
-/// The confirming action's label.
+/// The confirming action's label: the green button's, naming what it ends.
 pub(in crate::app) fn confirm_label(count: ShellCount) -> String {
     match count {
-        ShellCount::Exact(1) => "Restart now (ends 1 shell)".to_owned(),
-        ShellCount::Exact(count) => format!("Restart now (ends {count} shells)"),
-        ShellCount::About(1) => "Restart now (ends about 1 shell)".to_owned(),
-        ShellCount::About(count) => format!("Restart now (ends about {count} shells)"),
-        ShellCount::Unknown => "Restart now (ends all running shells)".to_owned(),
+        ShellCount::Exact(1) => "Restart now, end 1 shell".to_owned(),
+        ShellCount::Exact(count) => format!("Restart now, end {count} shells"),
+        ShellCount::About(1) => "Restart now, end about 1 shell".to_owned(),
+        ShellCount::About(count) => format!("Restart now, end about {count} shells"),
+        ShellCount::Unknown => "Restart now, end all running shells".to_owned(),
     }
 }
 
@@ -527,31 +527,43 @@ fn reason_lines(reasons: &[String]) -> Vec<DialogLine> {
     kept
 }
 
-/// The question's explanation, shared by the dialog and the terminal note:
-/// everything above the action hints, as paragraphs.
+/// The question's explanation as the terminal note prints it: its heading,
+/// then the [`question_body`] the dialog shows.
 pub(in crate::app) fn question_lines(question: &RestartQuestion) -> Vec<DialogLine> {
     let mut lines = vec![
         DialogLine::new("TRUSTED SPLINTERM UPGRADE QUESTION"),
         DialogLine::blank(),
     ];
+    lines.extend(question_body(question));
+    lines
+}
+
+/// The question's explanation, shared by the dialog and the terminal note:
+/// everything above the deadline and the answer hint, as paragraphs.
+fn question_body(question: &RestartQuestion) -> Vec<DialogLine> {
+    let mut lines = Vec::new();
     let installed = trusted_label(&question.installed_version, 64);
     match &question.running {
         RunningDaemon::Build {
             version,
             generation,
         } => {
-            lines.push(DialogLine::new(
-                "The running Splinterm daemon is not the installed build.",
-            ));
+            lines.push(
+                DialogLine::new("The running Splinterm daemon is not the installed build.")
+                    .with_style(DialogStyle::Strong),
+            );
             lines.push(
                 DialogLine::new(format!(
                     "  Running:   Splinterm {}, generation {generation}",
                     trusted_label(version, 64)
                 ))
-                .with_indent(13),
+                .with_indent(13)
+                .with_lead(13),
             );
             lines.push(
-                DialogLine::new(format!("  Installed: Splinterm {installed}")).with_indent(13),
+                DialogLine::new(format!("  Installed: Splinterm {installed}"))
+                    .with_indent(13)
+                    .with_lead(13),
             );
             lines.push(prose(format!(
                 "It still has {}, so it is not restarted without asking.",
@@ -622,22 +634,25 @@ pub(in crate::app) fn question_text(question: &RestartQuestion) -> Vec<String> {
         .collect()
 }
 
-/// The whole dialog: the question, the deadline, and the actions. The dialog
-/// child adds the keyboard hint, which names its dialog shortcut.
+/// The whole dialog: the frame's title, the question, the deadline, how to
+/// answer, and the two buttons' labels, the green one naming what a restart
+/// ends. The frame's legend says how to engage the keyboard.
 pub(in crate::app) fn dialog_lines(question: &RestartQuestion) -> Vec<DialogLine> {
-    let mut lines = question_lines(question);
+    let mut lines = vec![DialogLine::title("restart splinterd?")];
+    lines.extend(question_body(question));
     lines.push(DialogLine::new(format!(
         "Closing this dialog, or no answer within {} seconds, means Not now.",
         RESPOND_WITHIN.as_secs()
     )));
     lines.push(DialogLine::blank());
-    lines.push(DialogLine::hint(format!(
-        "[D / Esc / Enter  Not now]     [R  {}]",
-        confirm_label(question.shells)
-    )));
-    lines.push(DialogLine::hint(
-        "Click the red left area for Not now or the green right area to restart.",
-    ));
+    lines.push(
+        DialogLine::hint(
+            "R or the green Restart button (right) restarts. Enter, Escape, D, or the red Not now button (left) answer Not now.",
+        )
+        .with_wrap_at(WRAP_COLUMNS),
+    );
+    lines.push(DialogLine::deny("Not now"));
+    lines.push(DialogLine::allow(confirm_label(question.shells)));
     lines
 }
 
@@ -709,6 +724,11 @@ struct RestartDialogPrompt {
     parent_pid: u32,
     /// The question's paragraphs, which the dialog wraps to its width.
     lines: Vec<DialogLine>,
+    /// How long the launcher waits for an answer, which the frame counts
+    /// down; 0, from a launcher that did not send it, shows no countdown.
+    /// Display only: the launcher's own deadline still decides.
+    #[serde(default)]
+    respond_within_seconds: u64,
 }
 
 impl DialogPrompt for RestartDialogPrompt {
@@ -748,7 +768,7 @@ impl DialogPrompt for RestartDialogPrompt {
         decision: std_mpsc::Sender<bool>,
         shortcut: Option<DialogShortcut>,
     ) -> WindowOptions {
-        let mut lines = self
+        let lines = self
             .lines
             .iter()
             .map(|line| DialogLine {
@@ -756,9 +776,9 @@ impl DialogPrompt for RestartDialogPrompt {
                 ..line.clone()
             })
             .collect::<Vec<_>>();
-        lines.push(DialogLine::hint(keyboard_hint("dialog", shortcut)));
         TrustedConsentUi::restart(decision)
             .with_shortcut(shortcut)
+            .with_respond_within(Duration::from_secs(self.respond_within_seconds))
             .with_text(DialogText {
                 lines,
                 minimum_rows: MIN_DIALOG_ROWS,
@@ -1034,6 +1054,7 @@ async fn ask(question: &RestartQuestion) -> bool {
             capability,
             parent_pid: std::process::id(),
             lines: dialog_lines(question),
+            respond_within_seconds: RESPOND_WITHIN.as_secs(),
         },
         Err(error) => {
             eprintln!("splinterm: could not ask ({error:#}); nothing was restarted.");
@@ -1222,10 +1243,7 @@ mod tests {
             }
         );
         assert_eq!(question.installed_version, "0.2.1");
-        assert_eq!(
-            confirm_label(question.shells),
-            "Restart now (ends 4 shells)"
-        );
+        assert_eq!(confirm_label(question.shells), "Restart now, end 4 shells");
 
         // A running daemon from before live upgrade was enabled reports
         // `Unsupported`, and the question says its build is the reason.
@@ -1242,7 +1260,7 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("then run `splinterm upgrade`"), "{text}");
-        assert_eq!(confirm_label(blocked.shells), "Restart now (ends 1 shell)");
+        assert_eq!(confirm_label(blocked.shells), "Restart now, end 1 shell");
     }
 
     #[test]
@@ -1253,7 +1271,7 @@ mod tests {
         assert_eq!(question.daemon_pid, PID);
         assert_eq!(
             confirm_label(question.shells),
-            "Restart now (ends about 3 shells)"
+            "Restart now, end about 3 shells"
         );
         let text = line_texts(&dialog_lines(&question)).join(" ");
         assert!(text.contains("such as 0.1.x"), "{text}");
@@ -1264,7 +1282,7 @@ mod tests {
         let uncounted = asked(&unreadable(Unreadable::OtherProtocol, None));
         assert_eq!(
             confirm_label(uncounted.shells),
-            "Restart now (ends all running shells)"
+            "Restart now, end all running shells"
         );
         let text = line_texts(&dialog_lines(&uncounted)).join(" ");
         assert!(text.contains("ends all running shells"), "{text}");
@@ -1433,7 +1451,7 @@ mod tests {
         let lines = natural_rows_of(&dialog_lines(&question));
         let text = lines.join(" ");
         for expected in [
-            "TRUSTED SPLINTERM UPGRADE QUESTION",
+            "The running Splinterm daemon is not the installed build.",
             "Running:   Splinterm 0.2.6, generation 3",
             "Installed: Splinterm 0.2.1",
             "It still has 4 running shells",
@@ -1441,10 +1459,21 @@ mod tests {
             "choose Not now, then run `splinterm upgrade`",
             "Not now opens nothing and changes nothing.",
             "no answer within 120 seconds, means Not now",
-            "[D / Esc / Enter  Not now]     [R  Restart now (ends 4 shells)]",
+            "R or the green Restart button (right) restarts.",
+            "the red Not now button (left) answer Not now.",
         ] {
             assert!(text.contains(expected), "missing {expected:?} in\n{text}");
         }
+        // The frame's title and the buttons, which are not body rows.
+        let dialog = DialogText {
+            lines: dialog_lines(&question),
+            minimum_rows: 0,
+        };
+        assert_eq!(dialog.title(), "restart splinterd?");
+        assert_eq!(dialog.deny_label(), "Not now");
+        assert_eq!(dialog.allow_label(), "Restart now, end 4 shells");
+        assert!(!text.contains("Restart now, end"), "{text}");
+        assert!(!text.contains("TRUSTED SPLINTERM"), "{text}");
         assert!(!text.contains("[G"), "{text}");
         assert!(lines.iter().all(|line| line.len() <= MAX_DIALOG_COLUMNS));
         assert_eq!(
@@ -1509,6 +1538,7 @@ mod tests {
             capability: vec![1; CAPABILITY_BYTES],
             parent_pid: 42,
             lines,
+            respond_within_seconds: RESPOND_WITHIN.as_secs(),
         };
         prompt.validate().unwrap();
         let (decision, _receiver) = std_mpsc::channel();
@@ -1516,7 +1546,7 @@ mod tests {
         let options = prompt.window_options(decision, shortcut);
         let snapshot = options.snapshot.as_ref().unwrap();
         assert_eq!(usize::from(options.initial_rows), snapshot.rows);
-        // The child adds the keyboard hint and engages by the same chord.
+        // The frame's legend names the chord the dialog engages by.
         assert_eq!(
             options
                 .trusted_consent
@@ -1536,11 +1566,10 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            shown.contains(
-                "Click inside this dialog or press Ctrl+Alt+G first to answer with the keyboard."
-            ),
+            shown.contains("click inside or ctrl alt g to use the keyboard"),
             "{shown}"
         );
+        assert!(!shown.contains("Click inside this dialog"), "{shown}");
         assert_eq!(snapshot.title, "Upgrade question");
     }
 
@@ -1573,6 +1602,7 @@ mod tests {
                 capability: vec![1; CAPABILITY_BYTES],
                 parent_pid: 42,
                 lines: dialog_lines(&question),
+                respond_within_seconds: RESPOND_WITHIN.as_secs(),
             };
             prompt.validate().unwrap();
             for shortcut in [Some(DialogShortcut::default()), None] {
@@ -1591,6 +1621,7 @@ mod tests {
             capability: vec![1; CAPABILITY_BYTES],
             parent_pid: 42,
             lines: vec![DialogLine::new("question")],
+            respond_within_seconds: 0,
         };
         good.validate().unwrap();
         for bad in [

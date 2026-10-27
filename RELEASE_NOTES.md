@@ -70,8 +70,8 @@ running daemon by themselves.
   do not interoperate. Upgrade both ends of a remote connection, and keep
   `splinterm-mcp` at the same version.
 - The agent access prompt no longer grants on Enter: Enter denies, and only `G`
-  or the grant area grants. Its keys do nothing until you click inside it or
-  press the dialog shortcut (see "Trusted dialogs").
+  or the green Allow button grants. Its keys do nothing until you click inside
+  it or press the dialog shortcut (see "Trusted dialogs").
 - **Revoke all access** (`Ctrl+Shift+R`) asks with exact counts before it acts,
   except in a Window opened on a single Splint (`splinterm launch --splint-id
   ID`), which has no command palette.
@@ -115,10 +115,10 @@ running daemon by themselves.
   cancel or proceed without them. In a terminal it asks `[c]ancel / [p]roceed`.
   Without one, or from inside a Splinterm terminal, a small trusted "Splinterm —
   Upgrade" dialog asks instead (see "Trusted dialogs"); only `G` or its green
-  area proceeds. Closing it or not answering cancels; with no answer in time
-  the command prints "No answer about the Windows within N seconds;
-  cancelling." Proceeding closes those Windows; their terminals keep running
-  and reopen from Recent Dojos.
+  **Proceed** button proceeds. Closing it or not answering cancels; with no
+  answer in time the command prints "No answer about the Windows within N
+  seconds; cancelling." Proceeding closes those Windows; their terminals keep
+  running and reopen from Recent Dojos.
 - If the new build fails before it takes over, the daemon rolls back to the
   previous build in the same process and keeps every terminal. Windows show
   "Rolled back".
@@ -148,12 +148,13 @@ running daemon by themselves.
 - Another build with live terminals, or a daemon the launcher cannot read (such
   as 0.1.x), gets a trusted "Splinterm — Upgrade" dialog naming the running and
   installed versions. **Not now** is the default and opens nothing: `Enter`,
-  `Escape`, `D`, the red left area, closing the dialog, or no answer within
-  120 seconds. Only `R` or the green right area chooses **Restart now (ends N
-  shells)**, with the daemon's exact count. For a daemon it cannot read, the
-  count is a best-effort "ends about N shells", or "all running shells" when
-  none can be counted. When the daemon reports that nothing blocks a live
-  upgrade, the dialog says to choose **Not now** and run `splinterm upgrade`.
+  `Escape`, `D`, the red left **Not now** button, closing the dialog, or no
+  answer within 120 seconds. Only `R` or the green right button chooses
+  **Restart now, end N shells**, with the daemon's exact count. For a daemon
+  it cannot read, the count is a best-effort "end about N shells", or "end all
+  running shells" when none can be counted. When the daemon reports that
+  nothing blocks a live upgrade, the dialog says to choose **Not now** and run
+  `splinterm upgrade`.
 - With no answer, the launcher prints "splinterm: no answer within 120 seconds,
   so nothing was restarted." instead of a failure, and exits as for **Not now**
   (status 3).
@@ -216,10 +217,10 @@ a hostile program running as your account.
   package upgrade keeps an **Always** grant; restart an agent that was running
   before the upgrade.
 - The prompt is a trusted dialog (see "Trusted dialogs"). Enter, Escape, and
-  `D` deny; only `G` or a click on the grant area grants. Earlier releases
-  granted on Enter. You choose the duration with the mouse or the arrow keys;
-  **Just this once** is preselected, and the grant action names your exact
-  choice, for example **Always allow Manage for 'Workspace'**. Closing the
+  `D` deny; only `G` or a click on the green **Allow** button grants. Earlier
+  releases granted on Enter. You choose the duration with the mouse or the
+  arrow keys; **Just this once** is preselected, and the Allow button names
+  your exact choice, for example **Allow Manage while open**. Closing the
   prompt denies.
 - The prompt shows the agent's reported name (as a label only), its exact
   executable path, the workspace name with its short ID, the level, and the
@@ -295,6 +296,27 @@ a hostile program running as your account.
   Given a smaller size anyway, a dialog rewraps its text and then shrinks it.
   While any text is still hidden, it can only be declined: it never grants,
   proceeds, or restarts, and says so in place of its key hints.
+- Trusted dialogs are redrawn as one box: a thin `warning` frame with a
+  lowercase title such as "agent access request" set into it, the request as
+  one sentence, the details as an aligned table, the durations as list rows
+  with the chosen one highlighted, and two labelled buttons below: a red no
+  button on the left and a green yes button on the right that names exactly
+  what it does, such as **Allow Look once**, **Proceed, close 2 Windows**, or
+  **Restart now, end 4 shells**, each with its keys under its label. Only a
+  click inside the green button says yes. The frame's bottom edge says how to
+  engage the keyboard until you click or press the dialog shortcut, then
+  which keys answer. When the agent reported a name, the access prompt now
+  says that the agent names itself and Splinterm cannot verify that name. A
+  button label too long for its half counts as hidden text, so the dialog
+  can then only be declined. The box casts the same hard shadow as the
+  in-Window popups. The upgrade and restart questions count their time to
+  answer down at the right of the top edge, such as `cancels in 0:42`; the
+  access prompt shows no countdown. Trusted dialogs always use the default,
+  even padding, whatever `[main] padding-*` says.
+- Names in the access prompt and the **Agent access** list show every quote
+  and quote look-alike (such as `ʼ`, `′`, `“`, or a backtick) as an escape
+  such as `\u{02bc}`, and a run of spaces as one space, so a name cannot
+  imitate the prompt's wording.
 
 ## Agent status
 
@@ -508,8 +530,9 @@ a hostile program running as your account.
   half-strength scrim.
 - Trusted dialogs (access consent, upgrade, restart) take your theme and its
   `[colors]` keys as they open, always opaque: the frame in `warning`, the
-  left "no" area in `danger` and the right "yes" area in `success`, kept
-  readable. Since their text names the areas red and green, a theme whose
+  left "no" button's edge and label in `danger` and the right "yes" button's
+  in `success`, each over a light tint of its colour, kept readable. Since
+  their text names the buttons red and green, a theme whose
   danger is not red or success not green gets Splinterm's own red and green
   there, and a dialog whose colours cannot be kept red, green and apart
   (on a mid-grey background, say) keeps Splinterm's own palette. Their text

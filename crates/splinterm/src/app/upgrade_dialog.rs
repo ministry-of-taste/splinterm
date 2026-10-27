@@ -42,7 +42,8 @@ use splinterd::{
 };
 use splinterm::automation::HandoffDecisionPrompt;
 use splinterm::{
-    DialogIdentity, DialogLine, DialogText, TrustedConsentUi, WindowOptions, config::ResolvedTheme,
+    DialogIdentity, DialogLine, DialogStyle, DialogText, TrustedConsentUi, WindowOptions,
+    config::ResolvedTheme,
 };
 use splinterm_protocol::{
     HandoffUnresponsiveWindow, MAX_HANDOFF_DOJO_NAME_BYTES, MAX_HANDOFF_WINDOW_DOJOS,
@@ -50,7 +51,7 @@ use splinterm_protocol::{
 };
 
 use super::consent::{
-    keyboard_hint, read_private_frame_bounded, run_trusted_dialog_window, trusted_label,
+    read_private_frame_bounded, run_trusted_dialog_window, trusted_label,
     write_private_frame_bounded,
 };
 
@@ -88,14 +89,10 @@ pub(in crate::app) trait DialogPrompt:
 /// The widest dialog line, matching the consent snapshot's column clamp.
 pub(in crate::app) const MAX_DIALOG_COLUMNS: usize = 120;
 
-/// The share of the dialog's rows above the consent chrome's action areas,
-/// which cover the bottom 22% of the Window.
-const TEXT_ROWS_PERCENT: usize = splinterm::frontend::dialog_text::TEXT_ROWS_PERCENT;
-
 /// The fewest grid rows an upgrade or restart question asks for.
 pub(in crate::app) const MIN_DIALOG_ROWS: usize = 18;
 
-/// The width the footer's explanation wraps at, as it always has.
+/// The width the footer's explanation and answer hint wrap at.
 const FOOTER_WRAP_COLUMNS: usize = 70;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -190,18 +187,18 @@ fn window_line(window: &HandoffUnresponsiveWindow) -> String {
     line
 }
 
-/// The dialog text: the Windows, what proceeding does, and how to answer.
-/// The explanation and the actions are always shown in full below the list,
-/// with the deadline before the actions and the keyboard hint last.
-fn dialog_lines(prompt: &UpgradeDialogPrompt, shortcut: Option<DialogShortcut>) -> Vec<DialogLine> {
+/// The dialog text: the frame's title, the Windows, what proceeding does,
+/// the deadline, how to answer, and the two buttons' labels, the green one
+/// naming how many Windows close.
+fn dialog_lines(prompt: &UpgradeDialogPrompt) -> Vec<DialogLine> {
     let count = prompt.windows.len();
+    let windows = if count == 1 { "Window" } else { "Windows" };
     let mut lines = vec![
-        DialogLine::new("TRUSTED SPLINTERM UPGRADE QUESTION"),
-        DialogLine::blank(),
+        DialogLine::title("close windows to upgrade?"),
         DialogLine::new(format!(
-            "splinterd is upgrading. {count} Window{} cannot take part:",
-            if count == 1 { "" } else { "s" }
-        )),
+            "splinterd is upgrading. {count} {windows} cannot take part:"
+        ))
+        .with_style(DialogStyle::Strong),
     ];
     let listed = |window| DialogLine::new(window_line(window)).with_indent(4);
     // Every Window gets a line while they fit; past that, the last line
@@ -231,26 +228,30 @@ fn dialog_lines(prompt: &UpgradeDialogPrompt, shortcut: Option<DialogShortcut>) 
             prompt.respond_within_seconds
         )),
         DialogLine::blank(),
-        DialogLine::hint("[D / Esc / Enter  Cancel]     [G  Proceed]"),
-        DialogLine::hint("Click the red left area to cancel or the green right area to proceed."),
-        DialogLine::hint(keyboard_hint("dialog", shortcut)),
+        DialogLine::hint(
+            "G or the green Proceed button (right) proceeds. Enter, Escape, D, or the red Cancel button (left) cancel.",
+        )
+        .with_wrap_at(FOOTER_WRAP_COLUMNS),
+        DialogLine::deny("Cancel"),
+        DialogLine::allow(format!("Proceed, close {count} {windows}")),
     ]);
     lines
 }
 
-/// Rows above and below the Window list at the dialog's natural width: the
-/// three header rows, then the blank row, the two rows of the explanation,
-/// the pause and deadline rows, the blank row, the two action hints, and
-/// the keyboard hint.
-const FIXED_DIALOG_ROWS: usize = 3 + 9;
+/// Body rows above and below the Window list at the dialog's natural
+/// width: the header row, then the blank row, the two rows of the
+/// explanation, the pause and deadline rows, the blank row, and the two
+/// rows of the answer hint.
+const FIXED_DIALOG_ROWS: usize = 1 + 8;
 
 /// The tallest dialog, in terminal rows. The static snapshot cannot scroll,
 /// so the dialog is sized to its content within this bound.
 const MAX_DIALOG_ROWS: usize = 40;
 
-/// The most Window lines that fit above the action areas of the tallest
-/// dialog; a longer list is summarized in its last line.
-const MAX_LISTED_WINDOWS: usize = MAX_DIALOG_ROWS * TEXT_ROWS_PERCENT / 100 - FIXED_DIALOG_ROWS;
+/// The most Window lines that fit the body of the tallest dialog, inside
+/// its box; a longer list is summarized in its last line.
+const MAX_LISTED_WINDOWS: usize =
+    MAX_DIALOG_ROWS - splinterm::frontend::dialog_text::CHROME_ROWS - FIXED_DIALOG_ROWS;
 
 /// The snapshot identity of the upgrade and restart questions.
 pub(in crate::app) fn question_identity() -> DialogIdentity {
@@ -261,9 +262,9 @@ pub(in crate::app) fn question_identity() -> DialogIdentity {
     }
 }
 
-fn dialog_text(prompt: &UpgradeDialogPrompt, shortcut: Option<DialogShortcut>) -> DialogText {
+fn dialog_text(prompt: &UpgradeDialogPrompt) -> DialogText {
     DialogText {
-        lines: dialog_lines(prompt, shortcut),
+        lines: dialog_lines(prompt),
         minimum_rows: MIN_DIALOG_ROWS,
     }
 }
@@ -276,7 +277,8 @@ fn dialog_window_options(
 ) -> WindowOptions {
     TrustedConsentUi::upgrade(decision)
         .with_shortcut(shortcut)
-        .with_text(dialog_text(prompt, shortcut))
+        .with_respond_within(Duration::from_secs(prompt.respond_within_seconds))
+        .with_text(dialog_text(prompt))
         .with_identity(question_identity())
         .into_window_options()
 }
@@ -650,16 +652,13 @@ fn timed_out(error: &anyhow::Error) -> bool {
 mod tests {
     use super::*;
 
-    use splinterm::frontend::dialog_text::{natural_layout, natural_rows};
+    use splinterm::frontend::dialog_text::{CHROME_ROWS, natural_layout, natural_rows};
     use splinterm_core::{DojoId, LairId};
     use splinterm_protocol::{HandoffWindowDojo, HandoffWindowIssue};
 
     /// The dialog's rows of text at its natural size.
-    fn dialog_rows_of(
-        prompt: &UpgradeDialogPrompt,
-        shortcut: Option<DialogShortcut>,
-    ) -> Vec<String> {
-        natural_layout(&[dialog_text(prompt, shortcut)], 0).rows
+    fn dialog_rows_of(prompt: &UpgradeDialogPrompt) -> Vec<String> {
+        natural_layout(&[dialog_text(prompt)], 0).rows
     }
 
     /// The footer's rows at the natural size, as they always read.
@@ -667,8 +666,8 @@ mod tests {
         "Proceeding closes these Windows. Their terminals keep running in the",
         "upgraded daemon; reopen them from the Recent Dojos picker.",
         "Input is paused in every Window until you answer.",
-        "[D / Esc / Enter  Cancel]     [G  Proceed]",
-        "Click the red left area to cancel or the green right area to proceed.",
+        "G or the green Proceed button (right) proceeds. Enter, Escape, D, or",
+        "the red Cancel button (left) cancel.",
     ];
 
     fn window(pid: u32, dojos: usize, name_bytes: usize) -> HandoffUnresponsiveWindow {
@@ -763,17 +762,24 @@ mod tests {
     }
 
     #[test]
-    fn the_dialog_names_its_shortcut_and_engages_by_it() {
+    fn the_dialog_names_its_buttons_and_engages_by_its_shortcut() {
         let dialog = prompt(vec![window(5, 0, 0)]);
-        let lines = dialog_rows_of(&dialog, shortcut());
+        // The frame's title and the buttons; the frame's legend, not the
+        // body, says how to engage the keyboard.
+        let text = dialog_text(&dialog);
+        assert_eq!(text.title(), "close windows to upgrade?");
+        assert_eq!(text.deny_label(), "Cancel");
+        assert_eq!(text.allow_label(), "Proceed, close 1 Window");
+        assert_eq!(
+            dialog_text(&prompt(vec![window(5, 0, 0), window(6, 0, 0)])).allow_label(),
+            "Proceed, close 2 Windows"
+        );
+        let lines = dialog_rows_of(&dialog);
         assert_eq!(
             lines.last().map(String::as_str),
-            Some("Click inside this dialog or press Ctrl+Alt+G first to answer with the keyboard.")
+            Some("the red Cancel button (left) cancel.")
         );
-        assert_eq!(
-            dialog_rows_of(&dialog, None).last().map(String::as_str),
-            Some("Click inside this dialog first to answer with the keyboard.")
-        );
+        assert!(!lines.iter().any(|line| line.contains("Click inside")));
         let (decision, _receiver) = std_mpsc::channel();
         let options = dialog_window_options(&dialog, decision, shortcut());
         assert_eq!(
@@ -819,7 +825,7 @@ mod tests {
     fn the_largest_prompt_fits_the_bounded_dialog_with_a_count_and_the_actions() {
         let windows = (1..=64).map(|pid| window(pid, 32, 128)).collect::<Vec<_>>();
         let dialog = prompt(windows);
-        let lines = dialog_rows_of(&dialog, shortcut());
+        let lines = dialog_rows_of(&dialog);
         let listed = lines
             .iter()
             .filter(|line| line.starts_with("  • PID "))
@@ -832,9 +838,9 @@ mod tests {
         );
         assert!(lines.contains(&summary), "{lines:#?}");
         assert!(
-            lines[2].contains("64 Windows cannot take part"),
+            lines[0].contains("64 Windows cannot take part"),
             "{}",
-            lines[2]
+            lines[0]
         );
         for footer in DIALOG_FOOTER {
             assert!(
@@ -852,11 +858,10 @@ mod tests {
         let options = dialog_window_options(&dialog, decision, shortcut());
         let snapshot = options.snapshot.as_ref().unwrap();
         assert!(snapshot.rows <= MAX_DIALOG_ROWS, "{}", snapshot.rows);
-        // The grid shows the whole snapshot, and the text ends above the
-        // bottom 22% the action areas cover.
+        // The grid shows the whole snapshot, the text and the box around it.
         assert_eq!(usize::from(options.initial_rows), snapshot.rows);
         assert_eq!(usize::from(options.initial_columns), snapshot.columns);
-        assert!(lines.len() * 100 <= snapshot.rows * TEXT_ROWS_PERCENT);
+        assert_eq!(lines.len() + CHROME_ROWS, snapshot.rows);
         assert_eq!(snapshot.visible_rows.len(), snapshot.rows);
         assert_eq!(snapshot.title, "Upgrade question");
         assert_eq!(snapshot.cursor_row, -1);
@@ -998,7 +1003,7 @@ mod tests {
             .map(|pid| window(pid, 32, 128))
             .collect::<Vec<_>>();
         let dialog = prompt(windows);
-        let lines = dialog_rows_of(&dialog, shortcut());
+        let lines = dialog_rows_of(&dialog);
         assert_eq!(
             lines
                 .iter()
@@ -1007,26 +1012,26 @@ mod tests {
             MAX_LISTED_WINDOWS
         );
         assert!(!lines.iter().any(|line| line.contains("more Windows")));
-        assert!(natural_rows(&[dialog_text(&dialog, shortcut())]) <= MAX_DIALOG_ROWS);
+        assert!(natural_rows(&[dialog_text(&dialog)]) <= MAX_DIALOG_ROWS);
         assert_eq!(lines.len(), FIXED_DIALOG_ROWS + MAX_LISTED_WINDOWS);
-        let single = dialog_rows_of(&prompt(vec![window(5, 0, 0)]), shortcut());
+        let single = dialog_rows_of(&prompt(vec![window(5, 0, 0)]));
         assert!(
-            single[2].contains("1 Window cannot take part"),
+            single[0].contains("1 Window cannot take part"),
             "{}",
-            single[2]
+            single[0]
         );
     }
 
     #[test]
     fn the_dialog_says_what_proceeding_does_and_how_to_answer() {
-        let text = dialog_rows_of(&prompt(vec![window(5, 0, 0)]), shortcut()).join("\n");
+        let text = dialog_rows_of(&prompt(vec![window(5, 0, 0)])).join("\n");
         assert!(text.contains("PID 5 — did not answer in time — Dojos: none named"));
         assert!(text.contains("Proceeding closes these Windows"));
         assert!(text.contains("terminals keep running"));
         assert!(text.contains("Recent Dojos picker"));
         assert!(text.contains("no answer within 18 seconds, cancels"));
-        assert!(text.contains("[D / Esc / Enter  Cancel]"));
-        assert!(text.contains("[G  Proceed]"));
+        assert!(text.contains("G or the green Proceed button (right) proceeds"));
+        assert!(text.contains("the red Cancel button (left) cancel"));
         assert!(!text.contains("G / Enter"));
     }
 

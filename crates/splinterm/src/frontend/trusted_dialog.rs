@@ -13,25 +13,29 @@
 //! [`UPGRADE_ARMING_DELAY`], and the delay starts again
 //! whenever the dialog regains focus and, in the access consent dialog,
 //! whenever the selected duration changes. Key repeats are always ignored.
-//! A click in the deny or cancel area always counts. See [`Engagement`].
+//! A click on the red (deny or cancel) button always counts. See [`Engagement`].
 //!
 //! The access consent dialog (ADR 0014) is default-deny. `Enter`, `Escape`
-//! and `D` deny; only `G` or the green right action area grants, and the red
-//! left one denies. The person chooses the duration with the arrow keys or
+//! and `D` deny; only `G` or the green Allow button (right) grants, and the red
+//! Deny button (left) denies. The person chooses the duration with the arrow keys or
 //! by clicking its row, never with a letter: "Just this once" is preselected,
 //! withheld durations cannot be selected, and selecting never grants. See
 //! [`AccessChoice`].
 //!
 //! The upgrade question (Plan 0061 M3.13d) proceeds only on a deliberate act,
-//! because proceeding closes Windows. Only `G` or the green area proceeds;
+//! because proceeding closes Windows. Only `G` or the green button proceeds;
 //! `Enter`, `Escape` and `D` cancel.
 //!
 //! The launcher's restart question (Plan 0037 Milestone 4) ends running
 //! shells, so it follows the upgrade question's rules with its own key: only
-//! `R` or the green area restarts; `Enter`, `Escape` and `D` answer "Not now",
+//! `R` or the green button restarts; `Enter`, `Escape` and `D` answer "Not now",
 //! and `G` does nothing.
 
 use std::time::{Duration, Instant};
+
+use splinterd::dialog_shortcut::DialogShortcut;
+
+use super::dialog_text::DialogInk;
 
 /// Which trusted dialog a `TrustedConsentUi` Window shows.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -107,7 +111,7 @@ impl Engagement {
         }
     }
 
-    #[cfg(test)]
+    /// Whether a click inside or the dialog shortcut engaged it.
     pub(crate) const fn engaged(self) -> bool {
         self.engaged
     }
@@ -119,38 +123,6 @@ impl Engagement {
                 now.saturating_duration_since(armed_from) >= UPGRADE_ARMING_DELAY
             })
     }
-}
-
-/// The share of a trusted dialog's height its red and green action areas
-/// take while the text above them leaves room.
-pub(crate) const ACTION_AREA_PERCENT: u32 = 22;
-
-/// The shortest the action areas get, in cell rows, when the text needs the
-/// rest of the Window.
-pub(crate) const MINIMUM_ACTION_ROWS: u32 = 2;
-
-/// Where a trusted dialog's action areas begin, in pixels from the top of a
-/// Window `height` tall whose text ends `text_bottom` pixels from its top.
-///
-/// They take the bottom [`ACTION_AREA_PERCENT`] of the Window while the text
-/// ends above that. When a small Window (a tiled one, say) leaves the text
-/// no room, they shrink to begin where the text ends, down to
-/// `minimum_height`, so the actions never cover text that fits. The Window
-/// lays its text out again so that it fits (`super::dialog_text::layout`);
-/// only text that cannot fit even at [`DIALOG_FONT_FLOOR_PERCENT`] would
-/// reach the actions, and the layout drops rows instead.
-pub(crate) fn action_area_top(height: u32, text_bottom: u32, minimum_height: u32) -> u32 {
-    let preferred = height.saturating_mul(100 - ACTION_AREA_PERCENT) / 100;
-    let lowest = height.saturating_sub(minimum_height);
-    text_bottom.min(lowest).max(preferred)
-}
-
-/// How many of a static dialog's `rows` hold text: up to and including the
-/// last one with a visible character.
-pub(crate) fn dialog_text_rows(rows: &[splinterm_protocol::TerminalRow]) -> usize {
-    rows.iter()
-        .rposition(|row| row.cells.iter().any(|cell| !cell.content.trim().is_empty()))
-        .map_or(0, |last| last + 1)
 }
 
 /// The smallest a trusted dialog's font gets, in percent of the configured
@@ -240,9 +212,13 @@ impl AccessChoice {
         self.selected
     }
 
-    #[cfg(test)]
     pub(crate) const fn engagement(&self) -> Engagement {
         self.engagement
+    }
+
+    /// How many durations can be chosen.
+    pub(crate) fn offered(&self) -> usize {
+        self.offered.iter().filter(|offered| **offered).count()
     }
 
     /// A click inside the dialog engages it (see [`Engagement::engage`]).
@@ -327,20 +303,105 @@ impl AccessChoice {
 }
 
 impl TrustedDialogKind {
+    /// What happens when the time to answer runs out, before the time
+    /// left in the frame's countdown, such as "cancels in 0:18".
+    pub(crate) const fn countdown_verb(self) -> &'static str {
+        match self {
+            Self::AccessConsent => "denies in",
+            Self::Upgrade => "cancels in",
+            Self::Restart => "not now in",
+        }
+    }
+
     /// What the dialog shows in place of its answer hints while part of its
     /// text is hidden: it cannot say yes until the Window is larger.
     pub(crate) const fn clipped_notice(self) -> &'static str {
         match self {
             Self::AccessConsent => {
-                "Part of this request is hidden, so it cannot be granted. Make this window larger to grant. Enter, Escape, D, or the red area deny."
+                "Part of this request is hidden, so it cannot be granted. Make this window larger to grant. Enter, Escape, D, or the red Deny button (left) deny."
             }
             Self::Upgrade => {
-                "Part of this question is hidden, so it cannot proceed. Make this window larger to proceed. Enter, Escape, D, or the red area cancel."
+                "Part of this question is hidden, so it cannot proceed. Make this window larger to proceed. Enter, Escape, D, or the red Cancel button (left) cancel."
             }
             Self::Restart => {
-                "Part of this question is hidden, so it cannot restart. Make this window larger to restart. Enter, Escape, D, or the red area answer Not now."
+                "Part of this question is hidden, so it cannot restart. Make this window larger to restart. Enter, Escape, D, or the red Not now button (left) answer Not now."
             }
         }
+    }
+
+    /// The keys under the red left button: every dialog's no keys, Enter
+    /// (`↵`) among them, its default.
+    pub(crate) const fn deny_keys(self) -> &'static str {
+        match self {
+            Self::AccessConsent | Self::Upgrade | Self::Restart => "esc · d · ↵",
+        }
+    }
+
+    /// The key under the green right button: the only key that says yes
+    /// ([`Self::key_decision`], [`AccessChoice::key`]).
+    pub(crate) const fn allow_keys(self) -> &'static str {
+        match self {
+            Self::AccessConsent | Self::Upgrade => "g",
+            Self::Restart => "r",
+        }
+    }
+
+    /// The legend set into the frame's bottom edge, its forms best first
+    /// (see `dialog_text::DialogChrome::legend`). Until a click or
+    /// `shortcut` engages the keyboard it says how to; then it names the
+    /// keys, `key verb` pairs dropped from the end as the frame narrows.
+    /// `choices` is whether there is more than one duration to choose.
+    pub(crate) fn legend(
+        self,
+        live: bool,
+        choices: bool,
+        shortcut: Option<DialogShortcut>,
+    ) -> Vec<Vec<(String, DialogInk)>> {
+        let text = |text: &str| (text.to_owned(), DialogInk::Secondary);
+        let key = |text: &str| (text.to_owned(), DialogInk::Text);
+        if !live {
+            let Some(shortcut) = shortcut else {
+                return vec![
+                    vec![text("click inside to use the keyboard")],
+                    vec![text("click for keys")],
+                ];
+            };
+            let chord = shortcut.label().to_lowercase().replace('+', " ");
+            return vec![
+                vec![
+                    text("click inside or "),
+                    key(&chord),
+                    text(" to use the keyboard"),
+                ],
+                vec![text("click or "), key(&chord), text(" for keys")],
+                vec![text("click for keys")],
+            ];
+        }
+        let mut pairs: Vec<(&str, &str)> = Vec::new();
+        match self {
+            Self::AccessConsent => {
+                if choices {
+                    pairs.push(("↑↓", "how long"));
+                }
+                pairs.extend([("g", "allow"), ("esc", "deny")]);
+            }
+            Self::Upgrade => pairs.extend([("g", "proceed"), ("esc", "cancel")]),
+            Self::Restart => pairs.extend([("r", "restart"), ("esc", "not now")]),
+        }
+        (1..=pairs.len())
+            .rev()
+            .map(|count| {
+                let mut form = Vec::new();
+                for (index, (pair_key, verb)) in pairs[..count].iter().enumerate() {
+                    if index > 0 {
+                        form.push(text(" · "));
+                    }
+                    form.push(key(pair_key));
+                    form.push(text(&format!(" {verb}")));
+                }
+                form
+            })
+            .collect()
     }
 
     /// The title the Window maps with.
@@ -733,68 +794,89 @@ mod tests {
         );
     }
 
-    /// The action areas keep the bottom 22% while the text ends above it,
-    /// as before.
+    /// The keys under each button are exactly the keys that answer: every
+    /// no key on the red left one, and the one yes key on the green right.
     #[test]
-    fn roomy_dialogs_keep_their_action_areas_at_the_bottom_fifth() {
-        assert_eq!(action_area_top(1000, 500, 40), 780);
-        assert_eq!(action_area_top(1000, 780, 40), 780);
-        assert_eq!(action_area_top(375, 0, 40), 292);
-    }
-
-    /// In a small Window the action areas begin where the text ends, so they
-    /// never cover it, and keep at least their minimum height. Only text
-    /// taller than that leaves is clipped at them.
-    #[test]
-    fn action_areas_never_cover_text_that_fits_above_their_minimum() {
-        // The 2026-10-22 VM case: tiled 621×375, 18 px rows of text.
-        let row = 18;
-        let minimum = MINIMUM_ACTION_ROWS * row + 5;
-        for text_rows in 0..=24 {
-            let text_bottom = 4 + text_rows * row;
-            let top = action_area_top(375, text_bottom, minimum);
-            assert!(top >= 292, "{text_rows}: {top}");
-            if text_bottom <= 375 - minimum {
-                assert!(top >= text_bottom, "{text_rows}: {top} covers text");
-            } else {
-                assert_eq!(top, 375 - minimum, "{text_rows}: clipped at the minimum");
-            }
-        }
-        for height in 1..=600 {
-            for text_bottom in (0..=height).step_by(7) {
-                let top = action_area_top(height, text_bottom, minimum);
-                assert!(top <= height);
-                assert!(top >= height * 78 / 100);
-                assert!(
-                    top >= text_bottom || height - top <= minimum.max(height - height * 78 / 100),
-                    "{height} {text_bottom}: {top}"
+    fn the_button_keys_are_the_keys_that_answer() {
+        let clicked = Instant::now();
+        let engagement = engaged_at(clicked);
+        let now = clicked + UPGRADE_ARMING_DELAY;
+        let named = |key: TrustedDialogKey| match key {
+            TrustedDialogKey::Escape => "esc",
+            TrustedDialogKey::D => "d",
+            TrustedDialogKey::Enter => "↵",
+            TrustedDialogKey::G => "g",
+            TrustedDialogKey::R => "r",
+            _ => "",
+        };
+        for kind in KINDS {
+            let deny: Vec<_> = kind.deny_keys().split(" · ").collect();
+            for key in KEYS {
+                let decision = kind.key_decision(key, false, engagement, now);
+                let name = named(key);
+                assert_eq!(
+                    decision == Some(false),
+                    deny.contains(&name) && !name.is_empty(),
+                    "{kind:?} {key:?}"
+                );
+                assert_eq!(
+                    decision == Some(true),
+                    kind.allow_keys() == name,
+                    "{kind:?} {key:?}"
                 );
             }
         }
-        // A Window too short for even the minimum keeps the bottom 22%.
-        assert_eq!(action_area_top(30, 30, 41), 23);
+        let (choice, armed) = engaged_choice(vec![true, true, true]);
+        assert_eq!(
+            choice.key(TrustedDialogKey::G, false, armed),
+            Some(ConsentAction::Grant)
+        );
+        assert_eq!(TrustedDialogKind::AccessConsent.allow_keys(), "g");
     }
 
+    fn legend_text(form: &[(String, DialogInk)]) -> String {
+        form.iter().map(|(text, _)| text.as_str()).collect()
+    }
+
+    /// Until the keyboard is engaged the legend says how to engage it,
+    /// naming the shortcut when it is on; then it names the answering keys,
+    /// its pairs dropped from the end.
     #[test]
-    fn dialog_text_ends_at_its_last_visible_character() {
-        fn row(text: &str) -> splinterm_protocol::TerminalRow {
-            splinterm_protocol::TerminalRow {
-                row_id: None,
-                linebreak: false,
-                cells: text
-                    .chars()
-                    .map(|character| splinterm_protocol::TerminalCell {
-                        content: character.to_string(),
-                        spacer_remaining: None,
-                        attributes: splinterm_protocol::CellAttributes::default(),
-                    })
-                    .collect(),
-            }
-        }
-        assert_eq!(dialog_text_rows(&[]), 0);
-        assert_eq!(dialog_text_rows(&[row(""), row("   ")]), 0);
-        let rows = [row("TITLE"), row(""), row("text"), row("  "), row("")];
-        assert_eq!(dialog_text_rows(&rows), 3);
+    fn the_legend_says_how_to_engage_then_which_keys_answer() {
+        let shortcut = Some(DialogShortcut::default());
+        let inert = TrustedDialogKind::AccessConsent.legend(false, true, shortcut);
+        assert_eq!(
+            legend_text(&inert[0]),
+            "click inside or ctrl alt g to use the keyboard"
+        );
+        // The chord is in primary text, the rest secondary.
+        assert!(inert[0].contains(&("ctrl alt g".to_owned(), DialogInk::Text)));
+        assert_eq!(legend_text(inert.last().unwrap()), "click for keys");
+        let off = TrustedDialogKind::Restart.legend(false, false, None);
+        assert_eq!(legend_text(&off[0]), "click inside to use the keyboard");
+        let live = TrustedDialogKind::AccessConsent.legend(true, true, shortcut);
+        assert_eq!(
+            live.iter()
+                .map(|form| legend_text(form))
+                .collect::<Vec<_>>(),
+            [
+                "↑↓ how long · g allow · esc deny",
+                "↑↓ how long · g allow",
+                "↑↓ how long",
+            ]
+        );
+        assert_eq!(
+            legend_text(&TrustedDialogKind::AccessConsent.legend(true, false, shortcut)[0]),
+            "g allow · esc deny"
+        );
+        assert_eq!(
+            legend_text(&TrustedDialogKind::Upgrade.legend(true, false, shortcut)[0]),
+            "g proceed · esc cancel"
+        );
+        assert_eq!(
+            legend_text(&TrustedDialogKind::Restart.legend(true, false, None)[0]),
+            "r restart · esc not now"
+        );
     }
 
     /// A dialog keeps its configured font when its text fits, steps down

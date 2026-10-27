@@ -42,13 +42,13 @@ pub mod wayland;
 pub mod window_continuation;
 
 pub use frontend::{
-    AccessConsentRenderer, AuthorityStatus, DialogIdentity, DialogLine, DialogLineRole, DialogText,
-    ExplorerContextTarget, FontUpdate, LairDirection, LairExplorerActivationTarget, LairPromptKind,
-    LairPromptTarget, PerfTraceCorrelation, SelectorKind, SessionPickerCatalog,
-    SessionPickerCreationTarget, SessionPickerDecision, SessionPickerItem, SessionPickerTarget,
-    SessionPickerUi, TerminalGridLimits, ThemeUpdate, TrustedConsentUi, WindowCommand,
-    WindowDojoIdentity, WindowOptions, WindowPaneOptions, WindowThemeColors, WindowTopologyCommand,
-    WindowTopologyUpdate, WindowUpdate,
+    AccessConsentRenderer, AuthorityStatus, DialogIdentity, DialogLine, DialogLineRole,
+    DialogStyle, DialogText, ExplorerContextTarget, FontUpdate, LairDirection,
+    LairExplorerActivationTarget, LairPromptKind, LairPromptTarget, PerfTraceCorrelation,
+    SelectorKind, SessionPickerCatalog, SessionPickerCreationTarget, SessionPickerDecision,
+    SessionPickerItem, SessionPickerTarget, SessionPickerUi, TerminalGridLimits, ThemeUpdate,
+    TrustedConsentUi, WindowCommand, WindowDojoIdentity, WindowOptions, WindowPaneOptions,
+    WindowThemeColors, WindowTopologyCommand, WindowTopologyUpdate, WindowUpdate,
 };
 pub use wayland::{
     CloseSignal, PhaseEnd, WindowSurface, check_window_options, run as run_window, run_window_on,

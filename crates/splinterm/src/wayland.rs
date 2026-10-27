@@ -990,6 +990,7 @@ impl WaylandSession {
             app.apply_clipboard_image_events();
             app.tick_cursor_blink(queue_handle)?;
             app.tick_agent_spinner(queue_handle)?;
+            app.tick_trusted_countdown(queue_handle);
             let Some(dispatch_timeout) = app.event_loop_dispatch_timeout() else {
                 break;
             };
@@ -12211,8 +12212,13 @@ impl App {
             (timeout, _) => timeout,
         };
         // Wake to clear an expired upgrade outcome notice.
-        match (timeout, self.handoff.timeout(Instant::now())) {
+        let timeout = match (timeout, self.handoff.timeout(Instant::now())) {
             (Some(timeout), Some(notice)) => Some(timeout.min(notice)),
+            (timeout, _) => timeout,
+        };
+        // Wake to count a trusted dialog's time left down.
+        match (timeout, self.trusted_countdown_timeout()) {
+            (Some(timeout), Some(countdown)) => Some(timeout.min(countdown)),
             (timeout, _) => timeout,
         }
     }
@@ -16446,7 +16452,7 @@ mod tests {
             })
             .into_window_options();
         let snapshot = dialog.snapshot.clone().unwrap();
-        // 18 rows of text take at most 72% of 25 rows; the narrowest width.
+        // 18 rows of text and the box's 7 make 25 rows; the narrowest width.
         assert_eq!((snapshot.columns, snapshot.rows), (64, 25));
         assert_eq!((dialog.initial_columns, dialog.initial_rows), (64, 25));
         let prepared = prepare_window(&mut dialog).unwrap();

@@ -804,9 +804,9 @@ come before their legacy aliases, in `omarchy-theme-color`'s order:
 | focus-ring | active pane border, focused frames | `active_border_color` | the accent |
 | text-muted | inactive tab labels, menu secondary text | `muted`, `dark_foreground`, `dark_fg` | the foreground mixed 30% toward the background |
 | accent | active tab underline, selection rails | `accent`, `cursor`, `blue`, `color4` | Foot cursor colour |
-| danger | needs input, error, Terminate, a trusted dialog's no area | `red`, `color1` | Foot `regular1` |
+| danger | needs input, error, Terminate, a trusted dialog's no button | `red`, `color1` | Foot `regular1` |
 | warning | working, "Asking", a trusted dialog's frame | `warning`, `yellow`, `color3` | Foot `regular3` |
-| success | idle, a trusted dialog's yes area | `success`, `green`, `color2` | Foot `regular2` |
+| success | idle, a trusted dialog's yes button | `success`, `green`, `color2` | Foot `regular2` |
 | info | done | `cyan`, `color6` | Foot `regular6` |
 | remote-marker | the remote host tag | `signal`, `magenta`, `color5` | Foot `regular5` |
 
@@ -916,9 +916,9 @@ accent=#8c6c3e
 | `text-muted` | inactive tab labels, and the secondary text of menus, pickers and the Explorer, raised to 4.5:1 there | the theme's, ramped from `text` |
 | `text-faint` | through `status-stale` only | `text` mixed 55% toward `surface` |
 | `accent` | the active tab underline, selection rails, the history overlay | the theme's |
-| `danger` | Terminate in the command palette, the tab menu and the Dojo prompt, raised to 4.5:1 there; a trusted dialog's red (no) area; and through `status-needs-input` and `status-error` | the theme's |
+| `danger` | Terminate in the command palette, the tab menu and the Dojo prompt, raised to 4.5:1 there; a trusted dialog's red (no) button; and through `status-needs-input` and `status-error` | the theme's |
 | `warning` | the "Asking" marker, a trusted dialog's frame, and through `status-working` | the theme's |
-| `success` | a trusted dialog's green (yes) area, and through `status-idle` | the theme's |
+| `success` | a trusted dialog's green (yes) button, and through `status-idle` | the theme's |
 | `info` | through `status-done` only | the theme's |
 | `status-needs-input` | the needs-input status glyph | `danger` |
 | `status-error` | the error status glyph | `danger` |
@@ -950,11 +950,12 @@ and Terminate labels to 4.5:1 against their own panel and selected row, so a
 there; on a translucent panel, muted text and Terminate labels move toward
 the text as far as they need to read over any backdrop. Trusted dialogs
 (access consent, upgrade, restart), which take the theme as they open, with
-its `[colors]` keys, and are always opaque, raise their text to 4.5:1 and
-their frame and answer areas to 3:1 against their background. Their text
-tells you to click the red area to say no and the green one to say yes,
+its `[colors]` keys, and are always opaque, raise their text to 4.5:1 against
+what it sits on (the background, the selected row, or a button's light tint)
+and their frame and button edges to 3:1 against their background. Their text
+tells you to click the red button to say no and the green one to say yes,
 so a `danger` that is not red or a `success` that is not green, whether the
-theme's or set here, gives way to Splinterm's own red or green there; areas
+theme's or set here, gives way to Splinterm's own red or green there; buttons
 too close to each other, or a frame too close to either, give way as well,
 and a dialog whose colours still cannot be kept apart takes Splinterm's own
 palette. Dialogs take only colours from the theme: their text size is the

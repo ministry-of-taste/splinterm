@@ -47,7 +47,7 @@ pub(crate) fn agent_access_test_entry(
 pub(crate) use agent_status::state_tint;
 pub(crate) use agent_status::{AgentAggregate, AgentGlyphs, AgentSpinner, badged_tab_label};
 pub(crate) use binding_help::{BINDING_HELP_PAGE_ITEMS, BindingHelpUi};
-pub use dialog_text::{DialogIdentity, DialogLine, DialogLineRole, DialogText};
+pub use dialog_text::{DialogIdentity, DialogLine, DialogLineRole, DialogStyle, DialogText};
 #[cfg(test)]
 pub(crate) use lair_explorer::LairExplorerRowKind;
 pub(crate) use lair_explorer::{
@@ -74,7 +74,4 @@ pub use topology::{
     LairPromptTarget, SelectorKind, SessionPickerCatalog, SessionPickerCreationTarget,
     SessionPickerTarget, WindowDojoIdentity, WindowTopologyCommand, WindowTopologyUpdate,
 };
-pub(crate) use trusted_dialog::{
-    MINIMUM_ACTION_ROWS, TrustedDialogKey, TrustedDialogKind, action_area_top, dialog_font_step,
-    dialog_text_rows,
-};
+pub(crate) use trusted_dialog::{TrustedDialogKey, TrustedDialogKind, dialog_font_step};

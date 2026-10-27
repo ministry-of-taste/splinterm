@@ -423,24 +423,30 @@ The prompt is deliberate by default:
   Ctrl+Alt+G then reaches it from any Window while it waits; see
   [Trusted dialogs](usage.md#trusted-dialogs) and
   [Integrations](integrations.md).
-- Enter, Escape, and `D` deny. Only `G` or a click on the grant area grants.
+- Enter, Escape, and `D` deny. Only `G` or a click on the green **Allow**
+  button (right) grants.
   Earlier releases granted on Enter; this one does not.
 - Input is ignored for a short moment after your click, each time the prompt
   regains focus, and each time you change the duration. Held-down keys never
-  answer it. A click on the deny area always counts.
+  answer it. A click on the red **Deny** button (left) always counts.
 - You choose the duration with the mouse or the arrow keys, never with a
   letter. **Just this once** is preselected, and a duration that is not offered
   is shown with the reason and cannot be chosen.
-- The grant action names your exact choice, for example **Always allow Manage
-  for 'Workspace'**. That one answer is the whole confirmation.
+- The Allow button names your exact choice, for example **Allow Manage while
+  open** or **Always allow Manage**, and the chosen duration's row names the
+  workspace. That one answer is the whole confirmation.
 - Choosing a longer duration shows who shares it, and, when your answer would
   replace an earlier one for the same agent and workspace, what it replaces.
 
-The prompt shows the agent's reported name, its exact executable path, the
-workspace name with its short ID, the level with one line of what it allows, and
-the exact scopes. Names and paths are shown escaped, as data, in the same form
-as the **Agent access** list: a control or bidirectional character appears as an
-escape such as `\u{202e}`, so the name you approve reads the same in the list.
+The prompt shows the request as one sentence with the agent's reported name.
+When the agent reported a name, a note follows that the agent names itself and
+Splinterm cannot verify that name. Then come its exact executable path, the
+workspace name with its short ID, the level with one line of what it allows,
+and the exact scopes. Names and paths are shown escaped, as data, in the same
+form as the **Agent access** list: a control or bidirectional character, and
+every quote or quote look-alike, appears as an escape such as `\u{202e}`, and
+a run of spaces as one space, so the name you approve reads the same in the
+list and cannot imitate the prompt's own wording.
 
 A request that a grant already covers is answered at once, without a prompt.
 Prompts appear one at a time; further requests wait their turn. If you do not
