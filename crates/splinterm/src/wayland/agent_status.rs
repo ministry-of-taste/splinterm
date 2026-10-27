@@ -134,6 +134,12 @@ impl TabAgentStatus {
         Some(next)
     }
 
+    /// The working spinner's current frame, which the upgrade banner shows
+    /// too.
+    pub(super) const fn spinner(&self) -> AgentSpinner {
+        self.spinner
+    }
+
     /// How long the event loop may sleep at `now` before the next frame;
     /// `None` while the spinner rests. Reuses the last pass's decision.
     fn spinner_timeout(&self, now: Instant) -> Option<Duration> {
@@ -227,17 +233,19 @@ impl App {
         let moves_here =
             AgentSpinner::animates(self.input.reduced_motion, self.input.keyboard_focused, true);
         let agent = &self.tab_state.agent;
+        // A running upgrade's banner spins with the same frames.
         let tabs_working = moves_here
-            && self
-                .tab_state
-                .tab_strip_layout
-                .as_ref()
-                .is_some_and(|layout| {
-                    layout
-                        .tabs
-                        .iter()
-                        .any(|tab| agent.shows_working(tab.dojo_id))
-                });
+            && (self.handoff.banner_working()
+                || self
+                    .tab_state
+                    .tab_strip_layout
+                    .as_ref()
+                    .is_some_and(|layout| {
+                        layout
+                            .tabs
+                            .iter()
+                            .any(|tab| agent.shows_working(tab.dojo_id))
+                    }));
         // A picker's shown loading line moves the same spinner.
         let picker_loading = moves_here
             && self

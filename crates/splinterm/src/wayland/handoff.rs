@@ -18,6 +18,7 @@ use std::{
 };
 
 use crate::{
+    geometry::Rect,
     handoff_status::{
         HandoffBanner, HandoffPresentation, HandoffStatusHub, HandoffTransition, WindowHandoffPhase,
     },
@@ -68,6 +69,9 @@ pub(super) struct HandoffFrontend {
     /// The held failure was reported once the Window was declared lost.
     lost_reported: bool,
     pub(super) text_cache: SessionPickerTextCache,
+    /// Where the last draw put the banner and its shadow, buffer px: a
+    /// spinner frame damages it.
+    pub(super) painted_banner: Option<Rect>,
 }
 
 impl HandoffFrontend {
@@ -165,6 +169,18 @@ impl HandoffFrontend {
     /// The banner's text, also appended to the Window title.
     pub(super) fn banner_text(&self) -> Option<String> {
         self.presentation.banner().map(HandoffBanner::text)
+    }
+
+    /// The banner the Window shows, if any.
+    pub(super) fn banner(&self) -> Option<HandoffBanner> {
+        self.presentation.banner()
+    }
+
+    /// Whether the banner shows a running upgrade, whose spinner moves.
+    pub(super) fn banner_working(&self) -> bool {
+        self.presentation
+            .banner()
+            .is_some_and(HandoffBanner::is_working)
     }
 
     /// How long the event loop may sleep before an outcome notice expires.

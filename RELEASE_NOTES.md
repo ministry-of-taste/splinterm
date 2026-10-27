@@ -598,6 +598,18 @@ a hostile program running as your account.
   control and invisible characters removed. Terminate says "Running
   programs are stopped." A Window too small for a prompt, or too narrow
   for its buttons, cancels it rather than hide it.
+- The strips are the same box too, with its shadow and no scrim, where
+  they always were. Search, at the bottom left, has a four-edge focused
+  frame with the current match and the count in it (`2 / 17`,
+  `searching…`, `no matches`), the accent `›` and a block cursor, and its
+  keys in the bottom edge (`ctrl n next  ctrl p prev  esc close`, or
+  `↵ search` before a search); the current match is selected and outlined
+  in the accent. The history indicator, at the top right, is text instead
+  of bitmap digits in a passive box: `↑ 17 / 351  +4 new` and the return
+  keys as chips (`shift end`), still clicked to return to live. The
+  upgrade banner, at the top centre, is framed in the warning colour with
+  a Braille spinner while the upgrade runs, in danger with `✕` once the
+  connection is lost, and on the divider with `✓` once it rolls back.
 - Trusted dialogs (access consent, upgrade, restart) take your theme and its
   `[colors]` keys as they open, always opaque: the frame in `warning`, the
   left "no" button's edge and label in `danger` and the right "yes" button's

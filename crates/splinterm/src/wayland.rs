@@ -156,9 +156,9 @@ use crate::renderer::{
     ChromeSource, ChromeSurface, ChromeText, ChromeTextStyle, CommandPaletteLayout,
     CursorPresentation, DojoPromptLayout, HistoryOverlayStatus, LairExplorerAction,
     LairExplorerLayout, LairExplorerMetrics, LairExplorerPresentationMode, PaletteBody,
-    PaletteShape, PickerHitTarget, RenderContext, SessionPickerPurpose, SessionPickerTextCache,
-    SnapshotFrame, SnapshotOverlays, TabContextMenuLayout, TextRow, background_bgra,
-    chrome_panel_fill, chrome_panel_palette, clear_snapshot_caches, command_palette_hit_test,
+    PaletteShape, PickerHitTarget, RenderContext, SearchStrip, SessionPickerPurpose,
+    SessionPickerTextCache, SnapshotFrame, SnapshotOverlays, TabContextMenuLayout, TextRow,
+    background_bgra, chrome_panel_palette, clear_snapshot_caches, command_palette_hit_test,
     command_palette_layout, command_palette_row_hit_test, dojo_prompt_hit_test, dojo_prompt_layout,
     dojo_prompt_metrics, explorer_minimum_docked_terminal_width, fill_rect, history_overlay_layout,
     lair_explorer_action_hit_test, lair_explorer_agent_hit_test,
@@ -170,8 +170,8 @@ use crate::renderer::{
     paint_session_picker, paint_snapshot_overlays, paint_snapshot_presented,
     paint_snapshot_region_presented, paint_snapshot_rows_presented, paint_tab_context_menu,
     picker_status_line, premultiplied_theme_rgba, scroll_snapshot_pixels, search_overlay_panel,
-    session_picker_layout, snapshot_row_rect, tab_context_menu_hit_test, tab_context_menu_layout,
-    tab_menu_content_width, write_ppm,
+    session_picker_layout, snapshot_row_rect, strip_bounds, tab_context_menu_hit_test,
+    tab_context_menu_layout, tab_menu_content_width, write_ppm,
 };
 #[cfg(test)]
 use crate::renderer::{lair_explorer_layout, paint_box_drawing_cell};
@@ -1111,6 +1111,7 @@ fn assemble_app(
             explorer_layout: None,
             explorer_text_cache: SessionPickerTextCache::default(),
             search_text_cache: SessionPickerTextCache::default(),
+            history_text_cache: SessionPickerTextCache::default(),
             painted_search_panel: None,
             explorer_visible_start: 0,
             explorer_agents_start: 0,
@@ -1455,6 +1456,22 @@ impl SearchUiState {
     fn resync_required(&mut self) {
         self.in_flight = self.in_flight.saturating_sub(1);
         self.forget_results();
+    }
+
+    /// Whether `selection` is the current match, as revealing it selected
+    /// it, while the search strip is open: the match is then outlined.
+    fn selects_current_match(&self, selection: Option<Selection>) -> bool {
+        let (Some(_), Some(item), Some(selection)) =
+            (&self.input, self.matches.get(self.selected), selection)
+        else {
+            return false;
+        };
+        [selection.anchor, selection.end].iter().all(|endpoint| {
+            endpoint.active_screen == ActiveScreen::Normal
+                && endpoint.history_generation == self.page_generation
+                && endpoint.row_id == item.row_id
+        }) && selection.anchor.column == item.start_column
+            && selection.end.column == item.end_column.saturating_sub(1)
     }
 
     /// Whether the results name rows of history `generation`. Results from
@@ -2418,8 +2435,10 @@ struct PresentationState {
     explorer_layout: Option<LairExplorerLayout>,
     explorer_text_cache: SessionPickerTextCache,
     search_text_cache: SessionPickerTextCache,
-    /// Where the last committed frame drew the terminal search field, in
-    /// buffer pixels; the next frame damages it if the field closes or moves.
+    history_text_cache: SessionPickerTextCache,
+    /// Where the last committed frame drew the terminal search strip and its
+    /// shadow, in buffer pixels; the next frame damages it if the strip
+    /// closes or moves.
     painted_search_panel: Option<Rect>,
     explorer_visible_start: usize,
     /// The agents section's first row in view, kept as the tree's start is.
@@ -8254,6 +8273,7 @@ impl App {
         self.modal.session_picker_text_cache.clear();
         self.presentation.explorer_text_cache.clear();
         self.presentation.search_text_cache.clear();
+        self.presentation.history_text_cache.clear();
         self.modal.command_palette_text_cache.clear();
         self.modal.dojo_prompt_text_cache.clear();
         self.modal.tab_context_menu_text_cache.clear();
@@ -12984,6 +13004,11 @@ impl App {
                     selection_foreground: self.presentation.theme.selection_foreground,
                     url_color: self.presentation.theme.url,
                     accent_color: self.presentation.theme.roles.accent,
+                    search_match: self
+                        .panes
+                        .pane
+                        .search
+                        .selects_current_match(self.panes.pane.selection),
                 },
             );
             if let Some(layout) = pane_layout.as_ref() {
@@ -13004,24 +13029,22 @@ impl App {
                 &self.panes.pane.scrollback_viewport,
                 self.panes.pane.snapshot.as_ref(),
             ) {
-                // The digits are text on the raised surface.
-                let roles = self.presentation.theme.roles;
-                let digits = crate::color::contrast_corrected(roles.accent, roles.surface_raised);
+                let return_keys = crate::frontend::shortcut_chips(
+                    self.input.keymap.primary_shortcut(ActionId::ReturnToLive),
+                );
                 paint_history_overlay(
+                    &mut self.presentation.history_text_cache,
+                    &self.presentation.render_context,
                     canvas,
                     width,
                     height,
                     content_buffer_rect,
                     self.surface.scale_120,
+                    self.presentation.renderer_generation,
+                    chrome_panel_palette(self.presentation.theme, ChromeSurface::Popup),
                     status,
-                    chrome_panel_fill(
-                        roles.surface_raised,
-                        ChromeSurface::Popup.shell_alpha(self.presentation.theme.shell),
-                        self.presentation.theme.background_alpha,
-                        &[digits],
-                    ),
-                    digits,
-                );
+                    &return_keys,
+                )?;
             }
             if let Some(button_top) = trusted_action_top {
                 paint_trusted_consent_chrome(
@@ -13126,7 +13149,8 @@ impl App {
         if let Some(input) = self.panes.pane.search.input.as_ref() {
             if let Some(terminal) = search_paint_rect(content_rect, explorer_layout.as_ref()) {
                 let terminal = Self::buffer_rect(terminal, self.surface.scale_120)?;
-                search_panel = search_overlay_panel(terminal, self.surface.scale_120);
+                search_panel = search_overlay_panel(terminal, self.surface.scale_120)
+                    .map(|panel| strip_bounds(panel, self.surface.scale_120));
                 paint_search_overlay(
                     &mut self.presentation.search_text_cache,
                     &self.presentation.render_context,
@@ -13137,18 +13161,22 @@ impl App {
                     self.surface.scale_120,
                     self.presentation.renderer_generation,
                     chrome_panel_palette(self.presentation.theme, ChromeSurface::Popup),
-                    input.text(),
-                    &self.panes.pane.search.query,
-                    self.panes.pane.search.matches.len(),
-                    self.panes.pane.search.selected,
-                    self.panes.pane.search.searching,
+                    SearchStrip {
+                        input: input.text(),
+                        searched_query: &self.panes.pane.search.query,
+                        matches: self.panes.pane.search.matches.len(),
+                        selected: self.panes.pane.search.selected,
+                        searching: self.panes.pane.search.searching,
+                    },
+                    self.input.keyboard_focused,
                 )?;
             }
             self.surface.buffers[buffer_index].stale.mark_full();
         }
         // The upgrade banner: inside the terminal area, below the tab strip,
-        // clear of the history overlay, and beneath interactive popups.
-        if let Some(text) = self.handoff.banner_text() {
+        // clear of the history strip, and beneath interactive popups.
+        self.handoff.painted_banner = None;
+        if let Some(banner) = self.handoff.banner() {
             if let Some(terminal) = search_paint_rect(content_rect, explorer_layout.as_ref()) {
                 let history = history_overlay_status(
                     &self.panes.pane.scrollback_viewport,
@@ -13174,7 +13202,7 @@ impl App {
                         height,
                     }
                 });
-                paint_handoff_banner(
+                self.handoff.painted_banner = paint_handoff_banner(
                     &mut self.handoff.text_cache,
                     &self.presentation.render_context,
                     canvas,
@@ -13185,8 +13213,10 @@ impl App {
                     self.surface.scale_120,
                     self.presentation.renderer_generation,
                     chrome_panel_palette(self.presentation.theme, ChromeSurface::Popup),
-                    &text,
-                )?;
+                    banner,
+                    self.tab_state.agent.spinner().glyph(),
+                )?
+                .map(|panel| strip_bounds(panel, self.surface.scale_120));
             }
             self.surface.buffers[buffer_index].stale.mark_full();
         }
@@ -13384,18 +13414,37 @@ impl App {
                     i32::try_from(region.height).unwrap_or(i32::MAX),
                 );
             }
+            // The banner's spinner, already in buffer px with its shadow.
+            if spinner_damage && let Some(region) = self.handoff.painted_banner {
+                self.surface.window.wl_surface().damage_buffer(
+                    i32::try_from(region.x).unwrap_or(i32::MAX),
+                    i32::try_from(region.y).unwrap_or(i32::MAX),
+                    i32::try_from(region.width).unwrap_or(i32::MAX),
+                    i32::try_from(region.height).unwrap_or(i32::MAX),
+                );
+            }
         }
         if history_status != self.panes.pane.painted_history_status {
             let content = Self::buffer_rect(self.content_rect(), self.surface.scale_120)?;
             if let Some(layout) =
                 history_overlay_layout(content.width, content.height, self.surface.scale_120)
             {
+                // The strip and its shadow.
                 let (x, y, overlay_width, overlay_height) = layout.panel;
+                let bounds = strip_bounds(
+                    Rect {
+                        x: content.x.saturating_add(u32::try_from(x).unwrap_or(0)),
+                        y: content.y.saturating_add(u32::try_from(y).unwrap_or(0)),
+                        width: overlay_width,
+                        height: overlay_height,
+                    },
+                    self.surface.scale_120,
+                );
                 self.surface.window.wl_surface().damage_buffer(
-                    x.saturating_add(i32::try_from(content.x).unwrap_or(i32::MAX)),
-                    y.saturating_add(i32::try_from(content.y).unwrap_or(i32::MAX)),
-                    i32::try_from(overlay_width).unwrap_or(i32::MAX),
-                    i32::try_from(overlay_height).unwrap_or(i32::MAX),
+                    i32::try_from(bounds.x).unwrap_or(i32::MAX),
+                    i32::try_from(bounds.y).unwrap_or(i32::MAX),
+                    i32::try_from(bounds.width).unwrap_or(i32::MAX),
+                    i32::try_from(bounds.height).unwrap_or(i32::MAX),
                 );
             }
         }

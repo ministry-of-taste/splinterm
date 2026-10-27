@@ -102,11 +102,7 @@ pub(crate) use overlays::explorer::{
     lair_explorer_palette, lair_explorer_shown_layout, lair_explorer_shows_working,
     lair_explorer_with_agents, paint_lair_explorer,
 };
-pub(crate) use overlays::handoff::paint_handoff_banner;
-pub(crate) use overlays::history::{
-    HistoryOverlayStatus, SnapshotOverlays, history_overlay_layout, paint_history_overlay,
-    paint_snapshot_overlays,
-};
+pub(crate) use overlays::history::{SnapshotOverlays, paint_snapshot_overlays};
 pub(crate) use overlays::menu_box::{
     TabContextMenuLayout, paint_tab_context_menu, tab_context_menu_hit_test,
     tab_context_menu_layout, tab_menu_content_width,
@@ -114,8 +110,7 @@ pub(crate) use overlays::menu_box::{
 #[cfg(test)]
 pub(crate) use overlays::picker::session_picker_palette;
 pub(crate) use overlays::picker::{
-    ChromeSurface, SessionPickerPurpose, SessionPickerTextCache, chrome_panel_fill,
-    chrome_panel_palette, paint_search_overlay, search_overlay_panel,
+    ChromeSurface, SessionPickerPurpose, SessionPickerTextCache, chrome_panel_palette,
 };
 pub(crate) use overlays::picker_box::{
     paint_session_picker, picker_status_line, session_picker_layout,
@@ -124,8 +119,10 @@ pub(crate) use overlays::prompt_box::{
     DojoPromptLayout, dojo_prompt_hit_test, dojo_prompt_layout, dojo_prompt_metrics,
     paint_dojo_prompt,
 };
-#[cfg(test)]
-use raster::pixel_index;
+pub(crate) use overlays::strip_box::{
+    HistoryOverlayStatus, SearchStrip, history_overlay_layout, paint_handoff_banner,
+    paint_history_overlay, paint_search_overlay, search_overlay_panel, strip_bounds,
+};
 use raster::{alpha_u8, blend_glyph, blend_rect, premultiplied_rgba};
 pub(crate) use raster::{background_bgra, fill_rect, paint_box_drawing_cell};
 use settings::{

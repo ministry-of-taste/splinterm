@@ -568,15 +568,34 @@ impl ChromeBoxLayout {
         palette: &SessionPickerPalette,
         frame_color: u32,
     ) -> Result<()> {
+        self.paint_frame_titled(
+            painter,
+            palette,
+            frame_color,
+            (ChromeTextStyle::Bold, palette.primary),
+        )
+    }
+
+    /// [`Self::paint_frame`] with the title in `title` (its style and
+    /// colour): a passive box, such as the history strip, sets its title
+    /// regular and muted.
+    pub(super) fn paint_frame_titled(
+        &self,
+        painter: &mut ChromePainter<'_>,
+        palette: &SessionPickerPalette,
+        frame_color: u32,
+        title: (ChromeTextStyle, u32),
+    ) -> Result<()> {
         paint_outline(painter, self.frame, self.border, frame_color);
+        let (title_style, title_color) = title;
         if let Some(title) = &self.title {
             painter.fill(title.knockout, palette.panel_fill);
             painter.text(
                 &title.text.text,
-                ChromeTextStyle::Bold,
+                title_style,
                 title.text.rect,
                 PickerTextAlignment::Left,
-                palette.primary,
+                title_color,
             )?;
         }
         if let Some(label) = &self.right_label {

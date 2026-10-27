@@ -1,0 +1,1009 @@
+//! The strips in the popup box (Plan 0065 milestone 6): terminal search at
+//! the bottom left of the terminal area, the history position at its top
+//! right and the upgrade banner at its top centre, each one row of content
+//! in the shared box with its hard shadow and no scrim.
+//!
+//! Search takes keys, so its frame is the focused one, with the match count
+//! in the frame and its keys in the bottom edge. History is passive: a muted
+//! title over the divider frame, its position as text and the return chips,
+//! which keep the click that returns to live. The banner's frame says how
+//! the upgrade is going: warning with a spinner while it runs, danger once
+//! the connection is lost, the divider once it has settled.
+
+use anyhow::Result;
+
+use crate::{
+    geometry::Rect,
+    handoff_status::{HandoffBanner, HandoffNotice},
+};
+
+use super::{
+    super::{ChromeTextStyle, RenderContext},
+    actions::InputLineLayout,
+    chrome_box::{BOX_EDGE, BOX_SHADOW_OFFSET, ChromeBox, ChromePainter, opaque},
+    chrome_rows::{ROW_HEIGHT, ROW_PADDING, paint_key_chips, text_cells},
+    picker::{PickerTextAlignment, SessionPickerPalette, SessionPickerTextCache},
+};
+
+/// Logical px between a strip and the terminal area's edges.
+const STRIP_MARGIN: u32 = 8;
+/// Logical px between the inside of the frame and the content row, above
+/// and below it.
+const STRIP_PADDING: u32 = 10;
+/// A strip's height, logical px: the frame's edges, the padding and one
+/// row.
+pub(crate) const STRIP_HEIGHT: u32 = (BOX_EDGE + STRIP_PADDING) * 2 + ROW_HEIGHT;
+/// Logical px from the panel's side to the content.
+const STRIP_INSET: u32 = BOX_EDGE + ROW_PADDING;
+/// The search strip is this wide at most, logical px.
+const SEARCH_WIDTH: u32 = 440;
+/// A search strip narrower than this is not shown.
+const SEARCH_MINIMUM_WIDTH: u32 = 160;
+/// The history strip's width, logical px.
+const HISTORY_WIDTH: u32 = 340;
+/// A history strip narrower than this is not shown.
+const HISTORY_MINIMUM_WIDTH: u32 = 180;
+/// The room the history strip's return chips take, logical px.
+const RETURN_WIDTH: u32 = 96;
+/// A banner narrower than this is not shown.
+const BANNER_MINIMUM_WIDTH: u32 = 160;
+
+fn scaled(logical: u32, scale_120: u32) -> u32 {
+    logical.saturating_mul(scale_120).div_ceil(120).max(1)
+}
+
+/// What a strip at `panel` (buffer px) covers: the panel and its shadow,
+/// so the Window damages both where it was and where it is.
+#[must_use]
+pub(crate) fn strip_bounds(panel: Rect, scale_120: u32) -> Rect {
+    let offset = BOX_SHADOW_OFFSET.saturating_mul(scale_120).div_ceil(120);
+    Rect {
+        width: panel.width.saturating_add(offset),
+        height: panel.height.saturating_add(offset),
+        ..panel
+    }
+}
+
+/// The content row inside a strip's frame, buffer px.
+fn content_row(panel: Rect, scale_120: u32) -> Rect {
+    let x = scaled(STRIP_INSET, scale_120).min(panel.width / 2);
+    let y = scaled(BOX_EDGE + STRIP_PADDING, scale_120).min(panel.height / 2);
+    Rect {
+        x: panel.x.saturating_add(x),
+        y: panel.y.saturating_add(y),
+        width: panel.width.saturating_sub(x.saturating_mul(2)),
+        height: panel.height.saturating_sub(y.saturating_mul(2)),
+    }
+}
+
+fn cells_px(cells: u32, cell_width: u32) -> u32 {
+    cells.saturating_mul(cell_width)
+}
+
+/// The terminal search strip's panel, in buffer pixels, at the bottom left
+/// of `terminal`; `None` when the terminal is too small to show it. The
+/// painter and the Window's surface damage both use it, so a frame that
+/// removes or moves the strip damages exactly where it was drawn.
+#[must_use]
+pub(crate) fn search_overlay_panel(terminal: Rect, scale_120: u32) -> Option<Rect> {
+    if scale_120 == 0 {
+        return None;
+    }
+    let margin = scaled(STRIP_MARGIN, scale_120);
+    let width = terminal
+        .width
+        .saturating_sub(margin.saturating_mul(2))
+        .min(scaled(SEARCH_WIDTH, scale_120));
+    let height = scaled(STRIP_HEIGHT, scale_120);
+    if width < scaled(SEARCH_MINIMUM_WIDTH, scale_120)
+        || terminal.height < height.saturating_add(margin.saturating_mul(2))
+    {
+        return None;
+    }
+    Some(Rect {
+        x: terminal.x.saturating_add(margin),
+        y: terminal.y.saturating_add(
+            terminal
+                .height
+                .saturating_sub(margin)
+                .saturating_sub(height),
+        ),
+        width,
+        height,
+    })
+}
+
+/// What the search strip shows.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SearchStrip<'a> {
+    /// The query as typed.
+    pub(crate) input: &'a str,
+    /// The query last searched for.
+    pub(crate) searched_query: &'a str,
+    pub(crate) matches: usize,
+    pub(crate) selected: usize,
+    /// Older history is still being searched.
+    pub(crate) searching: bool,
+}
+
+impl SearchStrip<'_> {
+    /// Whether the typed query is the one the results answer.
+    fn searched(&self) -> bool {
+        !self.searched_query.is_empty() && self.input == self.searched_query
+    }
+
+    /// The count in the frame: the current match and how many, once the
+    /// typed query is searched; nothing before.
+    fn count(&self) -> Option<String> {
+        if !self.searched() {
+            return None;
+        }
+        Some(match (self.matches, self.searching) {
+            (0, true) => "searching…".to_owned(),
+            (0, false) => "no matches".to_owned(),
+            (matches, _) => format!(
+                "{} / {matches}",
+                self.selected.saturating_add(1).min(matches)
+            ),
+        })
+    }
+
+    /// The keys in the bottom frame: moving between matches once searched,
+    /// searching before.
+    fn legend(&self) -> &'static [(&'static str, &'static str)] {
+        if self.searched() && self.matches > 0 {
+            &[("ctrl n", "next"), ("ctrl p", "prev"), ("esc", "close")]
+        } else {
+            &[("↵", "search"), ("esc", "close")]
+        }
+    }
+}
+
+/// Paints the search strip inside `terminal`, the terminal side of any
+/// Explorer split: `search` in the frame with the count at its right, the
+/// accent `›`, the query and a block cursor, and the keys in the bottom
+/// edge. Returns whether it was drawn.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the bounded search strip keeps geometry, palette and cache in one paint seam"
+)]
+pub(crate) fn paint_search_overlay(
+    cache: &mut SessionPickerTextCache,
+    context: &RenderContext,
+    canvas: &mut [u8],
+    canvas_width: u32,
+    canvas_height: u32,
+    terminal: Rect,
+    scale_120: u32,
+    renderer_generation: u64,
+    palette: SessionPickerPalette,
+    search: SearchStrip<'_>,
+    keyboard_focused: bool,
+) -> Result<bool> {
+    let Some(panel) = search_overlay_panel(terminal, scale_120) else {
+        return Ok(false);
+    };
+    let mut painter = ChromePainter::new(
+        cache,
+        context,
+        canvas,
+        canvas_width,
+        canvas_height,
+        scale_120,
+        renderer_generation,
+    );
+    let cell = painter.box_cell()?;
+    let count = search.count();
+    let right_label = count.as_deref().into_iter().collect::<Vec<_>>();
+    let chrome = ChromeBox {
+        title: "search",
+        right_label: &right_label,
+        right_active: None,
+        legend: search.legend(),
+    }
+    .layout(panel, scale_120, cell);
+    chrome.paint_surface(&mut painter, &palette);
+    let row = content_row(panel, scale_120);
+    let regular = painter.cell(ChromeTextStyle::Regular)?;
+    let line = InputLineLayout::new(row, 0, regular);
+    painter.text(
+        "›",
+        ChromeTextStyle::Regular,
+        line.marker,
+        PickerTextAlignment::Left,
+        palette.accent_text,
+    )?;
+    let query = search
+        .input
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(256)
+        .collect::<String>();
+    if let Some((shown, cursor)) = line.fitted(row, &query) {
+        painter.text(
+            &shown,
+            ChromeTextStyle::Regular,
+            Rect {
+                x: line.text_x,
+                width: cursor.x.saturating_sub(line.text_x),
+                ..row
+            },
+            PickerTextAlignment::Left,
+            palette.primary,
+        )?;
+        painter.fill(cursor, opaque(palette.selected_rail));
+        if query.is_empty() {
+            let after = cursor.x.saturating_add(cursor.width);
+            painter.text(
+                "search the scrollback",
+                ChromeTextStyle::Regular,
+                Rect {
+                    x: after,
+                    width: line.end.saturating_sub(after),
+                    ..row
+                },
+                PickerTextAlignment::Left,
+                palette.secondary,
+            )?;
+        }
+    }
+    chrome.paint_frame(
+        &mut painter,
+        &palette,
+        if keyboard_focused {
+            palette.focused_frame
+        } else {
+            palette.frame
+        },
+    )?;
+    painter.finish();
+    Ok(true)
+}
+
+/// Where the history strip goes in a content area of `width` by `height`,
+/// relative to it, in the same px as those.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct HistoryOverlayLayout {
+    pub(crate) panel: (i32, i32, u32, u32),
+    /// The return chips' end of the strip, its full height: a click there
+    /// returns to live.
+    pub(crate) return_to_live: (i32, i32, u32, u32),
+}
+
+/// Where the history position stands while the view is scrolled back.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct HistoryOverlayStatus {
+    pub(crate) offset_from_bottom: usize,
+    pub(crate) available_rows: usize,
+    pub(crate) unseen_rows: usize,
+}
+
+/// The history strip at the top right of a `width` by `height` content
+/// area at `scale_120`; `None` when the area is too small for it. A pure
+/// function of its arguments, so the pointer's hit test and the painter
+/// agree.
+#[must_use]
+pub(crate) fn history_overlay_layout(
+    width: u32,
+    height: u32,
+    scale_120: u32,
+) -> Option<HistoryOverlayLayout> {
+    if width == 0 || height == 0 || scale_120 == 0 {
+        return None;
+    }
+    let margin = scaled(STRIP_MARGIN, scale_120)
+        .min(width / 4)
+        .min(height / 4);
+    let panel_width =
+        scaled(HISTORY_WIDTH, scale_120).min(width.saturating_sub(margin.saturating_mul(2)));
+    let panel_height = scaled(STRIP_HEIGHT, scale_120);
+    if panel_width < scaled(HISTORY_MINIMUM_WIDTH, scale_120)
+        || height < panel_height.saturating_add(margin.saturating_mul(2))
+    {
+        return None;
+    }
+    let x = width.saturating_sub(margin).saturating_sub(panel_width);
+    let action_width = scaled(RETURN_WIDTH + STRIP_INSET, scale_120).min(panel_width / 2);
+    Some(HistoryOverlayLayout {
+        panel: (
+            i32::try_from(x).ok()?,
+            i32::try_from(margin).ok()?,
+            panel_width,
+            panel_height,
+        ),
+        return_to_live: (
+            i32::try_from(x.saturating_add(panel_width.saturating_sub(action_width))).ok()?,
+            i32::try_from(margin).ok()?,
+            action_width,
+            panel_height,
+        ),
+    })
+}
+
+fn tuple_rect((x, y, width, height): (i32, i32, u32, u32)) -> Rect {
+    Rect {
+        x: u32::try_from(x).unwrap_or(0),
+        y: u32::try_from(y).unwrap_or(0),
+        width,
+        height,
+    }
+}
+
+/// Paints the history strip over `area`, the content area (buffer px): a muted `history`
+/// title over the divider frame, the accent `↑`, how far back the view
+/// is, how many rows arrived since in muted text when they fit, and
+/// `return_keys` as chips at its right end, or `↓ live` with no binding.
+/// Returns its layout, offset into the canvas.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "content-relative trusted strip painting keeps geometry, palette and cache explicit"
+)]
+pub(crate) fn paint_history_overlay(
+    cache: &mut SessionPickerTextCache,
+    context: &RenderContext,
+    canvas: &mut [u8],
+    width: u32,
+    height: u32,
+    area: Rect,
+    scale_120: u32,
+    renderer_generation: u64,
+    palette: SessionPickerPalette,
+    status: HistoryOverlayStatus,
+    return_keys: &[String],
+) -> Result<Option<HistoryOverlayLayout>> {
+    let Some(mut layout) = history_overlay_layout(area.width, area.height, scale_120) else {
+        return Ok(None);
+    };
+    let (Ok(offset_x), Ok(offset_y)) = (i32::try_from(area.x), i32::try_from(area.y)) else {
+        return Ok(None);
+    };
+    for rect in [&mut layout.panel, &mut layout.return_to_live] {
+        rect.0 = rect.0.saturating_add(offset_x);
+        rect.1 = rect.1.saturating_add(offset_y);
+    }
+    let panel = tuple_rect(layout.panel);
+    let mut painter = ChromePainter::new(
+        cache,
+        context,
+        canvas,
+        width,
+        height,
+        scale_120,
+        renderer_generation,
+    );
+    let cell = painter.box_cell()?;
+    let chrome = ChromeBox {
+        title: "history",
+        right_label: &[],
+        right_active: None,
+        legend: &[],
+    }
+    .layout(panel, scale_120, cell);
+    chrome.paint_surface(&mut painter, &palette);
+    let row = content_row(panel, scale_120);
+    let (cell_width, _) = painter.cell(ChromeTextStyle::Regular)?;
+    let row_right = row.x.saturating_add(row.width);
+    let action = tuple_rect(layout.return_to_live);
+    let room = Rect {
+        x: action.x,
+        width: row_right.saturating_sub(action.x),
+        ..row
+    };
+    let chips_start = if return_keys.is_empty() {
+        None
+    } else {
+        paint_key_chips(&mut painter, &palette, return_keys, room, true)?
+    };
+    if chips_start.is_none() {
+        painter.text(
+            "↓ live",
+            ChromeTextStyle::Regular,
+            room,
+            PickerTextAlignment::Right,
+            palette.accent_text,
+        )?;
+    }
+    let text_end = action.x.saturating_sub(cell_width);
+    let at = |cells: u32| row.x.saturating_add(cells_px(cells, cell_width));
+    let clip = |from: u32, cells: u32| Rect {
+        x: from,
+        width: cells_px(cells, cell_width).min(text_end.saturating_sub(from)),
+        ..row
+    };
+    painter.text(
+        "↑",
+        ChromeTextStyle::Regular,
+        clip(row.x, 1),
+        PickerTextAlignment::Left,
+        palette.accent_text,
+    )?;
+    let position = format!(
+        "{} / {}",
+        status.offset_from_bottom.min(999),
+        status.available_rows.min(999)
+    );
+    let position_cells = text_cells(&position);
+    painter.text(
+        &position,
+        ChromeTextStyle::Regular,
+        clip(at(2), position_cells),
+        PickerTextAlignment::Left,
+        palette.primary,
+    )?;
+    if status.unseen_rows > 0 {
+        let unseen = format!("+{} new", status.unseen_rows.min(999));
+        let from = at(2 + position_cells + 2);
+        let unseen_cells = text_cells(&unseen);
+        // Shown whole or not at all.
+        if from.saturating_add(cells_px(unseen_cells, cell_width)) <= text_end {
+            painter.text(
+                &unseen,
+                ChromeTextStyle::Regular,
+                clip(from, unseen_cells),
+                PickerTextAlignment::Left,
+                palette.secondary,
+            )?;
+        }
+    }
+    chrome.paint_frame_titled(
+        &mut painter,
+        &palette,
+        palette.frame,
+        (ChromeTextStyle::Regular, palette.secondary),
+    )?;
+    painter.finish();
+    Ok(Some(layout))
+}
+
+/// Where the banner goes in buffer pixels, its content `content_width`
+/// buffer px wide, inside `terminal` and left of `avoid` (the history
+/// strip) when that shares the banner's band. `None` when the terminal is
+/// too small for a legible banner.
+#[must_use]
+pub(crate) fn handoff_banner_layout(
+    terminal: Rect,
+    avoid: Option<Rect>,
+    content_width: u32,
+    scale_120: u32,
+) -> Option<Rect> {
+    if scale_120 == 0 || terminal.width == 0 || terminal.height == 0 {
+        return None;
+    }
+    let margin = scaled(STRIP_MARGIN, scale_120);
+    let height = scaled(STRIP_HEIGHT, scale_120);
+    if terminal.height < height.saturating_add(margin.saturating_mul(2)) {
+        return None;
+    }
+    let y = terminal.y.saturating_add(margin);
+    let left = terminal.x.saturating_add(margin);
+    let mut right = terminal
+        .x
+        .saturating_add(terminal.width)
+        .saturating_sub(margin);
+    if let Some(avoid) = avoid {
+        let band = y..y.saturating_add(height);
+        let shares_band = avoid.y < band.end && avoid.y.saturating_add(avoid.height) > band.start;
+        if shares_band && avoid.x > left && avoid.x < right {
+            right = avoid.x.saturating_sub(margin).max(left);
+        }
+    }
+    let available = right.saturating_sub(left);
+    if available < scaled(BANNER_MINIMUM_WIDTH, scale_120) {
+        return None;
+    }
+    let width = content_width
+        .saturating_add(scaled(STRIP_INSET, scale_120).saturating_mul(2))
+        .min(available);
+    Some(Rect {
+        x: left.saturating_add(available.saturating_sub(width) / 2),
+        y,
+        width,
+        height,
+    })
+}
+
+/// How a banner looks: its frame, its mark and the mark's colour.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BannerLook {
+    frame: u32,
+    mark: char,
+    mark_color: u32,
+}
+
+/// Running, the banner is in the warning colour with `spinner` as its
+/// mark; lost, in danger with `✕`; settled, on the divider with `✓` in
+/// success when the old daemon came back or `!` in warning when the
+/// upgrade was cancelled.
+const fn banner_look(
+    banner: HandoffBanner,
+    palette: &SessionPickerPalette,
+    spinner: char,
+) -> BannerLook {
+    match banner {
+        HandoffBanner::Preparing | HandoffBanner::InputPaused | HandoffBanner::Reconnecting => {
+            BannerLook {
+                frame: palette.warning,
+                mark: spinner,
+                mark_color: palette.warning,
+            }
+        }
+        HandoffBanner::Lost => BannerLook {
+            frame: palette.danger,
+            mark: '✕',
+            mark_color: palette.danger,
+        },
+        HandoffBanner::Notice(HandoffNotice::RolledBack) => BannerLook {
+            frame: palette.frame,
+            mark: '✓',
+            mark_color: palette.success,
+        },
+        HandoffBanner::Notice(HandoffNotice::Cancelled(_)) => BannerLook {
+            frame: palette.frame,
+            mark: '!',
+            mark_color: palette.warning,
+        },
+    }
+}
+
+/// Paints the upgrade banner and returns its panel, or `None` when the
+/// terminal is too small for it: no title, its mark (`spinner` while the
+/// upgrade runs) and label centred in the frame its state colours.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "trusted strip painting keeps geometry, palette, and cache explicit"
+)]
+pub(crate) fn paint_handoff_banner(
+    cache: &mut SessionPickerTextCache,
+    context: &RenderContext,
+    canvas: &mut [u8],
+    canvas_width: u32,
+    canvas_height: u32,
+    terminal: Rect,
+    avoid: Option<Rect>,
+    scale_120: u32,
+    renderer_generation: u64,
+    palette: SessionPickerPalette,
+    banner: HandoffBanner,
+    spinner: char,
+) -> Result<Option<Rect>> {
+    if scale_120 == 0 {
+        return Ok(None);
+    }
+    let mut painter = ChromePainter::new(
+        cache,
+        context,
+        canvas,
+        canvas_width,
+        canvas_height,
+        scale_120,
+        renderer_generation,
+    );
+    let (cell_width, _) = painter.cell(ChromeTextStyle::Regular)?;
+    let label = banner.label();
+    // The mark, a space, the label.
+    let content_cells = text_cells(&label).saturating_add(2);
+    let Some(panel) = handoff_banner_layout(
+        terminal,
+        avoid,
+        cells_px(content_cells, cell_width),
+        scale_120,
+    ) else {
+        painter.finish();
+        return Ok(None);
+    };
+    let look = banner_look(banner, &palette, spinner);
+    let cell = painter.box_cell()?;
+    let chrome = ChromeBox {
+        title: "",
+        right_label: &[],
+        right_active: None,
+        legend: &[],
+    }
+    .layout(panel, scale_120, cell);
+    chrome.paint_surface(&mut painter, &palette);
+    let row = content_row(panel, scale_120);
+    let row_right = row.x.saturating_add(row.width);
+    let start = row.x.saturating_add(
+        row.width
+            .saturating_sub(cells_px(content_cells, cell_width))
+            / 2,
+    );
+    painter.text(
+        look.mark.encode_utf8(&mut [0; 4]),
+        ChromeTextStyle::Regular,
+        Rect {
+            x: start,
+            width: cell_width.min(row_right.saturating_sub(start)),
+            ..row
+        },
+        PickerTextAlignment::Left,
+        look.mark_color,
+    )?;
+    let label_x = start.saturating_add(cells_px(2, cell_width));
+    painter.text(
+        &label,
+        ChromeTextStyle::Regular,
+        Rect {
+            x: label_x,
+            width: row_right.saturating_sub(label_x),
+            ..row
+        },
+        PickerTextAlignment::Left,
+        palette.primary,
+    )?;
+    chrome.paint_frame(&mut painter, &palette, look.frame)?;
+    painter.finish();
+    Ok(Some(panel))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{config::ResolvedTheme, renderer::session_picker_palette};
+    use splinterm_protocol::HandoffCancelReason;
+
+    const WIDTH: u32 = 900;
+    const HEIGHT: u32 = 480;
+    const TERMINAL: Rect = Rect {
+        x: 260,
+        y: 40,
+        width: 600,
+        height: 360,
+    };
+
+    fn pixel(canvas: &[u8], x: u32, y: u32) -> [u8; 3] {
+        let index = usize::try_from((y * WIDTH + x) * 4).unwrap();
+        [canvas[index + 2], canvas[index + 1], canvas[index]]
+    }
+
+    fn rgb(color: u32) -> [u8; 3] {
+        let [_, red, green, blue] = color.to_be_bytes();
+        [red, green, blue]
+    }
+
+    /// Every painted pixel is inside `bounds`.
+    fn painted_inside(canvas: &[u8], bounds: Rect) -> bool {
+        let mut painted = false;
+        for y in 0..HEIGHT {
+            for x in 0..WIDTH {
+                let index = usize::try_from((y * WIDTH + x) * 4).unwrap();
+                let blank = canvas[index..index + 4] == [0; 4];
+                let inside = x >= bounds.x
+                    && x < bounds.x + bounds.width
+                    && y >= bounds.y
+                    && y < bounds.y + bounds.height;
+                if !blank && !inside {
+                    return false;
+                }
+                painted |= !blank;
+            }
+        }
+        painted
+    }
+
+    fn search(
+        cache: &mut SessionPickerTextCache,
+        strip: SearchStrip<'_>,
+        focused: bool,
+    ) -> (bool, Vec<u8>) {
+        let mut canvas = vec![0_u8; usize::try_from(WIDTH * HEIGHT * 4).unwrap()];
+        let drawn = paint_search_overlay(
+            cache,
+            &RenderContext::new(u16::MAX),
+            &mut canvas,
+            WIDTH,
+            HEIGHT,
+            TERMINAL,
+            120,
+            1,
+            session_picker_palette(ResolvedTheme::default()),
+            strip,
+            focused,
+        )
+        .unwrap();
+        (drawn, canvas)
+    }
+
+    const SEARCHED: SearchStrip<'static> = SearchStrip {
+        input: "alpha",
+        searched_query: "alpha",
+        matches: 3,
+        selected: 1,
+        searching: false,
+    };
+
+    /// The search strip sits at the bottom left of the terminal area in
+    /// the box: a four-edge focused frame, `search` and the match count in
+    /// it, the query after the accent `›`, and its keys in the bottom edge.
+    /// Nothing is drawn outside the strip and its shadow, which the Window
+    /// damages.
+    #[test]
+    fn search_is_a_box_with_the_count_in_its_focused_frame() {
+        let palette = session_picker_palette(ResolvedTheme::default());
+        let mut cache = SessionPickerTextCache::default();
+        let (drawn, canvas) = search(&mut cache, SEARCHED, true);
+        assert!(drawn);
+        let panel = search_overlay_panel(TERMINAL, 120).unwrap();
+        assert_eq!(panel.x, TERMINAL.x + 8);
+        assert_eq!(panel.y + panel.height, TERMINAL.y + TERMINAL.height - 8);
+        assert_eq!((panel.width, panel.height), (440, STRIP_HEIGHT));
+        assert!(painted_inside(&canvas, strip_bounds(panel, 120)));
+        assert!(!painted_inside(&canvas, panel), "the shadow");
+        for text in [
+            "search", "2 / 3", "›", "alpha", "ctrl n", "next", "ctrl p", "esc",
+        ] {
+            assert!(cache.contains_source(text), "{text} was not drawn");
+        }
+        let (left, top) = (panel.x + 9, panel.y + 9);
+        let (right, bottom) = (panel.x + panel.width - 10, panel.y + panel.height - 10);
+        for (x, y) in [
+            (left, panel.y + 34),
+            (right, panel.y + 34),
+            (panel.x + 220, top),
+            (right - 4, bottom),
+        ] {
+            assert_eq!(pixel(&canvas, x, y), rgb(palette.focused_frame), "{x},{y}");
+        }
+        let (_, unfocused) = search(&mut cache, SEARCHED, false);
+        assert_eq!(pixel(&unfocused, left, panel.y + 34), rgb(palette.frame));
+
+        // Before a search: no count, and Enter searches.
+        let mut fresh = SessionPickerTextCache::default();
+        search(
+            &mut fresh,
+            SearchStrip {
+                input: "bravo",
+                ..SEARCHED
+            },
+            true,
+        );
+        assert!(fresh.contains_source("↵") && !fresh.contains_source("2 / 3"));
+        for (matches, searching, count) in [(0, true, "searching…"), (0, false, "no matches")] {
+            let mut fresh = SessionPickerTextCache::default();
+            search(
+                &mut fresh,
+                SearchStrip {
+                    matches,
+                    searching,
+                    ..SEARCHED
+                },
+                true,
+            );
+            assert!(fresh.contains_source(count), "{count}");
+        }
+    }
+
+    /// A terminal area too small for the strip gets none, and nothing is
+    /// drawn; a long query keeps its end.
+    #[test]
+    fn search_skips_unusable_geometry_and_keeps_a_long_querys_end() {
+        let tiny = Rect {
+            width: 150,
+            ..TERMINAL
+        };
+        assert_eq!(search_overlay_panel(tiny, 120), None);
+        assert_eq!(search_overlay_panel(TERMINAL, 0), None);
+        let short = Rect {
+            height: STRIP_HEIGHT + 15,
+            ..TERMINAL
+        };
+        assert_eq!(search_overlay_panel(short, 120), None);
+        let mut cache = SessionPickerTextCache::default();
+        let long = format!("{}tail\n", "x".repeat(2_000));
+        let (drawn, _) = search(
+            &mut cache,
+            SearchStrip {
+                input: &long,
+                ..SEARCHED
+            },
+            true,
+        );
+        assert!(drawn);
+        assert!(cache.contains_source("esc"));
+    }
+
+    fn history(
+        cache: &mut SessionPickerTextCache,
+        status: HistoryOverlayStatus,
+        keys: &[String],
+    ) -> (Option<HistoryOverlayLayout>, Vec<u8>) {
+        let mut canvas = vec![0_u8; usize::try_from(WIDTH * HEIGHT * 4).unwrap()];
+        let layout = paint_history_overlay(
+            cache,
+            &RenderContext::new(u16::MAX),
+            &mut canvas,
+            WIDTH,
+            HEIGHT,
+            TERMINAL,
+            120,
+            1,
+            session_picker_palette(ResolvedTheme::default()),
+            status,
+            keys,
+        )
+        .unwrap();
+        (layout, canvas)
+    }
+
+    /// The history strip is passive text at the top right: `history` over
+    /// the divider frame, the accent `↑`, the position, the rows that
+    /// arrived since, and the return chips at its right end, whose end of
+    /// the strip is the click target. Counts clamp at 999.
+    #[test]
+    fn history_is_passive_text_with_its_return_chips() {
+        let palette = session_picker_palette(ResolvedTheme::default());
+        let layout = history_overlay_layout(960, 600, 120).unwrap();
+        assert_eq!(layout.panel, (960 - 8 - 340, 8, 340, STRIP_HEIGHT));
+        let (x, y, width, height) = layout.return_to_live;
+        assert_eq!((y, height), (8, STRIP_HEIGHT));
+        assert_eq!(
+            i64::from(x) + i64::from(width),
+            i64::from(layout.panel.0) + 340
+        );
+        assert_eq!(width, RETURN_WIDTH + STRIP_INSET);
+        assert!(history_overlay_layout(150, 600, 120).is_none());
+        assert!(history_overlay_layout(960, 70, 120).is_none());
+        assert!(history_overlay_layout(960, 600, 0).is_none());
+
+        let mut cache = SessionPickerTextCache::default();
+        let keys = vec!["shift".to_owned(), "end".to_owned()];
+        let status = HistoryOverlayStatus {
+            offset_from_bottom: 17,
+            available_rows: 351,
+            unseen_rows: 4,
+        };
+        let (painted, canvas) = history(&mut cache, status, &keys);
+        let painted = painted.unwrap();
+        for text in ["history", "↑", "17 / 351", "+4 new", "shift", "end"] {
+            assert!(cache.contains_source(text), "{text} was not drawn");
+        }
+        let panel = tuple_rect(painted.panel);
+        assert_eq!(panel.x, TERMINAL.x + TERMINAL.width - 8 - 340);
+        assert_eq!(panel.y, TERMINAL.y + 8);
+        assert!(painted_inside(&canvas, strip_bounds(panel, 120)));
+        assert_eq!(
+            pixel(&canvas, panel.x + 9, panel.y + 34),
+            rgb(palette.frame),
+            "a passive frame"
+        );
+        let action = tuple_rect(painted.return_to_live);
+        assert_eq!(action.x + action.width, panel.x + panel.width);
+
+        let mut fresh = SessionPickerTextCache::default();
+        history(
+            &mut fresh,
+            HistoryOverlayStatus {
+                offset_from_bottom: 4_096,
+                available_rows: 4_096,
+                unseen_rows: 1_000,
+            },
+            &[],
+        );
+        for text in ["999 / 999", "↓ live"] {
+            assert!(fresh.contains_source(text), "{text} was not drawn");
+        }
+    }
+
+    fn banner(
+        cache: &mut SessionPickerTextCache,
+        banner: HandoffBanner,
+        avoid: Option<Rect>,
+    ) -> (Option<Rect>, Vec<u8>) {
+        let mut canvas = vec![0_u8; usize::try_from(WIDTH * HEIGHT * 4).unwrap()];
+        let panel = paint_handoff_banner(
+            cache,
+            &RenderContext::new(u16::MAX),
+            &mut canvas,
+            WIDTH,
+            HEIGHT,
+            TERMINAL,
+            avoid,
+            120,
+            1,
+            session_picker_palette(ResolvedTheme::default()),
+            banner,
+            '⠙',
+        )
+        .unwrap();
+        (panel, canvas)
+    }
+
+    /// The banner sits centred at the top of the terminal area, clear of
+    /// the history strip when it shares its band; a terminal too small for
+    /// it gets none.
+    #[test]
+    fn the_banner_is_centred_at_the_top_and_clear_of_history() {
+        let panel = handoff_banner_layout(TERMINAL, None, 240, 120).unwrap();
+        assert_eq!((panel.width, panel.height), (240 + 40, STRIP_HEIGHT));
+        assert_eq!(panel.y, TERMINAL.y + 8);
+        assert_eq!(panel.x + panel.width / 2, TERMINAL.x + TERMINAL.width / 2);
+        let wide = handoff_banner_layout(TERMINAL, None, 5_000, 120).unwrap();
+        assert_eq!(wide.width, TERMINAL.width - 16);
+        let history = Rect {
+            x: TERMINAL.x + TERMINAL.width - 308,
+            y: TERMINAL.y + 8,
+            width: 300,
+            height: STRIP_HEIGHT,
+        };
+        let clear = handoff_banner_layout(TERMINAL, Some(history), 5_000, 120).unwrap();
+        assert!(clear.x + clear.width + 8 <= history.x);
+        let below = Rect {
+            y: TERMINAL.y + 200,
+            ..history
+        };
+        assert_eq!(
+            handoff_banner_layout(TERMINAL, Some(below), 5_000, 120),
+            Some(wide)
+        );
+        let tiny = Rect {
+            height: STRIP_HEIGHT,
+            ..TERMINAL
+        };
+        assert_eq!(handoff_banner_layout(tiny, None, 100, 120), None);
+        assert_eq!(handoff_banner_layout(TERMINAL, None, 100, 0), None);
+    }
+
+    /// A running upgrade's banner is framed in the warning colour with the
+    /// spinner in place of its `…`; a lost one in danger with `✕`; a settled
+    /// one on the divider with `✓` or `!`.
+    #[test]
+    fn the_banner_frame_and_mark_follow_the_upgrade() {
+        let palette = session_picker_palette(ResolvedTheme::default());
+        assert_ne!(palette.warning, palette.frame);
+        for (state, frame, mark, label) in [
+            (
+                HandoffBanner::InputPaused,
+                palette.warning,
+                "⠙",
+                "Upgrading — input paused",
+            ),
+            (
+                HandoffBanner::Preparing,
+                palette.warning,
+                "⠙",
+                "Preparing upgrade",
+            ),
+            (
+                HandoffBanner::Lost,
+                palette.danger,
+                "✕",
+                "Lost connection to splinterd — reopen from the launcher",
+            ),
+            (
+                HandoffBanner::Notice(HandoffNotice::RolledBack),
+                palette.frame,
+                "✓",
+                "Rolled back",
+            ),
+            (
+                HandoffBanner::Notice(HandoffNotice::Cancelled(HandoffCancelReason::Blocked)),
+                palette.frame,
+                "!",
+                "Upgrade cancelled — something blocked it",
+            ),
+        ] {
+            let mut cache = SessionPickerTextCache::default();
+            let (panel, canvas) = banner(&mut cache, state, None);
+            let panel = panel.unwrap();
+            assert!(painted_inside(&canvas, strip_bounds(panel, 120)));
+            assert_eq!(
+                pixel(&canvas, panel.x + 9, panel.y + 34),
+                rgb(frame),
+                "{label}"
+            );
+            assert!(cache.contains_source(mark), "{label}");
+            assert!(cache.contains_source(label), "{label}");
+            assert!(!cache.contains_source("Preparing upgrade…"));
+        }
+    }
+
+    /// Every strip row is tall enough for the largest UI text.
+    #[test]
+    fn strip_rows_fit_the_largest_ui_text() {
+        use super::super::super::text::CHROME_MAXIMUM_LINE_HEIGHT;
+
+        const { assert!(ROW_HEIGHT >= CHROME_MAXIMUM_LINE_HEIGHT) };
+        assert_eq!(STRIP_HEIGHT, 68);
+    }
+}

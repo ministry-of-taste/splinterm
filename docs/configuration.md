@@ -917,8 +917,8 @@ accent=#8c6c3e
 | `text-faint` | through `status-stale` only | `text` mixed 55% toward `surface` |
 | `accent` | the active tab underline, selection rails, the history overlay | the theme's |
 | `danger` | Terminate in the command palette, the tab menu and the Dojo prompt, raised to 4.5:1 there; a trusted dialog's red (no) button; and through `status-needs-input` and `status-error` | the theme's |
-| `warning` | the "Asking" marker, a trusted dialog's frame, and through `status-working` | the theme's |
-| `success` | a trusted dialog's green (yes) button, and through `status-idle` | the theme's |
+| `warning` | the "Asking" marker, a trusted dialog's frame, the upgrade banner's frame and spinner while it runs, and through `status-working` | the theme's |
+| `success` | a trusted dialog's green (yes) button, the upgrade banner's check mark, and through `status-idle` | the theme's |
 | `info` | through `status-done` only | the theme's |
 | `status-needs-input` | the needs-input status glyph | `danger` |
 | `status-error` | the error status glyph | `danger` |
