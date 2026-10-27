@@ -74,6 +74,10 @@ pub enum LairPromptKind {
     Terminate,
 }
 
+/// A saved layout preview row's launch column for a Splint that has no
+/// recipe to restore it with; the prompt draws it in danger.
+pub const NOT_RESTORABLE: &str = "not restorable";
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LairPromptTarget {
     pub topology_revision: TopologyRevision,

@@ -11,9 +11,13 @@ use crate::navigation_projection::{
 
 use super::{
     LairDirection, LairPromptKind, LairPromptTarget, SelectorKind, WindowTopologyCommand,
-    agent_access::{RevokeAccessUi, WindowAccessCommand},
+    agent_access::{RevokeAccessUi, WindowAccessCommand, prompt_name, single_line},
     text_edit::BoundedTextEditor,
 };
+
+/// A name quoted in a prompt's question is cut to this many cells, so the
+/// question keeps its count and its `?` on a 440 px prompt.
+const QUESTION_NAME_CELLS: usize = 40;
 
 const MAX_QUERY_BYTES: usize = 256;
 const MAX_QUERY_SCALARS: usize = 128;
@@ -53,8 +57,16 @@ impl RenameDojoUi {
         &self.target
     }
 
+    pub(crate) fn target_name(&self) -> &str {
+        &self.target.name
+    }
+
     pub(crate) fn input(&self) -> &str {
         self.editor.text()
+    }
+
+    pub(crate) const fn editor(&self) -> &BoundedTextEditor {
+        &self.editor
     }
 
     pub(crate) fn append_text(&mut self, text: &str) -> bool {
@@ -156,6 +168,14 @@ impl RenameLairUi {
 
     pub(crate) fn input(&self) -> &str {
         self.editor.text()
+    }
+
+    pub(crate) const fn editor(&self) -> &BoundedTextEditor {
+        &self.editor
+    }
+
+    pub(crate) fn target_name(&self) -> &str {
+        &self.target.name
     }
 
     pub(crate) fn append_text(&mut self, text: &str) -> bool {
@@ -315,7 +335,9 @@ impl DojoPromptUi {
 
     /// The title set into the prompt's frame, lowercase, and its body: the
     /// question first, then what it means. A rename has no body: its field
-    /// holds the current name.
+    /// holds the current name. Every name is made one line and a quoted one
+    /// cut to [`QUESTION_NAME_CELLS`], so none can add a line or a table row
+    /// or push the question's end out of the prompt.
     pub(crate) fn title_and_body(&self) -> (&'static str, String) {
         match self {
             Self::Rename(_) => ("rename dojo", String::new()),
@@ -323,7 +345,7 @@ impl DojoPromptUi {
                 "terminate dojo",
                 format!(
                     "Terminate ‘{}’ and its {} pane{}?\nRunning programs are stopped.",
-                    prompt.target().name,
+                    prompt_name(&prompt.target().name, QUESTION_NAME_CELLS),
                     prompt.target().pane_count,
                     if prompt.target().pane_count == 1 {
                         ""
@@ -334,8 +356,14 @@ impl DojoPromptUi {
             ),
             Self::RenameLair(_) => ("rename lair", String::new()),
             Self::PreviewLair(target) => ("saved lair preview", target.preview.clone()),
+            // The question names the count and the target, so the preview's
+            // summary line, which names them again, is left out.
             Self::RestoreLair(prompt) => (
-                "restore saved lair",
+                if prompt.target().dojo_id.is_some() {
+                    "restore dojo"
+                } else {
+                    "restore saved lair"
+                },
                 format!(
                     "Restore {} captured Splint{} into ‘{}’?\n{}",
                     prompt.target().targets.len(),
@@ -344,15 +372,19 @@ impl DojoPromptUi {
                     } else {
                         "s"
                     },
-                    prompt.target().name,
-                    prompt.target().preview,
+                    prompt_name(&prompt.target().name, QUESTION_NAME_CELLS),
+                    prompt
+                        .target()
+                        .preview
+                        .split_once('\n')
+                        .map_or("", |(_, rows)| rows),
                 ),
             ),
             Self::TerminateLair(prompt) => (
                 "terminate lair",
                 format!(
                     "Terminate ‘{}’ and its {} captured pane{}?\nRunning programs are stopped.",
-                    prompt.target().name,
+                    prompt_name(&prompt.target().name, QUESTION_NAME_CELLS),
                     prompt.target().targets.len(),
                     if prompt.target().targets.len() == 1 {
                         ""
@@ -363,6 +395,27 @@ impl DojoPromptUi {
             ),
             Self::RevokeAccess(prompt) => prompt.title_and_body(),
         }
+    }
+
+    /// A rename's target as it is named now, made one line, for the
+    /// prompt's frame.
+    pub(crate) fn rename_target(&self) -> Option<String> {
+        match self {
+            Self::Rename(prompt) => Some(single_line(prompt.target_name())),
+            Self::RenameLair(prompt) => Some(single_line(prompt.target_name())),
+            _ => None,
+        }
+    }
+
+    /// Whether a rename's whole name is selected, as it is when the prompt
+    /// opens: the first keystroke then replaces it.
+    pub(crate) fn input_selected(&self) -> bool {
+        let editor = match self {
+            Self::Rename(prompt) => prompt.editor(),
+            Self::RenameLair(prompt) => prompt.editor(),
+            _ => return false,
+        };
+        !editor.text().is_empty() && editor.selected_text() == Some(editor.text())
     }
 
     pub(crate) fn input(&self) -> Option<&str> {

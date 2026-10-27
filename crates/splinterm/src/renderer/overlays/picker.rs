@@ -509,12 +509,14 @@ fn panel_palette(theme: ResolvedTheme, panel: u32) -> SessionPickerPalette {
         contrast_corrected_against_all(secondary, &highlight_states).unwrap_or(secondary);
     let highlight_danger =
         contrast_corrected_against_all(danger, &highlight_states).unwrap_or(danger);
-    let away_from_text = if relative_luminance(primary) > relative_luminance(panel) {
-        0
+    // Darker on a dark theme; on a light one, lighter, further, since a
+    // light panel is already near white.
+    let (away_from_text, depth) = if relative_luminance(primary) > relative_luminance(panel) {
+        (0, FIELD_DEPTH)
     } else {
-        0x00ff_ffff
+        (0x00ff_ffff, LIGHT_FIELD_DEPTH)
     };
-    let field = mix_encoded(panel, away_from_text, FIELD_DEPTH);
+    let field = mix_encoded(panel, away_from_text, depth);
     let field_primary = contrast_corrected(primary, field);
     let field_accent = contrast_floor_toward(roles.accent, field_primary, field, TEXT_MIN_CONTRAST);
     let danger_ink = contrast_corrected(panel, danger_text);
@@ -549,8 +551,11 @@ fn panel_palette(theme: ResolvedTheme, panel: u32) -> SessionPickerPalette {
     }
 }
 
-/// How far a sunken field moves from the panel away from the text.
+/// How far a sunken field moves from the panel away from the text: on a
+/// dark theme, toward black.
 const FIELD_DEPTH: f64 = 0.2;
+/// On a light theme, toward white.
+const LIGHT_FIELD_DEPTH: f64 = 0.45;
 
 /// How much of the scrim behind a modal panel covers the Window: one level
 /// for every modal list and prompt (the command palette, key bindings,

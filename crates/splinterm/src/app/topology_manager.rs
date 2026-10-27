@@ -15,6 +15,7 @@ use splinterm::{
     },
     config::{AppConfig, TopologyReloadSettings},
     endpoint::{ConnectionFactory, LaunchSemantics},
+    frontend::{NOT_RESTORABLE, single_line},
     navigation_projection::{
         EndpointFreshness, NavigationAction, NavigationAgentStatus, NavigationAuthority,
         NavigationAvailability, NavigationExplorerSplintTarget, NavigationExplorerView,
@@ -1229,34 +1230,53 @@ fn collect_scoped_lair_targets(
 }
 
 /// A saved Lair's preview for its prompts: a summary line, then one
-/// tab-separated row per Splint (its Dojo, its title, its directory), which
-/// the prompt lines up as a table, then where it came from and what a
-/// restore leaves out.
-fn saved_layout_preview(lair: &splinterm_core::Lair) -> String {
-    /// A table cell: control characters, tabs and newlines among them,
-    /// become spaces, so a name cannot break the row.
-    fn cell(text: &str) -> String {
-        text.chars()
-            .map(|character| {
-                if character.is_control() {
-                    ' '
-                } else {
-                    character
-                }
-            })
-            .collect()
+/// tab-separated row per Splint (its Dojo, what it launches, its directory),
+/// which the prompt lines up as a table, then where it came from and what a
+/// restore leaves out. `dojo` keeps only that Dojo's rows, for a Dojo's
+/// restore. Every name and path is made one line, so none can add a line or
+/// a cell, and a directory under `home` starts with `~`.
+fn saved_layout_preview(
+    lair: &splinterm_core::Lair,
+    dojo: Option<DojoId>,
+    home: Option<&std::path::Path>,
+) -> String {
+    /// What a restore launches, from the trusted recipe rather than the
+    /// title the program set: the executable's file name and its arguments,
+    /// or the shell.
+    fn recipe(splint: &splinterm_core::Splint) -> String {
+        match splint.command.split_first() {
+            None => "shell".to_owned(),
+            Some((executable, _)) if executable.trim().is_empty() => NOT_RESTORABLE.to_owned(),
+            Some((executable, arguments)) => {
+                let name = std::path::Path::new(executable).file_name().map_or_else(
+                    || executable.clone(),
+                    |name| name.to_string_lossy().into_owned(),
+                );
+                single_line(
+                    &std::iter::once(name.as_str())
+                        .chain(arguments.iter().map(String::as_str))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                )
+            }
+        }
     }
-    fn leaves(dojo: &str, node: &LayoutNode, output: &mut Vec<String>) {
+    fn leaves(
+        dojo: &str,
+        node: &LayoutNode,
+        home: Option<&std::path::Path>,
+        output: &mut Vec<String>,
+    ) {
         match node {
             LayoutNode::Leaf(splint) => output.push(format!(
                 "{}\t{}\t{}",
-                cell(dojo),
-                cell(&splint.title),
-                cell(&splint.cwd.display().to_string())
+                single_line(dojo),
+                recipe(splint),
+                single_line(&home_relative(&splint.cwd, home))
             )),
             LayoutNode::Branch { first, second, .. } => {
-                leaves(dojo, first, output);
-                leaves(dojo, second, output);
+                leaves(dojo, first, home, output);
+                leaves(dojo, second, home, output);
             }
         }
     }
@@ -1264,20 +1284,41 @@ fn saved_layout_preview(lair: &splinterm_core::Lair) -> String {
     let retention = format!("{:?}", lair.retention).to_lowercase();
     let mut lines = vec![format!(
         "{} · {retention} · {dojos} Dojo{}",
-        cell(&lair.name),
+        single_line(&lair.name),
         if dojos == 1 { "" } else { "s" }
     )];
-    for dojo in &lair.dojos {
-        leaves(&dojo.name, &dojo.root, &mut lines);
+    for shown in lair
+        .dojos
+        .iter()
+        .filter(|candidate| dojo.is_none_or(|id| candidate.id == id))
+    {
+        leaves(&shown.name, &shown.root, home, &mut lines);
     }
     if let Some(provenance) = &lair.provenance {
-        lines.push(format!("Origin: {provenance}"));
+        lines.push(format!("Origin: {}", single_line(&provenance.to_string())));
     }
     lines.push(
-        "Not restored: scrollback, processes, shell state, environment, clipboard, images."
+        "Not restored: scrollback, running programs' state, shell state, environment, clipboard, images."
             .to_owned(),
     );
     lines.join("\n")
+}
+
+/// `path` with a leading `home` shown as `~`.
+fn home_relative(path: &std::path::Path, home: Option<&std::path::Path>) -> String {
+    match home.and_then(|home| path.strip_prefix(home).ok()) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
+    }
+}
+
+/// The user's home directory, for [`saved_layout_preview`].
+fn preview_home() -> Option<std::path::PathBuf> {
+    env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(std::path::PathBuf::from)
+        .filter(|home| home.is_absolute() && home.parent().is_some())
 }
 
 fn build_lair_prompt_target(
@@ -1312,7 +1353,7 @@ fn build_lair_prompt_target(
         dojo_id: None,
         name: lair.name.clone(),
         retention: lair.retention,
-        preview: saved_layout_preview(lair),
+        preview: saved_layout_preview(lair, None, preview_home().as_deref()),
         targets,
     })
 }
@@ -1854,13 +1895,13 @@ async fn show_dojo_restore_prompt(
                 .map(|dojo| (lair, dojo))
         })
         .context("captured Dojo is absent")?;
-    let mut target = LairPromptTarget {
+    let target = LairPromptTarget {
         topology_revision,
         lair_id: lair.id,
         dojo_id: Some(dojo_id),
         name: dojo.name.clone(),
         retention: lair.retention,
-        preview: saved_layout_preview(lair),
+        preview: saved_layout_preview(lair, Some(dojo_id), preview_home().as_deref()),
         targets: collect_lair_targets(lair, LairTargetState::Exited)?
             .into_iter()
             .filter(|target| target.dojo_id == dojo_id)
@@ -1878,7 +1919,6 @@ async fn show_dojo_restore_prompt(
             "selected Splint is no longer restorable"
         );
     }
-    target.preview = format!("Selected Dojo: {}\n{}", dojo.name, target.preview);
     updates
         .send(WindowTopologyUpdate::ShowLairPrompt {
             kind: LairPromptKind::Restore,
@@ -2078,7 +2118,11 @@ fn explorer_prompt_from_catalog(
         dojo_id,
         name: lair.name.clone(),
         retention: lair.retention,
-        preview: saved_layout_preview(lair),
+        preview: saved_layout_preview(
+            lair,
+            dojo_id.filter(|_| kind == LairPromptKind::Restore),
+            preview_home().as_deref(),
+        ),
         targets: Vec::new(),
     };
     if let Some(dojo_id) = dojo_id {
@@ -2088,7 +2132,6 @@ fn explorer_prompt_from_catalog(
             .find(|dojo| dojo.id == dojo_id)
             .context("captured Dojo is absent")?;
         target.name.clone_from(&dojo.name);
-        target.preview = format!("Selected Dojo: {}\n{}", dojo.name, target.preview);
         if kind == LairPromptKind::Rename {
             let mut ids = Vec::new();
             layout_splint_ids(&dojo.root, &mut ids);
@@ -4078,18 +4121,19 @@ mod tests {
 
     use super::{
         Axis, CloseAction, DojoId, DojoTab, LairDirection, LairExplorerActivationTarget, LairId,
-        LairTargetState, LayoutNode, PendingTopologyFocus, RefreshedCloseState, Response,
-        SessionEntry, SessionPickerTarget, SplintId, SplintState, SplitRatio,
+        LairTargetState, LayoutNode, NOT_RESTORABLE, PendingTopologyFocus, RefreshedCloseState,
+        Response, SessionEntry, SessionPickerTarget, SplintId, SplintState, SplitRatio,
         TopologyCommandOutcome, TopologyManagerWake, TopologyRevision, WindowTabSet,
         WindowTopologyCommand, WindowTopologyUpdate, build_lair_prompt_target, cancel_pane_tasks,
         captured_dojo_kill_targets, close_action, close_other_tab_targets,
         close_target_already_closed, collect_lair_targets, command_has_pending_split,
-        explorer_prompt_from_catalog, explorer_splint_from_snapshot, lair_navigation_target,
-        materialized_dojo_targets, next_topology_manager_wake, parent_ratio,
-        pending_focus_for_observation, picker_catalog, refreshed_close_state,
-        select_live_dojo_from, send_existing_tab_activation, tab_organization_promotes,
-        topology_command_outcome, topology_edit_target, topology_identity_diff,
-        validate_exited_close_target, validate_lair_retention_target, window_has_tab_capacity,
+        explorer_prompt_from_catalog, explorer_splint_from_snapshot, home_relative,
+        lair_navigation_target, materialized_dojo_targets, next_topology_manager_wake,
+        parent_ratio, pending_focus_for_observation, picker_catalog, refreshed_close_state,
+        saved_layout_preview, select_live_dojo_from, send_existing_tab_activation,
+        tab_organization_promotes, topology_command_outcome, topology_edit_target,
+        topology_identity_diff, validate_exited_close_target, validate_lair_retention_target,
+        window_has_tab_capacity,
     };
     use super::{ExplorerContextTarget, LairPromptKind, NavigationNodeId};
     use crate::app::pane_bridge::{PaneTask, pane_claims_initial_control};
@@ -4377,6 +4421,38 @@ mod tests {
     }
 
     #[test]
+    fn saved_layout_rows_name_the_recipe_and_keep_one_dojo_for_its_restore() {
+        use splinterm_core::Dojo;
+
+        let mut lair = splinterm_core::Lair::new("saved", PathBuf::from("/home/user/src"));
+        lair.provenance = Some("from\nelsewhere\u{202e}".to_owned());
+        let mut second = Dojo::with_shell("build", PathBuf::from("/home/user"));
+        let LayoutNode::Leaf(splint) = &mut second.root else {
+            unreachable!("a new Dojo is one Splint");
+        };
+        splint.command = vec![String::new()];
+        lair.dojos.push(second);
+        let home = PathBuf::from("/home/user");
+        let lines = saved_layout_preview(&lair, None, Some(&home));
+        let lines = lines.lines().collect::<Vec<_>>();
+        assert_eq!(lines[0], "saved · disposable · 2 Dojos");
+        assert_eq!(lines[1], format!("{}\tshell\t~/src", lair.dojos[0].name));
+        assert_eq!(lines[2], format!("build\t{NOT_RESTORABLE}\t~"));
+        assert_eq!(lines[3], "Origin: from elsewhere");
+        // A Dojo's restore lists that Dojo's rows only.
+        let only = saved_layout_preview(&lair, Some(lair.dojos[1].id), None);
+        let rows = only
+            .lines()
+            .filter(|line| line.contains('\t'))
+            .collect::<Vec<_>>();
+        assert_eq!(rows, [format!("build\t{NOT_RESTORABLE}\t/home/user")]);
+        assert_eq!(
+            home_relative(&PathBuf::from("/home/username"), Some(&home)),
+            "/home/username"
+        );
+    }
+
+    #[test]
     fn lair_lifecycle_targets_revalidate_retention_and_restorable_leaves() {
         use splinterm_core::LairRetention;
 
@@ -4408,7 +4484,10 @@ mod tests {
         let splint = lair.dojos[0].root.find_splint_mut(splint_id).unwrap();
         splint.state = SplintState::Exited(0);
         splint.last_incarnation = Some(4);
-        splint.title = "vim\tmain".to_owned();
+        // The title is the program's own and is never shown; the recipe is.
+        splint.title = "rm -rf\t/".to_owned();
+        splint.command = vec!["/usr/bin/nvim".to_owned(), "src/main\n.rs".to_owned()];
+        lair.dojos[0].name = "Dojo\n1\tx".to_owned();
         let target = build_lair_prompt_target(
             revision,
             &lair,
@@ -4419,18 +4498,20 @@ mod tests {
         assert_eq!(target.targets.len(), 1);
         assert_eq!(target.targets[0].splint_id, splint_id);
         // The preview: a summary line, one tab-separated row per Splint
-        // (Dojo, title, directory) that the prompt lines up as a table, a
-        // title's own tab made a space, and what a restore leaves out.
+        // (Dojo, what it launches, directory) that the prompt lines up as a
+        // table, a name's own newline and tab made spaces so it adds no
+        // line or cell, and what a restore leaves out.
         let lines = target.preview.lines().collect::<Vec<_>>();
         assert_eq!(lines[0], "saved · saved · 1 Dojo");
-        assert_eq!(lines[1], format!("{}\tvim main\t/tmp", lair.dojos[0].name));
+        assert_eq!(lines[1], "Dojo 1 x\tnvim src/main .rs\t/tmp");
         assert_eq!(
             lines.last().copied(),
             Some(
-                "Not restored: scrollback, processes, shell state, environment, clipboard, images."
+                "Not restored: scrollback, running programs' state, shell state, environment, clipboard, images."
             )
         );
         assert_eq!(lines.len(), 3);
+        assert!(!target.preview.contains("rm -rf"));
 
         for actual in [
             LairRetention::Disposable,

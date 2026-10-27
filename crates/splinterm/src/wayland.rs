@@ -159,9 +159,9 @@ use crate::renderer::{
     PaletteShape, PickerHitTarget, RenderContext, SessionPickerPurpose, SessionPickerTextCache,
     SnapshotFrame, SnapshotOverlays, TabContextMenuLayout, TextRow, background_bgra,
     chrome_panel_fill, chrome_panel_palette, clear_snapshot_caches, command_palette_hit_test,
-    command_palette_layout, command_palette_row_hit_test, dojo_prompt_button_width,
-    dojo_prompt_hit_test, dojo_prompt_layout, explorer_minimum_docked_terminal_width, fill_rect,
-    history_overlay_layout, lair_explorer_action_hit_test, lair_explorer_agent_hit_test,
+    command_palette_layout, command_palette_row_hit_test, dojo_prompt_hit_test, dojo_prompt_layout,
+    dojo_prompt_metrics, explorer_minimum_docked_terminal_width, fill_rect, history_overlay_layout,
+    lair_explorer_action_hit_test, lair_explorer_agent_hit_test,
     lair_explorer_agents_label_hit_test, lair_explorer_chrome_cell_width,
     lair_explorer_disclosure_hit_test, lair_explorer_filter_hit_test,
     lair_explorer_footer_hit_test, lair_explorer_hit_test, lair_explorer_shown_layout,
@@ -12642,14 +12642,16 @@ impl App {
             }
         }
         let dojo_prompt_layout = if let Some(prompt) = self.modal.dojo_prompt.as_ref() {
-            let button_width = dojo_prompt_button_width(
+            let content = self.content_rect();
+            let metrics = dojo_prompt_metrics(
                 &mut self.modal.dojo_prompt_text_cache,
                 &self.presentation.render_context,
                 prompt,
+                content,
                 self.surface.scale_120,
                 self.presentation.renderer_generation,
             )?;
-            dojo_prompt_layout(self.content_rect(), prompt, button_width)
+            dojo_prompt_layout(content, prompt, metrics)
         } else {
             None
         };

@@ -9,7 +9,7 @@ use anyhow::Result;
 use unicode_width::UnicodeWidthChar;
 
 use crate::{
-    frontend::{DojoPromptUi, TerminationDecision},
+    frontend::{DojoPromptUi, NOT_RESTORABLE, TerminationDecision},
     geometry::Rect,
 };
 
@@ -18,7 +18,9 @@ use super::{
     actions::InputLineLayout,
     chrome_box::{BOX_EDGE, ChromeBox, ChromePainter, opaque, paint_outline, paint_scrim},
     chrome_rows::text_cells,
-    picker::{PickerTextAlignment, SessionPickerPalette, SessionPickerTextCache},
+    picker::{
+        PickerTextAlignment, SessionPickerPalette, SessionPickerTextCache, picker_buffer_rect,
+    },
 };
 
 /// A prompt is this wide at most, logical px.
@@ -33,10 +35,10 @@ const PROMPT_INSET: u32 = 18;
 const PROMPT_GAP: u32 = 14;
 /// One body line, logical px.
 const PROMPT_LINE_HEIGHT: u32 = 24;
-/// A confirmation's body: its question and what it means.
-const CONFIRM_LINES: usize = 2;
-/// A summary's body: a saved layout, or what a revoke ends.
-const SUMMARY_LINES: usize = 7;
+/// A confirmation's body at most: its question and what it means.
+const CONFIRM_LINES: usize = 4;
+/// A summary's body at most: a saved layout, or what a revoke ends.
+const SUMMARY_LINES: usize = 12;
 /// The rename field, logical px.
 const FIELD_HEIGHT: u32 = 30;
 /// Logical px from the field's edge to its `›`.
@@ -56,6 +58,8 @@ pub(crate) struct DojoPromptLayout {
     pub(crate) panel: Rect,
     /// The body's lines, inside the frame's inset; empty for a rename.
     pub(crate) body: Rect,
+    /// How many body lines `body` holds.
+    pub(crate) lines: usize,
     /// A rename's field.
     pub(crate) input: Option<Rect>,
     /// Cancel, or a preview's or notice's lone Close.
@@ -71,12 +75,12 @@ fn prompt_legend(state: &DojoPromptUi) -> &'static [(&'static str, &'static str)
     } else if state.is_preview() {
         &[("↵ esc", "close")]
     } else {
-        &[("←→", "choose"), ("↵", "confirm"), ("esc", "cancel")]
+        &[("←→", "choose"), ("↵", "select"), ("esc", "cancel")]
     }
 }
 
-/// How many body lines a prompt has room for: none for a rename.
-const fn body_line_budget(state: &DojoPromptUi) -> usize {
+/// How many body lines a prompt shows at most: none for a rename.
+const fn body_line_cap(state: &DojoPromptUi) -> usize {
     if state.is_rename() {
         0
     } else if state.uses_layout_summary() {
@@ -98,70 +102,135 @@ fn button_labels(state: &DojoPromptUi) -> Vec<&'static str> {
     }
 }
 
-/// Every button's width in logical px: the widest label in its brackets,
-/// `[ label ]`, with the padding either side, so both buttons match.
-pub(crate) fn dojo_prompt_button_width(
+/// What a prompt's layout needs measured in its chrome text: every
+/// button's width and how many lines its body wraps to.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct DojoPromptMetrics {
+    /// The widest label in its brackets, `[ label ]`, with the padding
+    /// either side, so both buttons match, in logical px.
+    pub(crate) button_width: u32,
+    /// The body's lines, wrapped to the body's width, before any cut.
+    pub(crate) body_lines: usize,
+}
+
+/// A prompt's horizontal place in `content` (logical px): its margin, its
+/// left edge and its width.
+fn prompt_columns(content: Rect) -> (u32, u32, u32) {
+    let margin = PROMPT_MARGIN.min(content.width / 4).min(content.height / 4);
+    let width = PROMPT_WIDTH.min(content.width.saturating_sub(margin.saturating_mul(2)));
+    let x = content
+        .x
+        .saturating_add(content.width.saturating_sub(width) / 2);
+    (margin, x, width)
+}
+
+/// The body's left edge and width in `content`, logical px.
+fn body_columns(content: Rect) -> (u32, u32) {
+    let (_, x, width) = prompt_columns(content);
+    let inset = BOX_EDGE.saturating_add(PROMPT_INSET);
+    (
+        x.saturating_add(inset),
+        width.saturating_sub(inset.saturating_mul(2)),
+    )
+}
+
+/// Measures `state`'s buttons and body for a prompt in `area`, the
+/// content area (logical px), with the cell metrics the painter uses, so
+/// the layout sizes the body to its text.
+pub(crate) fn dojo_prompt_metrics(
     cache: &mut SessionPickerTextCache,
     context: &RenderContext,
     state: &DojoPromptUi,
+    area: Rect,
     scale_120: u32,
     renderer_generation: u64,
-) -> Result<u32> {
+) -> Result<DojoPromptMetrics> {
     let (cell_width, _) = cache.cell_metrics(
         context,
         ChromeTextStyle::Regular,
         scale_120,
         renderer_generation,
     )?;
-    let Some(widest) = button_labels(state).into_iter().map(text_cells).max() else {
-        return Ok(0);
+    let cell_width = cell_width.max(1);
+    let button_width = button_labels(state)
+        .into_iter()
+        .map(text_cells)
+        .max()
+        .map_or(0, |widest| {
+            let padding = BUTTON_PADDING.saturating_mul(scale_120).div_ceil(120);
+            let buffer = widest
+                .saturating_add(4)
+                .saturating_mul(cell_width)
+                .saturating_add(padding.saturating_mul(2));
+            buffer.saturating_mul(120).div_ceil(scale_120.max(1))
+        });
+    let body_lines = if body_line_cap(state) == 0 {
+        0
+    } else {
+        let (x, width) = body_columns(area);
+        let body = picker_buffer_rect(
+            Rect {
+                x,
+                y: area.y,
+                width,
+                height: 1,
+            },
+            scale_120,
+        );
+        let maximum = usize::try_from(body.width / cell_width).unwrap_or(usize::MAX);
+        let (_, source) = state.title_and_body();
+        body_lines(&source, maximum, usize::MAX).len()
     };
-    let padding = BUTTON_PADDING.saturating_mul(scale_120).div_ceil(120);
-    let buffer = widest
-        .saturating_add(4)
-        .saturating_mul(cell_width)
-        .saturating_add(padding.saturating_mul(2));
-    Ok(buffer.saturating_mul(120).div_ceil(scale_120.max(1)))
+    Ok(DojoPromptMetrics {
+        button_width,
+        body_lines,
+    })
 }
 
-/// The prompt centred in `content` (logical px), `button_width` per button
-/// from [`dojo_prompt_button_width`]. `None` when `content` cannot hold it
-/// and its margin; the Window then closes the prompt, so no hidden prompt
-/// takes keys.
+/// The prompt centred in `content` (logical px), sized by `metrics` from
+/// [`dojo_prompt_metrics`]: the body as many lines as its text, up to the
+/// prompt's cap and what `content` has room for. `None` when `content`
+/// cannot hold the prompt and its margin, or its buttons side by side; the
+/// Window then closes the prompt, so no hidden or unreadable prompt takes
+/// keys.
 #[must_use]
 pub(crate) fn dojo_prompt_layout(
     content: Rect,
     state: &DojoPromptUi,
-    button_width: u32,
+    metrics: DojoPromptMetrics,
 ) -> Option<DojoPromptLayout> {
     if content.width == 0 || content.height == 0 {
         return None;
     }
-    let margin = PROMPT_MARGIN.min(content.width / 4).min(content.height / 4);
-    let width = PROMPT_WIDTH.min(content.width.saturating_sub(margin.saturating_mul(2)));
+    let (margin, x, width) = prompt_columns(content);
     let inset = BOX_EDGE.saturating_add(PROMPT_INSET);
-    let lines = u32::try_from(body_line_budget(state)).unwrap_or(u32::MAX);
-    let body_height = PROMPT_LINE_HEIGHT.saturating_mul(lines);
-    let gap = if lines == 0 { 0 } else { PROMPT_GAP };
     let controls_height = if state.is_rename() {
         FIELD_HEIGHT
     } else {
         BUTTON_HEIGHT
     };
-    let height = inset
+    let wanted = metrics.body_lines.min(body_line_cap(state));
+    let gap = if wanted == 0 { 0 } else { PROMPT_GAP };
+    let fixed = inset
         .saturating_mul(2)
-        .saturating_add(body_height)
         .saturating_add(gap)
         .saturating_add(controls_height);
+    let room = content
+        .height
+        .saturating_sub(margin.saturating_mul(2))
+        .saturating_sub(fixed)
+        / PROMPT_LINE_HEIGHT;
+    let lines = wanted.min(usize::try_from(room).unwrap_or(usize::MAX));
     if width < PROMPT_MINIMUM_WIDTH
-        || content.height < height.saturating_add(margin.saturating_mul(2))
+        || content.height < fixed.saturating_add(margin.saturating_mul(2))
+        || (wanted > 0 && lines == 0)
     {
         return None;
     }
+    let body_height = PROMPT_LINE_HEIGHT.saturating_mul(u32::try_from(lines).unwrap_or(0));
+    let height = fixed.saturating_add(body_height);
     let panel = Rect {
-        x: content
-            .x
-            .saturating_add(content.width.saturating_sub(width) / 2),
+        x,
         y: content
             .y
             .saturating_add(content.height.saturating_sub(height) / 2),
@@ -182,6 +251,7 @@ pub(crate) fn dojo_prompt_layout(
     let mut layout = DojoPromptLayout {
         panel,
         body,
+        lines,
         input: None,
         cancel: None,
         terminate: None,
@@ -194,15 +264,17 @@ pub(crate) fn dojo_prompt_layout(
         });
         return Some(layout);
     }
+    // Buttons side by side, each its widest label: a Window too narrow
+    // for them gets no prompt rather than `[ … ]`.
     let count = if state.is_preview() { 1 } else { 2 };
-    let button_width = button_width
-        .min(
-            inner
-                .width
-                .saturating_sub(BUTTON_GAP.saturating_mul(count - 1))
-                / count,
-        )
-        .max(1);
+    let button_width = metrics.button_width.max(1);
+    if button_width
+        .saturating_mul(count)
+        .saturating_add(BUTTON_GAP.saturating_mul(count - 1))
+        > inner.width
+    {
+        return None;
+    }
     let right = inner.x.saturating_add(inner.width);
     let button = |from_right: u32| Rect {
         x: right.saturating_sub(
@@ -385,8 +457,10 @@ enum BodyLine {
 }
 
 /// `body` as at most `budget` lines of `maximum` cells: each source line
-/// wrapped, and a tab-separated one as a table row. When more remain, the
-/// last line is `…`.
+/// wrapped, and a tab-separated one as a table row. When they do not all
+/// fit, table rows give way first, to a `… N more` line, so the question
+/// and the notes after the table stay; failing that, the last line that
+/// fits is `…`.
 fn body_lines(body: &str, maximum: usize, budget: usize) -> Vec<BodyLine> {
     let mut lines = Vec::new();
     for (index, source) in body.lines().enumerate() {
@@ -405,15 +479,33 @@ fn body_lines(body: &str, maximum: usize, budget: usize) -> Vec<BodyLine> {
                     }),
             );
         }
-        if lines.len() > budget {
-            lines.truncate(budget.saturating_sub(1));
-            lines.push(BodyLine::Text {
-                text: "…".to_owned(),
+    }
+    if lines.len() <= budget {
+        return lines;
+    }
+    let is_row = |line: &BodyLine| matches!(line, BodyLine::Row(_));
+    if let (Some(first), Some(last)) = (
+        lines.iter().position(is_row),
+        lines.iter().rposition(is_row),
+    ) {
+        // The rows to drop, and one more line for the `… N more`.
+        let cut = lines.len().saturating_sub(budget).saturating_add(1);
+        if cut <= last - first + 1 {
+            let kept = last + 1 - cut;
+            let mut fitted = lines[..kept].to_vec();
+            fitted.push(BodyLine::Text {
+                text: format!("… {cut} more"),
                 primary: false,
             });
-            break;
+            fitted.extend_from_slice(&lines[last + 1..]);
+            return fitted;
         }
     }
+    lines.truncate(budget.saturating_sub(1));
+    lines.push(BodyLine::Text {
+        text: "…".to_owned(),
+        primary: false,
+    });
     lines
 }
 
@@ -459,7 +551,8 @@ fn line_rect(body: Rect, index: usize, line_height: u32) -> Option<Rect> {
 }
 
 /// The body: the question in primary text, the rest in secondary, and a
-/// saved layout's rows in aligned columns, the Splint in primary.
+/// saved layout's rows in aligned columns, what each Splint launches in
+/// primary, or in danger when it has nothing to launch.
 fn paint_body(
     painter: &mut ChromePainter<'_>,
     palette: &SessionPickerPalette,
@@ -514,10 +607,10 @@ fn paint_body(
                             ChromeTextStyle::Regular,
                             clip,
                             PickerTextAlignment::Left,
-                            if column == 1 {
-                                palette.primary
-                            } else {
-                                palette.secondary
+                            match column {
+                                1 if text == NOT_RESTORABLE => palette.danger,
+                                1 => palette.primary,
+                                _ => palette.secondary,
                             },
                         )?;
                     }
@@ -539,6 +632,7 @@ fn paint_field(
     palette: &SessionPickerPalette,
     input: Rect,
     value: &str,
+    selected: bool,
 ) -> Result<()> {
     painter.fill(input, opaque(palette.field));
     let border = painter.border();
@@ -555,16 +649,33 @@ fn paint_field(
     let Some((shown, cursor)) = line.fitted(input, value) else {
         return Ok(());
     };
+    let text = Rect {
+        x: line.text_x,
+        width: cursor.x.saturating_sub(line.text_x),
+        ..input
+    };
+    // Selected, as the name is when the prompt opens, the text is on the
+    // selection fill: the first keystroke replaces it.
+    if selected && !shown.is_empty() {
+        painter.fill(
+            Rect {
+                y: cursor.y,
+                height: cursor.height,
+                ..text
+            },
+            opaque(palette.selected_fill),
+        );
+    }
     painter.text(
         &shown,
         ChromeTextStyle::Regular,
-        Rect {
-            x: line.text_x,
-            width: cursor.x.saturating_sub(line.text_x),
-            ..input
-        },
+        text,
         PickerTextAlignment::Left,
-        palette.field_primary,
+        if selected {
+            palette.selected_primary
+        } else {
+            palette.field_primary
+        },
     )?;
     painter.fill(cursor, opaque(palette.field_accent));
     Ok(())
@@ -686,22 +797,24 @@ pub(crate) fn paint_dojo_prompt(
     paint_scrim(&mut painter, scrim, &palette);
     let cell = painter.box_cell()?;
     let (title, body) = state.title_and_body();
+    // A rename names what it renames in the frame, cut at its end.
+    let target = state.rename_target();
+    let right_label = target.as_deref().into_iter().collect::<Vec<_>>();
     let chrome = ChromeBox {
         title,
-        right_label: &[],
+        right_label: &right_label,
         right_active: None,
         legend: prompt_legend(state),
     }
     .layout(painter.buffer_rect(layout.panel), scale_120, cell);
     chrome.paint_surface(&mut painter, &palette);
-    let budget = body_line_budget(state);
-    if budget > 0 {
+    if layout.lines > 0 {
         let body_rect = painter.buffer_rect(layout.body);
-        paint_body(&mut painter, &palette, body_rect, &body, budget)?;
+        paint_body(&mut painter, &palette, body_rect, &body, layout.lines)?;
     }
     if let (Some(value), Some(input)) = (state.input(), layout.input) {
         let input = painter.buffer_rect(input);
-        paint_field(&mut painter, &palette, input, value)?;
+        paint_field(&mut painter, &palette, input, value, state.input_selected())?;
     } else {
         paint_buttons(&mut painter, &palette, layout, state)?;
     }
@@ -721,12 +834,13 @@ pub(crate) fn paint_dojo_prompt(
 #[cfg(test)]
 mod tests {
     use splinterm_core::{DojoId, LairId, LairRetention, SplintId, TopologyRevision};
+    use splinterm_protocol::AccessRevokeTarget;
 
     use super::{super::picker::picker_buffer_rect as buffer_rect, *};
     use crate::{
         color::{contrast_ratio, relative_luminance},
         config::ResolvedTheme,
-        frontend::LairPromptTarget,
+        frontend::{LairPromptTarget, RevokeAccessUi},
         renderer::session_picker_palette,
     };
 
@@ -764,10 +878,10 @@ mod tests {
             retention: LairRetention::Saved,
             preview: [
                 "m5a · saved · 2 Dojos",
-                "Dojo 1\tshell\t/home/user/src/splinterm",
-                "Dojo 1\tnvim\t/home/user/src/splinterm",
-                "build\tcargo watch\t/home/user/src/a/very/long/path/to/splinterm",
-                "Not restored: scrollback, processes, shell state, environment, clipboard, images.",
+                "Dojo 1\tshell\t~/src/splinterm",
+                "Dojo 1\tnvim src/main.rs\t~/src/splinterm",
+                "build\tcargo watch\t/srv/a/very/long/path/to/the/splinterm",
+                "Not restored: scrollback, running programs' state, shell state, environment, clipboard, images.",
             ]
             .join("\n"),
             targets: Vec::new(),
@@ -780,8 +894,8 @@ mod tests {
         cache: &mut SessionPickerTextCache,
     ) -> (DojoPromptLayout, Vec<u8>) {
         let context = RenderContext::new(u16::MAX);
-        let button_width = dojo_prompt_button_width(cache, &context, state, 120, 1).unwrap();
-        let layout = dojo_prompt_layout(CONTENT, state, button_width).unwrap();
+        let metrics = dojo_prompt_metrics(cache, &context, state, CONTENT, 120, 1).unwrap();
+        let layout = dojo_prompt_layout(CONTENT, state, metrics).unwrap();
         let mut canvas = vec![0_u8; 1280 * 800 * 4];
         paint_dojo_prompt(
             cache,
@@ -816,31 +930,41 @@ mod tests {
             .any(|y| (rect.x..rect.x + rect.width).any(|x| pixel(canvas, x, y) == rgb(color)))
     }
 
+    fn metrics(button_width: u32, body_lines: usize) -> DojoPromptMetrics {
+        DojoPromptMetrics {
+            button_width,
+            body_lines,
+        }
+    }
+
     /// Every prompt is centred and 440 px wide; a rename is its field
-    /// alone, a confirmation two lines over its buttons, a summary seven;
-    /// the buttons match, sit right-aligned 10 px apart with Cancel first,
-    /// and are hit half-open. A Window too small for a prompt gets none.
+    /// alone, a confirmation and a summary as many lines as their text, up
+    /// to four and twelve; the buttons match, sit right-aligned 10 px apart
+    /// with Cancel first, and are hit half-open. A Window too small for a
+    /// prompt gets none.
     #[test]
+    #[allow(clippy::too_many_lines, reason = "one geometry table and its edges")]
     fn prompts_are_centred_440_wide_with_right_aligned_buttons() {
         let inset = BOX_EDGE + PROMPT_INSET;
         let preview = DojoPromptUi::preview_lair(lair_target());
         let restore = DojoPromptUi::restore_lair(lair_target());
-        for (state, height) in [
-            (rename(), inset * 2 + FIELD_HEIGHT),
+        let controls = PROMPT_GAP + BUTTON_HEIGHT;
+        for (state, lines, height) in [
+            (rename(), 0, inset * 2 + FIELD_HEIGHT),
             (
                 terminate(),
-                inset * 2 + PROMPT_LINE_HEIGHT * 2 + PROMPT_GAP + BUTTON_HEIGHT,
+                2,
+                inset * 2 + PROMPT_LINE_HEIGHT * 2 + controls,
             ),
             (
-                restore,
-                inset * 2 + PROMPT_LINE_HEIGHT * 7 + PROMPT_GAP + BUTTON_HEIGHT,
+                terminate(),
+                9,
+                inset * 2 + PROMPT_LINE_HEIGHT * 4 + controls,
             ),
-            (
-                preview,
-                inset * 2 + PROMPT_LINE_HEIGHT * 7 + PROMPT_GAP + BUTTON_HEIGHT,
-            ),
+            (restore, 7, inset * 2 + PROMPT_LINE_HEIGHT * 7 + controls),
+            (preview, 30, inset * 2 + PROMPT_LINE_HEIGHT * 12 + controls),
         ] {
-            let layout = dojo_prompt_layout(CONTENT, &state, 120).unwrap();
+            let layout = dojo_prompt_layout(CONTENT, &state, metrics(120, lines)).unwrap();
             assert_eq!(layout.panel.width, PROMPT_WIDTH);
             assert_eq!(layout.panel.height, height);
             assert_eq!(layout.panel.x, (1280 - 440) / 2);
@@ -885,40 +1009,63 @@ mod tests {
                 None
             );
         }
-        // Narrower content: the prompt keeps its margin, the buttons fit.
-        let narrow = Rect {
-            width: 300,
-            ..CONTENT
-        };
-        let layout = dojo_prompt_layout(narrow, &terminate(), 400).unwrap();
-        assert_eq!(layout.panel.width, 252);
-        let (cancel, confirm) = (layout.cancel.unwrap(), layout.terminate.unwrap());
-        assert!(cancel.x >= layout.panel.x + inset);
-        assert_eq!(cancel.width, confirm.width);
-        // Too narrow, or too short: no prompt.
+        // Narrower content: the prompt keeps its margin and its buttons
+        // keep their whole labels; too narrow for both side by side, it is
+        // not shown rather than show `[ … ]`.
+        let context = RenderContext::new(u16::MAX);
+        let mut cache = SessionPickerTextCache::default();
+        let (cell, _) = cache
+            .cell_metrics(&context, ChromeTextStyle::Regular, 120, 1)
+            .unwrap();
+        for (width, shown) in [(420, true), (300, false)] {
+            let narrow = Rect { width, ..CONTENT };
+            let measured =
+                dojo_prompt_metrics(&mut cache, &context, &terminate(), narrow, 120, 1).unwrap();
+            let Some(layout) = dojo_prompt_layout(narrow, &terminate(), measured) else {
+                assert!(!shown, "{width} px shows the prompt");
+                continue;
+            };
+            assert!(shown, "{width} px is too narrow for both buttons");
+            assert_eq!(layout.panel.width, width - 48);
+            let (cancel, confirm) = (layout.cancel.unwrap(), layout.terminate.unwrap());
+            assert!(cancel.x >= layout.panel.x + inset);
+            assert_eq!(cancel.width, confirm.width);
+            assert!(
+                confirm.width >= text_cells("[ Terminate ]") * cell + 2 * BUTTON_PADDING,
+                "the label fits its button"
+            );
+        }
+        // Too narrow, or too short for one body line: no prompt. Short
+        // content shows fewer lines.
+        let fixed = inset * 2 + controls;
         for small in [
             Rect {
                 width: 180 + 47,
                 ..CONTENT
             },
             Rect {
-                height: 145 + 2 * 24,
+                height: fixed - 1 + 2 * 24,
+                ..CONTENT
+            },
+            Rect {
+                height: fixed + PROMPT_LINE_HEIGHT - 1 + 2 * 24,
                 ..CONTENT
             },
         ] {
-            assert!(dojo_prompt_layout(small, &terminate(), 120).is_none());
+            assert!(dojo_prompt_layout(small, &terminate(), metrics(120, 2)).is_none());
         }
-        assert!(
-            dojo_prompt_layout(
+        for (extra, lines) in [(1, 1), (2, 2), (3, 2)] {
+            let layout = dojo_prompt_layout(
                 Rect {
-                    height: 146 + 2 * 24,
+                    height: fixed + PROMPT_LINE_HEIGHT * extra + 2 * 24,
                     ..CONTENT
                 },
                 &terminate(),
-                120
+                metrics(120, 2),
             )
-            .is_some()
-        );
+            .unwrap();
+            assert_eq!(layout.lines, lines);
+        }
     }
 
     /// Both buttons are as wide as the widest label in its brackets, at
@@ -935,7 +1082,9 @@ mod tests {
                     .cell_metrics(&context, ChromeTextStyle::Regular, scale, 1)
                     .unwrap();
                 let width =
-                    dojo_prompt_button_width(&mut cache, &context, &terminate(), scale, 1).unwrap();
+                    dojo_prompt_metrics(&mut cache, &context, &terminate(), CONTENT, scale, 1)
+                        .unwrap()
+                        .button_width;
                 let buffer = buffer_rect(
                     Rect {
                         x: 0,
@@ -952,8 +1101,9 @@ mod tests {
                     "scale {scale}"
                 );
                 assert_eq!(
-                    dojo_prompt_button_width(&mut cache, &context, &rename(), scale, 1).unwrap(),
-                    0
+                    dojo_prompt_metrics(&mut cache, &context, &rename(), CONTENT, scale, 1)
+                        .unwrap(),
+                    DojoPromptMetrics::default()
                 );
             }
         }
@@ -985,7 +1135,7 @@ mod tests {
             "←→",
             "choose",
             "↵",
-            "confirm",
+            "select",
             "esc",
             "cancel",
         ] {
@@ -1019,6 +1169,31 @@ mod tests {
         let confirm = layout.terminate.unwrap();
         assert_eq!(edge(&canvas, confirm), rgb(palette.selected_fill));
         assert!(!paints(&canvas, confirm, palette.danger));
+        assert!(!restore.confirmation_destructive());
+
+        // Terminate Lair is destructive like Terminate: the danger fill.
+        let mut terminate_lair = DojoPromptUi::terminate_lair(lair_target());
+        assert!(terminate_lair.confirmation_destructive());
+        let DojoPromptUi::TerminateLair(confirmation) = &mut terminate_lair else {
+            unreachable!();
+        };
+        assert!(confirmation.move_selection());
+        let (layout, canvas) = paint(&terminate_lair, palette, &mut cache);
+        let confirm = layout.terminate.unwrap();
+        assert_eq!(edge(&canvas, confirm), rgb(palette.danger_fill));
+        assert!(paints(&canvas, confirm, palette.danger_ink));
+
+        // Revoke is not: chosen, it takes the selection fill.
+        let mut revoke = DojoPromptUi::RevokeAccess(revoke_entry(&["claude-read"]));
+        assert!(!revoke.confirmation_destructive());
+        let DojoPromptUi::RevokeAccess(confirmation) = &mut revoke else {
+            unreachable!();
+        };
+        assert!(confirmation.move_selection());
+        let (layout, canvas) = paint(&revoke, palette, &mut cache);
+        let confirm = layout.terminate.unwrap();
+        assert_eq!(edge(&canvas, confirm), rgb(palette.selected_fill));
+        assert!(!paints(&canvas, confirm, palette.danger_fill));
 
         assert_eq!(
             button_colors(&palette, true, true),
@@ -1045,12 +1220,16 @@ mod tests {
 
     /// A rename is its sunken field: the field fill inside a 1 px divider
     /// edge, unlike the panel and the selection, with the accent `›` and
-    /// block cursor; the keys say save and cancel.
+    /// block cursor; the keys say save and cancel, and the frame names what
+    /// it renames. The name opens selected, on the selection fill, so the
+    /// first keystroke visibly replaces it.
     #[test]
     fn the_rename_field_is_sunken_with_a_block_cursor() {
         let palette = session_picker_palette(ResolvedTheme::default());
         let mut cache = SessionPickerTextCache::default();
-        let state = rename();
+        let mut state = rename();
+        assert!(state.input_selected());
+        assert_eq!(state.rename_target().as_deref(), Some("captured"));
         let (layout, canvas) = paint(&state, palette, &mut cache);
         let input = layout.input.unwrap();
         assert_ne!(palette.field, palette.panel);
@@ -1072,6 +1251,12 @@ mod tests {
             assert!(cache.contains_source(text), "{text} was not drawn");
         }
         assert!(!cache.contains_source("Cancel"), "a rename has no buttons");
+        assert!(paints(&canvas, input, palette.selected_fill), "selected");
+        assert!(state.editor_mut().unwrap().insert("x"));
+        assert!(!state.input_selected());
+        let (_, canvas) = paint(&state, palette, &mut cache);
+        assert!(!paints(&canvas, input, palette.selected_fill));
+        assert!(cache.contains_source("x"));
     }
 
     /// The field is sunken away from the text: darker on a dark theme,
@@ -1105,14 +1290,18 @@ mod tests {
         }
     }
 
-    /// A saved layout reads as a table: each row's Dojo, Splint and
-    /// directory in aligned columns, a long directory keeping its end; the
-    /// question first, in primary text. More than fit end in `…`.
+    /// A saved layout reads as a table: each row's Dojo, what it launches
+    /// and its directory in aligned columns, a long directory keeping its
+    /// end; the question first, in primary text, and the summary line,
+    /// which repeats it, left out. Too many rows give way to `… N more`,
+    /// keeping the notes after them.
     #[test]
+    #[allow(clippy::too_many_lines, reason = "one table scenario")]
     fn previews_are_an_aligned_table() {
         let restore = DojoPromptUi::restore_lair(lair_target());
-        let (_, body) = restore.title_and_body();
-        assert!(body.starts_with("Restore 0 captured Splints into ‘m5a’?\n"));
+        let (title, body) = restore.title_and_body();
+        assert_eq!(title, "restore saved lair");
+        assert!(body.starts_with("Restore 0 captured Splints into ‘m5a’?\nDojo 1\t"));
         let lines = body_lines(&body, 48, SUMMARY_LINES);
         assert_eq!(
             lines[0],
@@ -1121,7 +1310,13 @@ mod tests {
                 primary: true
             }
         );
-        assert!(matches!(&lines[1], BodyLine::Text { primary: false, .. }));
+        assert!(matches!(&lines[1], BodyLine::Row(_)));
+        let mut dojo = lair_target();
+        dojo.dojo_id = Some(DojoId::new());
+        assert_eq!(
+            DojoPromptUi::restore_lair(dojo).title_and_body().0,
+            "restore dojo"
+        );
         let rows = lines
             .iter()
             .filter_map(|line| match line {
@@ -1132,9 +1327,9 @@ mod tests {
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[2][1], "cargo watch");
         let columns = column_cells(&lines, 48);
-        assert_eq!(columns, [6, 11, 48 - 6 - 11 - 4]);
+        assert_eq!(columns, [6, 16, 48 - 6 - 16 - 4]);
         let directory = fit_start(&rows[2][2], columns[2]);
-        assert!(directory.starts_with('…') && directory.ends_with("/path/to/splinterm"));
+        assert!(directory.starts_with('…') && directory.ends_with("/the/splinterm"));
         assert_eq!(cells(&directory), columns[2]);
         assert_eq!(fit_end("cargo watch --all", 11), "cargo watc…");
         // The note wraps at its spaces.
@@ -1144,15 +1339,42 @@ mod tests {
             BodyLine::Row(_) => true,
         }));
 
-        // Too many rows for the body: the last line says more remain.
-        let many = (0..20)
-            .map(|index| format!("Dojo\tpane {index}\t/tmp"))
+        // Too many rows for the body: rows give way to `… N more`, and the
+        // question and the note after them stay.
+        let many = std::iter::once("Restore 20 captured Splints into ‘m5a’?".to_owned())
+            .chain((0..20).map(|index| format!("Dojo\tpane {index}\t/tmp")))
+            .chain(std::iter::once("Not restored: images.".to_owned()))
             .collect::<Vec<_>>()
             .join("\n");
         let lines = body_lines(&many, 48, SUMMARY_LINES);
         assert_eq!(lines.len(), SUMMARY_LINES);
+        assert!(matches!(&lines[0], BodyLine::Text { primary: true, .. }));
+        assert_eq!(
+            lines[SUMMARY_LINES - 2],
+            BodyLine::Text {
+                text: "… 11 more".to_owned(),
+                primary: false
+            }
+        );
         assert_eq!(
             lines.last(),
+            Some(&BodyLine::Text {
+                text: "Not restored: images.".to_owned(),
+                primary: false
+            })
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| matches!(line, BodyLine::Row(_)))
+                .count(),
+            SUMMARY_LINES - 3
+        );
+        // Text alone that does not fit ends in `…`.
+        let prose = body_lines(&"word ".repeat(200), 48, 4);
+        assert_eq!(prose.len(), 4);
+        assert_eq!(
+            prose.last(),
             Some(&BodyLine::Text {
                 text: "…".to_owned(),
                 primary: false
@@ -1169,6 +1391,7 @@ mod tests {
         let (layout, _) = paint(&preview, palette, &mut cache);
         for text in [
             "saved lair preview",
+            "m5a · saved · 2 Dojos",
             "cargo watch",
             "build",
             "Close",
@@ -1177,6 +1400,136 @@ mod tests {
             assert!(cache.contains_source(text), "{text} was not drawn");
         }
         assert!(layout.terminate.is_none());
+        // Every line is shown: the body is as tall as its text.
+        let measured = dojo_prompt_metrics(
+            &mut cache,
+            &RenderContext::new(u16::MAX),
+            &preview,
+            CONTENT,
+            120,
+            1,
+        )
+        .unwrap();
+        assert_eq!(layout.lines, measured.body_lines);
+        assert!((5..=SUMMARY_LINES).contains(&layout.lines));
+
+        // A Splint with nothing to launch says so, in danger.
+        let mut broken = lair_target();
+        broken.preview = format!("m5a · saved · 1 Dojo\nDojo 1\t{NOT_RESTORABLE}\t/tmp");
+        let (_, canvas) = paint(&DojoPromptUi::preview_lair(broken), palette, &mut cache);
+        assert!(cache.contains_source(NOT_RESTORABLE));
+        assert!(paints(
+            &canvas,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 1280,
+                height: 800
+            },
+            palette.danger
+        ));
+    }
+
+    fn revoke_entry(rules: &[&str]) -> RevokeAccessUi {
+        let mut entry = crate::frontend::agent_access_test_entry(LairId::new());
+        entry.policy_rules = rules.iter().map(|rule| (*rule).to_owned()).collect();
+        RevokeAccessUi::entry(
+            AccessRevokeTarget::Remembered {
+                entry_id: format!("ra_{}", "0123456789abcdef".repeat(2)),
+            },
+            entry,
+        )
+    }
+
+    /// The text of `lines`, one string per line.
+    fn texts(lines: &[BodyLine]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| match line {
+                BodyLine::Text { text, .. } => text.clone(),
+                BodyLine::Row(row) => row.join("\t"),
+            })
+            .collect()
+    }
+
+    /// A destructive question keeps its whole text at ordinary name lengths
+    /// on a 42-cell body, then what it means; a name too long for a line is
+    /// cut so the count and `?` stay. A revoke keeps its policy line. A name
+    /// cannot add a line or a table row.
+    #[test]
+    fn questions_keep_their_end_and_names_stay_on_one_line() {
+        let context = RenderContext::new(u16::MAX);
+        let mut cache = SessionPickerTextCache::default();
+        for name in [
+            "n".repeat(20),
+            "lair ".repeat(8).trim_end().to_owned(),
+            "x".repeat(40),
+        ] {
+            let mut target = lair_target();
+            target.name.clone_from(&name);
+            target.targets = vec![
+                splinterm_protocol::MutationTarget {
+                    lair_id: target.lair_id,
+                    dojo_id: DojoId::new(),
+                    splint_id: SplintId::new(),
+                    incarnation: 1,
+                };
+                3
+            ];
+            let state = DojoPromptUi::terminate_lair(target);
+            let (_, body) = state.title_and_body();
+            let lines = body_lines(&body, 42, CONFIRM_LINES);
+            let shown = texts(&lines);
+            assert_eq!(
+                shown.last().map(String::as_str),
+                Some("Running programs are stopped."),
+                "{name}"
+            );
+            let question = shown[..shown.len() - 1].join(" ");
+            assert_eq!(
+                question,
+                format!("Terminate ‘{name}’ and its 3 captured panes?"),
+                "{name}"
+            );
+            // Measured, the prompt is as tall as that text.
+            let measured =
+                dojo_prompt_metrics(&mut cache, &context, &state, CONTENT, 120, 1).unwrap();
+            assert!(measured.body_lines <= CONFIRM_LINES, "{name}");
+        }
+        let long = DojoPromptUi::terminate(DojoId::new(), "y".repeat(90), 2, Vec::new());
+        let (_, body) = long.title_and_body();
+        let question = body.lines().next().unwrap();
+        assert!(question.ends_with("…’ and its 2 panes?"), "{question}");
+
+        let revoke = DojoPromptUi::RevokeAccess(revoke_entry(&["claude-read"]));
+        let (_, body) = revoke.title_and_body();
+        let shown = texts(&body_lines(&body, 42, SUMMARY_LINES)).join(" ");
+        assert!(
+            shown.contains("Access continues under policy rule")
+                && shown.ends_with("to remove it."),
+            "{shown}"
+        );
+
+        let spoof = DojoPromptUi::terminate(
+            DojoId::new(),
+            "a\nRunning\tb\u{202e}c\u{2028}d".to_owned(),
+            1,
+            Vec::new(),
+        );
+        let (_, body) = spoof.title_and_body();
+        let lines = body_lines(&body, 120, CONFIRM_LINES);
+        assert_eq!(
+            texts(&lines),
+            [
+                "Terminate ‘a Running bcd’ and its 1 pane?",
+                "Running programs are stopped."
+            ]
+        );
+        assert!(
+            lines
+                .iter()
+                .all(|line| matches!(line, BodyLine::Text { .. }))
+        );
     }
 
     /// Body lines stay inside the body at a fractional scale.

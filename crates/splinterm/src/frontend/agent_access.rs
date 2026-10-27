@@ -220,6 +220,51 @@ pub fn unsafe_display_character(character: char) -> bool {
         )
 }
 
+/// Untrusted text on one line of a trusted prompt or table: control
+/// characters, tabs and newlines among them, become spaces, and every other
+/// [`unsafe_display_character`] (bidi controls, the line and paragraph
+/// separators, invisible characters) is dropped, so the text can neither add
+/// a line or a table cell nor reorder or hide the text around it.
+#[must_use]
+pub fn single_line(text: &str) -> String {
+    text.chars()
+        .filter_map(|character| {
+            if character.is_control() {
+                Some(' ')
+            } else if unsafe_display_character(character) {
+                None
+            } else {
+                Some(character)
+            }
+        })
+        .collect()
+}
+
+/// A name quoted in a trusted prompt's question: [`single_line`], then cut
+/// at its end to `maximum_cells` cells with `…`, so the question around it
+/// keeps its count and its `?`.
+#[must_use]
+pub fn prompt_name(text: &str, maximum_cells: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+
+    let line = single_line(text);
+    let width = |character: char| character.width().unwrap_or(0).min(2);
+    if line.chars().map(width).sum::<usize>() <= maximum_cells {
+        return line;
+    }
+    let mut fitted = String::new();
+    let mut used = 0_usize;
+    for character in line.chars() {
+        if used + width(character) + 1 > maximum_cells {
+            break;
+        }
+        fitted.push(character);
+        used += width(character);
+    }
+    fitted.push('…');
+    fitted
+}
+
 /// Untrusted display text, escaped and bounded: every
 /// [`unsafe_display_character`] is shown as `\u{…}`, so text can neither
 /// break a line nor reorder or hide the text around it, and long text ends

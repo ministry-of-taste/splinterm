@@ -121,7 +121,7 @@ pub(crate) use overlays::picker_box::{
     paint_session_picker, picker_status_line, session_picker_layout,
 };
 pub(crate) use overlays::prompt_box::{
-    DojoPromptLayout, dojo_prompt_button_width, dojo_prompt_hit_test, dojo_prompt_layout,
+    DojoPromptLayout, dojo_prompt_hit_test, dojo_prompt_layout, dojo_prompt_metrics,
     paint_dojo_prompt,
 };
 #[cfg(test)]
