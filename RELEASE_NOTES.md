@@ -374,7 +374,10 @@ a hostile program running as your account.
   disposable Lair's "Disposable", and the current Dojo's "Current", and a
   plain running row leaves it blank. A line too long for the panel ends in an
   ellipsis after its last whole word instead of wrapping. Assistive
-  technology still reads the full words for every row. The breadcrumb line is
+  technology still reads the full words for every row. While the terminal has
+  the keyboard, the footer's hint says so, *Terminal has keys · click to
+  move*; it used to read as if a click left typing in the terminal, but a
+  click on a row gives the Explorer the keys. The breadcrumb line is
   gone; the title and the filters share one header line.
 - The Lair Explorer opens on **Live**, and its filters read Live, Saved, All
   (`f` cycles them in that order). Search looks through every Lair whatever the

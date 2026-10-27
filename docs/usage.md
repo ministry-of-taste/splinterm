@@ -203,8 +203,8 @@ connected · Running · Saved · 1 working*. The footer's second line shows the
 search field
 while you search, a navigation notice such as *Refreshing navigation…* when
 there is one, and otherwise who has the keyboard: *↑↓ move · F filter · Esc
-terminal* while the Explorer has focus, *Click rows · terminal input active*
-while the terminal does.
+terminal* while the Explorer has focus, *Terminal has keys · click to move*
+while the terminal does. Clicking a row gives the Explorer the keys.
 
 Parent rows summarize runtime state independently of retention and window
 attachment. A saved Lair can still be running, and a Dojo not open in this

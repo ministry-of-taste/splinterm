@@ -88,7 +88,7 @@ const fn explorer_hint_text(focused: bool) -> &'static str {
     if focused {
         "↑↓ move · F filter · Esc terminal"
     } else {
-        "Click rows · terminal input active"
+        "Terminal has keys · click to move"
     }
 }
 
@@ -1598,7 +1598,7 @@ mod tests {
     fn footer_context_line_makes_input_ownership_explicit() {
         assert_eq!(
             explorer_context_text(false, false, "", None, 40),
-            "Click rows · terminal input active"
+            "Terminal has keys · click to move"
         );
         assert_eq!(
             explorer_context_text(true, false, "", None, 40),
