@@ -108,7 +108,10 @@ impl WindowThemeColors {
     #[must_use]
     pub fn accept(&mut self, update: ThemeUpdate) -> ResolvedTheme {
         let Some(input) = update.input else {
+            // The input no longer matches the theme shown, so no reload may
+            // resolve that older theme again.
             self.applied = update.colors;
+            self.input = None;
             return update.theme;
         };
         let theme = update.theme.recolored(&input, &update.colors, &self.colors);
@@ -261,16 +264,18 @@ mod tests {
         };
         assert_eq!(same.accept(update), theme);
 
-        // A sender without input is shown as given.
+        // A sender without input is shown as given, and forgets the input
+        // of the theme before it: a later reload resolves nothing again.
         let update = ThemeUpdate {
             generation: 3,
             theme,
             colors: watched,
             input: None,
         };
-        assert_eq!(
-            WindowThemeColors::new(ThemeColorConfig::NONE, None).accept(update),
-            theme
-        );
+        let mut forgetting =
+            WindowThemeColors::new(ThemeColorConfig::NONE, Some(Arc::clone(&input)));
+        assert_eq!(forgetting.accept(update), theme);
+        forgetting.reload(colors("[colors]\naccent=#ff0000\n"));
+        assert_eq!(forgetting.recolor(theme), None);
     }
 }

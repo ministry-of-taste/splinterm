@@ -16,7 +16,7 @@ use crate::{
     config::{OmarchyShellSettings, ResolvedTheme},
     frontend::PickerHitTarget,
     geometry::Rect,
-    theme::ChromeTints,
+    theme::{ChromeTints, Role},
 };
 
 use super::super::{
@@ -697,7 +697,11 @@ pub(crate) fn session_picker_palette(theme: ResolvedTheme) -> SessionPickerPalet
         selected_primary,
         selected_fill,
     );
-    let focused_frame = if contrast_ratio(roles.focus_ring, roles.divider) >= 1.2 {
+    // A focus ring too close to the frame colour reads as no focus, so the
+    // accent takes its place, unless `[colors] focus-ring` chose it.
+    let focused_frame = if roles.verbatim.contains(Role::FocusRing)
+        || contrast_ratio(roles.focus_ring, roles.divider) >= 1.2
+    {
         roles.focus_ring
     } else {
         roles.accent
@@ -2346,6 +2350,26 @@ mod tests {
             Some(PickerHitTarget::New),
             "visual menu padding must preserve the full pointer target"
         );
+    }
+
+    #[test]
+    fn a_focus_ring_near_the_frame_gives_way_to_the_accent_unless_it_was_chosen() {
+        let builtin = ResolvedTheme::default();
+        let mut close = builtin;
+        close.roles.focus_ring = close.roles.divider;
+        assert_eq!(
+            session_picker_palette(close).focused_frame,
+            close.roles.accent
+        );
+        let chosen = ResolvedTheme::from_input_with_colors(
+            &crate::theme::ThemeInput::builtin(),
+            &crate::config::parse("[colors]\nfocus-ring=#7c7e80\n")
+                .unwrap()
+                .config
+                .theme_colors(),
+        );
+        assert_eq!(chosen.roles.focus_ring, chosen.roles.divider);
+        assert_eq!(session_picker_palette(chosen).focused_frame, 0x7c_7e_80);
     }
 
     #[test]

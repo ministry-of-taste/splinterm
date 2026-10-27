@@ -899,28 +899,28 @@ status-working=auto
 accent=#8c6c3e
 ```
 
-| Key | Used for | Without the key |
+| Key | Painted today | Without the key |
 | --- | --- | --- |
-| `surface` | the tab strip, the Explorer and other chrome backgrounds | the terminal background |
-| `surface-raised` | the selected Dojo tab body | the theme's ([role table](#native-omarchy-theme-integration)) |
-| `surface-sunken` | (not yet painted) | the theme's |
-| `selection` | the selected row's fill | the theme's |
-| `divider` | pane borders, frames | the theme's |
-| `focus-ring` | the active pane border, focused frames | the theme's, else `accent` |
-| `text` | chrome text | the terminal foreground |
+| `surface` | the tab strip, the Explorer panel, menus, pickers, popups and the gap behind a trusted dialog's answer areas | the terminal background |
+| `surface-raised` | the selected Dojo tab body | the theme's ([role table](#native-omarchy-theme-integration)); for the selected tab, Foot `bright0` when the theme names none |
+| `surface-sunken` | nothing yet | the theme's |
+| `selection` | the selected row of menus, pickers and the Explorer, mixed 24% over the panel | the theme's |
+| `divider` | pane borders and frames, menu and picker frames, the tab strip border | the theme's |
+| `focus-ring` | the active pane border, focused frames and focused menu frames | the theme's, else `accent` |
+| `text` | tab labels and menu, picker and Explorer text, which those panels raise to 4.5:1 | the terminal foreground |
 | `text-muted` | inactive tab labels | the theme's, ramped from `text` |
-| `text-faint` | faint text | `text` mixed 55% toward `surface` |
-| `accent` | the active tab underline, selection rails | the theme's |
-| `danger` | errors | the theme's |
-| `warning` | warnings, the "Asking" marker | the theme's |
-| `success` | success | the theme's |
-| `info` | information | the theme's |
-| `status-needs-input` | an agent waiting for input | `danger` |
-| `status-error` | an agent that reported an error | `danger` |
-| `status-working` | an agent at work | `warning` |
-| `status-done` | an agent that finished | `info` |
-| `status-idle` | an idle agent | `success` |
-| `status-stale` | a status that is no longer current | `text-faint` |
+| `text-faint` | through `status-stale` only | `text` mixed 55% toward `surface` |
+| `accent` | the active tab underline, selection rails, the history overlay | the theme's |
+| `danger` | through `status-needs-input` and `status-error` only | the theme's |
+| `warning` | the "Asking" marker, and through `status-working` | the theme's |
+| `success` | through `status-idle` only | the theme's |
+| `info` | through `status-done` only | the theme's |
+| `status-needs-input` | the needs-input status glyph | `danger` |
+| `status-error` | the error status glyph | `danger` |
+| `status-working` | the working status glyph | `warning` |
+| `status-done` | the done status glyph | `info` |
+| `status-idle` | the idle status glyph | `success` |
+| `status-stale` | a stale status and its marker | `text-faint` |
 | `remote-marker` | the remote host tag | the theme's |
 
 A value is `#RRGGBB` or `0xRRGGBB`; `colorN`, the terminal palette's ANSI
@@ -938,16 +938,23 @@ For each colour Splinterm takes the first of:
 4. Splinterm's derivation from other roles;
 5. the built-in palette.
 
-An overridden role is used as given. It is never mixed toward readable text
-or raised to a contrast floor, and a status role that follows it is drawn the
-same way. When it falls below its floor against `surface`, 4.5:1 for `text`,
-`text-muted`, `text-faint` and `remote-marker` and 3:1 for the hue and status
-roles, Splinterm says so once on standard error and still uses it. Menus,
-pickers and the Explorer still correct the text they draw for their own
-panel, as they do for every theme. A role that follows an overridden one
-follows the new value unless it is set itself: `accent` moves `focus-ring`
-when the theme names no focus ring, `text` moves `text-muted`, `text-faint`
-and the floors of the derived hues, and `warning` moves `status-working`.
+An overridden role is used as given, with one exception: menus, pickers and
+the Explorer raise their text to 4.5:1 against their own panel, as they do for
+every theme, so a `text` override too faint for a panel is raised there.
+Everywhere else the role is never mixed toward readable text or raised to a
+contrast floor, and a status role that follows it is drawn the same way. When
+it falls below its floor against `surface`, 4.5:1 for `text`, `text-muted`,
+`text-faint`, `remote-marker` and `warning` (which also paints the ASCII `A?`
+marker as text) and 3:1 for the other hue and status roles, Splinterm says so
+once on standard error, naming the section that set it, and still uses it. A
+`focus-ring` that is set itself is also always drawn, even where one too close
+to the frame colour would otherwise give way to the accent. A role that follows
+an overridden one follows the new value unless it is set itself: `accent`
+moves `focus-ring` when the theme names no focus ring of its own or names its
+accent as one (the shipped JSON theme does), `text` moves `text-muted`,
+`text-faint` and the floors of the derived hues, and `warning` moves
+`status-working`. A role key spelled with underscores, such as `focus_ring`,
+is reported with the name it means and ignored.
 
 `surface` and `text` recolour chrome only. The terminal keeps the theme's
 background, foreground and palette.

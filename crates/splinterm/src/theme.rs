@@ -91,7 +91,8 @@ pub struct ChromeRoles {
     /// The marker for a remote session.
     pub remote_marker: u32,
     /// The roles a `[colors]` override set, and the status roles that copy
-    /// one: they are painted as given, with no contrast floor anywhere.
+    /// one: they are painted as given, with no contrast floor, except that
+    /// menus, pickers and the Explorer raise their text on their panels.
     pub verbatim: RoleSet,
 }
 
@@ -184,17 +185,18 @@ impl Role {
         self as usize
     }
 
-    /// The contrast a derived role keeps against `surface`, which an
-    /// override is checked against: text roles and the remote tag 4.5:1,
-    /// signal and status roles 3:1. Other roles keep none.
+    /// The floor the role's paint keeps against `surface` when Splinterm
+    /// derives it, which an override is checked against: 4.5:1 for the
+    /// text roles, the remote tag, and `warning`, which also paints the
+    /// ASCII `A?` marker as text; 3:1 for the other signal and status roles.
+    /// Other roles keep none.
     #[must_use]
     pub const fn floor(self) -> Option<f64> {
         match self {
-            Self::Text | Self::TextMuted | Self::TextFaint | Self::RemoteMarker => {
+            Self::Text | Self::TextMuted | Self::TextFaint | Self::RemoteMarker | Self::Warning => {
                 Some(TEXT_MIN_CONTRAST)
             }
             Self::Danger
-            | Self::Warning
             | Self::Success
             | Self::Info
             | Self::StatusNeedsInput
@@ -347,15 +349,36 @@ impl RoleOverrideLayers {
             Appearance::Light => &self.light,
         })
     }
+
+    /// The section whose value for `role` is in effect for a theme of
+    /// `appearance`: its own section when that sets the role, else
+    /// `[colors]`.
+    #[must_use]
+    pub fn section_of(&self, role: Role, appearance: Appearance) -> &'static str {
+        let (layer, section) = match appearance {
+            Appearance::Dark => (&self.dark, "colors-dark"),
+            Appearance::Light => (&self.light, "colors-light"),
+        };
+        if layer.0[role.index()].is_some() {
+            section
+        } else {
+            "colors"
+        }
+    }
 }
 
-/// One diagnostic for each overridden role of `roles` that misses its
-/// contrast floor against its surface. Such a role is still used as given.
+/// One diagnostic for each overridden role of `roles`, a theme of
+/// `appearance` resolved under `layers`, that misses its contrast floor
+/// against its surface, naming the section that set it. Such a role is still
+/// used as given, except where menus, pickers and the Explorer raise their
+/// text for readability on their own panels.
 #[must_use]
 pub fn override_contrast_diagnostics(
     roles: &ChromeRoles,
-    overrides: &RoleOverrides,
+    layers: &RoleOverrideLayers,
+    appearance: Appearance,
 ) -> Vec<String> {
+    let overrides = layers.for_appearance(appearance);
     Role::ALL
         .into_iter()
         .filter(|role| overrides.value(*role).is_some())
@@ -363,9 +386,15 @@ pub fn override_contrast_diagnostics(
             let floor = role.floor()?;
             let color = role.of(roles);
             let contrast = contrast_ratio(color, roles.surface);
+            let raised = if role == Role::Text {
+                ", though menus, pickers and the Explorer raise it on their panels"
+            } else {
+                ""
+            };
             (contrast < floor).then(|| {
                 format!(
-                    "[colors] {} #{color:06x} has {contrast:.2}:1 contrast against the surface #{:06x}, below its {floor}:1 floor; using it as given",
+                    "[{}] {} #{color:06x} has {contrast:.2}:1 contrast against the surface #{:06x}, below its {floor}:1 floor; using it as given{raised}",
+                    layers.section_of(role, appearance),
                     role.key(),
                     roles.surface,
                 )
@@ -610,11 +639,12 @@ pub fn derive(input: &ThemeInput) -> ChromeRoles {
 /// Derives every chrome role from one theme input under `[colors]` role
 /// overrides. Pure: the same input and overrides always give the same roles.
 ///
-/// An overridden role is used exactly as given, with no ramp or contrast
+/// An overridden role is used as given, with no ramp or contrast
 /// floor; see [`override_contrast_diagnostics`]. Every role derived from it
 /// is derived again from the overridden value, so `text` moves the muted
 /// and faint text and every floor, and `warning` moves `status_working`,
-/// unless that role is overridden itself or the theme names it. Precedence
+/// unless that role is overridden itself or the theme names it (a focus
+/// ring the theme names as its own accent follows the accent). Precedence
 /// is the override, then the theme's hint or component, then derivation.
 ///
 /// Without overrides the roles follow Plan 0064's role table:
@@ -644,7 +674,12 @@ pub fn derive_with(input: &ThemeInput, overrides: &RoleOverrides) -> ChromeRoles
     let given = |role: Role| overrides.color(role, ansi);
     let surface = given(Role::Surface).unwrap_or(terminal.background);
     let text = given(Role::Text).unwrap_or(terminal.foreground);
-    let accent = given(Role::Accent).or(hints.accent).unwrap_or(ansi[4]);
+    let theme_accent = hints.accent.unwrap_or(ansi[4]);
+    let accent = given(Role::Accent).unwrap_or(theme_accent);
+    // A focus ring the theme names as its own accent follows the accent, so
+    // an overridden accent moves it; a distinct one, such as Omarchy
+    // `active_border_color`, is the theme's choice and stays.
+    let focus_hint = hints.focus_ring.filter(|hint| *hint != theme_accent);
     // Floors aim at readable text, not the raw foreground: a foreground
     // below 4.5:1 would otherwise send every floored role to pure black or
     // white, louder than the text and indistinguishable from each other.
@@ -706,9 +741,7 @@ pub fn derive_with(input: &ThemeInput, overrides: &RoleOverrides) -> ChromeRoles
         divider: given(Role::Divider)
             .or(hints.divider)
             .unwrap_or_else(|| legacy_srgb::midpoint(surface, text)),
-        focus_ring: given(Role::FocusRing)
-            .or(hints.focus_ring)
-            .unwrap_or(accent),
+        focus_ring: given(Role::FocusRing).or(focus_hint).unwrap_or(accent),
         text,
         text_muted,
         text_faint,
@@ -1092,20 +1125,65 @@ mod tests {
                 >= NON_TEXT_MIN_CONTRAST
         );
 
-        let diagnostics = override_contrast_diagnostics(&roles, &given);
+        let layers = RoleOverrideLayers {
+            colors: given,
+            ..RoleOverrideLayers::NONE
+        };
+        let diagnostics = override_contrast_diagnostics(&roles, &layers, Appearance::Dark);
         assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
         assert!(diagnostics[0].starts_with("[colors] text #1d2021 has "));
-        assert!(diagnostics[0].ends_with("below its 4.5:1 floor; using it as given"));
+        assert!(diagnostics[0].ends_with(
+            "below its 4.5:1 floor; using it as given, though menus, pickers and the Explorer raise it on their panels"
+        ));
         assert!(diagnostics[1].starts_with("[colors] danger #200000 has "));
-        assert!(diagnostics[1].contains("against the surface #0e1216, below its 3:1 floor"));
+        assert!(
+            diagnostics[1]
+                .ends_with("against the surface #0e1216, below its 3:1 floor; using it as given")
+        );
+        // A per-appearance section names itself, and only for its appearance.
+        let mut dark = RoleOverrides::NONE;
+        dark.set(Role::Danger, RoleValue::Color(0x20_00_00));
+        let layered = RoleOverrideLayers {
+            dark,
+            ..RoleOverrideLayers::NONE
+        };
+        let dark_roles = derive_with(&input, &layered.for_appearance(Appearance::Dark));
+        let diagnostics = override_contrast_diagnostics(&dark_roles, &layered, Appearance::Dark);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert!(diagnostics[0].starts_with("[colors-dark] danger #200000 has "));
+        assert!(override_contrast_diagnostics(&dark_roles, &layered, Appearance::Light).is_empty());
+        assert_eq!(
+            layered.section_of(Role::Danger, Appearance::Dark),
+            "colors-dark"
+        );
+        assert_eq!(
+            layered.section_of(Role::Danger, Appearance::Light),
+            "colors"
+        );
         // Accent carries no floor, and a role that clears its floor is quiet.
+        let quiet = RoleOverrideLayers {
+            colors: overrides(&[(Role::Danger, RoleValue::Palette(9))]),
+            ..RoleOverrideLayers::NONE
+        };
         assert!(
             override_contrast_diagnostics(
-                &derive_with(&input, &overrides(&[(Role::Danger, RoleValue::Palette(9))])),
-                &overrides(&[(Role::Danger, RoleValue::Palette(9))]),
+                &derive_with(&input, &quiet.colors),
+                &quiet,
+                Appearance::Dark,
             )
             .is_empty()
         );
+        // A verbatim warning is checked at 4.5:1: it also paints `A?` text.
+        let warning = RoleOverrideLayers {
+            colors: overrides(&[(Role::Warning, RoleValue::Color(0x80_60_00))]),
+            ..RoleOverrideLayers::NONE
+        };
+        let warning_roles = derive_with(&input, &warning.colors);
+        let contrast = contrast_ratio(0x80_60_00, warning_roles.surface);
+        assert!((NON_TEXT_MIN_CONTRAST..TEXT_MIN_CONTRAST).contains(&contrast));
+        let diagnostics = override_contrast_diagnostics(&warning_roles, &warning, Appearance::Dark);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert!(diagnostics[0].contains("below its 4.5:1 floor"));
     }
 
     #[test]

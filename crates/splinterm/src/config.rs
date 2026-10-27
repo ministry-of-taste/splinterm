@@ -1125,11 +1125,20 @@ fn parse_with_base(text: &str, config_dir: &Path) -> Result<ConfigLoad> {
         } else {
             format!("{section}.{key}")
         };
-        if let Some(layer) = role_colors.section_mut(&section)
-            && let Some(role) = Role::from_key(&key)
-        {
-            layer.set(role, parse_role_value(value, index)?);
-            continue;
+        if let Some(layer) = role_colors.section_mut(&section) {
+            if let Some(role) = Role::from_key(&key) {
+                layer.set(role, parse_role_value(value, index)?);
+                continue;
+            }
+            // `focus_ring` for `focus-ring`.
+            if let Some(role) = Role::from_key(&key.replace('_', "-")) {
+                diagnostics.push(format!(
+                    "line {}: unknown option {full} ignored; did you mean {}?",
+                    index + 1,
+                    role.key()
+                ));
+                continue;
+            }
         }
         let unsupported = match full.as_str() {
             "clipboard.image-directory" => {
@@ -1456,7 +1465,7 @@ fn parse_with_base(text: &str, config_dir: &Path) -> Result<ConfigLoad> {
             }
             key if key.starts_with("colors.") => {
                 diagnostics.push(format!(
-                    "line {}: colors come from the active Omarchy theme or explicit main.theme JSON; {key} ignored",
+                    "line {}: terminal colors come from the active Omarchy theme or explicit main.theme JSON; {key} ignored. [colors] sets Splinterm's chrome roles by name, such as accent or focus-ring",
                     index + 1
                 ));
                 false
@@ -1819,9 +1828,12 @@ impl ResolvedTheme {
         let theme = Self::from_input_with(input, &roles)
             .with_color_overrides(colors.alpha, colors.blur)
             .with_chrome_overrides(colors.chrome);
-        for diagnostic in override_contrast_diagnostics(&theme.roles, &roles) {
-            if first_theme_diagnostic(&diagnostic) {
-                eprintln!("splinterm theme: {diagnostic}");
+        if let Some(layers) = colors.roles.as_deref() {
+            for diagnostic in override_contrast_diagnostics(&theme.roles, layers, input.appearance)
+            {
+                if first_theme_diagnostic(&diagnostic) {
+                    eprintln!("splinterm theme: {diagnostic}");
+                }
             }
         }
         theme
@@ -3042,6 +3054,21 @@ mod tests {
         assert_eq!(loaded.config.theme_colors().roles.as_deref(), Some(&layers));
         assert_eq!(parse("").unwrap().config.role_colors, None);
         assert_eq!(theme_colors(""), ThemeColorConfig::NONE);
+        // A role key spelled with underscores is pointed at its name, and a
+        // terminal palette key at the role keys.
+        let misspelled =
+            parse("[colors-light]\nfocus_ring=#123456\n[colors]\nforeground=#ffffff\n").unwrap();
+        assert_eq!(misspelled.config.role_colors, None);
+        assert_eq!(
+            misspelled.diagnostics[0],
+            "line 2: unknown option colors-light.focus_ring ignored; did you mean focus-ring?"
+        );
+        assert!(
+            misspelled.diagnostics[1].starts_with("line 4: terminal colors come from")
+                && misspelled.diagnostics[1].contains("[colors] sets Splinterm's chrome roles"),
+            "{:?}",
+            misspelled.diagnostics
+        );
         // The shipped file's commented `[colors]` examples parse once
         // uncommented, and it sets none of them.
         let shipped = include_str!("../../../config/splinterm/config.ini");
@@ -3174,6 +3201,33 @@ mod tests {
             theme.roles.danger,
             ResolvedTheme::from_input(&light).roles.danger
         );
+    }
+
+    #[test]
+    fn an_accent_override_moves_a_focus_ring_the_theme_names_as_its_accent() {
+        // The shipped JSON theme names its accent as its pane_border_active.
+        let shipped: ThemePalette =
+            serde_json::from_str(include_str!("../../../config/splinterm/theme.json")).unwrap();
+        let input = shipped.input().unwrap();
+        assert_eq!(input.hints.focus_ring, input.hints.accent);
+        assert_eq!(
+            ResolvedTheme::from_input(&input).roles.focus_ring,
+            0x78_d2_ff
+        );
+        let accent = theme_colors("[colors]\naccent=#ff8800\n");
+        let theme = ResolvedTheme::from_input_with_colors(&input, &accent);
+        assert_eq!(theme.roles.accent, 0xff_88_00);
+        assert_eq!(theme.roles.focus_ring, 0xff_88_00);
+        assert_eq!(theme.pane_border_active(), 0xff_88_00);
+        // A focus ring of its own, such as Omarchy active_border_color, stays.
+        let mut distinct = input;
+        distinct.hints.focus_ring = Some(0x12_34_56);
+        let theme = ResolvedTheme::from_input_with_colors(&distinct, &accent);
+        assert_eq!(theme.roles.focus_ring, 0x12_34_56);
+        // And so does one set itself.
+        let both = theme_colors("[colors]\naccent=#ff8800\nfocus-ring=#00ff00\n");
+        let theme = ResolvedTheme::from_input_with_colors(&input, &both);
+        assert_eq!(theme.roles.focus_ring, 0x00_ff_00);
     }
 
     #[test]
