@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use splinterm_core::SplintId;
 use splinterm_protocol::AgentState;
 
-use super::{LairExplorerUi, agent_status::state_text};
+use super::{LairExplorerRow, LairExplorerUi, agent_status::state_text};
 use crate::accessibility::{
     MAX_ACCESSIBILITY_ITEMS, MAX_ACCESSIBLE_NAME_CHARS, SEARCH_NODE_ID, SemanticAction,
     SemanticActionRequest, SemanticAvailability, SemanticFocus, SemanticNavigationSnapshot,
@@ -41,6 +41,31 @@ struct NavigationIdentity {
     last_incarnation: Option<u64>,
 }
 
+/// What one accessible item stands for, so the registry gives a Splint's
+/// tree row and its agents row distinct, stable ids.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum NavigationKey {
+    /// A row of the tree.
+    Tree(NavigationIdentity),
+    /// The agents section's group item, for one endpoint generation.
+    AgentsGroup {
+        endpoint: String,
+        endpoint_generation: u64,
+    },
+    /// A Splint's row in the agents section.
+    Agent(NavigationIdentity),
+}
+
+/// The row an accessible item acts on, and which list it is in.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NavigationTarget {
+    Tree(NavigationNodeId),
+    Agent(NavigationNodeId),
+}
+
+/// The accessible name of the agents section's group item.
+const AGENTS_GROUP_NAME: &str = "Agents";
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum NavigationAccessAction {
     Terminal,
@@ -50,12 +75,16 @@ pub(crate) enum NavigationAccessAction {
     Item(NavigationNodeId),
     Expanded(NavigationNodeId, bool),
     Activate(NavigationNodeId),
+    /// Selects a Splint's row in the agents section.
+    AgentItem(NavigationNodeId),
+    /// Activates a Splint from its row in the agents section.
+    ActivateAgent(NavigationNodeId),
 }
 
 #[derive(Default)]
 pub(crate) struct NavigationAccessibility {
-    registry: SemanticNodeRegistry<NavigationIdentity>,
-    targets: HashMap<SemanticNodeId, NavigationNodeId>,
+    registry: SemanticNodeRegistry<NavigationKey>,
+    targets: HashMap<SemanticNodeId, NavigationTarget>,
     view: Option<NavigationExplorerView>,
     snapshot: Option<SemanticNavigationSnapshot>,
     generation: u64,
@@ -84,8 +113,16 @@ impl NavigationAccessibility {
         if let Some(announcement) = self.observe_agent_states(explorer) {
             self.agent_announcement = Some((announcement, String::new()));
         }
-        self.registry
-            .retain(|key| identities.contains_key(&key.node) && identities[&key.node] == *key);
+        let group = explorer.view().map(|view| NavigationKey::AgentsGroup {
+            endpoint: view.endpoint_namespace.clone(),
+            endpoint_generation: view.endpoint_generation,
+        });
+        self.registry.retain(|key| match key {
+            NavigationKey::Tree(identity) | NavigationKey::Agent(identity) => {
+                identities.get(&identity.node) == Some(identity)
+            }
+            NavigationKey::AgentsGroup { .. } => group.as_ref() == Some(key),
+        });
         self.targets.clear();
         let visible = explorer.visible() && !context.modal;
         if !visible {
@@ -93,48 +130,35 @@ impl NavigationAccessibility {
             self.agent_announcement = None;
         }
         let enabled = visible && context.enabled();
-        let mut items = Vec::new();
-        let mut ids = HashMap::new();
-        let rows = if visible { explorer.rows() } else { Vec::new() };
-        let mut limited = rows.len() > MAX_ACCESSIBILITY_ITEMS;
-        if visible {
-            for row in rows.into_iter().take(MAX_ACCESSIBILITY_ITEMS) {
-                let Some(identity) = identities.get(&row.id) else {
-                    continue;
-                };
-                let Ok(id) = self.registry.id_for(identity.clone()) else {
-                    limited = true;
-                    break;
-                };
-                let parent = parent(row.id).and_then(|parent| ids.get(&parent).copied());
-                if row.level != 1 && parent.is_none() {
-                    continue;
-                }
-                ids.insert(row.id, id);
-                self.targets.insert(id, row.id);
-                items.push(SemanticTreeItem {
-                    id,
-                    parent,
-                    name: safe_text(&row.label),
-                    status: safe_text(&row.accessible_status),
-                    level: row.level,
-                    expanded: row.expanded,
-                    selected: explorer.selected() == Some(row.id),
-                    current: row.current,
-                    availability: if row.pending {
-                        SemanticAvailability::Pending
-                    } else if enabled
-                        && row.enabled
-                        && !context.pending
-                        && !explorer.activation_pending()
-                    {
-                        SemanticAvailability::Enabled
-                    } else {
-                        SemanticAvailability::Disabled
-                    },
-                });
+        let availability = |row: &LairExplorerRow| {
+            if row.pending {
+                SemanticAvailability::Pending
+            } else if enabled && row.enabled && !context.pending && !explorer.activation_pending() {
+                SemanticAvailability::Enabled
+            } else {
+                SemanticAvailability::Disabled
             }
-        }
+        };
+        let mut items = Vec::new();
+        let (ids, mut limited) = if visible {
+            self.push_tree_items(explorer, &identities, &availability, &mut items)
+        } else {
+            (HashMap::new(), false)
+        };
+        let result_count = items.len();
+        let (agent_ids, agents_limited) = if visible {
+            self.push_agent_items(
+                explorer,
+                group,
+                &identities,
+                availability,
+                &mut items,
+                enabled,
+            )
+        } else {
+            (HashMap::new(), false)
+        };
+        limited |= agents_limited;
         let focus = if !context.keyboard_focused || context.modal || !context.permitted {
             SemanticFocus::None
         } else if visible && explorer.focused() {
@@ -142,8 +166,13 @@ impl NavigationAccessibility {
                 SemanticFocus::Search
             } else {
                 explorer
-                    .selected()
+                    .tree_selected()
                     .and_then(|selected| ids.get(&selected).copied())
+                    .or_else(|| {
+                        explorer
+                            .agent_selected()
+                            .and_then(|selected| agent_ids.get(&selected).copied())
+                    })
                     .map_or(SemanticFocus::Tree, SemanticFocus::Item)
             }
         } else {
@@ -153,9 +182,9 @@ impl NavigationAccessibility {
             generation: self.generation,
             visible,
             enabled,
-            result_count: items.len(),
+            result_count,
             status: visible.then(|| {
-                self.announced_status(navigation_status(explorer, limited, items.len(), &focus))
+                self.announced_status(navigation_status(explorer, limited, result_count, &focus))
             }),
             items,
             // The rail has no search: the tree's query waits for it unseen.
@@ -178,6 +207,114 @@ impl NavigationAccessibility {
             self.snapshot = Some(next.clone());
         }
         next
+    }
+
+    /// Appends the tree's rows to `items`, each under its parent. Returns
+    /// their ids by row and whether the item limit cut the tree short.
+    fn push_tree_items(
+        &mut self,
+        explorer: &LairExplorerUi,
+        identities: &HashMap<NavigationNodeId, NavigationIdentity>,
+        availability: &impl Fn(&LairExplorerRow) -> SemanticAvailability,
+        items: &mut Vec<SemanticTreeItem>,
+    ) -> (HashMap<NavigationNodeId, SemanticNodeId>, bool) {
+        let rows = explorer.rows();
+        let mut limited = rows.len() > MAX_ACCESSIBILITY_ITEMS;
+        let mut ids = HashMap::new();
+        for row in rows.into_iter().take(MAX_ACCESSIBILITY_ITEMS) {
+            let Some(identity) = identities.get(&row.id) else {
+                continue;
+            };
+            let Ok(id) = self.registry.id_for(NavigationKey::Tree(identity.clone())) else {
+                limited = true;
+                break;
+            };
+            let parent = parent(row.id).and_then(|parent| ids.get(&parent).copied());
+            if row.level != 1 && parent.is_none() {
+                continue;
+            }
+            ids.insert(row.id, id);
+            self.targets.insert(id, NavigationTarget::Tree(row.id));
+            items.push(SemanticTreeItem {
+                id,
+                parent,
+                name: safe_text(&row.label),
+                status: safe_text(&row.accessible_status),
+                level: row.level,
+                expanded: row.expanded,
+                selected: explorer.tree_selected() == Some(row.id),
+                current: row.current,
+                availability: availability(&row),
+            });
+        }
+        (ids, limited)
+    }
+
+    /// Appends the agents section to `items`: one more top-level item, a
+    /// group whose children are the section's rows, so its Splints read
+    /// apart from the tree's. Returns the rows' ids by Splint and whether the
+    /// item limit cut the section short.
+    fn push_agent_items(
+        &mut self,
+        explorer: &LairExplorerUi,
+        group: Option<NavigationKey>,
+        identities: &HashMap<NavigationNodeId, NavigationIdentity>,
+        availability: impl Fn(&LairExplorerRow) -> SemanticAvailability,
+        items: &mut Vec<SemanticTreeItem>,
+        enabled: bool,
+    ) -> (HashMap<NavigationNodeId, SemanticNodeId>, bool) {
+        let mut ids = HashMap::new();
+        let agents = explorer.shown_agent_rows();
+        if agents.is_empty() {
+            return (ids, false);
+        }
+        let Some(Ok(group_id)) = group.map(|group| self.registry.id_for(group)) else {
+            return (ids, true);
+        };
+        if items.len() >= MAX_ACCESSIBILITY_ITEMS {
+            return (ids, true);
+        }
+        items.push(SemanticTreeItem {
+            id: group_id,
+            parent: None,
+            name: AGENTS_GROUP_NAME.to_owned(),
+            status: format!("{} reporting", agents.len()),
+            level: 1,
+            expanded: None,
+            selected: false,
+            current: false,
+            availability: if enabled {
+                SemanticAvailability::Enabled
+            } else {
+                SemanticAvailability::Disabled
+            },
+        });
+        for agent in &agents {
+            let row = &agent.row;
+            let Some(identity) = identities.get(&row.id) else {
+                continue;
+            };
+            if items.len() >= MAX_ACCESSIBILITY_ITEMS {
+                return (ids, true);
+            }
+            let Ok(id) = self.registry.id_for(NavigationKey::Agent(identity.clone())) else {
+                return (ids, true);
+            };
+            ids.insert(row.id, id);
+            self.targets.insert(id, NavigationTarget::Agent(row.id));
+            items.push(SemanticTreeItem {
+                id,
+                parent: Some(group_id),
+                name: safe_text(&row.label),
+                status: safe_text(&row.accessible_status),
+                level: 2,
+                expanded: None,
+                selected: explorer.agent_selected() == Some(row.id),
+                current: row.current,
+                availability: availability(row),
+            });
+        }
+        (ids, false)
     }
 
     /// Records each live incarnation's agent state and returns a polite
@@ -289,7 +426,10 @@ impl NavigationAccessibility {
             SemanticAction::Focus(TERMINAL_NODE_ID) => Some(NavigationAccessAction::Terminal),
             SemanticAction::Focus(SEARCH_NODE_ID) => Some(NavigationAccessAction::SearchFocus),
             SemanticAction::Focus(TREE_NODE_ID) => Some(NavigationAccessAction::Tree),
-            SemanticAction::Focus(id) => target(id).map(NavigationAccessAction::Item),
+            SemanticAction::Focus(id) => target(id).map(|target| match target {
+                NavigationTarget::Tree(node) => NavigationAccessAction::Item(node),
+                NavigationTarget::Agent(node) => NavigationAccessAction::AgentItem(node),
+            }),
             SemanticAction::SetSearch(query) if valid_query_text(&query).is_ok() => {
                 Some(NavigationAccessAction::Search(query))
             }
@@ -298,7 +438,12 @@ impl NavigationAccessibility {
                     .items
                     .iter()
                     .find(|item| item.id == node && item.expanded.is_some())?;
-                target(node).map(|id| NavigationAccessAction::Expanded(id, expanded))
+                match target(node)? {
+                    NavigationTarget::Tree(id) => {
+                        Some(NavigationAccessAction::Expanded(id, expanded))
+                    }
+                    NavigationTarget::Agent(_) => None,
+                }
             }
             SemanticAction::Activate(id) => {
                 if context.pending || explorer.activation_pending() {
@@ -307,7 +452,10 @@ impl NavigationAccessibility {
                 snapshot.items.iter().find(|item| {
                     item.id == id && item.availability == SemanticAvailability::Enabled
                 })?;
-                target(id).map(NavigationAccessAction::Activate)
+                target(id).map(|target| match target {
+                    NavigationTarget::Tree(node) => NavigationAccessAction::Activate(node),
+                    NavigationTarget::Agent(node) => NavigationAccessAction::ActivateAgent(node),
+                })
             }
             SemanticAction::SetSearch(_) => None,
         }
@@ -950,6 +1098,12 @@ mod tests {
                 ("editor", "Running · Current · 1 needs input"),
                 ("shell", "Running · Needs input · approve the plan"),
                 ("notes", "Unavailable · Pinned"),
+                // The agents section repeats the Splint after the tree.
+                ("Agents", "1 reporting"),
+                (
+                    "shell",
+                    "work / editor · Running · Needs input · approve the plan"
+                ),
             ]
         );
         set_agent(&mut explorer, AgentState::Working, true);
@@ -1056,5 +1210,165 @@ mod tests {
         explorer.set_view(fresh_view(&explorer, AgentState::Error));
         let status = accessibility.refresh(&explorer, context()).status.unwrap();
         assert!(!status.contains("shell:"), "{status}");
+    }
+
+    /// The agents section is one more top-level item, `Agents`, whose
+    /// children are its rows. A Splint in both lists has two items with
+    /// distinct, stable ids, only one of them selected; focusing or
+    /// activating the agents item acts on the agents row, which has no
+    /// disclosure. The section leaves the tree's result count alone and is
+    /// gone on the rail.
+    #[test]
+    fn agents_section_is_a_group_of_its_rows() {
+        use crate::navigation_projection::NavigationAgentStatus;
+
+        let mut reporting = view();
+        reporting.lairs[0].dojos[0].splints[0].agent_status = Some(NavigationAgentStatus {
+            state: AgentState::NeedsInput,
+            detail: None,
+            stale: false,
+            stale_minutes: None,
+        });
+        let mut explorer = LairExplorerUi::default();
+        explorer.set_view(reporting);
+        explorer.focus();
+        explorer.reveal_current();
+        let shell = explorer
+            .rows()
+            .iter()
+            .find(|row| row.label == "shell")
+            .unwrap()
+            .id;
+        let mut accessibility = NavigationAccessibility::default();
+        let snapshot = accessibility.refresh(&explorer, context());
+        snapshot.tree_update().unwrap();
+        let tree = explorer.rows().len();
+        assert_eq!(snapshot.result_count, tree);
+        assert_eq!(snapshot.items.len(), tree + 2);
+        let group = snapshot.items[tree].clone();
+        assert_eq!(
+            (group.name.as_str(), group.level, group.parent),
+            (AGENTS_GROUP_NAME, 1, None)
+        );
+        assert_eq!(group.status, "1 reporting");
+        assert_eq!(group.expanded, None);
+        let agent = snapshot.items[tree + 1].clone();
+        assert_eq!(
+            (agent.name.as_str(), agent.level, agent.parent),
+            ("shell", 2, Some(group.id))
+        );
+        assert!(
+            agent.status.starts_with("work / editor · "),
+            "{}",
+            agent.status
+        );
+        assert_eq!(agent.availability, SemanticAvailability::Enabled);
+        let in_tree = snapshot
+            .items
+            .iter()
+            .find(|item| item.name == "shell" && item.level == 3)
+            .unwrap()
+            .clone();
+        assert_ne!(in_tree.id, agent.id);
+        assert!(in_tree.selected && !agent.selected);
+        assert_eq!(snapshot.focus, SemanticFocus::Item(in_tree.id));
+        let resolve = |accessibility: &NavigationAccessibility, action| {
+            accessibility.resolve(request(&snapshot, action), &explorer, context())
+        };
+        assert_eq!(
+            resolve(&accessibility, SemanticAction::Focus(agent.id)),
+            Some(NavigationAccessAction::AgentItem(shell))
+        );
+        assert_eq!(
+            resolve(&accessibility, SemanticAction::Activate(agent.id)),
+            Some(NavigationAccessAction::ActivateAgent(shell))
+        );
+        assert_eq!(
+            resolve(&accessibility, SemanticAction::Focus(in_tree.id)),
+            Some(NavigationAccessAction::Item(shell))
+        );
+        assert_eq!(
+            resolve(
+                &accessibility,
+                SemanticAction::SetExpanded {
+                    node: agent.id,
+                    expanded: true
+                }
+            ),
+            None
+        );
+        assert_eq!(
+            resolve(&accessibility, SemanticAction::Activate(group.id)),
+            None
+        );
+        // Selecting the agents row moves the selection and the focus there.
+        assert!(explorer.select_agent(shell));
+        let selected = accessibility.refresh(&explorer, context());
+        selected.tree_update().unwrap();
+        let agent_now = selected
+            .items
+            .iter()
+            .find(|item| item.parent == Some(group.id))
+            .unwrap();
+        assert_eq!(agent_now.id, agent.id);
+        assert!(agent_now.selected);
+        assert_eq!(
+            selected.items.iter().filter(|item| item.selected).count(),
+            1
+        );
+        assert_eq!(selected.focus, SemanticFocus::Item(agent.id));
+        // The rail has no section.
+        explorer.set_collapsed(true);
+        let rail = accessibility.refresh(&explorer, context());
+        rail.tree_update().unwrap();
+        assert!(rail.items.iter().all(|item| item.name != AGENTS_GROUP_NAME));
+    }
+
+    /// While the layout hides the agents section, as in a list too short for
+    /// it, assistive technology has no `Agents` group either, and a
+    /// selected agents row passes the selection to the Splint's tree row.
+    #[test]
+    fn hidden_agents_section_has_no_group() {
+        use crate::navigation_projection::NavigationAgentStatus;
+
+        let mut reporting = view();
+        reporting.lairs[0].dojos[0].splints[0].agent_status = Some(NavigationAgentStatus {
+            state: AgentState::NeedsInput,
+            detail: None,
+            stale: false,
+            stale_minutes: None,
+        });
+        let mut explorer = LairExplorerUi::default();
+        explorer.set_view(reporting);
+        explorer.focus();
+        explorer.reveal_current();
+        let shell = explorer
+            .rows()
+            .iter()
+            .find(|row| row.label == "shell")
+            .unwrap()
+            .id;
+        let mut accessibility = NavigationAccessibility::default();
+        assert!(explorer.select_agent(shell));
+        let shown = accessibility.refresh(&explorer, context());
+        assert!(
+            shown
+                .items
+                .iter()
+                .any(|item| item.name == AGENTS_GROUP_NAME)
+        );
+        assert!(explorer.set_agents_shown(false));
+        let hidden = accessibility.refresh(&explorer, context());
+        hidden.tree_update().unwrap();
+        assert!(
+            hidden
+                .items
+                .iter()
+                .all(|item| item.name != AGENTS_GROUP_NAME)
+        );
+        assert_eq!(explorer.tree_selected(), Some(shell));
+        let selected = hidden.items.iter().find(|item| item.selected).unwrap();
+        assert_eq!(selected.name, "shell");
+        assert_eq!(hidden.focus, SemanticFocus::Item(selected.id));
     }
 }

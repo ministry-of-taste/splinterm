@@ -311,7 +311,7 @@ const fn priority(state: AgentState) -> usize {
 }
 
 /// Lower is more urgent: every fresh state outranks every stale one.
-const fn rank(status: &NavigationAgentStatus) -> usize {
+pub(crate) const fn rank(status: &NavigationAgentStatus) -> usize {
     priority(status.state) + if status.stale { PRIORITY.len() } else { 0 }
 }
 
