@@ -415,6 +415,9 @@ const fn category(entry: &AccessEntry) -> &'static str {
     }
 }
 
+/// The group headers in the order the list shows them.
+const GROUP_ORDER: [&str; 5] = ["always", "while open", "once", "waiting", "policy"];
+
 /// The group header an entry shows under while nothing filters the list.
 const fn group(entry: &AccessEntry) -> &'static str {
     match entry.kind {
@@ -668,6 +671,15 @@ impl AgentAccessUi {
         let selected = self.selected_key().cloned();
         self.unavailable = None;
         self.all_rows = snapshot.entries.iter().map(AccessRow::new).collect();
+        // The daemon sorts by key, which interleaves kinds; each group's
+        // header shows once. The sort is stable, so the daemon's order
+        // holds within a group.
+        self.all_rows.sort_by_key(|row| {
+            GROUP_ORDER
+                .iter()
+                .position(|group| *group == row.group)
+                .unwrap_or(GROUP_ORDER.len())
+        });
         self.revoking
             .retain(|key| snapshot.entry(key).is_some_and(|entry| entry.revocable));
         self.snapshot = Some(snapshot.clone());
@@ -961,7 +973,8 @@ impl AgentAccessUi {
         {
             return "`splinterm access list` shows every entry".to_owned();
         }
-        "Type to search · Esc close".to_owned()
+        // The legend already says how to search and close.
+        String::new()
     }
 
     /// Filters the rows; whether the kept entry is still listed.
@@ -1496,13 +1509,13 @@ pub(crate) mod tests {
         vec![
             entry(remembered_key(), AccessEntryKind::Remembered, lair_id),
             entry(
-                AccessEntryKey::Grant { grant_id: 17 },
-                AccessEntryKind::Once,
+                AccessEntryKey::Grant { grant_id: 18 },
+                AccessEntryKind::WorkspaceSession,
                 lair_id,
             ),
             entry(
-                AccessEntryKey::Grant { grant_id: 18 },
-                AccessEntryKind::WorkspaceSession,
+                AccessEntryKey::Grant { grant_id: 17 },
+                AccessEntryKind::Once,
                 lair_id,
             ),
             entry(
@@ -1535,7 +1548,7 @@ pub(crate) mod tests {
         let rows = ui.rows();
         assert_eq!(
             rows.iter().map(|row| row.category).collect::<Vec<_>>(),
-            ["ALWAYS", "ONCE", "OPEN", "WAITING", "POLICY"]
+            ["ALWAYS", "OPEN", "ONCE", "WAITING", "POLICY"]
         );
         assert_eq!(
             rows.iter().map(|row| row.revocable).collect::<Vec<_>>(),
@@ -1548,7 +1561,7 @@ pub(crate) mod tests {
                 short_id(&lair_id)
             )
         );
-        assert!(rows[2].title.contains("while ‘work’"));
+        assert!(rows[1].title.contains("while ‘work’"));
         assert!(rows[3].title.starts_with("‘claude’ asks for Manage on"));
         assert!(rows[4].title.contains("policy rule ‘ci’"));
         assert_eq!(rows[3].status, "prompt showing");
@@ -1579,6 +1592,49 @@ pub(crate) mod tests {
         assert!(ui.footer().starts_with("Waiting for your answer"));
     }
 
+    /// The daemon lists entries by key, so grants of different kinds
+    /// interleave by grant ID; the list shows each group once, and the
+    /// selection stays on its entry when a read reorders them.
+    #[test]
+    fn interleaved_grant_kinds_show_each_group_header_once() {
+        let lair_id = LairId::new();
+        let grant = |grant_id, kind| entry(AccessEntryKey::Grant { grant_id }, kind, lair_id);
+        let entries = vec![
+            grant(17, AccessEntryKind::Once),
+            grant(18, AccessEntryKind::WorkspaceSession),
+            grant(19, AccessEntryKind::Once),
+            grant(20, AccessEntryKind::WorkspaceSession),
+            entry(remembered_key(), AccessEntryKind::Remembered, lair_id),
+        ];
+        validated(&entries);
+        let mut ui = AgentAccessUi::new(Some(&snapshot(1, entries.clone())), None);
+        let groups = ui.row_groups();
+        assert_eq!(
+            groups,
+            ["always", "while open", "while open", "once", "once"]
+        );
+        for label in ["always", "while open", "once"] {
+            let starts = (0..groups.len())
+                .filter(|index| {
+                    groups[*index] == label && (*index == 0 || groups[index - 1] != label)
+                })
+                .count();
+            assert_eq!(starts, 1, "{label}");
+        }
+        // Within a group the daemon's order holds.
+        assert_eq!(ui.rows()[1].key, AccessEntryKey::Grant { grant_id: 18 });
+        assert_eq!(ui.rows()[2].key, AccessEntryKey::Grant { grant_id: 20 });
+        assert!(ui.select_index(3));
+        assert_eq!(ui.rows()[3].key, AccessEntryKey::Grant { grant_id: 17 });
+        let mut reordered = entries;
+        reordered.reverse();
+        ui.apply_snapshot(&snapshot(2, reordered));
+        assert_eq!(
+            ui.rows()[ui.selected_index()].key,
+            AccessEntryKey::Grant { grant_id: 17 }
+        );
+    }
+
     #[test]
     fn revoke_names_the_listed_id_kind_never_the_runtime_grant_of_a_remembered_entry() {
         let lair_id = LairId::new();
@@ -1603,7 +1659,7 @@ pub(crate) mod tests {
         assert_eq!(
             ui.activate(),
             Some(AccessActivation::Revoke(AccessRevokeTarget::Grant {
-                grant_id: 17
+                grant_id: 18
             }))
         );
         // A second press while the daemon has not answered sends nothing.
@@ -1613,7 +1669,7 @@ pub(crate) mod tests {
         assert_eq!(
             ui.activate(),
             Some(AccessActivation::Revoke(AccessRevokeTarget::Grant {
-                grant_id: 18
+                grant_id: 17
             }))
         );
         // A remembered entry is never revoked by a grant key, and a
@@ -1627,13 +1683,13 @@ pub(crate) mod tests {
     fn filtering_keeps_the_selected_entry_and_reports_no_match() {
         let lair_id = LairId::new();
         let mut ui = AgentAccessUi::new(Some(&snapshot(4, inventory(lair_id))), None);
-        assert!(ui.select_index(2));
+        assert!(ui.select_index(1));
         assert!(ui.append_text("open"));
         assert_eq!(ui.rows().len(), 1);
         assert_eq!(ui.rows()[0].key, AccessEntryKey::Grant { grant_id: 18 });
         assert!(ui.clear_query());
         assert_eq!(ui.rows().len(), 5);
-        assert_eq!(ui.selected_index(), 2, "the selection follows its entry");
+        assert_eq!(ui.selected_index(), 1, "the selection follows its entry");
         assert!(ui.append_text("POLICY ci"));
         assert_eq!(ui.rows().len(), 1);
         assert!(ui.clear_query());
@@ -1717,7 +1773,7 @@ pub(crate) mod tests {
         );
         assert_eq!(ui.activate(), None);
         ui.finish_revoke(
-            Some(&AccessEntryKey::Grant { grant_id: 18 }),
+            Some(&AccessEntryKey::Grant { grant_id: 17 }),
             "Revoke failed: not found",
         );
         assert_eq!(ui.footer(), "Revoke failed: not found");
@@ -1961,7 +2017,7 @@ pub(crate) mod tests {
         let lair_id = LairId::new();
         let mut ui = AgentAccessUi::new(Some(&snapshot(4, inventory(lair_id))), None);
         assert!(ui.select_index(1));
-        // Grant 17 ends; grant 18 slides under the selection.
+        // Grant 18 ends; grant 17 slides under the selection.
         let mut entries = inventory(lair_id);
         entries.remove(1);
         ui.apply_snapshot(&snapshot(5, entries.clone()));
@@ -1976,7 +2032,7 @@ pub(crate) mod tests {
         assert_eq!(
             ui.activate(),
             Some(AccessActivation::Revoke(AccessRevokeTarget::Grant {
-                grant_id: 18
+                grant_id: 17
             }))
         );
         // Typing a search is a new choice too, and so are Home and End.
@@ -2033,12 +2089,12 @@ pub(crate) mod tests {
     fn a_click_never_revokes_the_row_a_revoke_moved_the_selection_to() {
         let lair_id = LairId::new();
         let mut ui = AgentAccessUi::new(Some(&snapshot(4, inventory(lair_id))), None);
-        // Enter revokes the just-this-once grant at once.
+        // Enter revokes the while-open grant at once.
         assert!(ui.select_index(1));
         assert_eq!(
             ui.activate(),
             Some(AccessActivation::Revoke(AccessRevokeTarget::Grant {
-                grant_id: 17
+                grant_id: 18
             }))
         );
         // The next read no longer lists it, and the selection lands on
@@ -2046,9 +2102,9 @@ pub(crate) mod tests {
         let mut entries = inventory(lair_id);
         entries.remove(1);
         ui.apply_snapshot(&snapshot(5, entries));
-        ui.finish_revoke(Some(&AccessEntryKey::Grant { grant_id: 17 }), "Revoked");
+        ui.finish_revoke(Some(&AccessEntryKey::Grant { grant_id: 18 }), "Revoked");
         let target = ui.row_key(1).cloned().unwrap();
-        assert_eq!(target, AccessEntryKey::Grant { grant_id: 18 });
+        assert_eq!(target, AccessEntryKey::Grant { grant_id: 17 });
         // Clicking that row to choose it, once or again, only selects it.
         assert!(ui.release_click(&target, 1));
         assert_eq!(ui.selected_index(), 1);
@@ -2059,7 +2115,7 @@ pub(crate) mod tests {
         assert_eq!(
             ui.activate(),
             Some(AccessActivation::Revoke(AccessRevokeTarget::Grant {
-                grant_id: 18
+                grant_id: 17
             }))
         );
         assert_eq!(ui.activate(), None);

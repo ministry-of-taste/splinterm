@@ -9,7 +9,10 @@ use std::ops::Range;
 use anyhow::Result;
 use unicode_width::UnicodeWidthChar;
 
-use crate::geometry::Rect;
+use crate::{
+    color::{TEXT_MIN_CONTRAST, contrast_floor_toward, mix_encoded},
+    geometry::Rect,
+};
 
 use super::{
     super::ChromeTextStyle,
@@ -195,20 +198,25 @@ pub(super) fn row_columns(
 /// Where one binding's chips go, in buffer px.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct ChipLayout {
+    /// The first shown key's index in the tokens: the keys before it
+    /// dropped.
+    pub(super) first: usize,
     /// One rect per shown key, in order.
     pub(super) chips: Vec<Rect>,
-    /// The `…` after the shown keys when later ones did not fit.
+    /// The `…` before the shown keys when earlier ones did not fit.
     pub(super) ellipsis: Option<Rect>,
-    /// From the first chip's left edge to the last chip's (or the `…`'s)
+    /// From the `…`'s (or the first chip's) left edge to the last chip's
     /// right edge.
     pub(super) width: u32,
 }
 
 /// One chip per key token, [`CHIP_GAP`] apart, each its key plus
 /// [`CHIP_PADDING`] each side, as tall as a cell and centred in `room`.
-/// Keys that do not fit drop from the end behind a `…` cell, so the chips
-/// never run past `room`. `right_aligned` puts the last chip at `room`'s
-/// right edge.
+/// When they do not all fit, the modifiers drop from the front behind a
+/// `…` cell (`… shift p`, then `… p`), so the key itself stays and the chips
+/// never run past `room`; then the last key alone, without the `…`; and no
+/// chips only when not even that fits. `right_aligned` puts the last chip
+/// at `room`'s right edge.
 pub(super) fn chip_layout(
     tokens: &[String],
     room: Rect,
@@ -226,27 +234,32 @@ pub(super) fn chip_layout(
                 .saturating_add(padding.saturating_mul(2))
         })
         .collect::<Vec<_>>();
-    let total = |shown: usize| {
-        let chips = widths[..shown].iter().copied().fold(0, u32::saturating_add);
+    // The width of the keys from `first` on, after a `…` when `ellipsis`.
+    let total = |first: usize, ellipsis: bool| {
+        let shown = widths.len() - first;
+        let chips = widths[first..].iter().copied().fold(0, u32::saturating_add);
         let gaps = gap.saturating_mul(u32::try_from(shown.saturating_sub(1)).unwrap_or(u32::MAX));
-        let ellipsis = if shown < widths.len() {
-            cell.0.saturating_add(if shown > 0 { gap } else { 0 })
+        let ellipsis = if ellipsis {
+            cell.0.saturating_add(gap)
         } else {
             0
         };
         chips.saturating_add(gaps).saturating_add(ellipsis)
     };
-    let Some(shown) = (0..=widths.len())
-        .rev()
-        .find(|shown| total(*shown) <= room.width && (*shown > 0 || widths.is_empty()))
-    else {
+    let last = widths.len().saturating_sub(1);
+    let fit = (0..widths.len())
+        .map(|first| (first, first > 0))
+        .chain((!widths.is_empty()).then_some((last, false)))
+        .find(|(first, ellipsis)| total(*first, *ellipsis) <= room.width);
+    let Some((first, ellipsis)) = fit else {
         return ChipLayout {
+            first: widths.len(),
             chips: Vec::new(),
             ellipsis: None,
             width: 0,
         };
     };
-    let width = total(shown);
+    let width = total(first, ellipsis);
     let height = cell.1.min(room.height);
     let y = room
         .y
@@ -256,8 +269,18 @@ pub(super) fn chip_layout(
     } else {
         room.x
     };
-    let mut chips = Vec::with_capacity(shown);
-    for chip_width in &widths[..shown] {
+    let ellipsis = ellipsis.then(|| {
+        let rect = Rect {
+            x,
+            y,
+            width: cell.0,
+            height,
+        };
+        x = x.saturating_add(cell.0).saturating_add(gap);
+        rect
+    });
+    let mut chips = Vec::with_capacity(widths.len() - first);
+    for chip_width in &widths[first..] {
         chips.push(Rect {
             x,
             y,
@@ -266,13 +289,8 @@ pub(super) fn chip_layout(
         });
         x = x.saturating_add(*chip_width).saturating_add(gap);
     }
-    let ellipsis = (shown < widths.len()).then_some(Rect {
-        x,
-        y,
-        width: cell.0,
-        height,
-    });
     ChipLayout {
+        first,
         chips,
         ellipsis,
         width,
@@ -386,6 +404,9 @@ struct RowColors {
     marker: u32,
     secondary: u32,
     chip: [u8; 4],
+    /// A chip's key: the secondary text, floored toward the primary until
+    /// it keeps 4.5:1 on the chip's own composed colour.
+    chip_text: u32,
     accent: u32,
 }
 
@@ -409,6 +430,23 @@ fn row_colors(palette: &SessionPickerPalette, state: RowState) -> RowColors {
         palette.accent_text
     };
     let [red, green, blue, _] = opaque(primary);
+    let chip_alpha = if state.selected {
+        SELECTED_CHIP_ALPHA
+    } else {
+        CHIP_ALPHA
+    };
+    let secondary = if state.disabled {
+        palette.secondary
+    } else {
+        secondary
+    };
+    // The chip on the row's opaque fill: the selection, or the panel.
+    let base = if state.selected {
+        palette.selected_fill
+    } else {
+        palette.panel
+    };
+    let chip_colour = mix_encoded(base, primary, f64::from(chip_alpha) / 255.0);
     RowColors {
         title,
         matched,
@@ -417,21 +455,9 @@ fn row_colors(palette: &SessionPickerPalette, state: RowState) -> RowColors {
         } else {
             palette.selected_accent
         },
-        secondary: if state.disabled {
-            palette.secondary
-        } else {
-            secondary
-        },
-        chip: [
-            red,
-            green,
-            blue,
-            if state.selected {
-                SELECTED_CHIP_ALPHA
-            } else {
-                CHIP_ALPHA
-            },
-        ],
+        secondary,
+        chip: [red, green, blue, chip_alpha],
+        chip_text: contrast_floor_toward(secondary, primary, chip_colour, TEXT_MIN_CONTRAST),
         accent: if state.selected {
             palette.selected_accent
         } else {
@@ -498,16 +524,6 @@ pub(super) fn paint_row(
             columns.trailing
         };
         let chips = chip_layout(row.chips, room, cell, scale_120, !row.chip_column);
-        for (chip, token) in chips.chips.iter().zip(row.chips) {
-            painter.blend(*chip, colors.chip);
-            painter.text(
-                token,
-                ChromeTextStyle::Regular,
-                *chip,
-                PickerTextAlignment::Center,
-                colors.secondary,
-            )?;
-        }
         if let Some(ellipsis) = chips.ellipsis {
             painter.text(
                 "…",
@@ -515,6 +531,16 @@ pub(super) fn paint_row(
                 ellipsis,
                 PickerTextAlignment::Center,
                 colors.secondary,
+            )?;
+        }
+        for (chip, token) in chips.chips.iter().zip(&row.chips[chips.first..]) {
+            painter.blend(*chip, colors.chip);
+            painter.text(
+                token,
+                ChromeTextStyle::Regular,
+                *chip,
+                PickerTextAlignment::Center,
+                colors.chip_text,
             )?;
         }
     }
@@ -701,7 +727,7 @@ mod tests {
     /// Chips never run past their room: keys drop from the end behind a
     /// `…`, and the chips are 3 px apart with 5 px inside each side.
     #[test]
-    fn chips_drop_from_the_end_and_never_run_past_the_row() {
+    fn chips_drop_modifiers_from_the_front_and_never_run_past_the_row() {
         let keys = tokens(&["ctrl", "shift", "↵"]);
         for scale in [120, 150, 180, 240] {
             let cell = (8 * scale / 120, 17 * scale / 120);
@@ -727,17 +753,29 @@ mod tests {
                     for pair in layout.chips.windows(2) {
                         assert_eq!(pair[1].x, pair[0].x + pair[0].width + gap);
                     }
-                    if let (Some(last), Some(ellipsis)) = (layout.chips.last(), layout.ellipsis) {
-                        assert_eq!(ellipsis.x, last.x + last.width + gap);
+                    if let (Some(first), Some(ellipsis)) = (layout.chips.first(), layout.ellipsis) {
+                        assert_eq!(first.x, ellipsis.x + ellipsis.width + gap);
                     }
                     assert!(layout.width <= room.width);
+                    // The shown keys are the last ones: the key survives.
+                    assert_eq!(layout.first + layout.chips.len(), keys.len());
+                    // `… shift ↵`, `… ↵`, then `↵` alone, then nothing.
+                    let alone = cell.0 + 2 * padding;
                     if layout.chips.len() == keys.len() {
                         assert_eq!(layout.width, natural);
                         assert!(layout.ellipsis.is_none());
                     } else {
                         assert!(room_width < natural);
-                        assert_eq!(layout.ellipsis.is_some(), layout.width > 0);
+                        assert_eq!(
+                            layout.ellipsis.is_some(),
+                            room_width >= cell.0 + gap + alone
+                        );
                     }
+                    assert_eq!(
+                        layout.chips.is_empty(),
+                        room_width < alone,
+                        "the last key shows while it fits alone"
+                    );
                     if right_aligned && layout.width > 0 {
                         assert_eq!(
                             parts.iter().map(|part| part.x + part.width).max(),
@@ -778,6 +816,73 @@ mod tests {
             .chips
             .is_empty()
         );
+    }
+
+    /// `ctrl shift p` narrows to `… shift p`, then `… p`, then `p` alone:
+    /// the final key survives while it fits at all.
+    #[test]
+    fn the_final_key_survives_a_narrow_row() {
+        let keys = tokens(&["ctrl", "shift", "p"]);
+        let cell = (8, 17);
+        // At 1×: chips 42, 50 and 18 px wide, 3 px apart; `…` is a cell.
+        let shown = |width| {
+            let layout = chip_layout(
+                &keys,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height: 28,
+                },
+                cell,
+                120,
+                true,
+            );
+            let mut text = layout.ellipsis.map(|_| vec!["…"]).unwrap_or_default();
+            text.extend(keys[layout.first..].iter().map(String::as_str));
+            assert_eq!(layout.chips.len(), keys.len() - layout.first);
+            text.join(" ")
+        };
+        assert_eq!(shown(116), "ctrl shift p");
+        assert_eq!(shown(115), "… shift p");
+        assert_eq!(shown(82), "… shift p");
+        assert_eq!(shown(81), "… p");
+        assert_eq!(shown(29), "… p");
+        assert_eq!(shown(28), "p");
+        assert_eq!(shown(18), "p");
+        assert_eq!(shown(17), "");
+    }
+
+    /// A chip's key keeps 4.5:1 on the chip's composed colour, on the
+    /// panel and on the selection, in every theme.
+    #[test]
+    fn chip_keys_keep_the_text_floor_on_their_chips() {
+        use crate::color::{contrast_ratio, packed_channels};
+        use crate::renderer::{ChromeSurface, chrome_panel_palette};
+
+        for (name, theme) in crate::config::tests::provider_themes() {
+            let palette = chrome_panel_palette(theme, ChromeSurface::Menu);
+            for selected in [false, true] {
+                let state = RowState {
+                    selected,
+                    ..RowState::default()
+                };
+                let colors = row_colors(&palette, state);
+                let base = if selected {
+                    palette.selected_fill
+                } else {
+                    palette.panel
+                };
+                let [red, green, blue, alpha] = colors.chip;
+                let chip = mix_encoded(
+                    base,
+                    packed_channels([red, green, blue]),
+                    f64::from(alpha) / 255.0,
+                );
+                let ratio = contrast_ratio(colors.chip_text, chip);
+                assert!(ratio >= 4.5, "{name} selected {selected}: {ratio:.2}");
+            }
+        }
     }
 
     #[test]

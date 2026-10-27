@@ -1327,22 +1327,46 @@ impl CommandCategory {
         }
     }
 
-    /// The group header the palette shows above this category's commands.
-    pub(crate) const fn group_label(self) -> &'static str {
+    /// The group this category's commands show under. `Dojos` holds the
+    /// Lair commands and `Tabs` the Dojo ones.
+    const fn group(self) -> PaletteGroup {
         match self {
-            Self::Application => "app",
-            Self::Dojos => "dojo",
-            Self::Tabs => "tab",
-            Self::Panes => "pane",
-            Self::History => "history",
-            Self::View => "view",
-            Self::Control => "control",
+            Self::Application => PaletteGroup::App,
+            Self::Dojos => PaletteGroup::Lair,
+            Self::Tabs => PaletteGroup::Dojo,
+            Self::Panes => PaletteGroup::Pane,
+            Self::History => PaletteGroup::History,
+            Self::View => PaletteGroup::View,
+            Self::Control => PaletteGroup::Control,
         }
     }
+}
 
-    /// Where the category's group sits in the palette, first to last.
-    const fn order(self) -> u8 {
-        self as u8
+/// The group a command shows under in the palette and in the key bindings
+/// list, in the order the groups go.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) enum PaletteGroup {
+    Dojo,
+    Pane,
+    History,
+    Lair,
+    View,
+    App,
+    Control,
+}
+
+impl PaletteGroup {
+    /// The group header.
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Dojo => "dojo",
+            Self::Pane => "pane",
+            Self::History => "history",
+            Self::Lair => "lair",
+            Self::View => "view",
+            Self::App => "app",
+            Self::Control => "control",
+        }
     }
 }
 
@@ -1490,6 +1514,46 @@ pub(crate) struct BuiltInCommandDescriptor {
     pub(crate) title: &'static str,
     pub(crate) keywords: &'static [&'static str],
     shortcut_action: Option<ActionId>,
+}
+
+impl BuiltInCommandDescriptor {
+    /// The group the command shows under: its category's, except that
+    /// opening recent Dojos and a new terminal are Dojo commands and Open
+    /// Remote… is an app command.
+    pub(crate) const fn group(&self) -> PaletteGroup {
+        match self.id {
+            BuiltInCommandId::RecentSessions | BuiltInCommandId::NewSession => PaletteGroup::Dojo,
+            BuiltInCommandId::OpenRemote => PaletteGroup::App,
+            _ => self.category.group(),
+        }
+    }
+}
+
+/// The group `action`'s key binding shows under: its command's, or for an
+/// action no command runs, the one its config namespace names.
+pub(crate) fn action_group(action: ActionId) -> PaletteGroup {
+    if action == ActionId::ToggleCurrentLairPin {
+        return PaletteGroup::Lair;
+    }
+    if let Some(descriptor) = BUILT_IN_COMMANDS
+        .iter()
+        .find(|descriptor| descriptor.shortcut_action == Some(action))
+    {
+        return descriptor.group();
+    }
+    match action
+        .config_name()
+        .split_once('.')
+        .map(|(namespace, _)| namespace)
+    {
+        Some("dojo" | "session") => PaletteGroup::Dojo,
+        Some("lair") => PaletteGroup::Lair,
+        Some("pane") => PaletteGroup::Pane,
+        Some("history" | "copy-mode") => PaletteGroup::History,
+        Some("view") => PaletteGroup::View,
+        Some("control" | "access") => PaletteGroup::Control,
+        _ => PaletteGroup::App,
+    }
 }
 
 pub(crate) fn action_search_metadata(
@@ -2021,7 +2085,7 @@ fn palette_commands(retention: LairRetention, query: &str) -> Vec<BuiltInCommand
         .filter(|descriptor| descriptor_matches(*descriptor, query))
         .collect::<Vec<_>>();
     if query.is_empty() {
-        commands.sort_by_key(|descriptor| descriptor.category.order());
+        commands.sort_by_key(BuiltInCommandDescriptor::group);
     } else {
         let query = query.to_lowercase();
         commands.sort_by_key(|descriptor| title_rank(descriptor.title, &query));
@@ -2250,7 +2314,7 @@ impl CommandPaletteUi {
         }
         self.filtered
             .iter()
-            .map(|command| command_descriptor(*command).category.group_label())
+            .map(|command| command_descriptor(*command).group().label())
             .collect()
     }
 
@@ -2393,7 +2457,7 @@ impl CommandPaletteUi {
         if !self.editor.insert(text) {
             return false;
         }
-        self.refilter();
+        self.requery();
         true
     }
 
@@ -2401,14 +2465,32 @@ impl CommandPaletteUi {
         if !self.editor.backspace() {
             return false;
         }
-        self.refilter();
+        self.requery();
         true
     }
 
     pub(crate) fn editor_changed(&mut self) {
-        self.refilter();
+        self.requery();
     }
 
+    /// New query text ranks the list afresh: its best match, the first
+    /// enabled row, is selected and the list scrolls to the top.
+    fn requery(&mut self) {
+        self.filtered = palette_commands(self.context.lair_retention, self.editor.text());
+        self.selected = self.first_enabled().unwrap_or(0);
+        self.visible_start = 0;
+        self.ensure_selected_visible(COMMAND_PALETTE_PAGE_ITEMS);
+        self.hovered = None;
+    }
+
+    fn first_enabled(&self) -> Option<usize> {
+        self.filtered
+            .iter()
+            .position(|command| self.command_enabled(*command))
+    }
+
+    /// The same query with commands enabled or disabled: the selection stays
+    /// on its command while that is still enabled.
     fn refilter(&mut self) {
         let selected = self.selected_command();
         self.filtered = palette_commands(self.context.lair_retention, self.editor.text());
@@ -2419,11 +2501,7 @@ impl CommandPaletteUi {
                     .iter()
                     .position(|candidate| *candidate == selected)
             })
-            .or_else(|| {
-                self.filtered
-                    .iter()
-                    .position(|command| self.command_enabled(*command))
-            })
+            .or_else(|| self.first_enabled())
             .unwrap_or(0);
         self.ensure_selected_visible(COMMAND_PALETTE_PAGE_ITEMS);
         self.hovered = None;
@@ -3187,7 +3265,7 @@ mod tests {
         let orders = palette
             .filtered()
             .iter()
-            .map(|command| command_descriptor(*command).category.order())
+            .map(|command| command_descriptor(*command).group())
             .collect::<Vec<_>>();
         assert!(orders.windows(2).all(|pair| pair[0] <= pair[1]));
         let mut seen = Vec::new();
@@ -3197,8 +3275,32 @@ mod tests {
                 seen.push(*group);
             }
         }
-        assert_eq!(seen.first(), Some(&"app"));
-        assert!(seen.contains(&"dojo") && seen.contains(&"pane"));
+        // The canvas's order.
+        assert_eq!(
+            seen,
+            ["dojo", "pane", "history", "lair", "view", "app", "control"]
+        );
+        // Lair commands are Lair commands; recent Dojos and a new terminal
+        // are Dojo commands.
+        for (command, group) in palette.filtered().iter().zip(&groups) {
+            let descriptor = command_descriptor(*command);
+            if *group == "dojo" {
+                assert!(!descriptor.title.contains("Lair"), "{}", descriptor.title);
+            }
+            if descriptor.title.contains("current Lair") || descriptor.title.ends_with(" Lair") {
+                assert_eq!(*group, "lair", "{}", descriptor.title);
+            }
+        }
+        for (command, group) in [
+            (BuiltInCommandId::RecentSessions, PaletteGroup::Dojo),
+            (BuiltInCommandId::NewSession, PaletteGroup::Dojo),
+            (BuiltInCommandId::NewDojo, PaletteGroup::Dojo),
+            (BuiltInCommandId::NextDojo, PaletteGroup::Dojo),
+            (BuiltInCommandId::ChooseLair, PaletteGroup::Lair),
+            (BuiltInCommandId::OpenRemote, PaletteGroup::App),
+        ] {
+            assert_eq!(command_descriptor(command).group(), group, "{command:?}");
+        }
 
         assert!(palette.append_text("zoom"));
         assert!(palette.row_groups().is_empty());
@@ -3380,6 +3482,16 @@ mod tests {
             palette.selected_command(),
             Some(BuiltInCommandId::DenyControlTransfer)
         );
+        // Typing ranks the list afresh and selects its best match, not the
+        // row selected before.
+        assert!(palette.append_text("e"));
+        assert_eq!(palette.selected_index(), palette.first_enabled().unwrap());
+        assert_eq!(
+            palette.selected_command(),
+            Some(BuiltInCommandId::EnterCopyMode)
+        );
+        assert_eq!(palette.visible_start(), 0);
+        assert!(palette.backspace());
         // Titles that start with the query rank first.
         assert!(palette.append_text("zoom"));
         assert_eq!(palette.selected_command(), Some(BuiltInCommandId::ZoomIn));
@@ -3404,12 +3516,18 @@ mod tests {
         disabled.select_first();
         assert_eq!(
             disabled.selected_command(),
-            Some(BuiltInCommandId::ShowKeybindings)
+            Some(BuiltInCommandId::RecentSessions)
         );
+        disabled.move_selection(4);
+        assert_eq!(
+            disabled.selected_command(),
+            Some(BuiltInCommandId::ChooseDojo)
+        );
+        // Previous, next, and both moves are disabled without other tabs.
         disabled.move_selection(1);
         assert_eq!(
             disabled.selected_command(),
-            Some(BuiltInCommandId::ReloadConfiguration)
+            Some(BuiltInCommandId::CloseCurrentTab)
         );
         assert!(!disabled.command_enabled(BuiltInCommandId::PreviousDojo));
         assert!(!disabled.update_hovered(Some(BuiltInCommandId::FocusLeft)));

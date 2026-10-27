@@ -3,8 +3,11 @@
 use unicode_casefold::UnicodeCaseFold;
 
 use crate::{
-    frontend::{action_menu::action_search_metadata, text_edit::BoundedTextEditor},
-    keymap::{ActionId, BindingSource, ResolvedKeymap},
+    frontend::{
+        action_menu::{PaletteGroup, action_group, action_search_metadata},
+        text_edit::BoundedTextEditor,
+    },
+    keymap::{ActionId, BindingSource, ResolvedBinding, ResolvedKeymap},
 };
 
 /// Rows the key bindings list shows at once at most.
@@ -12,18 +15,8 @@ pub(crate) const BINDING_HELP_PAGE_ITEMS: usize = 10;
 const MAX_QUERY_BYTES: usize = 256;
 const MAX_QUERY_SCALARS: usize = 128;
 
-/// The key bindings list's groups in order: each search category and the
-/// group header it shows under.
-const GROUPS: [(&str, &str); 8] = [
-    ("APP", "app"),
-    ("DOJO", "dojo"),
-    ("TAB", "tab"),
-    ("PANE", "pane"),
-    ("HISTORY", "history"),
-    ("VIEW", "view"),
-    ("CONTROL", "control"),
-    ("COPY MODE", "copy mode"),
-];
+/// Copy mode's keys go last, after every command group.
+const COPY_MODE_GROUP: (usize, &str) = (PaletteGroup::Control as usize + 1, "copy mode");
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct BindingHelpRow {
@@ -145,12 +138,11 @@ fn chip_token(key: &str) -> String {
     glyph.to_owned()
 }
 
-/// The group a search category shows under, and where that group sits.
-fn group(category: &str) -> (usize, &'static str) {
-    GROUPS
-        .iter()
-        .position(|(label, _)| *label == category)
-        .map_or((0, GROUPS[0].1), |index| (index, GROUPS[index].1))
+/// Where `action`'s group sits in the list, and its header: the group its
+/// command shows under in the palette.
+fn group(action: ActionId) -> (usize, &'static str) {
+    let group = action_group(action);
+    (group as usize, group.label())
 }
 
 /// A config name in words, for an action without a title of its own:
@@ -166,75 +158,101 @@ fn humanized(config_name: &str) -> String {
     })
 }
 
+/// One resolved binding's row, at its binding's index.
+fn binding_row(id: usize, binding: &ResolvedBinding) -> BindingHelpRow {
+    let action = binding.action();
+    let config_name = action.config_name();
+    let (label, category, keywords) = action_search_metadata(action).unwrap_or_else(|| {
+        let (label, keywords) = fallback_action_metadata(action);
+        (label, fallback_action_category(action), keywords)
+    });
+    let shortcut = binding.display().to_owned();
+    let source = binding.source().short_label();
+    let (group_order, group) = group(action);
+    let chips = shortcut_chips(&shortcut);
+    BindingHelpRow {
+        id,
+        search_fields: search_fields(
+            [label, config_name, &shortcut, &source, category, group],
+            keywords,
+            &chips,
+        ),
+        chips,
+        shortcut: shortcut.clone(),
+        action: config_name.to_owned(),
+        detail: format!("{config_name} · {source}"),
+        source: source.clone(),
+        compact: format!("{shortcut} — {config_name}"),
+        title: if label == config_name {
+            humanized(config_name)
+        } else {
+            label.to_owned()
+        },
+        group,
+        user: matches!(binding.source(), BindingSource::User { .. }),
+        group_order,
+    }
+}
+
 impl BindingHelpUi {
     pub(crate) fn new(keymap: &ResolvedKeymap) -> Self {
+        let actions = keymap
+            .bindings()
+            .iter()
+            .map(ResolvedBinding::action)
+            .collect::<Vec<_>>();
         let mut rows = keymap
             .bindings()
             .iter()
             .enumerate()
-            .map(|(id, binding)| {
-                let action = binding.action();
-                let config_name = action.config_name();
-                let (label, category, keywords) =
-                    action_search_metadata(action).unwrap_or_else(|| {
-                        let (label, keywords) = fallback_action_metadata(action);
-                        (label, fallback_action_category(action), keywords)
-                    });
-                let shortcut = binding.display().to_owned();
-                let source = binding.source().short_label();
-                let (group_order, group) = group(category);
-                BindingHelpRow {
-                    id,
-                    chips: shortcut_chips(&shortcut),
-                    shortcut: shortcut.clone(),
-                    action: config_name.to_owned(),
-                    detail: format!("{config_name} · {source}"),
-                    source: source.clone(),
-                    compact: format!("{shortcut} — {config_name}"),
-                    title: if label == config_name {
-                        humanized(config_name)
-                    } else {
-                        label.to_owned()
-                    },
-                    group,
-                    user: matches!(binding.source(), BindingSource::User { .. }),
-                    group_order,
-                    search_fields: search_fields(
-                        label,
-                        config_name,
-                        &shortcut,
-                        &source,
-                        category,
-                        keywords,
-                    ),
-                }
-            })
+            .map(|(id, binding)| binding_row(id, binding))
             .collect::<Vec<_>>();
         for copy in &COPY_ROWS {
             let id = rows.len();
             let source = "copy mode".to_owned();
-            let (group_order, group) = group("COPY MODE");
+            let (group_order, group) = COPY_MODE_GROUP;
+            let chips = copy
+                .chips
+                .iter()
+                .map(|chip| (*chip).to_owned())
+                .collect::<Vec<_>>();
             rows.push(BindingHelpRow {
                 id,
+                search_fields: search_fields(
+                    [
+                        copy.action,
+                        copy.action,
+                        copy.shortcut,
+                        &source,
+                        "COPY MODE",
+                        group,
+                    ],
+                    copy.keywords,
+                    &chips,
+                ),
                 shortcut: copy.shortcut.into(),
                 action: copy.action.into(),
                 source: source.clone(),
                 compact: copy.compact.into(),
                 title: copy.title.into(),
-                chips: copy.chips.iter().map(|chip| (*chip).to_owned()).collect(),
+                chips,
                 group,
                 detail: copy.shortcut.into(),
                 user: false,
                 group_order,
-                search_fields: search_fields(
-                    copy.action,
-                    copy.action,
-                    copy.shortcut,
-                    &source,
-                    "COPY MODE",
-                    copy.keywords,
-                ),
             });
+        }
+        // Binding rows sit at their binding's index, so a merge after the
+        // copy rows keeps every id distinct.
+        if let Some((positions, merged)) = merged_dojo_selection(&rows, &actions) {
+            let keep = positions[0];
+            let mut removed = positions[1..].to_vec();
+            removed.sort_unstable();
+            for position in removed.iter().rev() {
+                rows.remove(*position);
+            }
+            let keep = keep - removed.iter().filter(|position| **position < keep).count();
+            rows[keep] = merged;
         }
         // Group by group, in the keymap's order within each.
         rows.sort_by_key(|row| row.group_order);
@@ -397,19 +415,94 @@ impl BindingHelpUi {
     }
 }
 
-fn search_fields(
-    label: &str,
-    config_name: &str,
-    shortcut: &str,
-    source: &str,
-    category: &str,
-    keywords: &[&str],
-) -> Vec<String> {
-    [label, config_name, shortcut, source, category]
+/// What a row's search matches: its label, config name, shortcut, source,
+/// category and group, its keywords, and each of its chips, so `↵`, `←`,
+/// `pgdn` or `esc` find the bindings that use them.
+fn search_fields(texts: [&str; 6], keywords: &[&str], chips: &[String]) -> Vec<String> {
+    texts
         .into_iter()
         .chain(keywords.iter().copied())
+        .chain(chips.iter().map(String::as_str))
         .map(fold_search_text)
         .collect()
+}
+
+/// The nine Dojo selections, in digit order.
+const SELECT_DOJO: [ActionId; 9] = [
+    ActionId::SelectDojo1,
+    ActionId::SelectDojo2,
+    ActionId::SelectDojo3,
+    ActionId::SelectDojo4,
+    ActionId::SelectDojo5,
+    ActionId::SelectDojo6,
+    ActionId::SelectDojo7,
+    ActionId::SelectDojo8,
+    ActionId::SelectDojo9,
+];
+
+/// The nine "Select Dojo N" rows as one "Go to Dojo 1–9" row, with the
+/// positions in `rows` they hold (`actions[i]` is the action of `rows[i]`),
+/// the first being where the merged row goes. Only when each is bound once,
+/// all to the same modifiers with their own digit last, from one source;
+/// otherwise they stay nine rows.
+fn merged_dojo_selection(
+    rows: &[BindingHelpRow],
+    actions: &[ActionId],
+) -> Option<(Vec<usize>, BindingHelpRow)> {
+    let mut positions = Vec::with_capacity(SELECT_DOJO.len());
+    for (digit, select) in (1_usize..).zip(SELECT_DOJO) {
+        let mut found = actions
+            .iter()
+            .enumerate()
+            .filter(|(_, action)| **action == select)
+            .map(|(position, _)| position);
+        let position = found.next()?;
+        if found.next().is_some() {
+            return None;
+        }
+        let (last, modifiers) = rows.get(position)?.chips.split_last()?;
+        if *last != digit.to_string() || modifiers.is_empty() {
+            return None;
+        }
+        positions.push(position);
+    }
+    let first = &rows[positions[0]];
+    let modifiers = &first.chips[..first.chips.len() - 1];
+    if positions.iter().any(|position| {
+        let row = &rows[*position];
+        row.chips[..row.chips.len() - 1] != *modifiers || row.source != first.source
+    }) {
+        return None;
+    }
+    let mut chips = modifiers.to_vec();
+    chips.push("1…9".to_owned());
+    let shortcut = first
+        .shortcut
+        .strip_suffix('1')
+        .map_or_else(|| first.shortcut.clone(), |prefix| format!("{prefix}1…9"));
+    let action = "dojo.select-1…9";
+    let mut search_fields = positions
+        .iter()
+        .flat_map(|position| rows[*position].search_fields.iter().cloned())
+        .chain(["go to dojo 1–9", "1…9"].map(fold_search_text))
+        .collect::<Vec<_>>();
+    search_fields.sort();
+    search_fields.dedup();
+    let merged = BindingHelpRow {
+        id: first.id,
+        compact: format!("{shortcut} — {action}"),
+        shortcut,
+        action: action.to_owned(),
+        source: first.source.clone(),
+        title: "Go to Dojo 1–9".to_owned(),
+        chips,
+        group: first.group,
+        detail: format!("{action} · {}", first.source),
+        user: first.user,
+        group_order: first.group_order,
+        search_fields,
+    };
+    Some((positions, merged))
 }
 
 fn fallback_action_category(action: ActionId) -> &'static str {
@@ -568,8 +661,17 @@ mod tests {
     fn help_contains_every_resolved_binding_and_copy_mode_local_keys() {
         let keymap = built_in_keymap(KeymapProfile::OmarchyTmux);
         let help = BindingHelpUi::new(&keymap);
-        assert_eq!(help.rows().len(), keymap.bindings().len() + 3);
+        // The nine Dojo selections may share one row.
+        let merged = help
+            .rows()
+            .iter()
+            .any(|row| row.action == "dojo.select-1…9");
+        let merged_away = if merged { 8 } else { 0 };
+        assert_eq!(help.rows().len(), keymap.bindings().len() + 3 - merged_away);
         for (binding_id, binding) in keymap.bindings().iter().enumerate() {
+            if merged && SELECT_DOJO.contains(&binding.action()) {
+                continue;
+            }
             let rows = help
                 .rows()
                 .iter()
@@ -701,7 +803,7 @@ mod tests {
         assert!(help.backspace());
         assert!(help.clear_query());
         assert!(help.query().is_empty());
-        assert_eq!(help.rows().len(), keymap.bindings().len() + 3);
+        assert_eq!(help.rows().len(), help.total());
         assert!(!help.clear_query());
     }
 
@@ -736,23 +838,65 @@ mod tests {
     }
 
     #[test]
-    fn default_help_lists_and_finds_the_numbered_dojo_chords() {
+    fn default_help_lists_the_numbered_dojo_chords_as_one_row_and_finds_each() {
         let keymap = built_in_keymap(KeymapProfile::Splinterm);
+        let help = BindingHelpUi::new(&keymap);
+        let merged = help
+            .rows()
+            .iter()
+            .filter(|row| row.action.starts_with("dojo.select-"))
+            .collect::<Vec<_>>();
+        assert_eq!(merged.len(), 1, "the nine chords share one row");
+        let merged = merged[0];
+        assert_eq!(merged.title, "Go to Dojo 1–9");
+        assert_eq!(merged.chips, ["ctrl", "shift", "1…9"]);
+        assert_eq!(merged.shortcut, "Ctrl+Shift+1…9");
+        assert_eq!(
+            merged.detail,
+            format!("dojo.select-1…9 · {}", merged.source)
+        );
+        assert_eq!(merged.group, "dojo");
         for digit in 1..=9 {
             let shortcut = format!("Ctrl+Shift+{digit}");
-            let action = format!("dojo.select-{digit}");
             let mut help = BindingHelpUi::new(&keymap);
+            assert!(help.append_text(&shortcut));
             assert!(
                 help.rows()
                     .iter()
-                    .any(|row| row.shortcut == shortcut && row.action == action)
-            );
-            assert!(help.append_text(&shortcut));
-            assert!(
-                help.rows().iter().any(|row| row.action == action),
-                "query {shortcut:?} did not find {action}"
+                    .any(|row| row.action == "dojo.select-1…9"),
+                "query {shortcut:?} did not find the merged row"
             );
         }
+
+        // One chord bound differently: the nine stay nine rows.
+        let resolved = crate::keymap::resolve_keymap_text(
+            KeymapProfile::Splinterm,
+            r#"
+version = 1
+inherits = "splinterm"
+
+[[binding]]
+sequence = ["Alt+3"]
+action = "dojo.select-3"
+"#,
+            std::path::Path::new("keybindings.toml"),
+        )
+        .unwrap();
+        let help = BindingHelpUi::new(&resolved.keymap);
+        assert!(help.rows().iter().any(|row| row.shortcut == "Alt+3"));
+        for digit in 1..=9 {
+            let action = format!("dojo.select-{digit}");
+            assert!(
+                help.rows().iter().any(|row| row.action == action),
+                "{action} keeps its own row"
+            );
+        }
+        assert!(
+            !help
+                .rows()
+                .iter()
+                .any(|row| row.action == "dojo.select-1…9")
+        );
     }
 
     #[test]
@@ -795,18 +939,53 @@ mod tests {
                 assert!(!row.chips.is_empty(), "{}", row.action);
                 assert!(!row.title.is_empty());
                 assert_ne!(row.title, row.action, "{}", row.action);
-                assert!(GROUPS.iter().any(|(_, group)| *group == row.group));
+                assert!(
+                    [
+                        "dojo",
+                        "pane",
+                        "history",
+                        "lair",
+                        "view",
+                        "app",
+                        "control",
+                        "copy mode"
+                    ]
+                    .contains(&row.group),
+                    "{}",
+                    row.group
+                );
+                if row.group == "dojo" {
+                    assert!(!row.title.contains("Lair"), "{}", row.title);
+                }
                 assert!(!row.user);
                 if row.group == "copy mode" {
                     assert_eq!(row.detail, row.shortcut);
                 } else {
                     assert_eq!(row.detail, format!("{} · {}", row.action, row.source));
-                    assert_eq!(row.chips, shortcut_chips(&row.shortcut));
+                    if row.action != "dojo.select-1…9" {
+                        assert_eq!(row.chips, shortcut_chips(&row.shortcut));
+                    }
                 }
             }
             assert!(help.append_text("split"));
             assert!(help.row_groups().is_empty());
             assert!(!help.rows().is_empty());
+        }
+    }
+
+    /// Chip tokens find the bindings that use them.
+    #[test]
+    fn search_matches_chip_tokens() {
+        let keymap = built_in_keymap(KeymapProfile::Splinterm);
+        for token in ["↵", "←", "pgdn", "esc"] {
+            let mut help = BindingHelpUi::new(&keymap);
+            assert!(help.append_text(token));
+            assert!(
+                help.rows()
+                    .iter()
+                    .any(|row| row.chips.iter().any(|chip| chip == token)),
+                "{token} found nothing"
+            );
         }
     }
 }

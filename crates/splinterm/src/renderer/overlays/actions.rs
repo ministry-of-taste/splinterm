@@ -715,7 +715,9 @@ pub(crate) fn paint_command_palette(
     paint_palette_list(&mut painter, layout, &palette, state, keymap, pressed, body)?;
     if let Some(detail) = layout.detail {
         let text = match body {
-            PaletteBody::AgentAccess(access) => Some(access.footer()),
+            PaletteBody::AgentAccess(access) => {
+                Some(access.footer()).filter(|text| !text.is_empty())
+            }
             PaletteBody::BindingHelp(help) => help
                 .rows()
                 .get(help.selected_index())
@@ -898,7 +900,7 @@ fn paint_command_row(
     let query = state.query();
     let trailing = match &badge {
         Some(badge) => badge.as_str(),
-        None if chips.is_empty() && !query.is_empty() => descriptor.category.group_label(),
+        None if chips.is_empty() && !query.is_empty() => descriptor.group().label(),
         None => "",
     };
     paint_row(
@@ -2063,9 +2065,11 @@ mod tests {
         let groups = state.row_groups();
         let first = layout(&state);
         assert_eq!(first.list.height, LIST_HEIGHT);
-        assert_eq!(first.rows[0].header.map(|(_, label)| label), Some("app"));
+        assert_eq!(first.rows[0].header.map(|(_, label)| label), Some("dojo"));
         assert!(first.rows.len() <= LIST_MAXIMUM_ROWS);
-        assert!(first.rows.iter().filter(|row| row.header.is_some()).count() >= 2);
+        assert!(first.rows.iter().any(|row| row.header.is_some()));
+        // Every group starts once: dojo, pane, history, lair, view, app.
+        assert!(groups.windows(2).filter(|pair| pair[0] != pair[1]).count() + 1 >= 6);
         assert!(
             window_height(
                 &groups,
@@ -2755,9 +2759,9 @@ mod tests {
         assert!(cache.contains_source("type a command"));
         assert!(cache.contains_source("›"));
         // Groups with no query, and the bindings as chips.
-        assert!(cache.contains_source("app"));
+        assert!(cache.contains_source("dojo"));
         assert!(cache.contains_source("ctrl"));
-        assert!(!cache.contains_source("APP"));
+        assert!(!cache.contains_source("DOJO"));
         for (key, verb) in PaletteBody::Commands.legend() {
             assert!(cache.contains_source(key) && cache.contains_source(verb));
         }

@@ -24,8 +24,7 @@ pub(crate) use action_menu::{
 #[cfg(test)]
 pub(crate) use action_menu::{TAB_MENU_ACTIONS, tab_menu_descriptor};
 pub(crate) use agent_access::{
-    AGENT_ACCESS_PAGE_ITEMS, AccessActivation, AccessMarks, AgentAccessUi, PromptReconcile,
-    RevokeAccessUi, waiting_title,
+    AccessActivation, AccessMarks, AgentAccessUi, PromptReconcile, RevokeAccessUi, waiting_title,
 };
 pub use agent_access::{
     AccessSnapshot, MAX_WINDOW_ACCESS_ENTRIES, RevokeAllCheck, WindowAccessCommand,
@@ -46,7 +45,7 @@ pub(crate) fn agent_access_test_entry(
 #[cfg(test)]
 pub(crate) use agent_status::state_tint;
 pub(crate) use agent_status::{AgentAggregate, AgentGlyphs, AgentSpinner, badged_tab_label};
-pub(crate) use binding_help::{BINDING_HELP_PAGE_ITEMS, BindingHelpUi, shortcut_chips};
+pub(crate) use binding_help::{BindingHelpUi, shortcut_chips};
 pub use dialog_text::{DialogIdentity, DialogLine, DialogLineRole, DialogStyle, DialogText};
 #[cfg(test)]
 pub(crate) use lair_explorer::LairExplorerRowKind;

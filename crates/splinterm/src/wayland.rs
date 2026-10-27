@@ -129,18 +129,17 @@ use crate::diagnostics::{
     DiagnosticErrorCode, DiagnosticEventCode, DiagnosticLevel, ExitClass, global as diagnostics,
 };
 use crate::frontend::{
-    AgentAccessUi, AuthorityStatus, BINDING_HELP_PAGE_ITEMS, BindingHelpUi, BoundedTextEditor,
-    BuiltInCommandDispatch, BuiltInCommandId, CommandControlAction, CommandHistoryAction,
-    CommandPaletteContext, CommandPaletteUi, CommandTabMoveAvailability, CommandZoomAction,
-    DojoPromptUi, FontUpdate, LairDirection, LairExplorerDecision, LairExplorerFilter,
-    LairExplorerRow, LairExplorerUi, LairPromptKind, PerfTraceCorrelation, SelectorKind,
-    SessionPickerCatalog, SessionPickerCreationTarget, SessionPickerDecision, SessionPickerTarget,
-    SessionPickerUi, TabContextMenuUi, TabMenuActionId, TabMenuContext, TabMenuDispatch,
-    TabMenuRightPress, TerminalGridLimits, TerminationDecision, ThemeUpdate, TrustedConsentUi,
-    TrustedDialogKey, TrustedInput, WindowCommand, WindowDojoIdentity, WindowOptions,
-    WindowPaneOptions, WindowThemeColors, WindowTopologyCommand, WindowTopologyUpdate,
-    WindowUpdate, close_other_tabs_command, explorer_home, lair_lifecycle_command,
-    tab_menu_right_press,
+    AgentAccessUi, AuthorityStatus, BindingHelpUi, BoundedTextEditor, BuiltInCommandDispatch,
+    BuiltInCommandId, CommandControlAction, CommandHistoryAction, CommandPaletteContext,
+    CommandPaletteUi, CommandTabMoveAvailability, CommandZoomAction, DojoPromptUi, FontUpdate,
+    LairDirection, LairExplorerDecision, LairExplorerFilter, LairExplorerRow, LairExplorerUi,
+    LairPromptKind, PerfTraceCorrelation, SelectorKind, SessionPickerCatalog,
+    SessionPickerCreationTarget, SessionPickerDecision, SessionPickerTarget, SessionPickerUi,
+    TabContextMenuUi, TabMenuActionId, TabMenuContext, TabMenuDispatch, TabMenuRightPress,
+    TerminalGridLimits, TerminationDecision, ThemeUpdate, TrustedConsentUi, TrustedDialogKey,
+    TrustedInput, WindowCommand, WindowDojoIdentity, WindowOptions, WindowPaneOptions,
+    WindowThemeColors, WindowTopologyCommand, WindowTopologyUpdate, WindowUpdate,
+    close_other_tabs_command, explorer_home, lair_lifecycle_command, tab_menu_right_press,
 };
 use crate::geometry::{
     FontSize, OutputDpiObservation, Rect, SurfaceGeometry, WindowGeometry, buffer_to_logical_ceil,
@@ -7298,6 +7297,17 @@ impl App {
         }
     }
 
+    /// How far Page Up and Page Down move in the palette's list: the rows
+    /// its committed layout shows, which group headers make fewer than ten.
+    fn command_palette_page(&self) -> isize {
+        let rows = self
+            .modal
+            .command_palette_layout
+            .as_ref()
+            .map_or(1, |layout| layout.rows.len().max(1));
+        isize::try_from(rows).unwrap_or(isize::MAX)
+    }
+
     fn refresh_command_palette(&mut self) {
         self.modal.command_palette_layout = None;
         self.presentation.full_redraw = true;
@@ -9701,22 +9711,15 @@ impl App {
         if self.modal.binding_help.is_some() {
             let mut close = false;
             let mut changed = false;
+            let page = self.command_palette_page();
             if let Some(help) = self.modal.binding_help.as_mut() {
                 match event.keysym {
                     Keysym::Up => changed = help.move_selection(-1),
                     Keysym::Down => changed = help.move_selection(1),
                     Keysym::Home => changed = help.select_first(),
                     Keysym::End => changed = help.select_last(),
-                    Keysym::Page_Up => {
-                        changed = help.move_selection(
-                            -isize::try_from(BINDING_HELP_PAGE_ITEMS).unwrap_or(isize::MAX),
-                        );
-                    }
-                    Keysym::Page_Down => {
-                        changed = help.move_selection(
-                            isize::try_from(BINDING_HELP_PAGE_ITEMS).unwrap_or(isize::MAX),
-                        );
-                    }
+                    Keysym::Page_Up => changed = help.move_selection(-page),
+                    Keysym::Page_Down => changed = help.move_selection(page),
                     Keysym::u | Keysym::U
                         if self.input.modifiers.ctrl
                             && !self.input.modifiers.alt
