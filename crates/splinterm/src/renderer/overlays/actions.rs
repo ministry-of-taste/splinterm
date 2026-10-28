@@ -3,12 +3,10 @@
 use anyhow::Result;
 use unicode_width::UnicodeWidthChar;
 
-#[cfg(test)]
-use crate::frontend::{TAB_MENU_ACTIONS, tab_menu_descriptor};
 use crate::{
     frontend::{
         AgentAccessUi, BindingHelpUi, BuiltInCommandId, CommandPaletteUi, DojoPromptUi,
-        TabContextMenuUi, TabMenuActionId, TerminationDecision, command_descriptor, shortcut_chips,
+        TerminationDecision, command_descriptor, shortcut_chips,
     },
     geometry::Rect,
     keymap::ResolvedKeymap,
@@ -18,17 +16,13 @@ use super::{
     super::{ChromeTextStyle, RenderContext},
     chrome_box::{
         BOX_CLEARANCE, BOX_EDGE, ChromeBox, ChromePainter, opaque, paint_outline, paint_scrim,
-        shadow_rect,
     },
     chrome_rows::{
         GROUP_HEIGHT, LIST_MAXIMUM_ROWS, ListRow, ROW_HEIGHT, ROW_PADDING, RowState,
         paint_group_header, paint_row, row_columns, starts_group, title_match, visible_window,
         window_height,
     },
-    picker::{
-        PickerTextAlignment, ROW_HOVER_ALPHA, ROW_PRESS_ALPHA, SessionPickerPalette,
-        SessionPickerTextCache, editable_text,
-    },
+    picker::{PickerTextAlignment, SessionPickerPalette, SessionPickerTextCache, editable_text},
 };
 
 /// The palette's input line, inside the frame.
@@ -59,13 +53,6 @@ const PANEL_VERTICAL_MARGIN: u32 = 16;
 /// least [`PANEL_MINIMUM_TOP`] below it.
 const PANEL_TOP_PERCENT: u32 = 15;
 const PANEL_MINIMUM_TOP: u32 = 48;
-const TAB_MENU_WIDTH: u32 = 156;
-const TAB_MENU_ROW_HEIGHT: u32 = 28;
-const TAB_MENU_PADDING: u32 = 2;
-const TAB_MENU_CONTENT_INSET: u32 = 4;
-const TAB_MENU_INDICATOR_WIDTH: u32 = 12;
-const TAB_MENU_SHADOW: u32 = 6;
-const TAB_MENU_ANCHOR_GAP: u32 = 4;
 const PROMPT_MAX_WIDTH: u32 = 520;
 const PROMPT_MARGIN: u32 = 24;
 const PROMPT_PADDING: u32 = 24;
@@ -424,35 +411,6 @@ pub(crate) fn command_palette_row_hit_test(
         .map(|offset| layout.visible_start.saturating_add(offset))
 }
 
-/// The widest of `actions`' labels in logical px, regular or bold: chrome
-/// text is monospaced, so it is the most cells times the wider cell.
-pub(crate) fn tab_menu_label_width(
-    cache: &mut SessionPickerTextCache,
-    context: &RenderContext,
-    actions: &[crate::frontend::TabMenuActionDescriptor],
-    scale_120: u32,
-    renderer_generation: u64,
-) -> Result<u32> {
-    let mut cell_width = 0;
-    for style in [ChromeTextStyle::Regular, ChromeTextStyle::Bold] {
-        cell_width = cell_width.max(
-            cache
-                .cell_metrics(context, style, scale_120, renderer_generation)?
-                .0,
-        );
-    }
-    let cells = actions
-        .iter()
-        .map(|action| preview_text_width(action.title))
-        .max()
-        .unwrap_or(0);
-    Ok(u32::try_from(cells)
-        .unwrap_or(u32::MAX)
-        .saturating_mul(cell_width)
-        .saturating_mul(120)
-        .div_ceil(scale_120.max(1)))
-}
-
 /// An editable `value` after `prefix` with its caret, fitted to `clip_width`
 /// buffer pixels by keeping its end: the caret and the latest input stay
 /// visible and the start gives way behind `…`.
@@ -465,12 +423,6 @@ fn editable_field_text(
     let (cell_width, _) = painter.cell(ChromeTextStyle::Regular)?;
     let maximum_cells = usize::try_from(clip_width / cell_width).unwrap_or(usize::MAX);
     Ok(editable_text(prefix, value, maximum_cells))
-}
-
-/// `color` at `alpha` out of 255, to blend.
-fn translucent(color: u32, alpha: u8) -> [u8; 4] {
-    let [red, green, blue, _] = opaque(color);
-    [red, green, blue, alpha]
 }
 
 /// What the palette's list shows: its commands, the key bindings, or the
@@ -929,240 +881,6 @@ fn paint_command_row(
     )
 }
 
-/// The selected row's fill and accent rail.
-fn paint_selected_row(painter: &mut ChromePainter<'_>, rect: Rect, palette: &SessionPickerPalette) {
-    painter.fill(rect, opaque(palette.selected_fill));
-    let rail = painter.scaled(3).max(1);
-    painter.fill(
-        Rect {
-            width: rail.min(rect.width),
-            ..rect
-        },
-        opaque(palette.selected_rail),
-    );
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct TabMenuRowLayout {
-    pub(crate) action: TabMenuActionId,
-    pub(crate) label: &'static str,
-    pub(crate) rect: Rect,
-    pub(crate) title: Rect,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct TabContextMenuLayout {
-    pub(crate) panel: Rect,
-    pub(crate) rows: Vec<TabMenuRowLayout>,
-}
-
-#[must_use]
-pub(crate) fn tab_context_menu_layout(
-    bounds: Rect,
-    anchor: (u32, u32),
-    actions: &[crate::frontend::TabMenuActionDescriptor],
-    label_width: u32,
-) -> Option<TabContextMenuLayout> {
-    let rows_height =
-        TAB_MENU_ROW_HEIGHT.saturating_mul(u32::try_from(actions.len()).unwrap_or(u32::MAX));
-    if bounds.width <= TAB_MENU_SHADOW
-        || bounds.height < rows_height.saturating_add(TAB_MENU_SHADOW)
-    {
-        return None;
-    }
-    let preferred_width = label_width
-        .saturating_add(TAB_MENU_CONTENT_INSET.saturating_mul(2))
-        .saturating_add(TAB_MENU_INDICATOR_WIDTH)
-        .max(TAB_MENU_WIDTH);
-    let panel_width = preferred_width.min(bounds.width.saturating_sub(TAB_MENU_SHADOW));
-    let available_height = bounds.height.saturating_sub(TAB_MENU_SHADOW);
-    let vertical_padding = TAB_MENU_PADDING.min(available_height.saturating_sub(rows_height) / 2);
-    let panel_height = rows_height.saturating_add(vertical_padding.saturating_mul(2));
-    let maximum_x = bounds
-        .x
-        .saturating_add(bounds.width)
-        .saturating_sub(panel_width)
-        .saturating_sub(TAB_MENU_SHADOW);
-    let x = anchor.0.min(maximum_x).max(bounds.x);
-    let below = anchor.1.saturating_add(TAB_MENU_ANCHOR_GAP);
-    let maximum_y = bounds
-        .y
-        .saturating_add(bounds.height)
-        .saturating_sub(panel_height)
-        .saturating_sub(TAB_MENU_SHADOW);
-    let y = if below <= maximum_y {
-        below.max(bounds.y)
-    } else {
-        anchor
-            .1
-            .saturating_sub(panel_height)
-            .max(bounds.y)
-            .min(maximum_y)
-    };
-    let panel = Rect {
-        x,
-        y,
-        width: panel_width,
-        height: panel_height,
-    };
-    let horizontal_inset = TAB_MENU_CONTENT_INSET.min(panel_width / 6);
-    let indicator_width = TAB_MENU_INDICATOR_WIDTH
-        .min(panel_width.saturating_sub(horizontal_inset.saturating_mul(2)));
-    let rows = actions
-        .iter()
-        .enumerate()
-        .map(|(index, descriptor)| {
-            let rect = Rect {
-                x,
-                y: y.saturating_add(vertical_padding).saturating_add(
-                    TAB_MENU_ROW_HEIGHT.saturating_mul(u32::try_from(index).unwrap_or(u32::MAX)),
-                ),
-                width: panel_width,
-                height: TAB_MENU_ROW_HEIGHT,
-            };
-            TabMenuRowLayout {
-                action: descriptor.id,
-                label: descriptor.title,
-                rect,
-                title: Rect {
-                    x: rect
-                        .x
-                        .saturating_add(horizontal_inset)
-                        .saturating_add(indicator_width),
-                    y: rect.y,
-                    width: rect
-                        .width
-                        .saturating_sub(horizontal_inset.saturating_mul(2))
-                        .saturating_sub(indicator_width),
-                    height: rect.height,
-                },
-            }
-        })
-        .collect();
-    Some(TabContextMenuLayout { panel, rows })
-}
-
-#[must_use]
-pub(crate) fn tab_context_menu_hit_test(
-    layout: &TabContextMenuLayout,
-    point: (f64, f64),
-) -> Option<TabMenuActionId> {
-    layout
-        .rows
-        .iter()
-        .find(|row| contains(row.rect, point))
-        .map(|row| row.action)
-}
-
-#[allow(
-    clippy::too_many_arguments,
-    clippy::too_many_lines,
-    reason = "one specialized painter keeps tab-menu composition and selection treatment coherent"
-)]
-pub(crate) fn paint_tab_context_menu(
-    cache: &mut SessionPickerTextCache,
-    context: &RenderContext,
-    canvas: &mut [u8],
-    width: u32,
-    height: u32,
-    scale_120: u32,
-    renderer_generation: u64,
-    layout: &TabContextMenuLayout,
-    palette: SessionPickerPalette,
-    state: &TabContextMenuUi,
-    pressed: Option<TabMenuActionId>,
-    keyboard_focused: bool,
-) -> Result<()> {
-    let mut painter = ChromePainter::new(
-        cache,
-        context,
-        canvas,
-        width,
-        height,
-        scale_120,
-        renderer_generation,
-    );
-    let panel = painter.buffer_rect(layout.panel);
-    painter.blend(shadow_rect(panel, scale_120), palette.shadow);
-    painter.fill(panel, palette.panel_fill);
-    let border = painter.border();
-    let frame = if keyboard_focused {
-        palette.focused_frame
-    } else {
-        palette.frame
-    };
-    paint_outline(&mut painter, panel, border, frame);
-    for row in &layout.rows {
-        let rect = painter.buffer_rect(row.rect);
-        let enabled = state.action_enabled(row.action);
-        let selected = enabled && state.selected_action() == row.action;
-        if selected {
-            paint_selected_row(&mut painter, rect, &palette);
-        } else if enabled && state.hovered() == Some(row.action) {
-            painter.blend(rect, translucent(palette.selected_fill, ROW_HOVER_ALPHA));
-        }
-        if enabled && pressed == Some(row.action) {
-            painter.blend(rect, translucent(palette.selected_rail, ROW_PRESS_ALPHA));
-        }
-        let highlighted = enabled
-            && !selected
-            && (state.hovered() == Some(row.action) || pressed == Some(row.action));
-        let primary = if enabled {
-            palette.row_text(selected, highlighted).0
-        } else {
-            palette.secondary
-        };
-        // Terminate Lair and Terminate Dojo end running terminals.
-        let label_color = row_label_color(
-            &palette,
-            enabled && row.action.destructive(),
-            selected,
-            highlighted,
-            primary,
-        );
-        if selected {
-            let inset = painter.scaled(3).min(rect.width);
-            let indicator = Rect {
-                x: rect.x.saturating_add(inset),
-                width: painter
-                    .scaled(TAB_MENU_INDICATOR_WIDTH)
-                    .min(rect.width.saturating_sub(inset)),
-                ..rect
-            };
-            painter.text(
-                "›",
-                ChromeTextStyle::Bold,
-                indicator,
-                PickerTextAlignment::Left,
-                primary,
-            )?;
-        }
-        let clip = painter.buffer_rect(row.title);
-        painter.text(
-            row.label,
-            if selected {
-                ChromeTextStyle::Bold
-            } else {
-                ChromeTextStyle::Regular
-            },
-            clip,
-            PickerTextAlignment::Left,
-            label_color,
-        )?;
-    }
-    // Rows reach the panel's right edge; draw it over them.
-    painter.fill(
-        Rect {
-            x: panel.x.saturating_add(panel.width.saturating_sub(border)),
-            width: border,
-            ..panel
-        },
-        opaque(frame),
-    );
-    painter.finish();
-    Ok(())
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DojoPromptLayout {
     pub(crate) panel: Rect,
@@ -1294,22 +1012,6 @@ pub(crate) fn dojo_prompt_hit_test(
         Some(TerminationDecision::Terminate)
     } else {
         None
-    }
-}
-
-/// A menu row's label: a destructive action that can run, such as
-/// Terminate, in danger; any other row in `primary`.
-fn row_label_color(
-    palette: &SessionPickerPalette,
-    destructive: bool,
-    selected: bool,
-    highlighted: bool,
-    primary: u32,
-) -> u32 {
-    if destructive {
-        palette.row_danger(selected, highlighted)
-    } else {
-        primary
     }
 }
 
@@ -1496,7 +1198,7 @@ mod tests {
     };
     use crate::{
         config::ResolvedTheme,
-        frontend::{CommandPaletteContext, CommandTabMoveAvailability},
+        frontend::{CommandPaletteContext, CommandTabMoveAvailability, TabMenuActionId},
         renderer::session_picker_palette,
     };
     use splinterm_core::{DojoId, LairId, SplintId};
@@ -2108,113 +1810,6 @@ mod tests {
     }
 
     #[test]
-    fn lair_context_menu_layout_uses_the_available_action_catalog() {
-        let actions = [
-            TabMenuActionId::RenameLair,
-            TabMenuActionId::NewDojo,
-            TabMenuActionId::PinLair,
-            TabMenuActionId::PreviewLair,
-            TabMenuActionId::TerminateLair,
-        ]
-        .map(tab_menu_descriptor);
-        let bounds = Rect {
-            x: 0,
-            y: 0,
-            width: 640,
-            height: 400,
-        };
-        let layout = tab_context_menu_layout(bounds, (639, 399), &actions, 0).unwrap();
-        assert_eq!(layout.rows.len(), actions.len());
-        assert_eq!(layout.rows[0].action, TabMenuActionId::RenameLair);
-        assert_eq!(
-            layout.panel.height,
-            TAB_MENU_ROW_HEIGHT * u32::try_from(actions.len()).unwrap() + TAB_MENU_PADDING * 2
-        );
-        let row = layout.rows[0].rect;
-        assert_eq!(
-            tab_context_menu_hit_test(&layout, (f64::from(row.x), f64::from(row.y))),
-            Some(TabMenuActionId::RenameLair)
-        );
-        assert_eq!(
-            tab_context_menu_hit_test(&layout, (f64::from(row.x), f64::from(row.y + row.height))),
-            Some(actions[1].id)
-        );
-    }
-
-    #[test]
-    fn context_menu_layout_retains_explorer_label_instead_of_tab_label() {
-        let descriptor = crate::frontend::TabMenuActionDescriptor {
-            id: TabMenuActionId::ActivateTab,
-            title: "Open / Activate",
-        };
-        let bounds = Rect {
-            x: 0,
-            y: 0,
-            width: 640,
-            height: 400,
-        };
-        let layout = tab_context_menu_layout(bounds, (0, 0), &[descriptor], 0).unwrap();
-        assert_eq!(layout.rows[0].label, "Open / Activate");
-        assert_ne!(
-            layout.rows[0].label,
-            tab_menu_descriptor(descriptor.id).title
-        );
-    }
-
-    #[test]
-    fn context_menu_full_action_labels_fit_at_supported_scales() {
-        let context = RenderContext::new(u16::MAX);
-        let mut cache = SessionPickerTextCache::default();
-        let actions = TAB_MENU_ACTIONS.into_iter().chain(
-            [
-                TabMenuActionId::RenameLair,
-                TabMenuActionId::SaveLayout,
-                TabMenuActionId::PinLair,
-                TabMenuActionId::UnpinLair,
-                TabMenuActionId::PreviewLair,
-                TabMenuActionId::Restore,
-                TabMenuActionId::TerminateLair,
-                TabMenuActionId::FocusSplint,
-                TabMenuActionId::SplitBelow,
-                TabMenuActionId::SplitRight,
-                TabMenuActionId::CloseSplint,
-            ]
-            .map(tab_menu_descriptor),
-        );
-        for action in actions {
-            for width in [320, 640] {
-                let bounds = Rect {
-                    x: 17,
-                    y: 23,
-                    width,
-                    height: 400,
-                };
-                for scale in [120, 150, 180, 240] {
-                    let label_width =
-                        tab_menu_label_width(&mut cache, &context, &[action], scale, 1).unwrap();
-                    let layout = tab_context_menu_layout(
-                        bounds,
-                        (bounds.x + width, 400),
-                        &[action],
-                        label_width,
-                    )
-                    .unwrap();
-                    let clip = buffer_rect(layout.rows[0].title, scale);
-                    for style in [ChromeTextStyle::Regular, ChromeTextStyle::Bold] {
-                        let text_width = text_width(&context, action.title, style, scale);
-                        assert!(
-                            text_width <= clip.width,
-                            "{} at width {width}, scale {scale}: {text_width} > {}",
-                            action.title,
-                            clip.width
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
     fn list_titles_are_lowercase_and_the_source_column_ellipsizes() {
         assert_eq!(PaletteBody::Commands.title(), "commands");
         let keymap = ResolvedKeymap::default();
@@ -2279,16 +1874,12 @@ mod tests {
         }
     }
 
-    /// VM case E6: at maximum zoom "Preview saved layout" was clipped into
-    /// fragments. It must fit its menu row whole or end in an ellipsis.
-    /// Chrome no longer follows zoom, so the largest UI text size now
-    /// stands in for it.
+    /// Every fixed chrome line is tall enough for the largest UI text.
     #[test]
-    fn maximum_zoom_menu_labels_fit_their_rows_or_end_in_an_ellipsis() {
+    fn fixed_chrome_lines_fit_the_largest_ui_text() {
         use super::super::super::text::CHROME_MAXIMUM_LINE_HEIGHT;
 
         for height in [
-            TAB_MENU_ROW_HEIGHT,
             ROW_HEIGHT,
             GROUP_HEIGHT,
             INPUT_HEIGHT,
@@ -2299,165 +1890,6 @@ mod tests {
             PROMPT_BUTTON_HEIGHT,
         ] {
             assert!(height >= CHROME_MAXIMUM_LINE_HEIGHT);
-        }
-        let action = tab_menu_descriptor(TabMenuActionId::PreviewLair);
-        for scale in [120, 150, 180, 240] {
-            let context = RenderContext::new(u16::MAX)
-                .at_maximum_zoom(scale)
-                .at_maximum_chrome_font_size();
-            let mut cache = SessionPickerTextCache::default();
-            for width in [120, 160, 240, 640, 1268] {
-                let bounds = Rect {
-                    x: 0,
-                    y: 0,
-                    width,
-                    height: 754,
-                };
-                let label_width =
-                    tab_menu_label_width(&mut cache, &context, &[action], scale, 1).unwrap();
-                let layout =
-                    tab_context_menu_layout(bounds, (width / 2, 300), &[action], label_width)
-                        .unwrap();
-                let row = buffer_rect(layout.rows[0].rect, scale);
-                let clip = buffer_rect(layout.rows[0].title, scale);
-                for style in [ChromeTextStyle::Regular, ChromeTextStyle::Bold] {
-                    let full_width = text_width(&context, action.title, style, scale);
-                    paint_label(&mut cache, &context, action.title, style, scale, clip.width);
-                    let (drawn, _) = cache
-                        .drawn()
-                        .find(|(text, drawn_style)| {
-                            *drawn_style == style
-                                && action.title.starts_with(text.trim_end_matches('…'))
-                                && text_width(&context, text, style, scale) <= clip.width
-                        })
-                        .unwrap_or_else(|| panic!("scale {scale}, width {width}: no label"));
-                    let drawn = ChromeText::load_styled_with_context(drawn, scale, style, &context)
-                        .unwrap();
-                    assert!(drawn.pixel_height() <= chrome_maximum_cell_height(scale));
-                    assert!(
-                        drawn.pixel_height() <= row.height,
-                        "scale {scale}, width {width}: {} > {}",
-                        drawn.pixel_height(),
-                        row.height
-                    );
-                    if full_width > clip.width {
-                        assert!(
-                            cache.drawn().any(|(text, drawn_style)| {
-                                drawn_style == style
-                                    && text.ends_with('…')
-                                    && action.title.starts_with(text.trim_end_matches('…'))
-                            }),
-                            "scale {scale}, width {width}: no ellipsized label"
-                        );
-                    }
-                }
-            }
-            // A wide Window shows the whole label at the largest size.
-            let label_width =
-                tab_menu_label_width(&mut cache, &context, &[action], scale, 1).unwrap();
-            let bounds = Rect {
-                x: 0,
-                y: 0,
-                width: 1268,
-                height: 754,
-            };
-            let layout =
-                tab_context_menu_layout(bounds, (600, 300), &[action], label_width).unwrap();
-            let clip = buffer_rect(layout.rows[0].title, scale);
-            assert!(
-                text_width(&context, action.title, ChromeTextStyle::Bold, scale) <= clip.width,
-                "scale {scale}"
-            );
-        }
-    }
-
-    #[test]
-    fn context_menu_narrow_viewports_bound_labels_and_action_hits() {
-        for width in [1, 6, 7, 12, 40, 156, 223, 224, 230, 240, 640] {
-            let bounds = Rect {
-                x: 17,
-                y: 23,
-                width,
-                height: 400,
-            };
-            for anchor in [(0, 0), (bounds.x + width, bounds.y + bounds.height)] {
-                let Some(layout) =
-                    tab_context_menu_layout(bounds, anchor, &TAB_MENU_ACTIONS, u32::MAX)
-                else {
-                    assert!(width <= TAB_MENU_SHADOW);
-                    continue;
-                };
-                assert!(layout.panel.x >= bounds.x);
-                assert!(layout.panel.x + layout.panel.width + TAB_MENU_SHADOW <= bounds.x + width);
-                for row in &layout.rows {
-                    assert!(row.title.x >= row.rect.x);
-                    assert!(row.title.x + row.title.width <= row.rect.x + row.rect.width);
-                    let y = f64::from(row.rect.y);
-                    assert_eq!(
-                        tab_context_menu_hit_test(&layout, (f64::from(row.rect.x), y)),
-                        Some(row.action)
-                    );
-                    assert_eq!(
-                        tab_context_menu_hit_test(
-                            &layout,
-                            (f64::from(row.rect.x + row.rect.width), y)
-                        ),
-                        None
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn tab_context_menu_clamps_all_edges_and_keeps_half_open_rows() {
-        let bounds = Rect {
-            x: 0,
-            y: 0,
-            width: 640,
-            height: 400,
-        };
-        for anchor in [(0, 0), (639, 0), (0, 399), (639, 399)] {
-            let layout = tab_context_menu_layout(bounds, anchor, &TAB_MENU_ACTIONS, 0).unwrap();
-            assert_eq!(layout.panel.width, TAB_MENU_WIDTH);
-            assert_eq!(
-                layout.panel.height,
-                TAB_MENU_ROW_HEIGHT * u32::try_from(TAB_MENU_ACTIONS.len()).unwrap()
-                    + TAB_MENU_PADDING * 2
-            );
-            assert!(layout.panel.x >= bounds.x && layout.panel.y >= bounds.y);
-            assert!(
-                layout.panel.x + layout.panel.width + TAB_MENU_SHADOW <= bounds.x + bounds.width
-            );
-            assert!(
-                layout.panel.y + layout.panel.height + TAB_MENU_SHADOW <= bounds.y + bounds.height
-            );
-            assert_eq!(layout.rows.len(), TAB_MENU_ACTIONS.len());
-            for row in &layout.rows {
-                assert_eq!(row.rect.height, TAB_MENU_ROW_HEIGHT);
-                assert_eq!(
-                    row.title.x - row.rect.x,
-                    TAB_MENU_CONTENT_INSET + TAB_MENU_INDICATOR_WIDTH
-                );
-                assert_eq!(
-                    tab_context_menu_hit_test(
-                        &layout,
-                        (f64::from(row.rect.x), f64::from(row.rect.y))
-                    ),
-                    Some(row.action)
-                );
-                assert_ne!(
-                    tab_context_menu_hit_test(
-                        &layout,
-                        (
-                            f64::from(row.rect.x + row.rect.width),
-                            f64::from(row.rect.y)
-                        )
-                    ),
-                    Some(row.action)
-                );
-            }
-            assert!(layout.rows[0].rect.y + layout.rows[0].rect.height <= layout.rows[1].rect.y);
         }
     }
 
@@ -2604,108 +2036,6 @@ mod tests {
         )
         .unwrap();
         assert!(canvas.iter().any(|byte| *byte != 0));
-    }
-
-    #[test]
-    #[allow(
-        clippy::too_many_lines,
-        reason = "bounded paint, cache and narrow viewport scenario"
-    )]
-    fn tab_context_menu_paints_without_a_window_scrim() {
-        let bounds = Rect {
-            x: 0,
-            y: 0,
-            width: 640,
-            height: 400,
-        };
-        let layout = tab_context_menu_layout(bounds, (240, 40), &TAB_MENU_ACTIONS, 0).unwrap();
-        let mut state = TabContextMenuUi::new(crate::frontend::TabMenuContext {
-            lair_id: LairId::new(),
-            source_splint_id: SplintId::new(),
-            dojo_id: DojoId::new(),
-            dojo_name: "test".to_owned(),
-            pane_count: 2,
-            splints: vec![(SplintId::new(), 1), (SplintId::new(), 2)],
-            active: false,
-            other_dojo_ids: vec![DojoId::new()],
-        });
-        let mut canvas = vec![0_u8; 640 * 400 * 4];
-        let mut cache = SessionPickerTextCache::default();
-        let right_x = layout.panel.x + layout.panel.width - 1;
-        let top_edge = usize::try_from((layout.panel.y * 640 + right_x) * 4).unwrap();
-        let close_row = layout
-            .rows
-            .iter()
-            .position(|row| row.action == TabMenuActionId::CloseTab)
-            .unwrap();
-        for (hovered, pressed, row) in [
-            (None, None, 0),
-            (Some(TabMenuActionId::CloseTab), None, close_row),
-            (
-                Some(TabMenuActionId::CloseTab),
-                Some(TabMenuActionId::CloseTab),
-                close_row,
-            ),
-        ] {
-            state.update_hovered(hovered);
-            canvas.fill(0);
-            paint_tab_context_menu(
-                &mut cache,
-                &RenderContext::new(u16::MAX),
-                &mut canvas,
-                640,
-                400,
-                120,
-                1,
-                &layout,
-                session_picker_palette(ResolvedTheme::default()),
-                &state,
-                pressed,
-                true,
-            )
-            .unwrap();
-            assert_eq!(&canvas[..4], &[0, 0, 0, 0]);
-            let panel_offset =
-                usize::try_from((layout.panel.y * 640 + layout.panel.x) * 4).unwrap();
-            assert_ne!(&canvas[panel_offset..panel_offset + 4], &[0, 0, 0, 0]);
-            let row_y = layout.rows[row].rect.y + layout.rows[row].rect.height / 2;
-            let row_edge = usize::try_from((row_y * 640 + right_x) * 4).unwrap();
-            assert_eq!(
-                &canvas[row_edge..row_edge + 4],
-                &canvas[top_edge..top_edge + 4]
-            );
-        }
-        // Repaints reuse entries: each label at most once whole and once
-        // ellipsized to a row too narrow for it.
-        assert!(cache.len() <= TAB_MENU_ACTIONS.len() * 2 + 1);
-        for viewport_width in [7, 12, 40, 230] {
-            let narrow = Rect {
-                width: viewport_width,
-                ..bounds
-            };
-            let layout = tab_context_menu_layout(narrow, (0, 0), &TAB_MENU_ACTIONS, 260).unwrap();
-            canvas.fill(0);
-            paint_tab_context_menu(
-                &mut cache,
-                &RenderContext::new(u16::MAX),
-                &mut canvas,
-                640,
-                400,
-                120,
-                1,
-                &layout,
-                session_picker_palette(ResolvedTheme::default()),
-                &state,
-                None,
-                true,
-            )
-            .unwrap();
-            for y in 0..400 {
-                let outside = (y * 640 + viewport_width as usize) * 4;
-                let end = (y + 1) * 640 * 4;
-                assert!(canvas[outside..end].iter().all(|byte| *byte == 0));
-            }
-        }
     }
 
     #[test]
@@ -3056,21 +2386,6 @@ mod tests {
                 BuiltInCommandId::TerminateCurrentDojo | BuiltInCommandId::TerminateCurrentLair
             );
             assert_eq!(command.destructive(), destructive, "{command:?}");
-            for (selected, highlighted) in [(false, false), (false, true), (true, false)] {
-                let painted = row_label_color(
-                    &palette,
-                    command.destructive(),
-                    selected,
-                    highlighted,
-                    palette.primary,
-                );
-                let expected = if destructive {
-                    palette.row_danger(selected, highlighted)
-                } else {
-                    palette.primary
-                };
-                assert_eq!(painted, expected, "{command:?}");
-            }
         }
         for action in [
             TabMenuActionId::TerminateLair,
@@ -3085,11 +2400,6 @@ mod tests {
             );
             assert_eq!(action.destructive(), destructive, "{action:?}");
         }
-        // A disabled Terminate row is not drawn in danger.
-        assert_eq!(
-            row_label_color(&palette, false, false, false, palette.secondary),
-            palette.secondary
-        );
 
         let terminate = DojoPromptUi::terminate(
             DojoId::new(),

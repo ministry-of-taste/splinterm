@@ -30,7 +30,7 @@ These actions have deliberately different effects:
 | Close a Window owning an unpromoted transient Lair | Terminates its processes and removes the Lair |
 | Close a transient XDG command window | Terminates every process and removes its complete Lair |
 | Close a tab | Detaches that Dojo from this window |
-| Close Other Tabs | Detaches every other local tab without ending their Dojos |
+| Close other tabs | Detaches every other local tab without ending their Dojos |
 | Terminate Dojo from a tab menu | Confirms, then ends the Dojo's pane processes |
 | Terminate a live Splint | Ends its process after explicit confirmation |
 | Close an exited Splint | Removes the exited pane from topology |
@@ -58,7 +58,7 @@ Reset moves the complete session database to a timestamped backup, restarts the 
 
 ## Tab controls
 
-The visible tab strip supports activation, detach-only close, and a `+` action for Recent Dojos. Right-click a tab to Rename Tab, Activate Tab, create a New Dojo in its Lair, Close Tab, Close Other Tabs, or open confirmed Terminate Dojo. Opening the menu does not activate the target tab first.
+The visible tab strip supports activation, detach-only close, and a `+` action for Recent Dojos. Right-click a tab for its menu, titled with the tab's Dojo: Rename tab…, Activate tab, and New Dojo (in its Lair); then the detach-only Close tab and Close other tabs; then the confirmed Terminate Dojo…, last. Opening the menu does not activate the target tab first. In the Explorer, a Dojo's menu lists Open, Rename…, Restore…, Close tab and Terminate Dojo…, in that order, and a Lair's ends with Terminate Lair….
 
 The command palette separates the hierarchy: **Choose Lair** lists Lairs and switches through the selected Lair's most recently used Dojo, while **Choose Dojo** lists only Dojos in the active Lair. **Recent Dojos** remains a global cross-Lair list.
 

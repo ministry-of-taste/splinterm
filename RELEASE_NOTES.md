@@ -565,6 +565,18 @@ a hostile program running as your account.
   150 ms shows the shared Braille spinner in the accent and `loading`
   alone, instead of "Loading…"; `R` retries from a picker that failed to
   load.
+- The tab menu and the Explorer's menus are the same box, at the pointer
+  with no scrim: the frame names what the menu acts on (the Dojo, Lair or
+  Splint), so "Close" is never ambiguous. Labels are sentence case
+  ("Close other tabs", "Terminate Dojo…"; the Explorer's Open / Activate
+  is now Open; the Lair menu's Terminate… is Terminate Lair…), separators
+  group the actions, and Terminate is always last, in danger. In the
+  Explorer's Dojo menu, Restore… now comes before Close tab. In a menu for
+  the current tab, Lair or pane, a row whose action has a binding shows it
+  as chips; a menu for anything else shows none, since those keys act on
+  the current one. A menu is as wide as its widest row, and a Window too
+  short for every row closes the menu rather than hide it. The palette's
+  "Rename current tab…" and "Rename current Lair…" gain their ellipsis.
 - Trusted dialogs (access consent, upgrade, restart) take your theme and its
   `[colors]` keys as they open, always opaque: the frame in `warning`, the
   left "no" button's edge and label in `danger` and the right "yes" button's

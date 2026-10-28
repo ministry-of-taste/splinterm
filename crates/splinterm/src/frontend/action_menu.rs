@@ -492,6 +492,59 @@ impl TabMenuActionId {
     pub(crate) const fn destructive(self) -> bool {
         matches!(self, Self::TerminateLair | Self::TerminateDojo)
     }
+
+    /// The group the action sits in on a menu: going to or changing the
+    /// target, keeping or restoring its layout, closing it, then
+    /// terminating it, so a separator falls between kinds and Terminate is
+    /// always last.
+    pub(crate) const fn group(self) -> u8 {
+        match self {
+            Self::RenameTab
+            | Self::RenameLair
+            | Self::ActivateTab
+            | Self::NewDojo
+            | Self::FocusSplint
+            | Self::SplitBelow
+            | Self::SplitRight => 0,
+            Self::SaveLayout
+            | Self::PinLair
+            | Self::UnpinLair
+            | Self::PreviewLair
+            | Self::Restore => 1,
+            Self::CloseTab | Self::CloseOtherTabs | Self::CloseSplint => 2,
+            Self::TerminateLair | Self::TerminateDojo => 3,
+        }
+    }
+
+    /// The keymap action that does the same to the current Dojo, Lair or
+    /// pane, whose binding the menu shows as the row's chips.
+    pub(crate) const fn shortcut_action(self) -> Option<ActionId> {
+        match self {
+            Self::RenameTab => Some(ActionId::RenameCurrentTab),
+            Self::RenameLair => Some(ActionId::RenameCurrentLair),
+            Self::SaveLayout => Some(ActionId::SaveCurrentLair),
+            Self::PinLair | Self::UnpinLair => Some(ActionId::ToggleCurrentLairPin),
+            Self::PreviewLair => Some(ActionId::PreviewCurrentLair),
+            Self::TerminateLair => Some(ActionId::TerminateCurrentLair),
+            // Split below stacks the new pane under a horizontal divider.
+            Self::SplitBelow => Some(ActionId::SplitHorizontal),
+            Self::SplitRight => Some(ActionId::SplitVertical),
+            Self::CloseSplint => Some(ActionId::CloseFocusedPane),
+            Self::NewDojo => Some(ActionId::NewDojo),
+            Self::CloseTab => Some(ActionId::CloseCurrentTab),
+            Self::CloseOtherTabs => Some(ActionId::CloseOtherTabs),
+            Self::TerminateDojo => Some(ActionId::TerminateCurrentDojo),
+            // Restore means a Lair, a Dojo or a pane; Focus and Activate
+            // have no current-target binding.
+            Self::Restore | Self::FocusSplint | Self::ActivateTab => None,
+        }
+    }
+
+    /// The binding's display text in `keymap`, or `""` when it has none.
+    pub(crate) fn shortcut(self, keymap: &ResolvedKeymap) -> &str {
+        self.shortcut_action()
+            .map_or("", |action| keymap.primary_shortcut(action))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -526,11 +579,11 @@ pub(crate) struct TabMenuActionDescriptor {
 pub(crate) const TAB_MENU_ACTIONS: [TabMenuActionDescriptor; 6] = [
     TabMenuActionDescriptor {
         id: TabMenuActionId::RenameTab,
-        title: "Rename Tab",
+        title: "Rename tab…",
     },
     TabMenuActionDescriptor {
         id: TabMenuActionId::ActivateTab,
-        title: "Activate Tab",
+        title: "Activate tab",
     },
     TabMenuActionDescriptor {
         id: TabMenuActionId::NewDojo,
@@ -538,11 +591,11 @@ pub(crate) const TAB_MENU_ACTIONS: [TabMenuActionDescriptor; 6] = [
     },
     TabMenuActionDescriptor {
         id: TabMenuActionId::CloseTab,
-        title: "Close Tab",
+        title: "Close tab",
     },
     TabMenuActionDescriptor {
         id: TabMenuActionId::CloseOtherTabs,
-        title: "Close Other Tabs",
+        title: "Close other tabs",
     },
     TabMenuActionDescriptor {
         id: TabMenuActionId::TerminateDojo,
@@ -597,6 +650,11 @@ enum ContextMenuTarget {
     Tab(TabMenuContext),
     Explorer {
         target: ExplorerContextTarget,
+        /// The row's label, which the menu's frame shows.
+        title: String,
+        /// Whether the row is what the Window shows: a Lair that holds the
+        /// active Dojo, the active Dojo, or its focused Splint.
+        current: bool,
         actions: Vec<TabMenuActionDescriptor>,
         commands: Vec<WindowTopologyCommand>,
     },
@@ -680,6 +738,8 @@ impl TabContextMenuUi {
             live_incarnation: None,
         };
         let mut entries = Vec::new();
+        let mut title = lair.label.clone();
+        let mut current = lair.dojos.iter().any(|dojo| dojo.active_here);
         let live = |state| {
             matches!(
                 state,
@@ -789,6 +849,8 @@ impl TabContextMenuUi {
                     .dojos
                     .iter()
                     .find(|dojo| dojo.target.dojo_id == dojo_id)?;
+                title.clone_from(&dojo.label);
+                current = dojo.active_here;
                 let capability = dojo.target.capability;
                 if capability.is_enabled()
                     && matches!(
@@ -861,6 +923,8 @@ impl TabContextMenuUi {
                     .splints
                     .iter()
                     .find(|splint| splint.target.splint_id == splint_id)?;
+                title.clone_from(&splint.label);
+                current = dojo.active_here && splint.focused_here;
                 target.live_incarnation = splint.target.live_incarnation;
                 if splint.target.capability.is_enabled()
                     && matches!(
@@ -921,6 +985,8 @@ impl TabContextMenuUi {
         if entries.is_empty() {
             return None;
         }
+        // Group by kind, keeping each group's order: Terminate last.
+        entries.sort_by_key(|(id, _)| id.group());
         let (actions, commands) = entries
             .into_iter()
             .map(|(id, command)| {
@@ -929,7 +995,7 @@ impl TabContextMenuUi {
                         id,
                         title: match id {
                             TabMenuActionId::RenameTab => "Rename…",
-                            TabMenuActionId::ActivateTab => "Open / Activate",
+                            TabMenuActionId::ActivateTab => "Open",
                             TabMenuActionId::CloseTab => "Close tab",
                             _ => tab_menu_descriptor(id).title,
                         },
@@ -941,6 +1007,8 @@ impl TabContextMenuUi {
         Some(Self {
             context: ContextMenuTarget::Explorer {
                 target,
+                title,
+                current,
                 actions,
                 commands,
             },
@@ -954,6 +1022,25 @@ impl TabContextMenuUi {
         match self.context {
             ContextMenuTarget::Explorer { target, .. } => Some(target),
             ContextMenuTarget::Tab(_) => None,
+        }
+    }
+
+    /// What the menu acts on, for its frame: the tab's Dojo, or the
+    /// Explorer row's Lair, Dojo or Splint.
+    pub(crate) fn title(&self) -> &str {
+        match &self.context {
+            ContextMenuTarget::Explorer { title, .. } => title,
+            ContextMenuTarget::Tab(context) => &context.dojo_name,
+        }
+    }
+
+    /// Whether the menu acts on what the Window shows: the active tab, the
+    /// Lair that holds it, or its focused pane. Only then do its rows show
+    /// key chips, since a binding acts on the current Dojo, Lair or pane.
+    pub(crate) const fn is_current(&self) -> bool {
+        match &self.context {
+            ContextMenuTarget::Explorer { current, .. } => *current,
+            ContextMenuTarget::Tab(context) => context.active,
         }
     }
 
@@ -1112,6 +1199,16 @@ pub(crate) fn tab_menu_dispatch(
     }
 }
 
+/// Whether a separator goes above `actions[index]` on a menu: it starts a
+/// new group.
+pub(crate) fn tab_menu_starts_group(actions: &[TabMenuActionDescriptor], index: usize) -> bool {
+    index > 0
+        && actions
+            .get(index)
+            .zip(actions.get(index - 1))
+            .is_some_and(|(action, previous)| action.id.group() != previous.id.group())
+}
+
 pub(crate) fn tab_menu_descriptor(id: TabMenuActionId) -> TabMenuActionDescriptor {
     const EXPLORER_ACTIONS: &[TabMenuActionDescriptor] = &[
         TabMenuActionDescriptor {
@@ -1140,7 +1237,7 @@ pub(crate) fn tab_menu_descriptor(id: TabMenuActionId) -> TabMenuActionDescripto
         },
         TabMenuActionDescriptor {
             id: TabMenuActionId::TerminateLair,
-            title: "Terminate…",
+            title: "Terminate Lair…",
         },
         TabMenuActionDescriptor {
             id: TabMenuActionId::FocusSplint,
@@ -1673,7 +1770,7 @@ pub(crate) const BUILT_IN_COMMANDS: [BuiltInCommandDescriptor; BuiltInCommandId:
     BuiltInCommandDescriptor {
         id: BuiltInCommandId::RenameCurrentTab,
         category: CommandCategory::Tabs,
-        title: "Rename current tab",
+        title: "Rename current tab…",
         keywords: &["rename", "name", "current", "dojo", "tab"],
         shortcut_action: Some(ActionId::RenameCurrentTab),
     },
@@ -1757,7 +1854,7 @@ pub(crate) const BUILT_IN_COMMANDS: [BuiltInCommandDescriptor; BuiltInCommandId:
     BuiltInCommandDescriptor {
         id: BuiltInCommandId::RenameCurrentLair,
         category: CommandCategory::Dojos,
-        title: "Rename current Lair",
+        title: "Rename current Lair…",
         keywords: &["rename", "name", "current", "lair", "workspace"],
         shortcut_action: Some(ActionId::RenameCurrentLair),
     },
@@ -3203,6 +3300,116 @@ mod tests {
         assert!(!active.action_enabled(TabMenuActionId::ActivateTab));
         assert!(!active.action_enabled(TabMenuActionId::CloseOtherTabs));
         assert!(!active.update_hovered(Some(TabMenuActionId::ActivateTab)));
+    }
+
+    #[test]
+    fn menus_name_their_target_group_their_actions_and_end_in_terminate() {
+        let context = TabMenuContext {
+            lair_id: LairId::new(),
+            source_splint_id: SplintId::new(),
+            dojo_id: DojoId::new(),
+            dojo_name: "Dojo 1".to_owned(),
+            pane_count: 1,
+            splints: vec![(SplintId::new(), 4)],
+            active: true,
+            other_dojo_ids: Vec::new(),
+        };
+        let tab = TabContextMenuUi::new(context);
+        assert_eq!(tab.title(), "Dojo 1");
+        let titles = tab
+            .actions()
+            .iter()
+            .map(|action| action.title)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            titles,
+            [
+                "Rename tab…",
+                "Activate tab",
+                "New Dojo",
+                "Close tab",
+                "Close other tabs",
+                "Terminate Dojo…"
+            ]
+        );
+        let separators = (0..titles.len())
+            .filter(|index| tab_menu_starts_group(tab.actions(), *index))
+            .collect::<Vec<_>>();
+        assert_eq!(separators, [3, 5]);
+        let keymap = ResolvedKeymap::default();
+        assert_eq!(TabMenuActionId::NewDojo.shortcut(&keymap), "Ctrl+Shift+D");
+        assert_eq!(TabMenuActionId::CloseTab.shortcut(&keymap), "Ctrl+Shift+Q");
+        assert_eq!(TabMenuActionId::ActivateTab.shortcut(&keymap), "");
+        assert_eq!(
+            TabMenuActionId::SplitBelow.shortcut(&keymap),
+            "Ctrl+Shift+Enter"
+        );
+        assert_eq!(
+            TabMenuActionId::SplitRight.shortcut(&keymap),
+            "Ctrl+Shift+\\"
+        );
+
+        let mut view = super::super::lair_explorer::tests::view();
+        let lair = view.lairs[0].id;
+        let dojo = view.lairs[0].dojos[0].id;
+        let splint = view.lairs[0].dojos[0].splints[0].id;
+        let menu = |view: &NavigationExplorerView, node| {
+            TabContextMenuUi::for_explorer(view, node, Some(SplintId::new()), true, true).unwrap()
+        };
+        assert_eq!(menu(&view, lair).title(), "work");
+        assert_eq!(menu(&view, dojo).title(), "editor");
+        assert_eq!(menu(&view, splint).title(), "shell");
+        // Only a menu for what the Window shows says so, and so shows chips:
+        // the Lair holding the active Dojo, that Dojo, its focused pane.
+        assert!(menu(&view, lair).is_current());
+        assert!(menu(&view, dojo).is_current());
+        assert!(menu(&view, splint).is_current());
+        assert!(!menu(&view, view.lairs[1].id).is_current());
+        assert!(!menu(&view, view.lairs[1].dojos[0].id).is_current());
+        view.lairs[0].dojos[0].splints[0].focused_here = false;
+        assert!(!menu(&view, splint).is_current());
+        view.lairs[0].dojos[0].splints[0].focused_here = true;
+        // The Lair menu names what Terminate ends, as the Dojo menu does.
+        assert_eq!(
+            tab_menu_descriptor(TabMenuActionId::TerminateLair).title,
+            "Terminate Lair…"
+        );
+        // A restorable pane among a Dojo's: Restore groups with the layout
+        // actions ahead of Close, and Terminate stays last.
+        view.lairs[0].dojos[0].active_here = false;
+        view.lairs[0].dojos[0].target.capability.action = NavigationAction::ActivateDojo;
+        let mut restorable = view.lairs[0].dojos[0].splints[0].clone();
+        restorable.target.splint_id = SplintId::new();
+        restorable.lifecycle = NavigationLifecycle::Restorable;
+        restorable.target.live_incarnation = None;
+        restorable.target.capability.action = NavigationAction::PreviewRestoreSplint;
+        view.lairs[0].dojos[0].splints.push(restorable);
+        let dojo_menu = menu(&view, dojo);
+        let ids = dojo_menu
+            .actions()
+            .iter()
+            .map(|action| action.id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            [
+                TabMenuActionId::ActivateTab,
+                TabMenuActionId::RenameTab,
+                TabMenuActionId::Restore,
+                TabMenuActionId::CloseTab,
+                TabMenuActionId::TerminateDojo
+            ]
+        );
+        assert_eq!(dojo_menu.actions()[0].title, "Open");
+        // The Dojo is no longer the active one, so neither it, its Lair nor
+        // its focused pane is current.
+        assert!(!dojo_menu.is_current());
+        assert!(!menu(&view, lair).is_current());
+        assert!(!menu(&view, splint).is_current());
+        let separators = (0..ids.len())
+            .filter(|index| tab_menu_starts_group(dojo_menu.actions(), *index))
+            .collect::<Vec<_>>();
+        assert_eq!(separators, [2, 3, 4]);
     }
 
     #[test]

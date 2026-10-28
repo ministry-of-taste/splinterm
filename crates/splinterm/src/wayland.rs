@@ -171,7 +171,7 @@ use crate::renderer::{
     paint_snapshot_region_presented, paint_snapshot_rows_presented, paint_tab_context_menu,
     picker_status_line, premultiplied_theme_rgba, scroll_snapshot_pixels, search_overlay_panel,
     session_picker_layout, snapshot_row_rect, tab_context_menu_hit_test, tab_context_menu_layout,
-    tab_menu_label_width, write_ppm,
+    tab_menu_content_width, write_ppm,
 };
 #[cfg(test)]
 use crate::renderer::{lair_explorer_layout, paint_box_drawing_cell};
@@ -12583,7 +12583,6 @@ impl App {
         let inline_picker_open = self.modal.inline_picker_open();
         let command_palette_open = self.modal.command_palette.is_some();
         let dojo_prompt_open = self.modal.dojo_prompt.is_some();
-        let tab_context_menu_open = self.modal.tab_context_menu.is_some();
         let picker_layout = if inline_picker_open {
             let content = self.content_rect();
             let picker = self
@@ -12649,10 +12648,13 @@ impl App {
             .as_ref()
             .and_then(|prompt| dojo_prompt_layout(self.content_rect(), prompt));
         let tab_context_menu_layout = if let Some(menu) = self.modal.tab_context_menu.as_ref() {
-            let label_width = tab_menu_label_width(
+            // Chips name keys for the current tab, Lair or pane only.
+            let keymap = menu.is_current().then_some(&self.input.keymap);
+            let content_width = tab_menu_content_width(
                 &mut self.modal.tab_context_menu_text_cache,
                 &self.presentation.render_context,
                 menu.actions(),
+                keymap,
                 self.surface.scale_120,
                 self.presentation.renderer_generation,
             )?;
@@ -12665,11 +12667,18 @@ impl App {
                 },
                 self.modal.tab_context_menu_anchor,
                 menu.actions(),
-                label_width,
+                keymap,
+                content_width,
             )
         } else {
             None
         };
+        // A Window too short for every row shows no menu, so none stays open
+        // to take keys for a selection nobody can see.
+        if tab_context_menu_layout.is_none() {
+            self.close_tab_context_menu();
+        }
+        let tab_context_menu_open = self.modal.tab_context_menu.is_some();
         self.prepare_remote_host_text()?;
         let tab_layout = self.current_tab_strip_layout();
         let content_rect = self.content_rect();

@@ -139,9 +139,17 @@ A picker still waiting on the daemon after 150 ms shows the spinner and
 The trusted tab strip provides activation, a close target, and a `+` picker
 action. It is visible by default; hiding it is local to the current Window,
 reclaims its height for the pane grid, and does not persist or reappear when a
-new tab opens. Right-clicking a visible tab opens a tab-targeted menu for Rename Tab,
-Activate Tab, New Dojo, detach-only Close Tab, detach-only Close Other Tabs, and
-confirmed Terminate Dojo. Opening the menu does not first activate its tab.
+new tab opens. Right-clicking a visible tab opens a menu titled with that tab's
+Dojo: Rename tab…, Activate tab, New Dojo, then detach-only Close tab and Close
+other tabs, then confirmed Terminate Dojo… last, in the danger colour. Opening
+the menu does not first activate its tab.
+
+Menus open at the pointer, in the same box as the palette and pickers but with
+no scrim and no key hints in the bottom edge: the frame names what the menu acts
+on, and separators group its actions. When the menu is for the current tab,
+Lair or pane, an action with a key binding shows it as chips (`ctrl` `shift`
+`q`); a menu for anything else shows none, since those keys act on the current
+one. Arrows, Enter and Escape still work.
 
 **Detach and terminate are different operations.** Closing tabs or Windows is
 client-local. Terminating a Dojo is a named, confirmed daemon mutation and ends
@@ -197,11 +205,11 @@ Up/Down, Enter, and Escape to choose, run, or cancel an action:
 
 - **Lairs:** Rename, New Dojo, Save layout, Pin/Unpin, saved-layout Preview,
   Restore, and Terminate.
-- **Dojos:** Open/Activate, Rename, Close tab when open, Restore, and Terminate.
-- **Splints:** Focus, Split below/right, Close, and Restore for restorable work.
+- **Dojos:** Open, Rename, Restore, Close tab when open, and Terminate.
+- **Splints:** Focus, Split below/right, Restore for restorable work, and Close.
 
 Only applicable actions appear. Saved and non-open Lairs/Dojos can be renamed or
-managed without switching tabs; Open/Activate and Focus explicitly navigate.
+managed without switching tabs; Open and Focus explicitly navigate.
 New Dojo opens the newly created tab. Save layout retains a disposable Lair;
 unpinning leaves it saved. Splitting and closing require an attached running pane
 controlled by this window. Saved-only Lairs and Dojos are restored, not deleted;
