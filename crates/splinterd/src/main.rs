@@ -302,7 +302,7 @@ impl ControllerState {
         if self.by_splint.contains_key(&splint_id) {
             return Err(ProtocolError::new(
                 ErrorCode::ControllerUnavailable,
-                "live Splint already has a controller",
+                splinterm_protocol::SPLINT_ALREADY_CONTROLLED,
             ));
         }
         let id = self.next_id;
@@ -383,12 +383,16 @@ impl ControllerState {
         incarnation: u64,
         grant_id: Option<u64>,
     ) -> Result<PendingControlTransfer, ProtocolError> {
-        if self.by_connection.contains_key(&requester_connection_id)
-            || self.transfer_by_splint.contains_key(&splint_id)
-        {
+        if self.by_connection.contains_key(&requester_connection_id) {
             return Err(ProtocolError::new(
                 ErrorCode::ControlTransferUnavailable,
-                "control transfer is unavailable",
+                splinterm_protocol::TRANSFER_REQUESTER_CONTROLS,
+            ));
+        }
+        if self.transfer_by_splint.contains_key(&splint_id) {
+            return Err(ProtocolError::new(
+                ErrorCode::ControlTransferUnavailable,
+                splinterm_protocol::CONTROL_TRANSFER_PENDING,
             ));
         }
         let owner = self
@@ -399,7 +403,7 @@ impl ControllerState {
             .ok_or_else(|| {
                 ProtocolError::new(
                     ErrorCode::ControlTransferUnavailable,
-                    "live Splint has no matching controller",
+                    splinterm_protocol::NO_CONTROLLER_TO_TRANSFER,
                 )
             })?;
         let id = self.next_transfer_id;
@@ -513,7 +517,7 @@ impl ControllerState {
             .ok_or_else(|| {
                 ProtocolError::new(
                     ErrorCode::ControlTransferUnavailable,
-                    "live Splint has no matching controller",
+                    splinterm_protocol::NO_CONTROLLER_TO_TRANSFER,
                 )
             })?;
         self.next_id.checked_add(1).ok_or_else(|| {
@@ -25505,6 +25509,53 @@ mod tests {
             ErrorCode::RequestNotFound
         );
         assert!(controllers.authorize(10, owner.id, splint_id, 4).is_ok());
+    }
+
+    /// Plan 0067 M4: each refusal names its reason, so the MCP adapter can say
+    /// what to do next.
+    #[test]
+    fn control_transfer_refusals_name_their_reason() {
+        let reason = |error: ProtocolError| (error.code, error.message);
+        let unavailable =
+            |message: &str| (ErrorCode::ControlTransferUnavailable, message.to_owned());
+        let id = SplintId::new();
+        let mut c = ControllerState::default();
+
+        assert_eq!(
+            reason(c.request_transfer(20, id, 4, None).unwrap_err()),
+            unavailable(splinterm_protocol::NO_CONTROLLER_TO_TRANSFER)
+        );
+        assert_eq!(
+            reason(c.force_transfer(20, id, 4, None).unwrap_err()),
+            unavailable(splinterm_protocol::NO_CONTROLLER_TO_TRANSFER)
+        );
+
+        c.acquire(10, id, 4, None).unwrap();
+        assert_eq!(
+            reason(c.acquire(30, id, 4, None).unwrap_err()),
+            (
+                ErrorCode::ControllerUnavailable,
+                splinterm_protocol::SPLINT_ALREADY_CONTROLLED.to_owned(),
+            )
+        );
+        // A lease on another incarnation is no controller of this one.
+        assert_eq!(
+            reason(c.force_transfer(20, id, 5, None).unwrap_err()),
+            unavailable(splinterm_protocol::NO_CONTROLLER_TO_TRANSFER)
+        );
+
+        c.request_transfer(20, id, 4, None).unwrap();
+        assert_eq!(
+            reason(c.request_transfer(21, id, 4, None).unwrap_err()),
+            unavailable(splinterm_protocol::CONTROL_TRANSFER_PENDING)
+        );
+
+        let other = SplintId::new();
+        c.acquire(40, other, 2, None).unwrap();
+        assert_eq!(
+            reason(c.request_transfer(10, other, 2, None).unwrap_err()),
+            unavailable(splinterm_protocol::TRANSFER_REQUESTER_CONTROLS)
+        );
     }
 
     #[test]

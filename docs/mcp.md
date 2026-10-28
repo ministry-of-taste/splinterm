@@ -391,6 +391,24 @@ The controller remains bound to the grant that authorized it, so revocation also
 releases it. Omitting `takeover` preserves ordinary non-disruptive acquisition
 behavior.
 
+A control error says what to do next, in fixed adapter text:
+
+- `acquire_control` on a Splint that already has a controller fails with
+  `controller_unavailable`: ask for it with `request_control_transfer`, or take
+  it with `takeover: true`.
+- `request_control_transfer` waits up to 15 seconds for the pane's controller.
+  In a Splinterm Window, the person accepts with Ctrl+Shift+Y in that pane and
+  denies with Ctrl+Shift+N (the default keys). A denied or cancelled transfer
+  fails with `control_transfer_unavailable`, and an unanswered one with
+  `timeout`. Each says to take the pane with `takeover: true` if the grant
+  allows it, or to ask again and have the person press Ctrl+Shift+Y.
+- A transfer or takeover when nobody controls the Splint fails with
+  `control_transfer_unavailable` and says to call `acquire_control` without
+  `takeover`. A transfer while another one waits for an answer says to call
+  again once it ends.
+- A transfer or takeover no grant covers fails with `unauthorized` and says to
+  ask for Look and type with `request_lair_access`.
+
 ### Easy agent access
 
 > **Status:** implemented for 0.2. The contract is fixed by

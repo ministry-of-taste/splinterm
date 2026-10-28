@@ -26,9 +26,36 @@ use crate::{dispatch, resources::ResourceRegistry};
 const SCHEMA: &str = "splinterm.mcp.v2";
 const MAXIMUM_CONTROL_HANDLES: usize = 8;
 const TRANSFER_LIFETIME: Duration = Duration::from_secs(16);
+/// How long splinterd waits for a transfer's answer before it ends the
+/// transfer and closes the requester's connection (its
+/// `CONTROL_TRANSFER_TIMEOUT`).
+const DAEMON_TRANSFER_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// How many handles that expired with their daemon connection are remembered,
 /// so using one says why it no longer works (Plan 0061 M3.12b).
 const MAXIMUM_EXPIRED_HANDLES: usize = 32;
+
+/// A transfer that ended without control, then what to do next (Plan 0067
+/// M4). A grant that let the agent ask also covers a takeover, but a policy
+/// rule or development access may not, so both next steps are given.
+macro_rules! after_unanswered_transfer {
+    ($what:literal) => {
+        concat!(
+            $what,
+            "; to take the pane without asking, call acquire_control with takeover: true (needs a Look and type or Manage grant; request_lair_access asks for one). Or call request_control_transfer again and ask the person to press Ctrl+Shift+Y (the default key; Ctrl+Shift+N denies) in that pane within 15 seconds"
+        )
+    };
+}
+
+const TRANSFER_DENIED: &str =
+    after_unanswered_transfer!("the pane's controller denied the transfer");
+const TRANSFER_CANCELLED: &str = after_unanswered_transfer!(
+    "the transfer was cancelled before an answer, as when control of the pane changed"
+);
+const TRANSFER_TIMED_OUT: &str =
+    after_unanswered_transfer!("nobody answered the transfer within 15 seconds");
+/// A transfer request or takeover no grant covers (Plan 0067 M4).
+const TAKEOVER_NEEDS_GRANT: &str = "this needs a Look and type or Manage grant for this Splint's Lair; call request_lair_access with level look_and_type";
 
 #[derive(Debug, Clone)]
 struct Metadata {
@@ -305,7 +332,15 @@ impl ControlRegistry {
                 modes: modes.clone(),
             }
         };
-        let response = request(&mut connection, control_request, cancellation).await?;
+        let response = request(&mut connection, control_request, cancellation)
+            .await
+            .map_err(|failure| {
+                if takeover {
+                    needs_takeover_grant(failure)
+                } else {
+                    failure
+                }
+            })?;
         let Response::ControlGranted {
             controller_id,
             lair_id,
@@ -382,6 +417,9 @@ impl ControlRegistry {
         } else {
             None
         };
+        // Taken before the request, so it is never later than splinterd's
+        // own transfer timer.
+        let requested_at = tokio::time::Instant::now();
         let response = request(
             &mut requester,
             Request::RequestControlTransfer {
@@ -391,7 +429,8 @@ impl ControlRegistry {
             },
             cancellation,
         )
-        .await?;
+        .await
+        .map_err(needs_takeover_grant)?;
         let Response::ControlTransferPending {
             transfer_id,
             lair_id,
@@ -417,6 +456,7 @@ impl ControlRegistry {
                     subscription_id,
                     transfer_id,
                     metadata,
+                    requested_at,
                     cancellation,
                 )
                 .await;
@@ -448,6 +488,7 @@ impl ControlRegistry {
         subscription_id: u64,
         transfer_id: u64,
         metadata: Metadata,
+        requested_at: tokio::time::Instant,
         cancellation: &CancellationToken,
     ) -> Result<Value, dispatch::DispatchFailure> {
         let resolution = tokio::time::timeout(TRANSFER_LIFETIME, async {
@@ -461,7 +502,7 @@ impl ControlRegistry {
                         ));
                     }
                     frame = requester.next_server_frame() => frame
-                        .map_err(|error| dispatch::map_client_error(&error))?,
+                        .map_err(|error| ended_transfer_failure(&error, requested_at.elapsed()))?,
                 };
                 if let ServerFrame::Event {
                     subscription_id: event_subscription,
@@ -481,19 +522,10 @@ impl ControlRegistry {
             }
         })
         .await
-        .map_err(|_| {
-            dispatch::DispatchFailure::new(
-                "timeout",
-                "the control transfer decision timed out",
-                true,
-            )
-        })??;
-        let (ControlTransferOutcome::Granted, Some(controller_id)) = resolution else {
-            return Err(dispatch::DispatchFailure::new(
-                "control_transfer_unavailable",
-                "the graphical controller denied or cancelled the transfer",
-                true,
-            ));
+        .map_err(|_| transfer_timed_out())??;
+        let controller_id = match resolution {
+            (ControlTransferOutcome::Granted, Some(controller_id)) => controller_id,
+            (outcome, _) => return Err(unanswered_transfer(outcome)),
         };
         let handle = self
             .insert_controller(requester, controller_id, metadata.clone())
@@ -1424,6 +1456,46 @@ fn stale_handle() -> dispatch::DispatchFailure {
     )
 }
 
+/// A transfer request or takeover refused as unauthorized says which grant
+/// it needs (Plan 0067 M4); any other failure passes through.
+fn needs_takeover_grant(failure: dispatch::DispatchFailure) -> dispatch::DispatchFailure {
+    if failure.code == "unauthorized" {
+        dispatch::DispatchFailure::new("unauthorized", TAKEOVER_NEEDS_GRANT, false)
+    } else {
+        failure
+    }
+}
+
+/// The failure for a requested transfer that ended without control.
+fn unanswered_transfer(outcome: ControlTransferOutcome) -> dispatch::DispatchFailure {
+    match outcome {
+        ControlTransferOutcome::Denied => {
+            dispatch::DispatchFailure::new("control_transfer_unavailable", TRANSFER_DENIED, true)
+        }
+        ControlTransferOutcome::TimedOut => transfer_timed_out(),
+        // A grant without a controller ends like a cancel.
+        ControlTransferOutcome::Cancelled | ControlTransferOutcome::Granted => {
+            dispatch::DispatchFailure::new("control_transfer_unavailable", TRANSFER_CANCELLED, true)
+        }
+    }
+}
+
+fn transfer_timed_out() -> dispatch::DispatchFailure {
+    dispatch::DispatchFailure::new("timeout", TRANSFER_TIMED_OUT, true)
+}
+
+/// The failure for a requested transfer whose connection failed while it
+/// waited `waited`. splinterd ends an unanswered transfer by closing the
+/// requester's connection, so a close once its timer has run is that
+/// timeout, not a lost connection.
+fn ended_transfer_failure(error: &anyhow::Error, waited: Duration) -> dispatch::DispatchFailure {
+    if is_connection_loss(error) && waited >= DAEMON_TRANSFER_TIMEOUT {
+        transfer_timed_out()
+    } else {
+        dispatch::map_client_error(error)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1434,7 +1506,9 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use splinterm_protocol::{ClientFrame, ClientRole, ServerFrame, ServerLimits, encode_frame};
+    use splinterm_protocol::{
+        ClientFrame, ClientRole, ErrorCode, ProtocolError, ServerFrame, ServerLimits, encode_frame,
+    };
 
     use super::*;
 
@@ -2233,5 +2307,299 @@ mod tests {
     async fn cancelled_handled_input_and_resize_cleanup_without_rollback_claims() {
         cancelled_handled_action("splinterm.input").await;
         cancelled_handled_action("splinterm.resize").await;
+    }
+
+    /// Plan 0067 M4: a transfer that ends without control names the
+    /// takeover, the accept key, and the grant to ask for.
+    #[test]
+    fn an_unanswered_transfer_says_the_next_step() {
+        let failure = |outcome| {
+            let mapped = unanswered_transfer(outcome);
+            (mapped.code, mapped.message, mapped.retryable)
+        };
+        assert_eq!(
+            failure(ControlTransferOutcome::Denied),
+            ("control_transfer_unavailable", TRANSFER_DENIED, true)
+        );
+        assert_eq!(
+            failure(ControlTransferOutcome::Cancelled),
+            ("control_transfer_unavailable", TRANSFER_CANCELLED, true)
+        );
+        assert_eq!(
+            failure(ControlTransferOutcome::Granted),
+            ("control_transfer_unavailable", TRANSFER_CANCELLED, true)
+        );
+        assert_eq!(
+            failure(ControlTransferOutcome::TimedOut),
+            ("timeout", TRANSFER_TIMED_OUT, true)
+        );
+        for message in [TRANSFER_DENIED, TRANSFER_CANCELLED, TRANSFER_TIMED_OUT] {
+            assert!(message.contains("acquire_control with takeover: true"));
+            assert!(message.contains("press Ctrl+Shift+Y"));
+            assert!(message.contains("request_lair_access"));
+        }
+        assert!(TRANSFER_DENIED.starts_with("the pane's controller denied"));
+    }
+
+    /// splinterd closes the requester's connection when its 15-second timer
+    /// ends the transfer; an earlier close is a lost connection.
+    #[test]
+    fn a_connection_closed_by_the_transfer_timer_is_a_timeout() {
+        let closed = || anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+        let timed_out = ended_transfer_failure(&closed(), DAEMON_TRANSFER_TIMEOUT);
+        assert_eq!(
+            (timed_out.code, timed_out.message),
+            ("timeout", TRANSFER_TIMED_OUT)
+        );
+        let lost = ended_transfer_failure(&closed(), Duration::from_secs(3));
+        assert_eq!(
+            (lost.code, lost.message),
+            ("internal", dispatch::CONNECTION_LOST_DURING_CALL)
+        );
+        let other = ended_transfer_failure(&anyhow::anyhow!("bad frame"), Duration::from_secs(20));
+        assert_eq!(other.code, "internal");
+        assert_ne!(other.message, TRANSFER_TIMED_OUT);
+    }
+
+    #[test]
+    fn only_an_unauthorized_takeover_names_the_grant_it_needs() {
+        let unauthorized = needs_takeover_grant(dispatch::DispatchFailure::new(
+            "unauthorized",
+            "the exact policy scope or resource is not authorized",
+            false,
+        ));
+        assert_eq!(unauthorized.code, "unauthorized");
+        assert_eq!(unauthorized.message, TAKEOVER_NEEDS_GRANT);
+        assert!(!unauthorized.retryable);
+        let other = needs_takeover_grant(stale_handle());
+        assert_eq!(other.message, stale_handle().message);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_denied_external_transfer_says_the_next_step() {
+        let (directory, socket) = socket("denied-xfer");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (lair_id, dojo_id, splint_id) = ids();
+        let daemon = thread::spawn(move || {
+            let mut requester = accept(&listener);
+            let ClientFrame::Request {
+                request_id,
+                request: Request::SubscribeControl { .. },
+                ..
+            } = read_frame(&mut requester)
+            else {
+                panic!("expected control subscription")
+            };
+            write_frame(
+                &mut requester,
+                &ServerFrame::Response {
+                    request_id,
+                    result: Response::ControlSubscribed {
+                        subscription_id: 7,
+                        status: splinterm_protocol::ControlStatus {
+                            splint_id,
+                            incarnation: 2,
+                            controlled: true,
+                            locally_owned: false,
+                        },
+                    },
+                },
+            );
+            let ClientFrame::Request {
+                request_id,
+                request: Request::RequestControlTransfer { .. },
+                ..
+            } = read_frame(&mut requester)
+            else {
+                panic!("expected external transfer request")
+            };
+            write_frame(
+                &mut requester,
+                &ServerFrame::Response {
+                    request_id,
+                    result: Response::ControlTransferPending {
+                        transfer_id: 9,
+                        lair_id,
+                        dojo_id,
+                    },
+                },
+            );
+            write_frame(
+                &mut requester,
+                &ServerFrame::Event {
+                    subscription_id: 7,
+                    sequence: 1,
+                    event: SubscriptionEvent::ControlTransferResolved {
+                        transfer_id: 9,
+                        outcome: ControlTransferOutcome::Denied,
+                        controller_id: None,
+                    },
+                },
+            );
+        });
+
+        let resources = Arc::new(ResourceRegistry::default());
+        let registry = ControlRegistry::new_at(Arc::clone(&resources), &socket);
+        let failure = registry
+            .dispatch(
+                "splinterm.request_control_transfer",
+                &json!({
+                    "splint_id": splint_id.to_string(),
+                    "incarnation": 2,
+                    "modes": ["input"]
+                }),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (failure.code, failure.message),
+            ("control_transfer_unavailable", TRANSFER_DENIED)
+        );
+        registry.shutdown().await;
+        resources.shutdown().await;
+        join(daemon).await;
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A daemon refusal for each control request, and the adapter's answer.
+    async fn refused_control(
+        label: &str,
+        tool: &'static str,
+        takeover: bool,
+        error: ProtocolError,
+    ) -> dispatch::DispatchFailure {
+        let (directory, socket) = socket(label);
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (_, _, splint_id) = ids();
+        let daemon = thread::spawn(move || {
+            let mut requester = accept(&listener);
+            let mut frame = read_frame::<ClientFrame>(&mut requester);
+            if let ClientFrame::Request {
+                request_id,
+                request: Request::SubscribeControl { .. },
+                ..
+            } = frame
+            {
+                write_frame(
+                    &mut requester,
+                    &ServerFrame::Response {
+                        request_id,
+                        result: Response::ControlSubscribed {
+                            subscription_id: 7,
+                            status: splinterm_protocol::ControlStatus {
+                                splint_id,
+                                incarnation: 2,
+                                controlled: true,
+                                locally_owned: false,
+                            },
+                        },
+                    },
+                );
+                frame = read_frame(&mut requester);
+            }
+            let ClientFrame::Request { request_id, .. } = frame else {
+                panic!("expected a control request")
+            };
+            write_frame(
+                &mut requester,
+                &ServerFrame::Error {
+                    request_id: Some(request_id),
+                    error,
+                },
+            );
+        });
+
+        let resources = Arc::new(ResourceRegistry::default());
+        let registry = ControlRegistry::new_at(Arc::clone(&resources), &socket);
+        let failure = registry
+            .dispatch(
+                tool,
+                &json!({
+                    "splint_id": splint_id.to_string(),
+                    "incarnation": 2,
+                    "modes": ["input"],
+                    "takeover": takeover
+                }),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        registry.shutdown().await;
+        resources.shutdown().await;
+        join(daemon).await;
+        std::fs::remove_dir_all(directory).unwrap();
+        failure
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn control_refusals_through_the_registry_say_the_next_step() {
+        let unauthorized = || {
+            ProtocolError::new(
+                ErrorCode::Unauthorized,
+                "no exact persistent policy rule authorizes this request",
+            )
+        };
+        let nobody = refused_control(
+            "nobody-takeover",
+            "splinterm.acquire_control",
+            true,
+            ProtocolError::new(
+                ErrorCode::ControlTransferUnavailable,
+                splinterm_protocol::NO_CONTROLLER_TO_TRANSFER,
+            ),
+        )
+        .await;
+        assert_eq!(nobody.message, dispatch::NOBODY_CONTROLS);
+        let controlled = refused_control(
+            "controlled",
+            "splinterm.acquire_control",
+            false,
+            ProtocolError::new(
+                ErrorCode::ControllerUnavailable,
+                splinterm_protocol::SPLINT_ALREADY_CONTROLLED,
+            ),
+        )
+        .await;
+        assert_eq!(controlled.message, dispatch::ALREADY_CONTROLLED);
+        let pending = refused_control(
+            "pending-xfer",
+            "splinterm.request_control_transfer",
+            false,
+            ProtocolError::new(
+                ErrorCode::ControlTransferUnavailable,
+                splinterm_protocol::CONTROL_TRANSFER_PENDING,
+            ),
+        )
+        .await;
+        assert_eq!(pending.message, dispatch::TRANSFER_ALREADY_PENDING);
+        let takeover = refused_control(
+            "unauth-takeover",
+            "splinterm.acquire_control",
+            true,
+            unauthorized(),
+        )
+        .await;
+        assert_eq!(takeover.message, TAKEOVER_NEEDS_GRANT);
+        let transfer = refused_control(
+            "unauth-xfer",
+            "splinterm.request_control_transfer",
+            false,
+            unauthorized(),
+        )
+        .await;
+        assert_eq!(transfer.message, TAKEOVER_NEEDS_GRANT);
+        // A plain acquire is not a takeover; its refusal stays general.
+        let acquire = refused_control(
+            "unauth-acquire",
+            "splinterm.acquire_control",
+            false,
+            unauthorized(),
+        )
+        .await;
+        assert_eq!(
+            acquire.message,
+            "the exact policy scope or resource is not authorized"
+        );
     }
 }

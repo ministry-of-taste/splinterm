@@ -1110,6 +1110,23 @@ pub const ACCESS_REQUEST_EXPIRED: &str = "the access request expired without an 
 /// passes it on, so the agent knows what to ask for.
 pub const NO_WORKSPACE_GRANT: &str = "no grant or policy covers any workspace; request access to one (MCP: request_lair_access with the Lair in SPLINTERM_LAIR_ID)";
 
+/// The `ControllerUnavailable` reason an acquire gets when the live Splint
+/// already has a controller. The MCP adapter tells it apart by it.
+pub const SPLINT_ALREADY_CONTROLLED: &str = "live Splint already has a controller";
+
+/// The `ControlTransferUnavailable` reason a transfer request or a takeover
+/// gets when nobody controls the live Splint, so there is nothing to
+/// transfer. The MCP adapter tells it apart by it.
+pub const NO_CONTROLLER_TO_TRANSFER: &str = "live Splint has no matching controller";
+
+/// The `ControlTransferUnavailable` reason a transfer request gets while
+/// another transfer of the same Splint waits for an answer.
+pub const CONTROL_TRANSFER_PENDING: &str = "a control transfer of this Splint is already pending";
+
+/// The `ControlTransferUnavailable` reason a transfer request gets from a
+/// connection that already holds a controller lease.
+pub const TRANSFER_REQUESTER_CONTROLS: &str = "this connection already holds a controller lease";
+
 /// The `Unauthorized` reason a terminal approver gets without its session's
 /// controlling terminal on standard input and output.
 pub const CONSENT_APPROVER_NEEDS_TERMINAL: &str =
