@@ -29666,6 +29666,12 @@ mod tests {
             assert_eq!(record.decision, splinterm_protocol::AuditDecision::Allowed);
             assert_eq!(record.reason, "remembered_grant");
         }
+        // The covering grant names no other incarnation: pages and their
+        // continuations for the next one are refused.
+        assert_eq!(
+            scrollback_outcomes(state, peer, splint_id, incarnation + 1).await,
+            refused
+        );
         let entry_id = remembered.entry_id.unwrap();
         assert!(revoke_remembered_grant(state, &entry_id).await.is_some());
         assert_eq!(
@@ -29693,10 +29699,15 @@ mod tests {
 
     /// Plan 0067 M5, from the live probe: a Manage workspace grant closes an
     /// exited Splint and its Dojo. Once something else closed them (as the
-    /// Window of a disposable Lair does), a close names nothing and is
-    /// refused exactly as one naming a resource that never existed: an
-    /// answer of `not_found` would tell a peer without a grant which
-    /// identifiers are unused.
+    /// Window of a disposable Lair does), a close of the gone Splint or Dojo
+    /// is refused exactly like one naming a resource that never existed.
+    ///
+    /// Known follow-up: a resource that exists in a Lair the peer has no
+    /// grant for is refused with another message ("no exact persistent
+    /// policy rule authorizes this request"), and
+    /// `bind_current_terminal_incarnation` answers `not_found` before
+    /// authorization for a Splint with no live process, so both still tell
+    /// existence or liveness apart.
     #[tokio::test]
     async fn a_workspace_grant_closes_exited_splints_until_they_are_gone() {
         use agent_access::{AccessLevel, GrantDuration};
