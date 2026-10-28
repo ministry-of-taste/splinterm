@@ -18,7 +18,6 @@ const REMOTE_SCHEMA_VERSION: u8 = 1;
 const MAX_REMOTE_DOCUMENT_BYTES: usize = 64 * 1024;
 const MAX_REMOTE_DOCUMENT_BYTES_U64: u64 = 64 * 1024;
 const MAX_REMOTE_PROFILES: usize = 64;
-const MAX_PROFILE_NAME_BYTES: usize = 64;
 const MAX_HOST_BYTES: usize = 255;
 const MAX_PATH_BYTES: usize = 4 * 1024;
 const MAX_USER_BYTES: usize = 64;
@@ -371,14 +370,9 @@ fn has_unsafe_text(value: &str) -> bool {
 }
 
 fn validate_profile_name(name: &str) -> Result<()> {
-    if name.is_empty()
-        || name.len() > MAX_PROFILE_NAME_BYTES
-        || name.starts_with('-')
-        || has_unsafe_text(name)
-        || !name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-    {
+    // The protocol owns the rule, so a consent origin and a configured
+    // profile can never disagree on what a usable name is.
+    if !splinterm_protocol::usable_remote_profile_name(name) {
         bail!("remote profile name {name:?} is invalid");
     }
     Ok(())

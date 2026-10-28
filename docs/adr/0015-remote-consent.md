@@ -39,7 +39,11 @@ at the same time:
   the person in their own terminal on the daemon host, registers with
   `SubscribeConsentOffers { kind: terminal }`.
 
-The first valid answer from any route settles the request. The daemon then
+Every eligible responder gets the prompt. A daemon holds at most 16
+responders.
+
+Each responder connection gets its own offer, with its own offer ID and nonce.
+The first valid answer from any route consumes the request. The daemon then
 withdraws every other offer (`ConsentOfferWithdrawn` with reason
 `answered_elsewhere`) and kills and reaps the local dialog if it is still
 showing. A route that fails or disconnects drops out, and the others keep
@@ -49,25 +53,44 @@ at once with `consent_unavailable`, as today.
 
 A remote Window shows the prompt in its own dialog child, which keeps every
 rule of the trusted dialog (a separate process, never focused on map, inert
-keys until engaged, an arming delay, default deny). The Window sets the
-prompt's origin itself, from its own endpoint: the SSH profile name and the
-daemon's hostname. The daemon never supplies an origin, so a remote daemon
-cannot produce a dialog that looks local.
+keys until engaged, an arming delay, default deny).
+
+### Origin
+
+The process that launches the dialog sets the prompt's origin, never the
+offer. The daemon's own prompts are `local`. A remote Window sets the `remote`
+kind and its own SSH profile name from its endpoint, and adds the remote
+daemon's self-reported `Hello` hostname for display only. A remote daemon can
+therefore claim any hostname, but it can never produce a local origin. A
+Window that cannot build a valid remote origin skips or denies the offer; it
+never falls back to local.
+
+### Untrusted offer strings
+
+Every string an offer carries (the requester path, the agent name, the
+workspace name, each shared-identity path) is chosen by an agent, its host, or
+a remote daemon, and is untrusted. The protocol bounds its length only. Every
+responder, the dialog and the terminal approver alike, neutralises C0 and C1
+controls, ESC, and bidi and invisible formatting characters before display,
+exactly as the consent dialog and the **Agent access** list escape them
+today, and quotes names so they cannot pass for prompt text.
 
 ### Binding
 
 An offer (`ConsentOffered`) carries the daemon generation, an offer ID that is
 never reused, the agent-visible request ID, a fresh 32-byte random nonce, the
-seconds left to answer, and the prompt content without the dialog capability
-or origin. An answer (`AnswerConsentOffer`) is accepted only on the connection
-the offer was sent on, only while that offer is outstanding, and only when the
-generation and nonce match; a grant must name a duration the offered prompt
-offers. Everything else fails with `NotFound` and grants nothing. A valid answer
-commits through the same re-checks as a local answer: the request is still
-pending, the requester is alive with the same identity, the workspace exists,
-and no handoff fence is up. The audit records which route answered.
+seconds left to answer, and the prompt content without the dialog capability,
+the origin, or the countdown. An answer (`AnswerConsentOffer`) is accepted
+only on the connection that offer was sent to, only while that offer is
+outstanding, and only when the generation and nonce match; a grant must name a
+duration the offered prompt offers. Everything else fails with `NotFound` and
+grants nothing. A valid answer commits through the same re-checks as a local
+answer: the request is still pending, the requester is alive with the same
+identity, the workspace exists, and no handoff fence is up. The audit records
+the subscription and the answer, and which route answered.
 
-Offers and responders live in memory only. A daemon handoff fences the
+Offers and responders live in memory only. Subscribing and answering are
+fenced during a daemon handoff (`HandoffInProgress`). The fence ends the
 request, withdraws its offers (`fenced`), and ends the responders, which
 subscribe again on the new daemon.
 
@@ -100,8 +123,7 @@ decision.
 
 The private protocol moves to version 45:
 
-- requests `SubscribeConsentOffers { kind, presence }`,
-  `SetConsentPresence { presence }`, and
+- requests `SubscribeConsentOffers { kind }` and
   `AnswerConsentOffer { daemon_generation, offer_id, nonce, decision }`;
 - responses `ConsentOffersSubscribed { subscription_id }` and
   `ConsentOfferAnswered`;
@@ -111,16 +133,14 @@ The private protocol moves to version 45:
   `answered_elsewhere`;
 - the dialog prompt gains `respond_within_seconds` (at most the 120-second
   pending-request lifetime; zero shows no countdown) and `origin` (`local`, or
-  `remote` with a profile and hostname), both defaulted so older prompts
-  decode unchanged;
-- audit operations `subscribe_consent_offers`, `answer_consent_offer`, and
-  `withdraw_consent_offer`.
+  `remote` with a profile and an optional hostname), both defaulted so older
+  prompts decode unchanged;
+- audit operations `subscribe_consent_offers` and `answer_consent_offer`. A
+  withdrawal is not audited on its own: it always follows an audited event
+  (a cancel, an expiry, or the winning answer).
 
-A Window's presence (whether it is focused, its active Lair, and at most 32
-open Lairs) is display state for the daemon only. It is never an identity or
-an authority, and it is never shown to agents. There is no Hello capability
-bit: negotiation is exact-version, and support is opt-in by subscribing. MCP
-gains no tools or error codes.
+There is no Hello capability bit: negotiation is exact-version, and support is
+opt-in by subscribing. MCP gains no tools or error codes.
 
 ## Consequences
 
@@ -130,13 +150,20 @@ gains no tools or error codes.
   and approvers get the same prompt in parallel.
 - No relay connection gains trusted-UI identity, and no public surface (MCP or
   the machine CLI) answers a prompt.
-- **Residual risk.** A same-user process that deliberately escapes the Splint
-  and requester process trees (for example with `systemd-run --user`, or
-  through `ssh localhost`) can register as a responder, see every workspace
-  prompt, and answer it, Always included. Such a process can already edit
-  `policy.json` or the remembered-grant store, so this is the same class of
-  risk, not a new one. Consent bounds cooperating agents; it is not a sandbox
-  (ADR 0014). A compromised relay or remote account can likewise forge
-  answers and show remote-labelled dialogs, but it already controls that
-  account and everything its Windows show.
+- **Residual risk.**
+  - A same-user process that deliberately escapes the Splint and requester
+    process trees (for example with `systemd-run --user`, or through
+    `ssh localhost`) can register as a responder, see every workspace prompt,
+    and answer it, Always included.
+  - Any holder of the user's SSH credentials for the daemon host, including an
+    agent on another host using the user's key, gets an sshd-spawned relay
+    that passes the process-tree check, and can likewise see and answer every
+    prompt, Always included. The net change from today is none: that key
+    already gives a shell on the daemon host.
+  - Either can already edit `policy.json` or the remembered-grant store, so
+    this is the same class of risk, not a new one. Consent bounds cooperating
+    agents; it is not a sandbox (ADR 0014).
+  - A compromised relay or remote account can forge answers and show
+    remote-labelled dialogs, but it already controls that account and
+    everything its Windows show.
 - Every host connected by a remote Window must run protocol 45 together.

@@ -66,11 +66,6 @@ pub const MAX_CONSENT_RESPOND_WITHIN_SECONDS: u64 = PENDING_ACCESS_LIFETIME_SECO
 /// Bytes in one consent offer nonce (ADR 0015). The fixed-size wire array
 /// bounds decoding.
 pub const CONSENT_OFFER_NONCE_BYTES: usize = 32;
-/// The most open Lairs one consent responder's presence names.
-pub const MAX_CONSENT_PRESENCE_LAIRS: usize = 32;
-/// The longest remote profile name a consent prompt's origin names, in
-/// bytes: the remote profile-name limit.
-pub const MAX_CONSENT_ORIGIN_PROFILE_BYTES: usize = 64;
 /// The longest host-reported agent name a request may carry, in characters.
 /// Display data only; never an identity.
 pub const MAX_AGENT_NAME_CHARS: usize = 128;
@@ -268,6 +263,23 @@ pub enum ClientFrame {
 
 /// Maximum UTF-8 byte length of informational daemon hostname metadata.
 pub const MAX_DAEMON_HOSTNAME_BYTES: usize = 255;
+
+/// The longest remote profile name, in bytes.
+pub const MAX_REMOTE_PROFILE_NAME_BYTES: usize = 64;
+
+/// Whether `name` is a usable remote profile name: 1 to
+/// [`MAX_REMOTE_PROFILE_NAME_BYTES`] bytes of ASCII letters, digits, `.`,
+/// `_`, or `-`, not starting with `-` (so it can never read as an SSH
+/// option). Such a name has no control, whitespace, or bidi characters.
+#[must_use]
+pub fn usable_remote_profile_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_REMOTE_PROFILE_NAME_BYTES
+        && !name.starts_with('-')
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
 
 /// Accept only bounded hostname-like text. Reject controls, whitespace, formatting
 /// and bidi characters rather than attempting to repair an untrusted identity.
@@ -1043,25 +1055,18 @@ pub enum Request {
     /// [`SubscriptionEvent::ConsentOfferWithdrawn`] when one ends unanswered.
     ///
     /// A [`ConsentResponderKind::Window`] responder is a remote Window's
-    /// graphical relay connection and may carry its `presence`; a
-    /// [`ConsentResponderKind::Terminal`] responder is the approver command
-    /// from the installed client and carries none. Automation is never a
-    /// responder. Responder status belongs to this connection only.
+    /// graphical relay connection; a [`ConsentResponderKind::Terminal`]
+    /// responder is the approver command from the installed client.
+    /// Automation is never a responder. Responder status belongs to this
+    /// connection only.
     SubscribeConsentOffers {
         kind: ConsentResponderKind,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        presence: Option<ConsentPresence>,
-    },
-    /// Replaces a Window responder's presence on its subscribed connection.
-    /// Presence is never visible to agents or to `ReadGraphicalFocus`.
-    SetConsentPresence {
-        presence: ConsentPresence,
     },
     /// Answers one [`ConsentOffer`] sent on this connection, echoing its
-    /// generation, id, and nonce. The first valid answer from any route
-    /// settles the request; every other answer, a duplicate, a late answer,
-    /// or one on another connection fails with [`ErrorCode::NotFound`] and
-    /// grants nothing.
+    /// generation, id, and nonce; see [`validate_consent_answer`]. The first
+    /// valid answer from any route settles the request; every other answer,
+    /// a duplicate, a late answer, or one on another connection fails with
+    /// [`ErrorCode::NotFound`] and grants nothing.
     AnswerConsentOffer {
         daemon_generation: u64,
         offer_id: u64,
@@ -1070,40 +1075,19 @@ pub enum Request {
     },
 }
 
-impl Request {
-    /// Checks the protocol bounds of a consent responder request
-    /// ([`Request::SubscribeConsentOffers`], [`Request::SetConsentPresence`],
-    /// [`Request::AnswerConsentOffer`]); every other request passes.
-    ///
-    /// # Errors
-    /// Returns `InvalidArgument` for a terminal responder that carries a
-    /// presence, a presence naming more than [`MAX_CONSENT_PRESENCE_LAIRS`]
-    /// Lairs, or an answer with a zero generation or offer id.
-    pub fn validate_consent_responder(&self) -> Result<(), ProtocolError> {
-        match self {
-            Self::SubscribeConsentOffers {
-                kind: ConsentResponderKind::Terminal,
-                presence: Some(_),
-            } => Err(ProtocolError::new(
-                ErrorCode::InvalidArgument,
-                "a terminal consent responder carries no presence",
-            )),
-            Self::SubscribeConsentOffers {
-                presence: Some(presence),
-                ..
-            }
-            | Self::SetConsentPresence { presence } => presence.validate(),
-            Self::AnswerConsentOffer {
-                daemon_generation,
-                offer_id,
-                ..
-            } if *daemon_generation == 0 || *offer_id == 0 => Err(ProtocolError::new(
-                ErrorCode::InvalidArgument,
-                "a consent answer names a zero generation or offer",
-            )),
-            _ => Ok(()),
-        }
+/// Validates one [`Request::AnswerConsentOffer`]: a nonzero generation and
+/// offer id.
+///
+/// # Errors
+/// Returns `InvalidArgument` when either is zero.
+pub fn validate_consent_answer(daemon_generation: u64, offer_id: u64) -> Result<(), ProtocolError> {
+    if daemon_generation == 0 || offer_id == 0 {
+        return Err(ProtocolError::new(
+            ErrorCode::InvalidArgument,
+            "a consent answer names a zero generation or offer",
+        ));
     }
+    Ok(())
 }
 
 /// Who answers a [`Request::SubscribeConsentOffers`] responder's offers.
@@ -1114,33 +1098,6 @@ pub enum ConsentResponderKind {
     Window,
     /// The `splinterm approvals` command in the person's own terminal.
     Terminal,
-}
-
-/// What a Window responder shows: display state the daemon may use to
-/// order offers, never an identity or an authority.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ConsentPresence {
-    pub focused: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub active_lair: Option<LairId>,
-    /// At most [`MAX_CONSENT_PRESENCE_LAIRS`].
-    #[serde(default, deserialize_with = "deserialize_presence_lairs")]
-    pub open_lairs: Vec<LairId>,
-}
-
-impl ConsentPresence {
-    /// # Errors
-    /// Returns `InvalidArgument` when it names more than
-    /// [`MAX_CONSENT_PRESENCE_LAIRS`] open Lairs.
-    pub fn validate(&self) -> Result<(), ProtocolError> {
-        if self.open_lairs.len() > MAX_CONSENT_PRESENCE_LAIRS {
-            return Err(ProtocolError::new(
-                ErrorCode::InvalidArgument,
-                "consent presence names too many open Lairs",
-            ));
-        }
-        Ok(())
-    }
 }
 
 /// One single-use, offer-bound consent offer nonce (ADR 0015).
@@ -2434,7 +2391,6 @@ pub enum AuditOperation {
     AcknowledgeHandoffPrepare,
     SubscribeConsentOffers,
     AnswerConsentOffer,
-    WithdrawConsentOffer,
 }
 
 impl AuditOperation {
@@ -2492,7 +2448,6 @@ impl AuditOperation {
             Self::AcknowledgeHandoffPrepare => "acknowledge_handoff_prepare",
             Self::SubscribeConsentOffers => "subscribe_consent_offers",
             Self::AnswerConsentOffer => "answer_consent_offer",
-            Self::WithdrawConsentOffer => "withdraw_consent_offer",
         }
     }
 }
@@ -2804,13 +2759,25 @@ pub fn shared_identity_line(path: &str) -> String {
     format!("Any program that runs {path} shares this access.")
 }
 
+/// One trusted consent dialog's prompt, as its launcher sends it over the
+/// private descriptor.
+///
+/// Every string in the content (`requester`, `agent_name`, a Lair target's
+/// `lair_name`, each duration's `shared_by`) is untrusted: an agent, its
+/// host, or a remote daemon chose it. Validation bounds its length only.
+/// Every responder that shows it, the dialog and the terminal approver
+/// alike, must neutralise C0 and C1 controls, ESC, and bidi and invisible
+/// formatting characters before display, exactly as the consent dialog and
+/// the **Agent access** list escape them today (`splinterm::frontend`'s
+/// `shown_name`), and quote names so they cannot pass for prompt text.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConsentPrompt {
     pub capability: Vec<u8>,
+    /// Untrusted display text; see the type documentation.
     pub requester: String,
     pub requester_pid: u32,
     pub requester_uid: u32,
-    /// The host-reported agent name: display data only.
+    /// The host-reported agent name: untrusted display data only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_name: Option<String>,
     pub target: ConsentTarget,
@@ -2827,14 +2794,19 @@ pub struct ConsentPrompt {
     /// [`MAX_CONSENT_RESPOND_WITHIN_SECONDS`]; zero shows no countdown.
     #[serde(default)]
     pub respond_within_seconds: u64,
-    /// Where the request comes from. The process that launches the dialog
-    /// sets it: the daemon for its own prompts, and a remote Window from its
-    /// own endpoint, never from the offer it answers (ADR 0015).
+    /// Where the request comes from; see [`ConsentOrigin`] for who sets it.
     #[serde(default)]
     pub origin: ConsentOrigin,
 }
 
 /// Where a consent prompt's request comes from (ADR 0015).
+///
+/// The process that launches the dialog sets it, never the offer it
+/// answers. The daemon's own prompts are [`ConsentOrigin::Local`]. A remote
+/// Window sets [`ConsentOrigin::Remote`] and its SSH `profile` from its own
+/// endpoint, so a remote daemon can claim any hostname but can never
+/// produce a Local origin. A Window that cannot build a valid Remote origin
+/// skips or denies the offer; it never falls back to Local.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ConsentOrigin {
@@ -2843,20 +2815,21 @@ pub enum ConsentOrigin {
     Local,
     /// The daemon a remote Window reaches through its SSH profile.
     Remote {
-        /// A remote profile name: at most
-        /// [`MAX_CONSENT_ORIGIN_PROFILE_BYTES`] ASCII letters, digits, `.`,
-        /// `_`, or `-`, not starting with `-`.
+        /// The Window's own SSH profile name, as
+        /// [`usable_remote_profile_name`] accepts it.
         profile: String,
-        /// The remote daemon's hostname, as [`usable_daemon_hostname`]
-        /// accepts it.
-        daemon_hostname: String,
+        /// The remote daemon's self-reported `Hello` hostname, as
+        /// [`usable_daemon_hostname`] accepts it: display only, never an
+        /// identity, and absent when the daemon reported none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        daemon_hostname: Option<String>,
     },
 }
 
 impl ConsentOrigin {
     /// # Errors
-    /// A remote origin whose profile is not a usable remote profile name or
-    /// whose hostname is not a usable daemon hostname.
+    /// A remote origin whose profile is not a usable remote profile name, or
+    /// whose hostname, when present, is not a usable daemon hostname.
     pub fn validate(&self) -> Result<(), &'static str> {
         let Self::Remote {
             profile,
@@ -2865,16 +2838,13 @@ impl ConsentOrigin {
         else {
             return Ok(());
         };
-        let usable_profile = !profile.is_empty()
-            && profile.len() <= MAX_CONSENT_ORIGIN_PROFILE_BYTES
-            && !profile.starts_with('-')
-            && profile
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
-        if !usable_profile {
+        if !usable_remote_profile_name(profile) {
             return Err("consent origin profile is not a usable remote profile name");
         }
-        if usable_daemon_hostname(daemon_hostname).is_none() {
+        if daemon_hostname
+            .as_deref()
+            .is_some_and(|hostname| usable_daemon_hostname(hostname).is_none())
+        {
             return Err("consent origin hostname is not a usable daemon hostname");
         }
         Ok(())
@@ -2883,14 +2853,18 @@ impl ConsentOrigin {
 
 /// A [`ConsentPrompt`]'s content as a [`ConsentOffer`] carries it to a
 /// consent responder: without the capability, which the responder's own
-/// dialog mints; the origin, which the responder takes from its own
-/// endpoint; and the countdown, which the offer carries.
+/// dialog mints; the origin, which the responder sets itself; and the
+/// countdown, which the offer carries.
+///
+/// Its strings are untrusted exactly as [`ConsentPrompt`]'s are, and every
+/// responder neutralises them the same way before display.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OfferedConsentPrompt {
+    /// Untrusted display text; see [`ConsentPrompt`].
     pub requester: String,
     pub requester_pid: u32,
     pub requester_uid: u32,
-    /// The host-reported agent name: display data only.
+    /// The host-reported agent name: untrusted display data only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_name: Option<String>,
     pub target: ConsentTarget,
@@ -3697,13 +3671,6 @@ where
     D: serde::Deserializer<'de>,
 {
     deserialize_bounded_vec::<D, _, MAX_HANDOFF_BLOCKING_REASONS>(deserializer)
-}
-
-fn deserialize_presence_lairs<'de, D>(deserializer: D) -> Result<Vec<LairId>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    deserialize_bounded_vec::<D, _, MAX_CONSENT_PRESENCE_LAIRS>(deserializer)
 }
 
 fn deserialize_reported_lairs<'de, D>(deserializer: D) -> Result<Vec<LairId>, D::Error>
@@ -5534,7 +5501,6 @@ mod tests {
             AuditOperation::AcknowledgeHandoffPrepare,
             AuditOperation::SubscribeConsentOffers,
             AuditOperation::AnswerConsentOffer,
-            AuditOperation::WithdrawConsentOffer,
         ] {
             assert_eq!(
                 serde_json::to_string(&operation).unwrap(),
@@ -8576,15 +8542,6 @@ mod tests {
         }
     }
 
-    fn window_presence() -> ConsentPresence {
-        let active = LairId::new();
-        ConsentPresence {
-            focused: true,
-            active_lair: Some(active),
-            open_lairs: vec![active, LairId::new()],
-        }
-    }
-
     fn round_trip_request(request: &Request) -> serde_json::Value {
         let value = serde_json::to_value(request).unwrap();
         assert_eq!(
@@ -8606,42 +8563,23 @@ mod tests {
 
     #[test]
     fn consent_responder_requests_round_trip() {
-        let window = Request::SubscribeConsentOffers {
-            kind: ConsentResponderKind::Window,
-            presence: Some(window_presence()),
-        };
-        let value = round_trip_request(&window);
-        assert_eq!(value["type"], "subscribe_consent_offers");
-        assert_eq!(value["kind"], "window");
-        assert_eq!(value["presence"]["focused"], true);
-        assert_eq!(window.validate_consent_responder(), Ok(()));
-
-        // A terminal approver sends no presence, and the field is omitted.
-        let terminal = Request::SubscribeConsentOffers {
-            kind: ConsentResponderKind::Terminal,
-            presence: None,
-        };
-        let value = round_trip_request(&terminal);
-        assert_eq!(
-            value,
-            serde_json::json!({"type": "subscribe_consent_offers", "kind": "terminal"})
-        );
-        assert_eq!(terminal.validate_consent_responder(), Ok(()));
-
-        let presence = Request::SetConsentPresence {
-            presence: ConsentPresence::default(),
-        };
-        let value = round_trip_request(&presence);
-        assert_eq!(value["type"], "set_consent_presence");
-        assert!(value["presence"].get("active_lair").is_none());
-        // An empty presence decodes without its optional fields.
-        assert_eq!(
+        for (kind, name) in [
+            (ConsentResponderKind::Window, "window"),
+            (ConsentResponderKind::Terminal, "terminal"),
+        ] {
+            let value = round_trip_request(&Request::SubscribeConsentOffers { kind });
+            assert_eq!(
+                value,
+                serde_json::json!({"type": "subscribe_consent_offers", "kind": name})
+            );
+        }
+        // An unknown responder kind never decodes.
+        assert!(
             serde_json::from_value::<Request>(serde_json::json!({
-                "type": "set_consent_presence",
-                "presence": {"focused": false},
+                "type": "subscribe_consent_offers",
+                "kind": "automation",
             }))
-            .unwrap(),
-            presence
+            .is_err()
         );
 
         for decision in [
@@ -8663,7 +8601,7 @@ mod tests {
                 serde_json::json!(vec![0xa5_u8; CONSENT_OFFER_NONCE_BYTES]),
                 "the nonce keeps the plain fixed-size array wire shape"
             );
-            assert_eq!(answer.validate_consent_responder(), Ok(()));
+            assert_eq!(validate_consent_answer(3, 7), Ok(()));
         }
     }
 
@@ -8859,7 +8797,7 @@ mod tests {
         remote.respond_within_seconds = MAX_CONSENT_RESPOND_WITHIN_SECONDS;
         remote.origin = ConsentOrigin::Remote {
             profile: "neuromancer".to_owned(),
-            daemon_hostname: "neuromancer.lan".to_owned(),
+            daemon_hostname: Some("neuromancer.lan".to_owned()),
         };
         assert_eq!(remote.validate(), Ok(()));
         let encoded = serde_json::to_value(&remote).unwrap();
@@ -8893,7 +8831,7 @@ mod tests {
         // the offer's countdown, and its own origin.
         let origin = ConsentOrigin::Remote {
             profile: "loop".to_owned(),
-            daemon_hostname: "localhost".to_owned(),
+            daemon_hostname: Some("localhost".to_owned()),
         };
         let rebuilt =
             offered
@@ -8985,99 +8923,114 @@ mod tests {
         offer.offer_id = 0;
         assert!(offer.validate().is_err());
 
-        // Presence names at most 32 open Lairs, on the wire and in memory.
-        let lair = serde_json::to_value(LairId::new()).unwrap();
-        let presence_with = |count: usize| {
-            serde_json::json!({
-                "type": "set_consent_presence",
-                "presence": {"focused": true, "open_lairs": vec![lair.clone(); count]},
-            })
-        };
-        let decoded =
-            serde_json::from_value::<Request>(presence_with(MAX_CONSENT_PRESENCE_LAIRS)).unwrap();
-        assert_eq!(decoded.validate_consent_responder(), Ok(()));
-        assert!(
-            serde_json::from_value::<Request>(presence_with(MAX_CONSENT_PRESENCE_LAIRS + 1))
-                .is_err()
-        );
-        let crowded = ConsentPresence {
-            focused: false,
-            active_lair: None,
-            open_lairs: (0..=MAX_CONSENT_PRESENCE_LAIRS)
-                .map(|_| LairId::new())
-                .collect(),
-        };
-        for request in [
-            Request::SetConsentPresence {
-                presence: crowded.clone(),
-            },
-            Request::SubscribeConsentOffers {
-                kind: ConsentResponderKind::Window,
-                presence: Some(crowded),
-            },
-            // A terminal approver has no presence.
-            Request::SubscribeConsentOffers {
-                kind: ConsentResponderKind::Terminal,
-                presence: Some(ConsentPresence::default()),
-            },
-            Request::AnswerConsentOffer {
-                daemon_generation: 0,
-                offer_id: 7,
-                nonce: ConsentOfferNonce::new([1; CONSENT_OFFER_NONCE_BYTES]),
-                decision: ConsentDecision::Deny,
-            },
-            Request::AnswerConsentOffer {
-                daemon_generation: 3,
-                offer_id: 0,
-                nonce: ConsentOfferNonce::new([1; CONSENT_OFFER_NONCE_BYTES]),
-                decision: ConsentDecision::Deny,
-            },
-        ] {
+        // An answer names a nonzero generation and offer.
+        assert_eq!(validate_consent_answer(3, 7), Ok(()));
+        for (daemon_generation, offer_id) in [(0, 7), (3, 0), (0, 0)] {
             assert_eq!(
-                request.validate_consent_responder().unwrap_err().code,
+                validate_consent_answer(daemon_generation, offer_id)
+                    .unwrap_err()
+                    .code,
                 ErrorCode::InvalidArgument,
-                "{request:?}"
+                "{daemon_generation} {offer_id}"
             );
         }
-        // Other requests are not consent responder requests.
-        assert_eq!(Request::Ping.validate_consent_responder(), Ok(()));
     }
 
     #[test]
     fn consent_origins_name_a_usable_profile_and_hostname() {
-        let remote = |profile: &str, daemon_hostname: &str| ConsentOrigin::Remote {
+        let remote = |profile: &str, daemon_hostname: Option<&str>| ConsentOrigin::Remote {
             profile: profile.to_owned(),
-            daemon_hostname: daemon_hostname.to_owned(),
+            daemon_hostname: daemon_hostname.map(str::to_owned),
         };
         assert_eq!(ConsentOrigin::Local.validate(), Ok(()));
-        assert_eq!(remote("work-box_2.lan", "neuromancer").validate(), Ok(()));
         assert_eq!(
-            remote(&"p".repeat(MAX_CONSENT_ORIGIN_PROFILE_BYTES), "h").validate(),
+            remote("work-box_2.lan", Some("neuromancer")).validate(),
+            Ok(())
+        );
+        assert_eq!(
+            remote(&"p".repeat(MAX_REMOTE_PROFILE_NAME_BYTES), Some("h")).validate(),
             Ok(())
         );
         let longest_host = "h".repeat(MAX_DAEMON_HOSTNAME_BYTES);
-        assert_eq!(remote("p", &longest_host).validate(), Ok(()));
-        let long_profile = "p".repeat(MAX_CONSENT_ORIGIN_PROFILE_BYTES + 1);
+        assert_eq!(remote("p", Some(&longest_host)).validate(), Ok(()));
+        let long_profile = "p".repeat(MAX_REMOTE_PROFILE_NAME_BYTES + 1);
         let long_host = "h".repeat(MAX_DAEMON_HOSTNAME_BYTES + 1);
         for (profile, daemon_hostname) in [
-            ("", "neuromancer"),
-            ("-oProxyCommand", "neuromancer"),
-            ("two words", "neuromancer"),
-            ("tab\there", "neuromancer"),
-            ("bidi\u{202e}", "neuromancer"),
-            ("caf\u{e9}", "neuromancer"),
-            (long_profile.as_str(), "neuromancer"),
-            ("neuromancer", ""),
-            ("neuromancer", "two words"),
-            ("neuromancer", "line\nbreak"),
-            ("neuromancer", "bidi\u{2066}host"),
-            ("neuromancer", long_host.as_str()),
+            ("", Some("neuromancer")),
+            ("", None),
+            ("-oProxyCommand", None),
+            ("two words", Some("neuromancer")),
+            ("tab\there", Some("neuromancer")),
+            ("bidi\u{202e}", Some("neuromancer")),
+            ("caf\u{e9}", Some("neuromancer")),
+            (long_profile.as_str(), Some("neuromancer")),
+            ("neuromancer", Some("")),
+            ("neuromancer", Some("two words")),
+            ("neuromancer", Some("line\nbreak")),
+            ("neuromancer", Some("bidi\u{2066}host")),
+            ("neuromancer", Some(long_host.as_str())),
         ] {
+            assert_eq!(
+                usable_remote_profile_name(profile),
+                profile == "neuromancer",
+                "{profile:?}"
+            );
             let origin = remote(profile, daemon_hostname);
             assert!(origin.validate().is_err(), "{origin:?}");
             let mut prompt = consent_prompt();
             prompt.origin = origin;
             assert!(prompt.validate().is_err(), "{prompt:?}");
         }
+    }
+
+    #[test]
+    fn a_remote_origin_may_omit_the_hostname_and_is_never_local() {
+        // A daemon that reported no usable hostname still yields a valid
+        // remote origin from the Window's own profile.
+        let profile_only = ConsentOrigin::Remote {
+            profile: "loop".to_owned(),
+            daemon_hostname: None,
+        };
+        assert_eq!(profile_only.validate(), Ok(()));
+        let encoded = serde_json::to_value(&profile_only).unwrap();
+        assert_eq!(
+            encoded,
+            serde_json::json!({"kind": "remote", "profile": "loop"})
+        );
+        assert_eq!(
+            serde_json::from_value::<ConsentOrigin>(encoded).unwrap(),
+            profile_only
+        );
+        let mut prompt = consent_prompt();
+        prompt.origin = profile_only.clone();
+        assert_eq!(prompt.validate(), Ok(()));
+
+        // A remote origin, valid or not, never equals, encodes as, or
+        // decodes to the local one, whatever hostname it claims.
+        let local = serde_json::to_value(ConsentOrigin::Local).unwrap();
+        assert_eq!(local, serde_json::json!({"kind": "local"}));
+        for daemon_hostname in [None, Some("localhost"), Some("this-computer"), Some("")] {
+            let remote = ConsentOrigin::Remote {
+                profile: "loop".to_owned(),
+                daemon_hostname: daemon_hostname.map(str::to_owned),
+            };
+            assert_ne!(remote, ConsentOrigin::Local);
+            let encoded = serde_json::to_value(&remote).unwrap();
+            assert_eq!(encoded["kind"], "remote");
+            assert_ne!(encoded, local);
+            assert_ne!(
+                serde_json::from_value::<ConsentOrigin>(encoded).unwrap(),
+                ConsentOrigin::Local
+            );
+            assert!(!format!("{remote:?}").starts_with("Local"));
+        }
+        // A remote origin without its profile never decodes, and so never
+        // degrades to the local default.
+        assert!(
+            serde_json::from_value::<ConsentOrigin>(serde_json::json!({"kind": "remote"})).is_err()
+        );
+        let mut missing = serde_json::to_value(consent_prompt()).unwrap();
+        missing["origin"] = serde_json::json!({"kind": "remote", "daemon_hostname": "h"});
+        assert!(serde_json::from_value::<ConsentPrompt>(missing).is_err());
     }
 }

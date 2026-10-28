@@ -6593,7 +6593,6 @@ fn trusted_ui_request(request: &Request) -> bool {
             | Request::ClaimHandoffControl { .. }
             | Request::AcknowledgeHandoffPrepare { .. }
             | Request::SubscribeConsentOffers { .. }
-            | Request::SetConsentPresence { .. }
             | Request::AnswerConsentOffer { .. }
     )
 }
@@ -6614,9 +6613,8 @@ fn interactive_bypass(
         && !matches!(
             request,
             Request::SubscribeConsentOffers {
-                kind: ConsentResponderKind::Window,
-                ..
-            } | Request::SetConsentPresence { .. }
+                kind: ConsentResponderKind::Window
+            }
         );
     let remote_human = remote_interactive_client
         && trusted_ui_request(request)
@@ -6631,8 +6629,7 @@ fn interactive_bypass(
                 | Request::AcknowledgeHandoffPrepare { .. }
                 // The approver command runs on the daemon host itself.
                 | Request::SubscribeConsentOffers {
-                    kind: ConsentResponderKind::Terminal,
-                    ..
+                    kind: ConsentResponderKind::Terminal
                 }
         );
     trusted_local || remote_human
@@ -6655,12 +6652,9 @@ fn consent_responder_admitted(
     match request {
         Request::SubscribeConsentOffers {
             kind: ConsentResponderKind::Window,
-            ..
-        }
-        | Request::SetConsentPresence { .. } => remote_interactive_client,
+        } => remote_interactive_client,
         Request::SubscribeConsentOffers {
             kind: ConsentResponderKind::Terminal,
-            ..
         } => trusted_local,
         Request::AnswerConsentOffer { .. } => remote_interactive_client || trusted_local,
         _ => false,
@@ -7877,7 +7871,6 @@ async fn request_policy_resources(
         | Request::CancelAllLairAccessRequests
         | Request::AcknowledgeHandoffPrepare { .. }
         | Request::SubscribeConsentOffers { .. }
-        | Request::SetConsentPresence { .. }
         | Request::AnswerConsentOffer { .. } => Vec::new(),
         Request::ListLairs
         | Request::InspectTopology
@@ -11401,9 +11394,7 @@ async fn handle_authorized_request(
             require_trusted_local_ui(trusted_ui_client, peer)?;
             return Err(handoff_requests::no_pending_handoff_prepare());
         }
-        request @ (Request::SubscribeConsentOffers { .. }
-        | Request::SetConsentPresence { .. }
-        | Request::AnswerConsentOffer { .. }) => {
+        request @ (Request::SubscribeConsentOffers { .. } | Request::AnswerConsentOffer { .. }) => {
             return Err(consent_responder_unsupported(
                 trusted_ui_client,
                 peer,
@@ -11438,7 +11429,14 @@ fn consent_responder_unsupported(
             "this connection cannot be a consent responder of that kind",
         );
     }
-    if let Err(error) = request.validate_consent_responder() {
+    if let Request::AnswerConsentOffer {
+        daemon_generation,
+        offer_id,
+        ..
+    } = request
+        && let Err(error) =
+            splinterm_protocol::validate_consent_answer(*daemon_generation, *offer_id)
+    {
         return error;
     }
     ProtocolError::new(
@@ -12024,12 +12022,12 @@ impl<'a> HandoffAdmission<'a> {
 ///   counts an unused close reads.
 /// - **Admitted:** read-only queries (including the mutation preflight and
 ///   image content for an existing attachment); advisory, connection-owned
-///   state no handoff captures (the published graphical focus, agent status,
-///   and a consent responder's presence, which Plan 0061 D6 and ADR 0015
-///   drop across a handoff); requests that only reduce authority (detach,
-///   release control, revoke a grant); and the handoff preparation and
-///   acknowledgement themselves, so a dry run still reports, a Window can
-///   acknowledge, and the gate answers a second `Execute` itself.
+///   state no handoff captures (the published graphical focus and agent
+///   status, which Plan 0061 D6 drops across a handoff); requests that only
+///   reduce authority (detach, release control, revoke a grant); and the
+///   handoff preparation and acknowledgement themselves, so a dry run still
+///   reports, a Window can acknowledge, and the gate answers a second
+///   `Execute` itself.
 ///
 /// Admitted requests that take the topology permit (topology inspection,
 /// the mutation preflight, grant revocation) wait for the fence to lift.
@@ -12067,8 +12065,7 @@ const fn handoff_fenced(request: &Request) -> bool {
         | Request::RevokeAccessEntry { .. }
         | Request::RevokeAllAccess { .. }
         | Request::PrepareDaemonHandoff { .. }
-        | Request::AcknowledgeHandoffPrepare { .. }
-        | Request::SetConsentPresence { .. } => false,
+        | Request::AcknowledgeHandoffPrepare { .. } => false,
         Request::CreateLair { .. }
         | Request::ClaimHandoffControl { .. }
         | Request::CreateLairAutomation { .. }
@@ -18811,18 +18808,13 @@ mod tests {
         ));
     }
 
-    fn consent_responder_requests() -> [Request; 4] {
+    fn consent_responder_requests() -> [Request; 3] {
         [
             Request::SubscribeConsentOffers {
                 kind: splinterm_protocol::ConsentResponderKind::Window,
-                presence: Some(splinterm_protocol::ConsentPresence::default()),
             },
             Request::SubscribeConsentOffers {
                 kind: splinterm_protocol::ConsentResponderKind::Terminal,
-                presence: None,
-            },
-            Request::SetConsentPresence {
-                presence: splinterm_protocol::ConsentPresence::default(),
             },
             Request::AnswerConsentOffer {
                 daemon_generation: 1,
@@ -18840,12 +18832,11 @@ mod tests {
     /// and automation is never a responder.
     #[test]
     fn consent_responders_are_admitted_only_by_role_and_kind() {
-        let [window, terminal, presence, answer] = consent_responder_requests();
+        let [window, terminal, answer] = consent_responder_requests();
         // (request, installed trusted UI admitted, remote Window admitted)
         for (request, trusted_local, remote) in [
             (&window, false, true),
             (&terminal, true, false),
-            (&presence, false, true),
             (&answer, true, true),
         ] {
             assert!(trusted_ui_request(request), "{request:?}");
@@ -18907,8 +18898,8 @@ mod tests {
             executable_identity::ExecutableIdentity::from_pid(std::process::id())
                 .expect("snapshot test executable"),
         );
-        let [window, terminal, presence, answer] = consent_responder_requests();
-        for request in [&window, &terminal, &presence, &answer] {
+        let [window, terminal, answer] = consent_responder_requests();
+        for request in [&window, &terminal, &answer] {
             // Automation, and a trusted UI role from a program that is not
             // the installed client.
             for (trusted_ui, remote_interactive) in [(false, false), (true, false)] {
@@ -18941,7 +18932,7 @@ mod tests {
 
         // A remote Window reaches the handler, which answers unsupported
         // until the daemon routes prompts to responders.
-        for request in [&window, &presence, &answer] {
+        for request in [&window, &answer] {
             let error = handle_request(request.clone(), &state, &peer, 1, 0, false, true)
                 .await
                 .unwrap_err();
@@ -18952,26 +18943,16 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.code, ErrorCode::Unauthorized);
-        // Out-of-bounds requests fail before the unsupported answer.
-        for request in [
-            Request::SetConsentPresence {
-                presence: splinterm_protocol::ConsentPresence {
-                    focused: true,
-                    active_lair: None,
-                    open_lairs: (0..=splinterm_protocol::MAX_CONSENT_PRESENCE_LAIRS)
-                        .map(|_| LairId::new())
-                        .collect(),
-                },
-            },
-            Request::AnswerConsentOffer {
-                daemon_generation: 0,
-                offer_id: 1,
+        // An out-of-bounds answer fails before the unsupported answer.
+        for (daemon_generation, offer_id) in [(0, 1), (1, 0)] {
+            let request = Request::AnswerConsentOffer {
+                daemon_generation,
+                offer_id,
                 nonce: splinterm_protocol::ConsentOfferNonce::new(
                     [7; splinterm_protocol::CONSENT_OFFER_NONCE_BYTES],
                 ),
                 decision: ConsentDecision::Deny,
-            },
-        ] {
+            };
             let error = handle_request(request, &state, &peer, 1, 0, false, true)
                 .await
                 .unwrap_err();

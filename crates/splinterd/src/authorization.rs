@@ -133,7 +133,6 @@ pub const fn for_request(request: &Request) -> RequestAuthorization {
         // relay connection or the approver command from the installed
         // client, by responder kind; never automation or policy.
         | Request::SubscribeConsentOffers { .. }
-        | Request::SetConsentPresence { .. }
         | Request::AnswerConsentOffer { .. } => RequestAuthorization::TrustedUi,
         Request::ListLairs | Request::InspectTopology | Request::InspectSplint { .. } => {
             RequestAuthorization::policy(&[Scope::TopologyMetadataRead])
@@ -356,8 +355,7 @@ mod tests {
     #[test]
     fn consent_responder_requests_are_human_ui_only() {
         use splinterm_protocol::{
-            CONSENT_OFFER_NONCE_BYTES, ConsentDecision, ConsentOfferNonce, ConsentPresence,
-            ConsentResponderKind,
+            CONSENT_OFFER_NONCE_BYTES, ConsentDecision, ConsentOfferNonce, ConsentResponderKind,
         };
 
         // Never policy: neither development access nor a policy rule admits
@@ -365,19 +363,10 @@ mod tests {
         // bypass and handler.
         for kind in [ConsentResponderKind::Window, ConsentResponderKind::Terminal] {
             assert_eq!(
-                for_request(&Request::SubscribeConsentOffers {
-                    kind,
-                    presence: None,
-                }),
+                for_request(&Request::SubscribeConsentOffers { kind }),
                 RequestAuthorization::TrustedUi
             );
         }
-        assert_eq!(
-            for_request(&Request::SetConsentPresence {
-                presence: ConsentPresence::default(),
-            }),
-            RequestAuthorization::TrustedUi
-        );
         assert_eq!(
             for_request(&Request::AnswerConsentOffer {
                 daemon_generation: 1,
