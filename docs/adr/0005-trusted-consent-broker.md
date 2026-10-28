@@ -1,6 +1,6 @@
 # ADR 0005: daemon-launched trusted consent client
 
-- **Status:** Accepted; persistent policy added by [ADR 0007](0007-supported-automation-policy.md); outcomes, prompt input, and remembered grants amended by [ADR 0014](0014-easy-agent-access.md)
+- **Status:** Accepted; persistent policy added by [ADR 0007](0007-supported-automation-policy.md); outcomes, prompt input, and remembered grants amended by [ADR 0014](0014-easy-agent-access.md); where workspace prompts are shown amended by [ADR 0015](0015-remote-consent.md)
 - **Date:** 2026-07-18
 
 ## Context
@@ -90,3 +90,17 @@ bounded framing stay as decided here.
   restart" no longer holds for an explicit Always answer, which the daemon
   stores in its remembered-grant store under the identity rules of ADR 0014. The
   20-second deadline is replaced by a bounded, cancellable pending request.
+
+## Amendment: remote consent (ADR 0015)
+
+[ADR 0015](0015-remote-consent.md), accepted for `0.2.0` and implemented on
+`main`, changes where a workspace access prompt is shown. The daemon still
+launches its own local dialog when it has a graphical session, and that dialog
+is unchanged. It now also offers the prompt to every eligible remote Window
+connected over SSH and every `splinterm approvals` terminal approver; the first
+valid answer wins and the others are withdrawn. A remote Window launches its
+own `splinterm consent` dialog for an offer, on the viewer's computer, with the
+same private descriptor, one-use capability, and input rules, and marks it
+remote. With no local dialog and no responder, the request still fails at
+once. Splint access requests and forced takeover stay local and
+daemon-launched only.

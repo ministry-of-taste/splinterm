@@ -297,9 +297,11 @@ verification, and lifecycle guidance.
 
 Easy agent access lets you give an agent access to one workspace (a Lair) in a
 single deliberate answer, choose how long that lasts, and see and revoke it
-later. It is for agents helping you in your own graphical session. Headless,
-remote, and administrative access keeps using the [policy file](#persistent-policy-v2),
-which does not change.
+later. It is for agents helping you while you are there to answer: the prompt
+shows in your graphical session, in a Splinterm Window connected to that
+computer over SSH, or in `splinterm approvals` in your own terminal there.
+Unattended and administrative access keeps using the
+[policy file](#persistent-policy-v2), which does not change.
 
 What it protects: it keeps cooperating agents inside what you agreed to and
 shows you which agent can reach what. It is not a sandbox. A program running as
@@ -453,6 +455,15 @@ The computer comes first in the table, on the `host` row, for example
 `this computer (wintermute)`, or just `this computer` when its hostname is not
 usable.
 
+A prompt shown in a remote Window, for an agent on the computer that Window
+is connected to, says so. Its title is **remote agent access request**, its
+sentence names that computer, the `host` row reads
+`neuromancer · remote, SSH profile 'work'` (the hostname that computer
+reports, then the SSH profile you connected with), and a last line says that
+answering there allows it on that computer only. A remote computer whose
+hostname matches this one is also named by its SSH profile, so it never reads
+as this computer ([remote Windows](remote.md#agent-access-prompts)).
+
 A request that a grant already covers is answered at once, without a prompt.
 Prompts appear one at a time; further requests wait their turn. If you do not
 answer right away, the request stays pending for up to two minutes, and the
@@ -467,7 +478,9 @@ If nothing can show the prompt, the request fails with `consent_unavailable`
 at once: "no Splinterm Window or approver connected to this computer can show
 the prompt".
 
-On a computer without a Window, such as a headless host, run
+A Splinterm Window connected over SSH to the computer the agent runs on shows
+the prompt too, as a dialog marked remote
+([remote Windows](remote.md#agent-access-prompts)). On a computer without a Window, such as a headless host, you can also run
 `splinterm approvals` in your own terminal there to answer prompts as text
 ([Usage](usage.md#answering-access-prompts-in-a-terminal)). It shows the same
 request and starts on Deny. splinterd refuses it inside a Splint, inside the
