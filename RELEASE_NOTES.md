@@ -181,8 +181,9 @@ running daemon by themselves.
 ## Easy agent access
 
 Easy agent access gives an agent one workspace (a Lair) in a single deliberate
-answer, for agents helping you in your own graphical session. Headless, remote,
-and administrative access still uses the policy file, which is unchanged. It
+answer, for agents helping you, answered in your own graphical session or in a
+remote Splinterm Window. Unattended and administrative access still uses the
+policy file, which is unchanged. It
 keeps cooperating agents inside what you agreed to; it is not a sandbox against
 a hostile program running as your account.
 
@@ -236,6 +237,11 @@ a hostile program running as your account.
   two minutes, and the agent collects your answer by asking again; the MCP tool
   `splinterm.request_lair_access` returns `status: "pending"` meanwhile instead
   of failing.
+- The prompt also opens in every remote Splinterm Window connected to the
+  computer the agent runs on, at the same time as that computer's own prompt,
+  so an agent on a headless machine can be answered from your workstation. The
+  first answer counts and closes the prompt everywhere else. With no display
+  and no Window connected, a request fails with `consent_unavailable` at once.
 - While a request waits, the Explorer marks its workspace **Agent asking for
   access**, the Window title ends with **AGENT ACCESS REQUEST WAITING**, and
   **Agent access** in the palette shows how many wait.

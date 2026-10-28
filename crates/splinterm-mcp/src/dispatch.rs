@@ -383,7 +383,7 @@ pub(crate) fn map_client_error(error: &Error) -> DispatchFailure {
         ),
         ErrorCode::ConsentUnavailable => (
             "consent_unavailable",
-            "trusted graphical consent is unavailable",
+            "no Splinterm Window or approver can show the access prompt",
             false,
         ),
         ErrorCode::ConsentDenied => ("consent_denied", "the access request was denied", false),

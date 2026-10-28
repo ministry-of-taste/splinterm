@@ -1,8 +1,9 @@
 # ADR 0015: agent access prompts in remote Windows and the terminal approver
 
-- **Status:** Proposed (Plan 0066). The protocol contract is on `main`; the
-  daemon still answers every consent responder request with
-  `UnsupportedOperation`, and prompts are routed as before.
+- **Status:** Proposed (Plan 0066). The protocol contract and the daemon's
+  routing are on `main`: the daemon offers workspace prompts to subscribed
+  responders and commits their answers. No Window or `splinterm approvals`
+  subscribes yet.
 - **Date:** 2026-10-27
 - **Amends:** [ADR 0005](0005-trusted-consent-broker.md) (where the trusted
   prompt is shown), [ADR 0010](0010-one-authentication-graphical-relay.md)

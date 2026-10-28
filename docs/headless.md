@@ -173,6 +173,14 @@ their connection-owned subscriptions, controller leases, and pending transfers;
 automation clients must reconnect explicitly. Local and SSH-remote human
 graphical clients do not use persistent policy and remain connected.
 
+## Agent access prompts
+
+A headless computer cannot show an [easy agent access](automation.md#easy-agent-access)
+prompt itself. A remote Splinterm Window connected to it over SSH shows the
+prompt instead, and its answer counts as one given here. With no Window
+connected, a request that needs a prompt fails at once with
+`consent_unavailable`; policy rules keep working without one.
+
 ## Runtime, state, restart, and recovery
 
 The default socket is `$XDG_RUNTIME_DIR/splinterm/splinterd.sock` and is removed

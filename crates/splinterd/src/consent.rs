@@ -1626,6 +1626,29 @@ impl PromptDetails {
     }
 }
 
+/// The content of one workspace prompt as a consent responder is offered it
+/// (ADR 0015): exactly what [`prompt_lair`] shows in the local dialog, built
+/// from the same request, without the dialog capability, the origin, or the
+/// countdown.
+pub fn offered_lair_prompt(
+    peer: &PeerIdentity,
+    lair_id: LairId,
+    lair_name: String,
+    scopes: Vec<AccessScope>,
+    details: PromptDetails,
+) -> splinterm_protocol::OfferedConsentPrompt {
+    splinterm_protocol::OfferedConsentPrompt {
+        requester: peer.requester_label(),
+        requester_pid: peer.pid,
+        requester_uid: peer.uid,
+        agent_name: details.agent_name,
+        target: ConsentTarget::Lair { lair_id, lair_name },
+        scopes,
+        level: details.level,
+        durations: details.durations,
+    }
+}
+
 /// Closes an open consent prompt from another task: the pending request was
 /// cancelled, expired, or ended while the person had not answered.
 ///

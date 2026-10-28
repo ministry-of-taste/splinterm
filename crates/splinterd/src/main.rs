@@ -9,6 +9,7 @@ mod handoff_windows;
 mod omarchy_environment;
 mod pending_access;
 mod persistence;
+mod remote_consent;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -1133,6 +1134,15 @@ struct DaemonState {
     /// Pending workspace access requests and their prompt queue (ADR 0014).
     /// Never carried across a handoff or restart.
     pending_access: pending_access::PendingAccess,
+    /// Remote Windows and terminal approvers registered to answer workspace
+    /// prompts, and the offers of the prompt now shown (ADR 0015). Never
+    /// carried across a handoff or restart.
+    consent_responders: Arc<remote_consent::ConsentResponders>,
+    /// Whether the daemon was started with a graphical session to show its
+    /// own consent dialog in (a non-empty `WAYLAND_DISPLAY`), read once when
+    /// this state is built. Remote responders are offered every workspace
+    /// prompt either way.
+    local_consent_display: bool,
     /// Unit tests answer workspace prompts through this instead of the
     /// trusted consent client.
     #[cfg(test)]
@@ -3404,6 +3414,13 @@ fn connect_workload_units(require_workload_cgroups: bool) -> Result<Option<Workl
     }
 }
 
+/// Whether this daemon has a graphical session to show its own consent dialog
+/// in: the dialog child inherits the daemon environment, so a non-empty
+/// `WAYLAND_DISPLAY` names the compositor that would show it.
+fn local_graphical_session() -> bool {
+    env::var_os("WAYLAND_DISPLAY").is_some_and(|display| !display.is_empty())
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "one generation's complete daemon state is assembled in one reviewable place"
@@ -3481,6 +3498,8 @@ fn build_daemon_state(inputs: DaemonStateInputs) -> Arc<DaemonState> {
         agent_access,
         identity_context,
         pending_access: pending_access::PendingAccess::with_ids(Arc::clone(&grant_ids)),
+        consent_responders: Arc::new(remote_consent::ConsentResponders::new(daemon_generation)),
+        local_consent_display: local_graphical_session(),
         #[cfg(test)]
         consent_script: StdMutex::default(),
         revocations,
@@ -4575,6 +4594,12 @@ async fn serve_authenticated(
         send_control(control, hello).await?;
     }
 
+    // However this connection ends, its consent responder ends with it at
+    // once (ADR 0015).
+    let _responder = ConnectionResponder {
+        responders: Arc::clone(&state.consent_responders),
+        connection_id,
+    };
     let mut subscriptions = HashMap::<u64, ConnectionSubscription>::new();
     let mut policy_reloads = state.policy_reloads.subscribe();
     let mut connection_revocations = state.connection_revocations.subscribe();
@@ -4731,6 +4756,10 @@ async fn serve_authenticated(
                     };
                     drop(task);
                     state.topology_hub.lock().await.remove(*subscription_id);
+                    // At once, not when the aborted task is next dropped.
+                    state
+                        .consent_responders
+                        .remove(connection_id, Some(*subscription_id));
                     append_request_audit(
                         state,
                         peer,
@@ -4925,6 +4954,10 @@ async fn serve_authenticated(
                                         },
                                     ),
                                 ),
+                                PendingSubscription::ConsentOffers { stream } => (
+                                    stream.subscription_id(),
+                                    spawn_consent_offer_subscription(stream, outbound.clone()),
+                                ),
                             };
                             subscriptions.insert(
                                 id,
@@ -4984,6 +5017,11 @@ enum PendingSubscription {
         /// The grant that authorized the subscription, whose revoke ends it.
         grant_id: Option<u64>,
         revocations: broadcast::Receiver<Revocation>,
+    },
+    /// A consent responder (ADR 0015): its offers and their withdrawals.
+    /// Dropped before it starts, its responder ends.
+    ConsentOffers {
+        stream: remote_consent::ResponderStream,
     },
 }
 
@@ -7272,8 +7310,11 @@ fn ensure_consent_prompter(state: &Arc<DaemonState>) {
         drop(tokio::spawn(async move {
             let state = &role.0;
             while let Some(job) = state.pending_access.next_prompt() {
-                let decision = Box::pin(show_lair_prompt(state, &job)).await;
-                Box::pin(settle_lair_prompt(state, job, decision)).await;
+                let (decision, route) = match Box::pin(show_lair_prompt(state, &job)).await {
+                    Ok((decision, route)) => (Ok(decision), route),
+                    Err(error) => (Err(error), remote_consent::AnswerRoute::Local),
+                };
+                Box::pin(settle_lair_prompt(state, job, decision, route)).await;
             }
         }));
     }
@@ -7289,12 +7330,23 @@ struct ScriptedPrompt {
     answer: tokio::sync::oneshot::Sender<ConsentDecision>,
 }
 
-/// Shows one queued request's prompt until the person answers, the request
-/// ends, or it expires.
+/// Shows one queued request's prompt on every route at once until one
+/// answers, the request ends, it expires, or every route has gone (ADR 0015):
+/// the daemon's own dialog when it has a graphical session, and an offer to
+/// every eligible consent responder. The first valid answer wins; every
+/// other offer is withdrawn and a dialog still showing is killed and reaped.
+/// With no route at all the request is unavailable at once.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one prompt's race across every route reads as one sequence"
+)]
 async fn show_lair_prompt(
     state: &Arc<DaemonState>,
     job: &pending_access::PromptJob,
-) -> anyhow::Result<ConsentDecision> {
+) -> anyhow::Result<(ConsentDecision, remote_consent::AnswerRoute)> {
+    use remote_consent::{AnswerRoute, OpenRound, ROUTES_CLOSED, Unavailable};
+    use splinterm_protocol::ConsentOfferEnd;
+
     let lair_name = state
         .topology
         .read()
@@ -7312,6 +7364,132 @@ async fn show_lair_prompt(
         job.agent_name.clone(),
     );
     let deadline = job.expires.saturating_duration_since(Instant::now());
+    let offered = consent::offered_lair_prompt(
+        &job.peer,
+        job.lair_id,
+        lair_name.clone(),
+        job.scopes.clone(),
+        details.clone(),
+    );
+    let context = remote_consent::TreeContext {
+        splint_leaders: splint_leaders(state).await,
+        requester: job
+            .peer
+            .start_time()
+            .map(|start_time| remote_consent::Requester {
+                pid: job.peer.pid,
+                start_time,
+            }),
+    };
+    let mut round = state
+        .consent_responders
+        .open_round(job.request_id, offered, job.expires, context)
+        .await;
+    // Responders too late to be offered it leave the prompt to expire.
+    if !state.local_consent_display && round.offered() == 0 && !round.too_late() {
+        return Err(Unavailable(remote_consent::NO_ROUTE).into());
+    }
+    // The local dialog has its own cancel, so the prompter closes it when
+    // another route wins as well as when the request ends.
+    let local_cancel = Arc::new(consent::PromptCancel::default());
+    let mut local = state.local_consent_display.then(|| {
+        Box::pin(local_lair_prompt(
+            state,
+            job,
+            lair_name,
+            details,
+            deadline,
+            Arc::clone(&local_cancel),
+        ))
+    });
+    let mut outstanding = round.outstanding();
+    let expiry = time::sleep(deadline);
+    tokio::pin!(expiry);
+    let outcome = loop {
+        tokio::select! {
+            // An accepted remote answer has already won: it goes first.
+            biased;
+            remote = round.answered() => break Ok((remote.decision, remote.route)),
+            shown = async {
+                match local.as_mut() {
+                    Some(local) => local.await,
+                    None => std::future::pending().await,
+                }
+            }, if local.is_some() => {
+                local = None;
+                match shown {
+                    Ok(decision) if round.claim_local() => break Ok((decision, AnswerRoute::Local)),
+                    // A responder answered first; its answer is next.
+                    Ok(_) => {}
+                    // A dialog that fails or is killed drops out; every other
+                    // route had the prompt from the start.
+                    Err(error) if round.any_outstanding() || round.settled() => {
+                        warn!(%error, "the local consent dialog failed; remote routes still show the prompt");
+                    }
+                    Err(error) if round.offered() == 0 => break Err(error),
+                    Err(error) => {
+                        warn!(%error, "the local consent dialog failed");
+                        break Err(Unavailable(ROUTES_CLOSED).into());
+                    }
+                }
+            }
+            () = OpenRound::every_route_closed(&mut outstanding),
+                if local.is_none() && round.offered() > 0 => {
+                // A responder that answered withdrew the rest; its answer
+                // is next.
+                if !round.settled() {
+                    break Err(Unavailable(ROUTES_CLOSED).into());
+                }
+            }
+            () = job.cancel.cancelled() => {
+                round.end_with(
+                    job.ended
+                        .get()
+                        .copied()
+                        .unwrap_or(ConsentOfferEnd::RequestEnded),
+                );
+                break Err(anyhow::anyhow!("consent prompt cancelled"));
+            }
+            () = &mut expiry => {
+                round.end_with(ConsentOfferEnd::Expired);
+                break Err(anyhow::anyhow!("consent prompt timed out"));
+            }
+        }
+    };
+    // Every offer still outstanding is withdrawn, with the reason the prompt
+    // ended.
+    drop(round);
+    // A dialog still showing is killed and reaped; its shortcut entry goes
+    // with it.
+    if let Some(local) = local {
+        local_cancel.cancel();
+        let _ = local.await;
+    }
+    outcome
+}
+
+/// Every Splint's session leader, which consent responders must be outside.
+async fn splint_leaders(state: &DaemonState) -> Vec<u32> {
+    state
+        .runtimes
+        .lock()
+        .await
+        .handles()
+        .values()
+        .map(LiveSplintHandle::child_pid)
+        .collect()
+}
+
+/// The daemon's own dialog for one workspace prompt, until it answers or
+/// `cancel` kills it.
+async fn local_lair_prompt(
+    state: &DaemonState,
+    job: &pending_access::PromptJob,
+    lair_name: String,
+    details: consent::PromptDetails,
+    deadline: Duration,
+    cancel: Arc<consent::PromptCancel>,
+) -> anyhow::Result<ConsentDecision> {
     #[cfg(test)]
     {
         let script = state
@@ -7330,14 +7508,14 @@ async fn show_lair_prompt(
                 })
                 .ok()
                 .context("the test prompter is gone")?;
+            // Closing the receiver is the test's view of a killed dialog.
             return tokio::select! {
                 answer = answered => answer.context("the test prompt closed unanswered"),
-                () = job.cancel.cancelled() => anyhow::bail!("consent prompt cancelled"),
-                () = time::sleep(deadline) => anyhow::bail!("consent prompt timed out"),
+                () = cancel.cancelled() => anyhow::bail!("consent prompt cancelled"),
             };
         }
     }
-    let prompt = consent::prompt_lair(
+    consent::prompt_lair(
         &state.install_prefix,
         &job.peer,
         job.lair_id,
@@ -7345,13 +7523,9 @@ async fn show_lair_prompt(
         job.scopes.clone(),
         details,
         deadline,
-        Arc::clone(&job.cancel),
-    );
-    tokio::select! {
-        answer = prompt => answer,
-        // The client is killed by the cancel; this only stops waiting.
-        () = job.cancel.cancelled() => anyhow::bail!("consent prompt cancelled"),
-    }
+        cancel,
+    )
+    .await
 }
 
 /// What the prompt shows for this requester and request: the level or
@@ -7428,10 +7602,14 @@ fn lair_prompt_details(
 /// `commit_agent_grant`, after checking the requester still runs as the
 /// verified process. An end that arrives during the commit wins, and the
 /// committed grant is revoked again.
+///
+/// `route` is where the answer came from, for the audit (ADR 0015): a remote
+/// answer commits through exactly the same checks as a local one.
 async fn settle_lair_prompt(
     state: &Arc<DaemonState>,
     job: pending_access::PromptJob,
     decision: anyhow::Result<ConsentDecision>,
+    route: remote_consent::AnswerRoute,
 ) {
     let request_id = job.request_id;
     let duration = match decision {
@@ -7441,6 +7619,14 @@ async fn settle_lair_prompt(
             }
             let ended = if Instant::now() >= job.expires {
                 pending_access::cancelled("the access request expired without an answer")
+            } else if let Some(&remote_consent::Unavailable(message)) =
+                error.downcast_ref::<remote_consent::Unavailable>()
+            {
+                info!(
+                    reason = message,
+                    "no route can show a workspace access prompt"
+                );
+                ProtocolError::new(ErrorCode::ConsentUnavailable, message)
             } else {
                 warn!(%error, "trusted Lair consent client failed closed");
                 ProtocolError::new(
@@ -7457,7 +7643,7 @@ async fn settle_lair_prompt(
                     &denied.peer,
                     denied.lair_id,
                     &denied.scopes,
-                    "denied by the person",
+                    route.deny_reason(),
                 );
             }
             return;
@@ -8670,6 +8856,9 @@ async fn append_request_result_audit(
         "authorization_denied"
     } else if revoked {
         "grant_revoked"
+    } else if result.is_ok() && matches!(request, Request::AnswerConsentOffer { .. }) {
+        // Which route answered (ADR 0015); never the nonce or the decision.
+        remote_consent::answer_audit_reason(peer)
     } else if authorization.policy_authorized() {
         "policy_match"
     } else if authorization.agent_grant == Some(agent_access::GrantDuration::WorkspaceSession) {
@@ -11394,13 +11583,56 @@ async fn handle_authorized_request(
             require_trusted_local_ui(trusted_ui_client, peer)?;
             return Err(handoff_requests::no_pending_handoff_prepare());
         }
-        request @ (Request::SubscribeConsentOffers { .. } | Request::AnswerConsentOffer { .. }) => {
-            return Err(consent_responder_unsupported(
+        request @ Request::SubscribeConsentOffers { kind } => {
+            require_consent_responder(
                 trusted_ui_client,
                 peer,
                 remote_interactive_client,
                 &request,
-            ));
+            )?;
+            let context = remote_consent::TreeContext {
+                splint_leaders: splint_leaders(state).await,
+                requester: None,
+            };
+            let stream = state
+                .consent_responders
+                .subscribe(
+                    connection_id,
+                    NEXT_SUBSCRIPTION.fetch_add(1, Ordering::Relaxed),
+                    kind,
+                    peer,
+                    context,
+                )
+                .await?;
+            return Ok(Handled {
+                response: Response::ConsentOffersSubscribed {
+                    subscription_id: stream.subscription_id(),
+                },
+                subscription: Some(PendingSubscription::ConsentOffers { stream }),
+            });
+        }
+        request @ Request::AnswerConsentOffer {
+            daemon_generation,
+            offer_id,
+            nonce,
+            decision,
+        } => {
+            require_consent_responder(
+                trusted_ui_client,
+                peer,
+                remote_interactive_client,
+                &request,
+            )?;
+            splinterm_protocol::validate_consent_answer(daemon_generation, offer_id)?;
+            state.consent_responders.answer(
+                connection_id,
+                peer,
+                daemon_generation,
+                offer_id,
+                &nonce,
+                decision,
+            )?;
+            Response::ConsentOfferAnswered
         }
     };
     Ok(Handled {
@@ -11409,40 +11641,27 @@ async fn handle_authorized_request(
     })
 }
 
-/// Answers a consent responder request (ADR 0015) until the daemon routes
-/// prompts to responders: the role and kind check, then the request bounds,
-/// then `UnsupportedOperation`. Nothing is registered or answered.
-fn consent_responder_unsupported(
+/// The handler's own role and kind check of a consent responder request
+/// (ADR 0015), after the authorization table and the interactive bypass.
+fn require_consent_responder(
     trusted_ui_client: bool,
     peer: &PeerIdentity,
     remote_interactive_client: bool,
     request: &Request,
-) -> ProtocolError {
-    if !consent_responder_admitted(
+) -> Result<(), ProtocolError> {
+    if consent_responder_admitted(
         trusted_ui_client,
         peer.connection_matches_splinterm(),
         remote_interactive_client,
         request,
     ) {
-        return ProtocolError::new(
+        Ok(())
+    } else {
+        Err(ProtocolError::new(
             ErrorCode::Unauthorized,
             "this connection cannot be a consent responder of that kind",
-        );
+        ))
     }
-    if let Request::AnswerConsentOffer {
-        daemon_generation,
-        offer_id,
-        ..
-    } = request
-        && let Err(error) =
-            splinterm_protocol::validate_consent_answer(*daemon_generation, *offer_id)
-    {
-        return error;
-    }
-    ProtocolError::new(
-        ErrorCode::UnsupportedOperation,
-        "this daemon does not yet offer consent prompts to responders",
-    )
 }
 
 /// Handoff requests are trusted-UI-only in the authorization table; this
@@ -14628,6 +14847,46 @@ fn spawn_topology_subscription(
     })
 }
 
+/// Streams one consent responder's offers and withdrawals (ADR 0015) as
+/// events of its subscription, in order. The responder ends when this task
+/// does: on `Detach`, on disconnect, or when the daemon drops a responder
+/// that stopped reading.
+fn spawn_consent_offer_subscription(
+    stream: remote_consent::ResponderStream,
+    outbound: mpsc::Sender<QueuedServerFrame>,
+) -> JoinHandle<()> {
+    let subscription_id = stream.subscription_id();
+    let (mut events, guard) = stream.into_parts();
+    tokio::spawn(async move {
+        let _responder = guard;
+        let mut sequence = 1_u64;
+        while let Some(event) = events.recv().await {
+            let frame = ServerFrame::Event {
+                subscription_id,
+                sequence,
+                event,
+            };
+            if outbound.send(frame.into()).await.is_err() {
+                break;
+            }
+            sequence = sequence.saturating_add(1);
+        }
+    })
+}
+
+/// Ends a connection's consent responder when the connection ends, however
+/// it ends.
+struct ConnectionResponder {
+    responders: Arc<remote_consent::ConsentResponders>,
+    connection_id: u64,
+}
+
+impl Drop for ConnectionResponder {
+    fn drop(&mut self) {
+        self.responders.remove(self.connection_id, None);
+    }
+}
+
 struct SubscriptionOutputs {
     outbound: mpsc::Sender<QueuedServerFrame>,
     control: mpsc::Sender<ControlFrame>,
@@ -17170,6 +17429,12 @@ mod tests {
             ))),
             identity_context: Arc::new(agent_access::IdentityContext::for_daemon()),
             pending_access: pending_access::PendingAccess::with_ids(grant_ids),
+            consent_responders: Arc::new(remote_consent::ConsentResponders::new(
+                handoff_requests::FRESH_DAEMON_GENERATION,
+            )),
+            // As before remote consent: every existing prompt test shows the
+            // local (scripted) dialog. Headless tests clear it.
+            local_consent_display: true,
             consent_script: StdMutex::default(),
             revocations,
             image_transfers: Mutex::new(TransferAdmission::default()),
@@ -18890,7 +19155,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn consent_responder_requests_are_unsupported_after_the_role_check() {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "every role, kind, and eligibility refusal of one request family"
+    )]
+    async fn consent_responder_requests_need_their_role_kind_and_an_eligible_process() {
         // Development terminal access never admits automation.
         let state = test_state(true);
         let mut peer = PeerIdentity::for_test();
@@ -18924,26 +19193,32 @@ mod tests {
             // The handler repeats the check for a trusted UI that is not the
             // installed client.
             assert_eq!(
-                consent_responder_unsupported(true, &peer, false, request).code,
+                require_consent_responder(true, &peer, false, request)
+                    .unwrap_err()
+                    .code,
                 ErrorCode::Unauthorized,
                 "{request:?}"
             );
         }
 
-        // A remote Window reaches the handler, which answers unsupported
-        // until the daemon routes prompts to responders.
-        for request in [&window, &answer] {
-            let error = handle_request(request.clone(), &state, &peer, 1, 0, false, true)
-                .await
-                .unwrap_err();
-            assert_eq!(error.code, ErrorCode::UnsupportedOperation, "{request:?}");
-        }
+        // A remote Window's role reaches the handler, whose `/proc` check
+        // refuses this test process: it is not the installed relay.
+        let error = handle_request(window.clone(), &state, &peer, 1, 0, false, true)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Unauthorized);
+        assert_eq!(state.consent_responders.responder_count(), 0);
+        // An answer from a connection that is no responder finds nothing.
+        let error = handle_request(answer.clone(), &state, &peer, 1, 0, false, true)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::NotFound);
         // The approver kind is the installed local client's only.
         let error = handle_request(terminal, &state, &peer, 1, 0, false, true)
             .await
             .unwrap_err();
         assert_eq!(error.code, ErrorCode::Unauthorized);
-        // An out-of-bounds answer fails before the unsupported answer.
+        // An out-of-bounds answer fails before any lookup.
         for (daemon_generation, offer_id) in [(0, 1), (1, 0)] {
             let request = Request::AnswerConsentOffer {
                 daemon_generation,
@@ -18958,6 +19233,29 @@ mod tests {
                 .unwrap_err();
             assert_eq!(error.code, ErrorCode::InvalidArgument);
         }
+        // An eligible Window subscribes once per connection; its stream ends
+        // the responder when dropped.
+        state.consent_responders.set_probe(Arc::new(|_, _| Ok(())));
+        let handled = handle_request(window.clone(), &state, &peer, 1, 0, false, true)
+            .await
+            .unwrap();
+        let Response::ConsentOffersSubscribed { subscription_id } = handled.response else {
+            panic!("a Window responder subscribes");
+        };
+        assert!(matches!(
+            &handled.subscription,
+            Some(PendingSubscription::ConsentOffers { stream })
+                if stream.subscription_id() == subscription_id
+        ));
+        assert_eq!(
+            handle_request(window.clone(), &state, &peer, 1, 0, false, true)
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::ResourceLimit
+        );
+        drop(handled);
+        assert_eq!(state.consent_responders.responder_count(), 0);
     }
 
     #[tokio::test]
@@ -22494,6 +22792,7 @@ mod tests {
             Ok(ConsentDecision::Grant {
                 duration: splinterm_protocol::GrantDuration::Once,
             }),
+            remote_consent::AnswerRoute::Local,
         )
         .await;
         assert!(matches!(
@@ -22510,6 +22809,7 @@ mod tests {
             Ok(ConsentDecision::Grant {
                 duration: splinterm_protocol::GrantDuration::Remembered,
             }),
+            remote_consent::AnswerRoute::Local,
         )
         .await;
         assert!(matches!(
@@ -22527,6 +22827,7 @@ mod tests {
             Ok(ConsentDecision::Grant {
                 duration: splinterm_protocol::GrantDuration::Once,
             }),
+            remote_consent::AnswerRoute::Local,
         )
         .await;
         assert!(matches!(
@@ -22566,6 +22867,7 @@ mod tests {
             Ok(ConsentDecision::Grant {
                 duration: splinterm_protocol::GrantDuration::Once,
             }),
+            remote_consent::AnswerRoute::Local,
         )
         .await;
         state.handoff_gate.set(HandoffGatePhase::Idle);
@@ -22598,6 +22900,451 @@ mod tests {
         .unwrap_err();
         assert_eq!(failed.code, ErrorCode::ConsentUnavailable);
         assert_eq!(state.pending_access.len(), 0);
+    }
+
+    // ---- ADR 0015 remote consent routing (Plan 0066 M4) ----
+
+    /// A daemon with no graphical session of its own.
+    fn headless(mut state: Arc<DaemonState>) -> Arc<DaemonState> {
+        Arc::get_mut(&mut state)
+            .expect("the state is not shared yet")
+            .local_consent_display = false;
+        state
+    }
+
+    /// A remote Window subscribed to consent offers as the daemon serves
+    /// one, with its `/proc` checks passed.
+    struct TestResponder {
+        connection_id: u64,
+        events: tokio::sync::mpsc::Receiver<splinterm_protocol::SubscriptionEvent>,
+        guard: Option<remote_consent::ResponderGuard>,
+    }
+
+    impl TestResponder {
+        async fn subscribe(state: &Arc<DaemonState>, connection_id: u64) -> Self {
+            state.consent_responders.set_probe(Arc::new(|_, _| Ok(())));
+            let handled = handle_request(
+                Request::SubscribeConsentOffers {
+                    kind: splinterm_protocol::ConsentResponderKind::Window,
+                },
+                state,
+                &PeerIdentity::for_test(),
+                connection_id,
+                0,
+                false,
+                true,
+            )
+            .await
+            .unwrap();
+            let Some(PendingSubscription::ConsentOffers { stream }) = handled.subscription else {
+                panic!("a Window responder subscribes");
+            };
+            let (events, guard) = stream.into_parts();
+            Self {
+                connection_id,
+                events,
+                guard: Some(guard),
+            }
+        }
+
+        async fn next(&mut self) -> splinterm_protocol::SubscriptionEvent {
+            time::timeout(Duration::from_secs(5), self.events.recv())
+                .await
+                .expect("an event arrives")
+                .expect("the subscription runs")
+        }
+
+        async fn offer(&mut self) -> splinterm_protocol::ConsentOffer {
+            match self.next().await {
+                splinterm_protocol::SubscriptionEvent::ConsentOffered { offer } => offer,
+                other => panic!("expected an offer, got {other:?}"),
+            }
+        }
+
+        async fn withdrawn(&mut self) -> (u64, splinterm_protocol::ConsentOfferEnd) {
+            match self.next().await {
+                splinterm_protocol::SubscriptionEvent::ConsentOfferWithdrawn {
+                    offer_id,
+                    reason,
+                } => (offer_id, reason),
+                other => panic!("expected a withdrawal, got {other:?}"),
+            }
+        }
+
+        fn quiet(&mut self) -> bool {
+            self.events.try_recv().is_err()
+        }
+
+        async fn answer(
+            &self,
+            state: &Arc<DaemonState>,
+            offer: &splinterm_protocol::ConsentOffer,
+            decision: ConsentDecision,
+        ) -> Result<Response, ProtocolError> {
+            handle_request(
+                Request::AnswerConsentOffer {
+                    daemon_generation: offer.daemon_generation,
+                    offer_id: offer.offer_id,
+                    nonce: offer.nonce,
+                    decision,
+                },
+                state,
+                &PeerIdentity::for_test(),
+                self.connection_id,
+                1,
+                false,
+                true,
+            )
+            .await
+            .map(|handled| handled.response)
+        }
+
+        /// The Window closes: its connection ends the responder.
+        fn close(&mut self) {
+            self.guard = None;
+        }
+    }
+
+    const ONCE: ConsentDecision = ConsentDecision::Grant {
+        duration: splinterm_protocol::GrantDuration::Once,
+    };
+
+    async fn finished(
+        waiting: tokio::task::JoinHandle<Result<Response, ProtocolError>>,
+    ) -> Result<Response, ProtocolError> {
+        time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("the request finishes")
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_headless_daemon_with_no_responder_is_unavailable_at_once() {
+        let state = headless(test_state(false));
+        let lair_id = insert_test_lair(&state, "agents").await;
+        let peer = with_start_time(PeerIdentity::for_test());
+        let mut prompts = script_prompts(&state);
+        let failed = time::timeout(
+            Duration::from_secs(5),
+            ask(
+                &state,
+                &peer,
+                lair_request(lair_id, &[AccessScope::Observe], 20_000),
+            ),
+        )
+        .await
+        .expect("the failure does not wait out the budget")
+        .unwrap_err();
+        assert_eq!(failed.code, ErrorCode::ConsentUnavailable);
+        assert_eq!(failed.message, remote_consent::NO_ROUTE);
+        assert!(prompts.try_recv().is_err(), "no local dialog is shown");
+        assert_eq!(state.pending_access.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_headless_prompt_goes_to_its_responders_until_the_last_one_closes() {
+        let state = headless(test_state(false));
+        let lair_id = insert_test_lair(&state, "agents").await;
+        let peer = with_start_time(PeerIdentity::for_test());
+        let mut prompts = script_prompts(&state);
+        let mut first = TestResponder::subscribe(&state, 11).await;
+        let mut second = TestResponder::subscribe(&state, 12).await;
+        let waiting = spawn_ask(
+            &state,
+            &peer,
+            lair_request(lair_id, &[AccessScope::Observe], 5_000),
+        );
+        let lost = first.offer().await;
+        let kept = second.offer().await;
+        assert_ne!(lost.offer_id, kept.offer_id);
+        assert_ne!(lost.nonce, kept.nonce);
+        assert!(prompts.try_recv().is_err(), "no local dialog is shown");
+        // One Window closing takes only its own offer.
+        first.close();
+        time::sleep(Duration::from_millis(50)).await;
+        assert!(second.quiet());
+        assert_eq!(state.pending_access.len(), 1, "the request still waits");
+        // The last one closing leaves no route.
+        second.close();
+        let failed = finished(waiting).await.unwrap_err();
+        assert_eq!(failed.code, ErrorCode::ConsentUnavailable);
+        assert_eq!(failed.message, remote_consent::ROUTES_CLOSED);
+        assert_eq!(state.pending_access.len(), 0);
+        assert!(!has_once_grant(&state, &peer, lair_id).await);
+    }
+
+    #[tokio::test]
+    async fn a_remote_answer_wins_over_the_local_dialog_and_the_other_offers() {
+        let state = test_state(false);
+        let lair_id = insert_test_lair(&state, "agents").await;
+        let peer = with_start_time(PeerIdentity::for_test());
+        let mut prompts = script_prompts(&state);
+        let mut winner = TestResponder::subscribe(&state, 11).await;
+        let mut loser = TestResponder::subscribe(&state, 12).await;
+        let waiting = spawn_ask(
+            &state,
+            &peer,
+            lair_request(lair_id, &[AccessScope::Observe], 5_000),
+        );
+        // Every route shows the prompt at once.
+        let mut local = next_scripted_prompt(&mut prompts).await;
+        let offer = winner.offer().await;
+        let other = loser.offer().await;
+        assert_eq!(offer.request_id, local.request_id);
+        assert!(offer.prompt.offers(splinterm_protocol::GrantDuration::Once));
+        assert_eq!(
+            winner.answer(&state, &offer, ONCE).await,
+            Ok(Response::ConsentOfferAnswered)
+        );
+        let grant = granted(finished(waiting).await.unwrap());
+        assert_eq!(
+            grant.source,
+            splinterm_protocol::AccessGrantSource::Ephemeral
+        );
+        assert_eq!(
+            loser.withdrawn().await,
+            (
+                other.offer_id,
+                splinterm_protocol::ConsentOfferEnd::AnsweredElsewhere
+            )
+        );
+        // The local dialog is closed.
+        time::timeout(Duration::from_secs(5), local.answer.closed())
+            .await
+            .expect("the local dialog is killed");
+        // A second answer, even the winner's again, finds nothing.
+        for (responder, offer) in [(&winner, &offer), (&loser, &other)] {
+            assert_eq!(
+                responder
+                    .answer(&state, offer, ONCE)
+                    .await
+                    .unwrap_err()
+                    .code,
+                ErrorCode::NotFound
+            );
+        }
+        assert!(winner.quiet());
+        wait_until_no_request_is_pending(&state).await;
+    }
+
+    #[tokio::test]
+    async fn the_local_dialog_answering_first_withdraws_every_offer() {
+        let state = test_state(false);
+        let lair_id = insert_test_lair(&state, "agents").await;
+        let peer = with_start_time(PeerIdentity::for_test());
+        let mut prompts = script_prompts(&state);
+        let mut responder = TestResponder::subscribe(&state, 11).await;
+        let waiting = spawn_ask(
+            &state,
+            &peer,
+            lair_request(lair_id, &[AccessScope::Observe], 5_000),
+        );
+        let local = next_scripted_prompt(&mut prompts).await;
+        let offer = responder.offer().await;
+        local.answer.send(ONCE).unwrap();
+        granted(finished(waiting).await.unwrap());
+        assert_eq!(
+            responder.withdrawn().await,
+            (
+                offer.offer_id,
+                splinterm_protocol::ConsentOfferEnd::AnsweredElsewhere
+            )
+        );
+        assert_eq!(
+            responder
+                .answer(&state, &offer, ConsentDecision::Deny)
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::NotFound
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_local_dialog_drops_out_and_the_remote_route_still_answers() {
+        let state = test_state(false);
+        let lair_id = insert_test_lair(&state, "agents").await;
+        let peer = with_start_time(PeerIdentity::for_test());
+        let mut prompts = script_prompts(&state);
+        let mut responder = TestResponder::subscribe(&state, 11).await;
+        let waiting = spawn_ask(
+            &state,
+            &peer,
+            lair_request(lair_id, &[AccessScope::Observe], 5_000),
+        );
+        // The local dialog fails without an answer.
+        drop(next_scripted_prompt(&mut prompts).await);
+        let offer = responder.offer().await;
+        time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(state.pending_access.len(), 1, "the request still waits");
+        assert_eq!(
+            responder
+                .answer(&state, &offer, ConsentDecision::Deny)
+                .await,
+            Ok(Response::ConsentOfferAnswered)
+        );
+        assert_eq!(
+            finished(waiting).await.unwrap_err().code,
+            ErrorCode::ConsentDenied
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_answers_commit_every_duration_through_the_same_checks() {
+        use splinterm_protocol::{AccessGrantSource, AccessLevel, GrantDuration};
+
+        let mut fixture = agent_fixture().await;
+        Arc::get_mut(&mut fixture.state)
+            .expect("the state is not shared yet")
+            .local_consent_display = false;
+        let state = Arc::clone(&fixture.state);
+        let peer = with_start_time(fixture.peer.clone());
+        let mut responder = TestResponder::subscribe(&state, 11).await;
+        let once = insert_test_lair(&state, "once").await;
+        let open = insert_test_lair(&state, "open").await;
+        for (lair_id, duration, source) in [
+            (once, GrantDuration::Once, AccessGrantSource::Ephemeral),
+            (
+                open,
+                GrantDuration::WorkspaceSession,
+                AccessGrantSource::WorkspaceSession,
+            ),
+            (
+                fixture.lair_id,
+                GrantDuration::Remembered,
+                AccessGrantSource::Remembered,
+            ),
+        ] {
+            let waiting = spawn_ask(
+                &state,
+                &peer,
+                Request::RequestLairAccess {
+                    lair_id,
+                    level: Some(AccessLevel::Look),
+                    scopes: Vec::new(),
+                    wait_millis: 5_000,
+                    agent_name: None,
+                },
+            );
+            let offer = responder.offer().await;
+            assert!(offer.prompt.offers(duration), "{duration:?} is offered");
+            assert_eq!(
+                responder
+                    .answer(&state, &offer, ConsentDecision::Grant { duration })
+                    .await,
+                Ok(Response::ConsentOfferAnswered)
+            );
+            let grant = granted(finished(waiting).await.unwrap());
+            assert_eq!(grant.source, source, "{duration:?}");
+            wait_until_no_request_is_pending(&state).await;
+        }
+        drop(fixture);
+    }
+
+    #[tokio::test]
+    async fn a_duration_the_prompt_does_not_offer_leaves_the_offer_open() {
+        let state = headless(test_state(false));
+        let lair_id = insert_test_lair(&state, "agents").await;
+        // Without a pinned identity only "Just this once" is offered.
+        let peer = with_start_time(PeerIdentity::for_test());
+        let mut responder = TestResponder::subscribe(&state, 11).await;
+        let waiting = spawn_ask(
+            &state,
+            &peer,
+            lair_request(lair_id, &[AccessScope::Observe], 5_000),
+        );
+        let offer = responder.offer().await;
+        let always = ConsentDecision::Grant {
+            duration: splinterm_protocol::GrantDuration::Remembered,
+        };
+        assert_eq!(
+            responder
+                .answer(&state, &offer, always)
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidArgument
+        );
+        assert!(responder.quiet(), "the offer is still outstanding");
+        assert_eq!(
+            responder.answer(&state, &offer, ONCE).await,
+            Ok(Response::ConsentOfferAnswered)
+        );
+        granted(finished(waiting).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn every_unanswered_end_withdraws_the_offer_with_its_reason() {
+        use splinterm_protocol::ConsentOfferEnd;
+
+        let state = headless(test_state(false));
+        let peer = with_start_time(PeerIdentity::for_test());
+        let process = pending_access::ProcessKey::of(&peer).unwrap();
+        let mut responder = TestResponder::subscribe(&state, 11).await;
+        let scopes = [AccessScope::Observe];
+        for (name, reason) in [
+            ("cancel", ConsentOfferEnd::Cancelled),
+            ("expiry", ConsentOfferEnd::Expired),
+            ("workspace end", ConsentOfferEnd::RequestEnded),
+            ("revoke all", ConsentOfferEnd::Cancelled),
+            ("fence", ConsentOfferEnd::Fenced),
+        ] {
+            let lair_id = insert_test_lair(&state, name).await;
+            let request_id = pending_request_id(
+                &ask(&state, &peer, lair_request(lair_id, &scopes, 0))
+                    .await
+                    .unwrap(),
+            );
+            let offer = responder.offer().await;
+            assert_eq!(offer.request_id, request_id);
+            let mut fence = None;
+            match name {
+                "cancel" => assert!(state.pending_access.cancel(&process, lair_id, request_id)),
+                "expiry" => assert!(
+                    state
+                        .pending_access
+                        .expire(request_id, Instant::now() + Duration::from_secs(600))
+                ),
+                "workspace end" => end_lair_grants(&state, lair_id, "test workspace end").await,
+                "revoke all" => assert_eq!(state.pending_access.cancel_all(), 1),
+                _ => {
+                    let mut attempt = HandoffAttempt::begin(&state).await.unwrap();
+                    attempt.fence().await.unwrap();
+                    fence = Some(attempt);
+                }
+            }
+            assert_eq!(
+                responder.withdrawn().await,
+                (offer.offer_id, reason),
+                "{name}"
+            );
+            wait_until_no_request_is_pending(&state).await;
+            if let Some(attempt) = fence {
+                // The fence refuses every answer while it holds.
+                assert_eq!(
+                    responder
+                        .answer(&state, &offer, ONCE)
+                        .await
+                        .unwrap_err()
+                        .code,
+                    ErrorCode::HandoffInProgress
+                );
+                attempt.cancel(HandoffCancelReason::Requested).await;
+            }
+            // The withdrawn offer answers nothing and grants nothing.
+            assert_eq!(
+                responder
+                    .answer(&state, &offer, ONCE)
+                    .await
+                    .unwrap_err()
+                    .code,
+                ErrorCode::NotFound,
+                "{name}"
+            );
+            time::sleep(Duration::from_millis(20)).await;
+            assert!(!has_once_grant(&state, &peer, lair_id).await, "{name}");
+        }
+        assert!(responder.quiet());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

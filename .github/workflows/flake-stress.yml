@@ -27,8 +27,10 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev libfreetype6-dev libpixman-1-dev libxkbcommon-dev pkg-config
       - name: Fetch the locked dependency graph
         run: cargo fetch --locked
-      - name: Build the PTY child helper required by daemon integration tests
-        run: cargo build --frozen -p splinterm-pty --bin splinterm-pty-child
+      - name: Build the PTY child helper and relay required by daemon integration tests
+        run: >-
+          cargo build --frozen -p splinterm-pty --bin splinterm-pty-child
+          -p splinterm-relay --bin splinterm-relay
       - name: Run bounded repetitions and stop on first failure
         env:
           REQUESTED_ITERATIONS: ${{ inputs.iterations || '10' }}
