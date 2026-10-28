@@ -4,7 +4,8 @@
   consent prompt, pending requests, the access list with per-entry revoke and
   Revoke all access through the daemon API, the human and JSON CLI, and the
   command palette, the Explorer marks, the waiting indicator, and one-step MCP
-  host setup (`splinterm mcp setup`))
+  host setup (`splinterm mcp setup`)); where a prompt is shown amended by
+  [ADR 0015](0015-remote-consent.md)
 - **Date:** 2026-10-20
 - **Amends:** [ADR 0005](0005-trusted-consent-broker.md) (consent outcomes,
   prompt input, and persistence), [ADR 0007](0007-supported-automation-policy.md)
@@ -411,7 +412,8 @@ deadline. So a request that needs a prompt becomes a bounded, cancellable
 - Pending requests are never carried across a daemon upgrade or restart.
 
 If no trusted graphical session can show the prompt, the request fails closed
-immediately, as today.
+immediately, as today. (Amended by ADR 0015: a connected remote Window or
+terminal approver can also show it; see the amendment below.)
 
 ### Authorization and composition
 
@@ -639,3 +641,15 @@ non-graphical evidence must prove:
 
 The trusted prompt, the access list, and the Explorer marks also require one
 separately approved graphical acceptance session.
+
+## Amendment: remote consent (ADR 0015)
+
+[ADR 0015](0015-remote-consent.md), accepted for `0.2.0`, offers a workspace
+access prompt to every eligible remote Window and `splinterm approvals`
+terminal approver as well as to the local dialog, so a request fails with
+`consent_unavailable` only when none of them can show it. Every duration,
+Always included, may be answered remotely, and the answer passes the same
+re-checks before it commits. The prompt also counts down and names the
+computer the agent runs on. The rule that a request through `splinterm-relay`
+is never offered While this workspace is open or Always, the remembered-grant
+store, and the policy file are unchanged.

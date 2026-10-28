@@ -1,6 +1,6 @@
 # ADR 0010: Multiplex native remote channels over one authenticated SSH process
 
-- **Status:** Accepted and validated — transport, native human-interactive routing, and reviewed real-host graphical closure are complete
+- **Status:** Accepted and validated — transport, native human-interactive routing, and reviewed real-host graphical closure are complete; which workspace access prompts a relay connection may answer amended by [ADR 0015](0015-remote-consent.md)
 - **Date:** 2026-08-07
 
 ## Context
@@ -126,3 +126,15 @@ channel/session EOF, daemon pidfd exit, anti-starvation behavior, split transpor
 handshake/cancellation, no remote image transport, exact fake-SSH argv, one fake
 SSH process serving simultaneous daemon connections, child cleanup, strict
 profiles, and read-only `remote check`.
+
+## Amendment: remote consent (ADR 0015)
+
+[ADR 0015](0015-remote-consent.md), accepted for `0.2.0`, lets a native remote
+Window's relay connection subscribe as a consent responder on one more logical
+channel and answer the workspace access prompts the remote daemon offers it.
+This is not the rejected "Trusted-UI negotiation through SSH": the relay gains
+no trusted-UI identity, and nothing over SSH proves a compositor or a
+graphical session. The remote daemon decides which connections are eligible
+from its own process checks, and the dialog that shows the prompt is a local
+trusted client on the viewer's computer, launched by its Window. The relay's
+human-interactive role and the automation policy boundary are unchanged.

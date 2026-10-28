@@ -1,16 +1,14 @@
 # ADR 0015: agent access prompts in remote Windows and the terminal approver
 
-- **Status:** Proposed (Plan 0066). The protocol contract and the daemon's
-  routing are on `main`: the daemon offers workspace prompts to subscribed
-  responders and commits their answers, and a remote Window and `splinterm
-  approvals` subscribe and answer.
+- **Status:** Accepted for `0.2.0` (Plan 0066); implemented: the protocol
+  contract (protocol 45), the daemon's routing, the countdown and host row in
+  the dialog, the remote Window responder, and `splinterm approvals`.
 - **Date:** 2026-10-27
 - **Amends:** [ADR 0005](0005-trusted-consent-broker.md) (where the trusted
   prompt is shown), [ADR 0010](0010-one-authentication-graphical-relay.md)
   (what a relay connection may answer), and
   [ADR 0014](0014-easy-agent-access.md) (a prompt nobody local can show no
-  longer fails at once). The amendment notes in those ADRs follow when this
-  one is accepted.
+  longer fails at once). Each of those ADRs carries an amendment note.
 
 ## Context
 
