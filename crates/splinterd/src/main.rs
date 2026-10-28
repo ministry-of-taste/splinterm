@@ -6556,10 +6556,20 @@ struct RequestAuthorizationContext {
     /// The ADR 0014 source behind `ephemeral_grant_id`, when it is a
     /// workspace-session or remembered grant rather than a once grant.
     agent_grant: Option<agent_access::GrantDuration>,
+    /// Plan 0067: a Lair list or topology read that Lair grants authorized
+    /// sees only these Lairs. `None` sees every Lair.
+    granted_lairs: Option<HashSet<LairId>>,
     interactive_bypass: bool,
 }
 
 impl RequestAuthorizationContext {
+    /// Whether a Lair list or topology read may show this Lair.
+    fn shows_lair(&self, lair_id: LairId) -> bool {
+        self.granted_lairs
+            .as_ref()
+            .is_none_or(|granted| granted.contains(&lair_id))
+    }
+
     fn policy_authorized(&self) -> bool {
         self.policy_match
             .as_ref()
@@ -8590,6 +8600,54 @@ fn common_lair_resource(resources: &[policy::PolicyResource]) -> Option<LairId> 
     selected
 }
 
+/// Plan 0067: authorizes a Lair list or topology read that no daemon-wide
+/// policy rule covers. A live Lair counts when one of this peer's grants for
+/// it (just this once, while open, or remembered) alone covers `scopes`,
+/// matched exactly as for a request naming that Lair. `None` when none does.
+async fn lair_grant_topology_authorization(
+    state: &DaemonState,
+    peer: &PeerIdentity,
+    scopes: &[AccessScope],
+) -> Option<RequestAuthorizationContext> {
+    let live: Vec<LairId> = state
+        .topology
+        .read()
+        .await
+        .lairs()
+        .map(|lair| lair.id)
+        .collect();
+    let mut granted = HashSet::new();
+    let mut remaining = Vec::new();
+    {
+        let mut grants = state.grants.lock().await;
+        for lair_id in live {
+            if grants.authorize_lair(peer, lair_id, scopes).is_some() {
+                granted.insert(lair_id);
+            } else {
+                remaining.push(lair_id);
+            }
+        }
+    }
+    let now = unix_seconds_now();
+    let mut agent_grant = None;
+    let mut flush_due = false;
+    for lair_id in remaining {
+        if let Some(authorized) = state.agent_access.authorize(peer, lair_id, scopes, now) {
+            flush_due |= authorized.flush_due;
+            agent_grant = agent_grant.or(Some(authorized.duration));
+            granted.insert(lair_id);
+        }
+    }
+    if flush_due {
+        schedule_agent_access_flush(state);
+    }
+    (!granted.is_empty()).then(|| RequestAuthorizationContext {
+        agent_grant,
+        granted_lairs: Some(granted),
+        ..RequestAuthorizationContext::default()
+    })
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "authorization exhaustively evaluates every request authority in one auditable path"
@@ -8745,6 +8803,22 @@ async fn authorize_request(
                 ..RequestAuthorizationContext::default()
             });
         }
+    }
+    // Plan 0067: without a daemon-wide policy rule, a Lair list or topology
+    // read shows exactly the live Lairs this peer's grants cover.
+    if matches!(request, Request::ListLairs | Request::InspectTopology) {
+        let authorized = match ephemeral_access_scopes(&required_scopes) {
+            Some(scopes) if !scopes.is_empty() => {
+                lair_grant_topology_authorization(state, peer, &scopes).await
+            }
+            _ => None,
+        };
+        return authorized.ok_or_else(|| {
+            ProtocolError::new(
+                ErrorCode::Unauthorized,
+                splinterm_protocol::NO_WORKSPACE_GRANT,
+            )
+        });
     }
     if consent_capable_request(request) {
         Ok(RequestAuthorizationContext::default())
@@ -9469,12 +9543,19 @@ async fn handle_authorized_request(
         Request::ListLairs => {
             let lair = state.topology.read().await;
             Response::Lairs {
-                lairs: lair.lairs().cloned().collect(),
+                lairs: lair
+                    .lairs()
+                    .filter(|candidate| authorization.shows_lair(candidate.id))
+                    .cloned()
+                    .collect(),
                 topology_revision: lair.revision(),
             }
         }
         Request::InspectTopology => Response::Topology {
-            snapshot: consistent_topology_snapshot(state).await,
+            snapshot: shown_topology_snapshot(
+                consistent_topology_snapshot(state).await,
+                authorization,
+            ),
         },
         Request::SubscribeTopology => {
             let (id, snapshot, stream) = subscribe_topology(state, connection_id).await;
@@ -14451,6 +14532,30 @@ fn topology_snapshot_from(
     TopologySnapshot {
         revision: lair.revision(),
         topology: lair,
+        runtimes,
+    }
+}
+
+/// Plan 0067: the part of a snapshot a topology read may show, at the same
+/// revision: the Lairs it may show and their Splints' runtimes.
+fn shown_topology_snapshot(
+    snapshot: TopologySnapshot,
+    authorization: &RequestAuthorizationContext,
+) -> TopologySnapshot {
+    if authorization.granted_lairs.is_none() {
+        return snapshot;
+    }
+    let topology = snapshot
+        .topology
+        .retaining_lairs(|lair_id| authorization.shows_lair(lair_id));
+    let runtimes = snapshot
+        .runtimes
+        .into_iter()
+        .filter(|runtime| topology.find_splint(runtime.splint_id).is_some())
+        .collect();
+    TopologySnapshot {
+        revision: snapshot.revision,
+        topology,
         runtimes,
     }
 }
@@ -24158,6 +24263,118 @@ mod tests {
         assert_eq!(denied.code, ErrorCode::Unauthorized);
     }
 
+    /// `ListLairs` and `InspectTopology` for `peer`: the Lairs both show, or
+    /// the refusal both give. A shown snapshot validates at the live revision.
+    async fn shown_lairs(
+        state: &Arc<DaemonState>,
+        peer: &PeerIdentity,
+    ) -> Result<Vec<LairId>, ProtocolError> {
+        let listed = handle_request(Request::ListLairs, state, peer, 1, 0, false, false).await;
+        let inspected =
+            handle_request(Request::InspectTopology, state, peer, 1, 0, false, false).await;
+        let (listed, inspected) = match (listed, inspected) {
+            (Ok(listed), Ok(inspected)) => (listed.response, inspected.response),
+            (Err(listed), Err(inspected)) => {
+                assert_eq!(listed.code, inspected.code);
+                assert_eq!(listed.message, inspected.message);
+                return Err(listed);
+            }
+            _ => panic!("the Lair list and the topology read disagree"),
+        };
+        let Response::Lairs {
+            lairs,
+            topology_revision,
+        } = listed
+        else {
+            panic!("a Lair list answers with Lairs");
+        };
+        let Response::Topology { snapshot } = inspected else {
+            panic!("a topology read answers with a snapshot");
+        };
+        snapshot.validate().unwrap();
+        let revision = state.topology.read().await.revision();
+        assert_eq!(topology_revision, revision);
+        assert_eq!(snapshot.revision, revision);
+        let shown: Vec<LairId> = lairs.iter().map(|lair| lair.id).collect();
+        let inspected: Vec<LairId> = snapshot.topology.lairs().map(|lair| lair.id).collect();
+        assert_eq!(shown, inspected);
+        Ok(shown)
+    }
+
+    #[tokio::test]
+    async fn once_lair_grants_show_topology_reads_only_their_lairs() {
+        let state = test_state(false);
+        let peer = PeerIdentity::for_test();
+        let granted = Lair::new("granted", PathBuf::from("/tmp"));
+        let granted_id = granted.id;
+        let hidden = Lair::new("hidden", PathBuf::from("/tmp"));
+        let hidden_id = hidden.id;
+        {
+            let mut topology = state.topology.write().await;
+            let revision = topology.revision();
+            topology.insert_lair_at(revision, granted).unwrap();
+            let revision = topology.revision();
+            topology.insert_lair_at(revision, hidden).unwrap();
+        }
+        let refused = shown_lairs(&state, &peer).await.unwrap_err();
+        assert_eq!(refused.code, ErrorCode::Unauthorized);
+        assert_eq!(refused.message, splinterm_protocol::NO_WORKSPACE_GRANT);
+
+        // Another process's grant never counts.
+        let mut other = peer.clone();
+        other.pid = peer.pid.wrapping_add(1);
+        state.grants.lock().await.grant_lair(
+            &other,
+            granted_id,
+            vec![AccessScope::TopologyObserve],
+        );
+        assert!(shown_lairs(&state, &peer).await.is_err());
+        assert_eq!(shown_lairs(&state, &other).await.unwrap(), [granted_id]);
+
+        // A grant without topology_observe does not count.
+        state
+            .grants
+            .lock()
+            .await
+            .grant_lair(&peer, granted_id, vec![AccessScope::TopologyName]);
+        assert!(shown_lairs(&state, &peer).await.is_err());
+
+        let first = state
+            .grants
+            .lock()
+            .await
+            .grant_lair(&peer, granted_id, vec![AccessScope::TopologyObserve])
+            .grant
+            .grant_id;
+        assert_eq!(shown_lairs(&state, &peer).await.unwrap(), [granted_id]);
+        let second = state
+            .grants
+            .lock()
+            .await
+            .grant_lair(&peer, hidden_id, vec![AccessScope::TopologyObserve])
+            .grant
+            .grant_id;
+        let both: HashSet<LairId> = shown_lairs(&state, &peer)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(both, HashSet::from([granted_id, hidden_id]));
+
+        // A revoked grant stops counting on the next request.
+        state.grants.lock().await.revoke_any(first).unwrap();
+        assert_eq!(shown_lairs(&state, &peer).await.unwrap(), [hidden_id]);
+        state.grants.lock().await.revoke_any(second).unwrap();
+        let refused = shown_lairs(&state, &peer).await.unwrap_err();
+        assert_eq!(refused.message, splinterm_protocol::NO_WORKSPACE_GRANT);
+        // A topology subscription stays daemon-only.
+        let subscribe = Request::SubscribeTopology;
+        let subscribed = authorize_request(&subscribe, &state, &other, 0, false, false)
+            .await
+            .unwrap_err();
+        assert_eq!(subscribed.code, ErrorCode::Unauthorized);
+    }
+
     #[tokio::test]
     async fn remote_interactive_role_uses_human_terminal_authority_without_policy() {
         let state = test_state(false);
@@ -27443,14 +27660,27 @@ mod tests {
         let renamed = fixture.rename(peer).await.unwrap();
         assert_eq!(renamed.authorized_grant_id(), Some(manage.grant_id));
         assert_eq!(renamed.agent_grant, Some(GrantDuration::WorkspaceSession));
-        // No source reaches another workspace or a daemon-level request.
+        // No source reaches a daemon-level request; a Lair list shows only
+        // the granted workspace (Plan 0067).
         assert_eq!(
-            authorize_request(&Request::ListLairs, &fixture.state, peer, 0, false, false)
-                .await
-                .unwrap_err()
-                .code,
+            authorize_request(
+                &Request::SubscribeTopology,
+                &fixture.state,
+                peer,
+                0,
+                false,
+                false,
+            )
+            .await
+            .unwrap_err()
+            .code,
             ErrorCode::Unauthorized
         );
+        let listed = authorize_request(&Request::ListLairs, &fixture.state, peer, 0, false, false)
+            .await
+            .unwrap();
+        let granted = listed.granted_lairs.unwrap();
+        assert_eq!(granted, HashSet::from([fixture.lair_id]));
         // A Custom set grants exactly its scopes.
         let custom = agent_access::AccessSet::from_scopes([AccessScope::TopologyName]).unwrap();
         let other = PeerIdentity::for_test_executing(
@@ -27470,6 +27700,70 @@ mod tests {
             fixture.inspect(&other).await.unwrap().agent_grant,
             Some(GrantDuration::Remembered)
         );
+    }
+
+    #[tokio::test]
+    async fn open_workspace_and_remembered_grants_show_topology_reads_only_their_lair() {
+        use agent_access::{AccessLevel, GrantDuration};
+
+        let fixture = agent_fixture().await;
+        let peer = &fixture.peer;
+        let state = &fixture.state;
+        let hidden = Lair::new("hidden", PathBuf::from("/tmp"));
+        {
+            let mut topology = state.topology.write().await;
+            let revision = topology.revision();
+            topology.insert_lair_at(revision, hidden).unwrap();
+        }
+        assert!(shown_lairs(state, peer).await.is_err());
+
+        let session = fixture
+            .commit(
+                peer,
+                level(AccessLevel::Look),
+                GrantDuration::WorkspaceSession,
+            )
+            .await
+            .unwrap();
+        assert_eq!(shown_lairs(state, peer).await.unwrap(), [fixture.lair_id]);
+        let read = authorize_request(&Request::InspectTopology, state, peer, 0, false, false)
+            .await
+            .unwrap();
+        assert_eq!(read.agent_grant, Some(GrantDuration::WorkspaceSession));
+
+        // Another build is another identity, and a grant without
+        // topology_observe does not count.
+        let other = PeerIdentity::for_test_executing(
+            executable_identity::ExecutableIdentity {
+                sha256: "b".repeat(64),
+                ..peer.persistent_executable().unwrap().clone()
+            },
+            peer.durable_evidence().unwrap().clone(),
+        );
+        assert!(shown_lairs(state, &other).await.is_err());
+        let custom = agent_access::AccessSet::from_scopes([AccessScope::TopologyName]).unwrap();
+        fixture
+            .commit(&other, custom, GrantDuration::WorkspaceSession)
+            .await
+            .unwrap();
+        assert!(shown_lairs(state, &other).await.is_err());
+
+        // A revoked grant stops counting on the next request.
+        assert!(state.agent_access.revoke_session(session.grant_id));
+        assert!(shown_lairs(state, peer).await.is_err());
+
+        let remembered = fixture
+            .commit(peer, level(AccessLevel::Look), GrantDuration::Remembered)
+            .await
+            .unwrap();
+        assert_eq!(shown_lairs(state, peer).await.unwrap(), [fixture.lair_id]);
+        let read = authorize_request(&Request::ListLairs, state, peer, 0, false, false)
+            .await
+            .unwrap();
+        assert_eq!(read.agent_grant, Some(GrantDuration::Remembered));
+        let entry_id = remembered.entry_id.unwrap();
+        assert!(state.agent_access.revoke_remembered(&entry_id).is_some());
+        assert!(shown_lairs(state, peer).await.is_err());
     }
 
     #[tokio::test]

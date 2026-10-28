@@ -373,6 +373,8 @@ pub(crate) fn map_client_error(error: &Error) -> DispatchFailure {
 /// The tool error for a daemon refusal: a fixed code and message per
 /// daemon code, never the daemon's own text.
 fn map_protocol_error(error: &splinterm_protocol::ProtocolError) -> DispatchFailure {
+    use splinterm_protocol::NO_WORKSPACE_GRANT;
+
     let (code, message, retryable) = match error.code {
         ErrorCode::AuthenticationFailed => (
             "authentication_failed",
@@ -393,6 +395,10 @@ fn map_protocol_error(error: &splinterm_protocol::ProtocolError) -> DispatchFail
             false,
         ),
         ErrorCode::ConsentDenied => ("consent_denied", "the access request was denied", false),
+        // A Lair list or topology read no grant covers: say what to ask for.
+        ErrorCode::Unauthorized if error.message == NO_WORKSPACE_GRANT => {
+            ("unauthorized", NO_WORKSPACE_GRANT, false)
+        }
         ErrorCode::Unauthorized | ErrorCode::DevelopmentFeatureDisabled => (
             "unauthorized",
             "the exact policy scope or resource is not authorized",
@@ -2942,6 +2948,25 @@ mod protocol_error_tests {
             "the access request was cancelled",
         ));
         assert_eq!(other.message, "the daemon request was cancelled");
+    }
+
+    #[test]
+    fn a_topology_read_without_a_workspace_grant_says_what_to_ask_for() {
+        let ungranted = map_protocol_error(&ProtocolError::new(
+            ErrorCode::Unauthorized,
+            splinterm_protocol::NO_WORKSPACE_GRANT,
+        ));
+        assert_eq!(ungranted.code, "unauthorized");
+        assert!(ungranted.message.contains("request_lair_access"));
+        assert!(!ungranted.retryable);
+        let other = map_protocol_error(&ProtocolError::new(
+            ErrorCode::Unauthorized,
+            "no exact persistent policy rule authorizes this request",
+        ));
+        assert_eq!(
+            other.message,
+            "the exact policy scope or resource is not authorized"
+        );
     }
 }
 

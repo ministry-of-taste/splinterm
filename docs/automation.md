@@ -336,7 +336,9 @@ one corresponds to.
 | **Manage** | Look and type, plus start processes, change layout and names, close and terminate, and restore | Look and type, plus `process_spawn`, `topology_layout`, `topology_name`, `terminate`, `process_restore` | Look and type, plus `process_spawn`, `topology_layout_mutate`, `topology_name_mutate`, `process_terminate`, `process_restore` |
 
 Every level covers the whole workspace, including Dojos and Splints created
-later, and nothing outside it.
+later, and nothing outside it. An agent's list of Lairs and topology read show
+only the workspaces its grants cover; watching the whole topology for changes
+still needs the policy file.
 
 - No level includes clipboard access. A request that asks for a clipboard scope
   is rejected as invalid.
