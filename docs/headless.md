@@ -178,9 +178,11 @@ graphical clients do not use persistent policy and remain connected.
 A headless computer cannot show an [easy agent access](automation.md#easy-agent-access)
 prompt itself, so a request that needs one fails at once with
 `consent_unavailable`: "no Splinterm Window or approver connected to this
-computer can show the prompt". Policy rules keep working without one. The
-daemon can already pass such prompts to connected approvers; the Window and
-terminal approvers that answer them are not available yet.
+computer can show the prompt". Policy rules keep working without one. To answer
+such prompts, run `splinterm approvals` in your own terminal on that computer,
+for example in an SSH login, not inside a Splinterm pane
+([Usage](usage.md#answering-access-prompts-in-a-terminal)). Remote Window
+approvers are not available yet.
 
 The daemon refuses an approver that runs inside a Splint's or the requesting
 agent's process tree or session, or, when workloads run in systemd units,

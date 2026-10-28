@@ -708,6 +708,60 @@ alone and binds nothing; the chord then still engages a dialog that has focus.
 Choose another Ctrl+Alt chord, or turn the shortcut off, with
 [`[integration] dialog-shortcut`](configuration.md#supported-keys).
 
+### Answering access prompts in a terminal
+
+On a computer with no Splinterm Window to show the access prompt, such as a
+headless host you reach over SSH, run `splinterm approvals` in a terminal on
+that computer:
+
+```bash
+ssh my-server
+splinterm approvals
+```
+
+It prints `Waiting for agent access requests on my-server… (Ctrl+C to quit)`
+and then shows each request as text, with the same lines as the dialog: the
+agent's reported name and the note that it names itself, the `host` row
+(`this computer (my-server)`), the program, the process, the workspace, the
+access, and the scopes, escaped in the same way. Below them are your choices:
+**Deny**, then only the durations the request offers, such as
+**Allow Manage once**, **Allow Manage while open**, and **Always allow Manage**.
+It counts down the time left, such as `denies in 1:42`. It can run on a desktop
+too; a Window's dialog and the terminal then show the same request, and the
+first answer wins. The other closes and says the request was answered
+elsewhere.
+
+It is protected the same way as the dialog:
+
+- Each request starts on **Deny**. Up/Down or `j`/`k` choose, and Enter
+  answers. Escape, `q`, or Ctrl+C deny.
+- Keys typed before a request appears are thrown away, and keys count only
+  about a second after it appears. After you move to an Allow choice, Enter
+  counts about 600 ms later.
+- When the time runs out it prints `Expired: no answer sent` and sends nothing.
+  A request that is cancelled, answered elsewhere, or ended by a daemon upgrade
+  closes and says why.
+- While the terminal is too small to show the whole request it can only deny.
+- It answers only a person: it refuses to start unless standard input and
+  output are its own controlling terminal, and it has no option that answers
+  for you.
+
+Run it in your own terminal, not inside a Splinterm pane or a tmux or screen
+session started from one. splinterd checks where it runs and refuses it inside
+any Splint, inside the requesting agent's session or process tree, and, with
+workload cgroups, inside any Splint's cgroup, so agents cannot start it for
+themselves. Only the installed `splinterm` beside the running `splinterd` may
+answer, as for `splinterm upgrade --now` ([CLI](cli.md#daemon-upgrade)); a
+development build is refused. If too many approvers and remote Windows are
+connected it says so.
+After a lost connection or a daemon upgrade it connects again by itself; Ctrl+C
+with no request waiting quits.
+
+A same-user process that starts a terminal outside the process tree, for
+example with `systemd-run --user --pty`, could still run it there. That is the
+same kind of risk as an agent editing your policy file, which it can already do
+as your account.
+
 ## Exit, restore, and relaunch
 
 A Splint has a stable ID across process exits. Each new process under that leaf

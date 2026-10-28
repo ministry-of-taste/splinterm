@@ -467,6 +467,12 @@ If nothing can show the prompt, the request fails with `consent_unavailable`
 at once: "no Splinterm Window or approver connected to this computer can show
 the prompt".
 
+On a computer without a Window, such as a headless host, run
+`splinterm approvals` in your own terminal there to answer prompts as text
+([Usage](usage.md#answering-access-prompts-in-a-terminal)). It shows the same
+request, starts on Deny, and refuses to run inside a Splinterm pane or a tmux or
+screen session started from one, so an agent cannot answer its own request.
+
 ### Seeing and revoking access
 
 `splinterm access list` shows every grant of every duration, with the agent's

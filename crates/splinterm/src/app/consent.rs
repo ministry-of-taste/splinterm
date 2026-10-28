@@ -102,7 +102,7 @@ const PROMPT_LINE_CHARS: usize = 100;
 /// every quote and quote look-alike, and the list's separator are shown as
 /// `\u{…}`, and a run of spaces as one space. At most `maximum` characters,
 /// the last an ellipsis when it was cut; an escape is never cut in two.
-fn display_name(value: &str, maximum: usize) -> String {
+pub(in crate::app) fn display_name(value: &str, maximum: usize) -> String {
     let shown = splinterm::frontend::shown_prompt_name(value, maximum);
     // Cut text gets its ellipsis past `maximum`; uncut text always fits.
     if shown.chars().count() <= maximum {
@@ -114,7 +114,7 @@ fn display_name(value: &str, maximum: usize) -> String {
 /// One line of the prompt, wrapped at [`PROMPT_LINE_CHARS`] at most; every
 /// wrapped row after the first is indented by `indent` columns. The Window
 /// wraps it at spaces, and inside a word (a path) only where it must.
-fn prompt_line(text: impl Into<String>, indent: usize) -> DialogLine {
+pub(in crate::app) fn prompt_line(text: impl Into<String>, indent: usize) -> DialogLine {
     DialogLine::new(text)
         .with_indent(indent)
         .with_wrap_at(PROMPT_LINE_CHARS)
@@ -159,7 +159,7 @@ fn consent_target_line(target: &ConsentTarget) -> DialogLine {
 }
 
 /// The workspace name as grant labels and duration rows show it.
-fn workspace_label(target: &ConsentTarget) -> String {
+pub(in crate::app) fn workspace_label(target: &ConsentTarget) -> String {
     let ConsentTarget::Lair { lair_name, .. } = target else {
         return String::new();
     };
@@ -168,7 +168,10 @@ fn workspace_label(target: &ConsentTarget) -> String {
 
 /// What the grant names: the level, "Custom access" for any other workspace
 /// scope set, or "this access" for a Splint request.
-fn access_label(level: Option<AccessLevel>, target: &ConsentTarget) -> &'static str {
+pub(in crate::app) fn access_label(
+    level: Option<AccessLevel>,
+    target: &ConsentTarget,
+) -> &'static str {
     match (level, target) {
         (Some(level), _) => level.label(),
         (None, ConsentTarget::Lair { .. }) => "Custom access",
@@ -189,7 +192,7 @@ fn grant_label(access: &str, duration: GrantDuration, workspace: &str) -> String
 /// The green button's label for one duration: the grant without the
 /// workspace's name, which the request sentence, the table and the chosen
 /// duration's row all show, so it always fits half the box.
-fn button_label(access: &str, duration: GrantDuration) -> String {
+pub(in crate::app) fn button_label(access: &str, duration: GrantDuration) -> String {
     match duration {
         GrantDuration::Once => format!("Allow {access} once"),
         GrantDuration::WorkspaceSession => format!("Allow {access} while open"),
@@ -197,7 +200,7 @@ fn button_label(access: &str, duration: GrantDuration) -> String {
     }
 }
 
-fn duration_row(duration: GrantDuration, workspace: &str) -> String {
+pub(in crate::app) fn duration_row(duration: GrantDuration, workspace: &str) -> String {
     match duration {
         GrantDuration::Once => "Just this once: five minutes, for this process only".to_owned(),
         GrantDuration::WorkspaceSession => format!(
@@ -226,7 +229,7 @@ fn replacement_line(
 
 /// The computer this dialog runs on, as its kernel names it, when that name
 /// is a usable hostname: the same name its daemon reports to Windows.
-fn local_hostname() -> Option<String> {
+pub(in crate::app) fn local_hostname() -> Option<String> {
     let name = rustix::system::uname();
     usable_daemon_hostname(name.nodename().to_str().ok()?).map(str::to_owned)
 }
@@ -349,14 +352,18 @@ fn request_sentence(prompt: &ConsentPrompt, workspace: &str, remote: Option<&str
 }
 
 /// The lines one chosen duration adds below the duration list.
-struct ChosenLines {
-    shared: Option<DialogLine>,
-    replaced: Option<DialogLine>,
+pub(in crate::app) struct ChosenLines {
+    pub(in crate::app) shared: Option<DialogLine>,
+    pub(in crate::app) replaced: Option<DialogLine>,
 }
 
 /// The lines a chosen duration adds below the list: who shares it and what
 /// it replaces.
-fn chosen_lines(prompt: &ConsentPrompt, selected: usize, workspace: &str) -> ChosenLines {
+pub(in crate::app) fn chosen_lines(
+    prompt: &ConsentPrompt,
+    selected: usize,
+    workspace: &str,
+) -> ChosenLines {
     let chosen = prompt.durations.get(selected);
     let shared = chosen
         .and_then(|offer| offer.shared_by.as_deref())
@@ -375,20 +382,17 @@ fn chosen_lines(prompt: &ConsentPrompt, selected: usize, workspace: &str) -> Cho
     ChosenLines { shared, replaced }
 }
 
-/// The prompt's text with the duration at `selected` chosen: the request
-/// sentence, the note that the agent names itself, for a remote request the
-/// note that the answer allows it on that host only, the table of where and
-/// who asks and for what, how long, and the answer hint; the frame's title
-/// ("remote agent access request" for a remote one) and the two buttons'
-/// labels, the green one naming the chosen grant. The chosen duration's
-/// lines sit in slots, so every selection has the same rows in the same
-/// places at any width, and choosing a duration never moves the rows the
-/// pointer selects. `local_hostname` names this computer.
-fn consent_text(
+/// The prompt's request, the same in the dialog and in the terminal
+/// approver (`splinterm approvals`): the frame's title ("remote agent access
+/// request" for a remote one), the request sentence, the note that the
+/// agent names itself, for a remote request the note that the answer allows
+/// it on that host only, and the table of where and who asks and for what,
+/// ending with its `scopes` row. Every name and path in it is escaped
+/// ([`display_name`]). `local_hostname` names this computer.
+pub(in crate::app) fn consent_request_lines(
     prompt: &ConsentPrompt,
-    selected: usize,
     local_hostname: Option<&str>,
-) -> DialogText {
+) -> Vec<DialogLine> {
     let workspace = workspace_label(&prompt.target);
     let host = PromptHost::of(prompt, local_hostname);
     let remote = host.remote_name();
@@ -443,6 +447,23 @@ fn consent_text(
     ));
     let labels: Vec<_> = prompt.scopes.iter().map(|scope| scope.label()).collect();
     lines.push(table_line("scopes", labels.join(", ")));
+    lines
+}
+
+/// The prompt's text with the duration at `selected` chosen: the request
+/// ([`consent_request_lines`]), how long, and the answer hint; the frame's
+/// title and the two buttons' labels, the green one naming the chosen
+/// grant. The chosen duration's lines sit in slots, so every selection has
+/// the same rows in the same places at any width, and choosing a duration
+/// never moves the rows the pointer selects. `local_hostname` names this
+/// computer.
+fn consent_text(
+    prompt: &ConsentPrompt,
+    selected: usize,
+    local_hostname: Option<&str>,
+) -> DialogText {
+    let workspace = workspace_label(&prompt.target);
+    let mut lines = consent_request_lines(prompt, local_hostname);
     lines.push(DialogLine::blank());
     lines.push(DialogLine::new("how long").with_style(DialogStyle::Group));
     for (index, offer) in prompt.durations.iter().enumerate() {

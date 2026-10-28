@@ -3,6 +3,7 @@
 mod access_cli;
 mod access_monitor;
 mod agent_status_cli;
+mod approvals;
 mod cli;
 mod commands;
 mod consent;

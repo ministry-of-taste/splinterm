@@ -377,6 +377,23 @@ pub(in crate::app) enum Command {
     /// Private daemon-launched trusted consent surface.
     #[command(hide = true)]
     Consent,
+    /// Answer agent access requests in this terminal.
+    ///
+    /// For a computer with no Splinterm Window to show the access prompt,
+    /// such as a headless host you reach over SSH. Run it in your own
+    /// terminal on the computer splinterd runs on, not inside a Splinterm
+    /// pane or a tmux or screen session started from one: splinterd refuses
+    /// it there, so agents cannot start it for themselves. Only the installed
+    /// splinterm beside the running splinterd may answer.
+    ///
+    /// Each request shows its agent, program, workspace and access, starts
+    /// on Deny, and counts down. Keys typed before it appears are thrown
+    /// away, and keys count only a moment after it appears. Up/Down or j/k
+    /// choose, Enter answers; Escape, q or Ctrl+C deny. When the time runs
+    /// out nothing is sent. Ctrl+C with no request waiting quits. There is
+    /// no option that answers without you.
+    #[command(verbatim_doc_comment)]
+    Approvals,
     /// Inspect or start a live daemon upgrade that keeps terminals running.
     ///
     /// Without --now, show whether the running daemon could hand its terminals
@@ -839,6 +856,34 @@ mod tests {
         let help = Cli::command().render_long_help().to_string();
         assert!(!help.contains("launcher-check"), "{help}");
         assert!(!help.contains("restart-dialog"), "{help}");
+    }
+
+    #[test]
+    fn approvals_takes_no_options_and_its_help_says_where_to_run_it() {
+        use clap::CommandFactory as _;
+
+        let parsed = Cli::try_parse_from(["splinterm", "approvals"]).unwrap();
+        assert!(matches!(parsed.command, Some(Command::Approvals)));
+        for rejected in [
+            &["splinterm", "approvals", "--yes"][..],
+            &["splinterm", "approvals", "--allow"][..],
+            &["splinterm", "approvals", "deny"][..],
+        ] {
+            assert!(Cli::try_parse_from(rejected).is_err(), "{rejected:?}");
+        }
+        let mut command = Cli::command();
+        assert!(command.render_long_help().to_string().contains("approvals"));
+        let approvals = command.find_subcommand_mut("approvals").unwrap();
+        let help = approvals.render_long_help().to_string();
+        for expected in [
+            "not inside a Splinterm",
+            "pane or a tmux or screen session started from one",
+            "agents cannot start it for themselves",
+            "starts\non Deny",
+            "no option that answers without you",
+        ] {
+            assert!(help.contains(expected), "missing {expected:?} in {help}");
+        }
     }
 
     #[test]
