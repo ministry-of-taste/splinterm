@@ -19,7 +19,7 @@
             "cells"
           ],
           "default": "text",
-          "description": "text: the screen as one plain-text string, one line per line. cells: one object per cell with its display width."
+          "description": "text: the screen as one plain-text string; wrapped rows are joined (not on the alternate screen) and trailing spaces dropped. cells: one object per cell with its display width."
         }
       }
     }

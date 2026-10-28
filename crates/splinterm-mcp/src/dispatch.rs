@@ -14,17 +14,17 @@ use splinterm_automation_client::{
 };
 use splinterm_core::{Axis, DojoId, LairId, LayoutNode, SplintId, SplitRatio, SplitSide};
 use splinterm_protocol::{
-    AccessGrant, AccessGrantSource, AccessScope, AgentState, AgentStatusReport, AuditDecision,
-    AuditOutcome, AutomationLaunch, ErrorCode, MAX_SCROLLBACK_PAGE_ROWS, MAX_SEARCH_QUERY_BYTES,
-    MAX_SEARCH_RESULTS, MutationPreflight, MutationPreparation, Request, Response,
-    RestoreLeafResult, ScrollbackPage, SearchPage, SplintLifecycle, SplintRuntimeSummary,
+    AccessGrant, AccessGrantSource, AccessScope, ActiveScreen, AgentState, AgentStatusReport,
+    AuditDecision, AuditOutcome, AutomationLaunch, ErrorCode, MAX_SCROLLBACK_PAGE_ROWS,
+    MAX_SEARCH_QUERY_BYTES, MAX_SEARCH_RESULTS, MutationPreflight, MutationPreparation, Request,
+    Response, RestoreLeafResult, ScrollbackPage, SearchPage, SplintLifecycle, SplintRuntimeSummary,
     TerminalProvenance, TerminalRow, TerminalSnapshot, TopologySnapshot,
 };
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     limits::MAXIMUM_TOOL_RESPONSE_BYTES,
-    terminal_text::{TerminalFormat, terminal_text},
+    terminal_text::{TerminalFormat, TextLayout, terminal_text},
 };
 
 const SCHEMA: &str = "splinterm.mcp.v2";
@@ -1044,15 +1044,30 @@ fn terminal_snapshot_output(
     Ok(success(
         tool,
         resource,
-        terminal_rows_data(format, &provenance.title, &snapshot.visible_rows, None)?,
+        terminal_rows_data(
+            format,
+            screen_layout(snapshot.active_screen),
+            &provenance.title,
+            &snapshot.visible_rows,
+            None,
+        )?,
         false,
         "untrusted_terminal_data",
     ))
 }
 
+/// Foot reflows only the main screen, so only its wrapped rows are joined.
+const fn screen_layout(screen: ActiveScreen) -> TextLayout {
+    match screen {
+        ActiveScreen::Normal => TextLayout::Screen,
+        ActiveScreen::Alternate => TextLayout::AlternateScreen,
+    }
+}
+
 /// The `data` of a terminal read in the requested format.
 fn terminal_rows_data(
     format: TerminalFormat,
+    layout: TextLayout,
     title: &str,
     rows: &[TerminalRow],
     continuation_cursor: Option<&str>,
@@ -1060,7 +1075,7 @@ fn terminal_rows_data(
     let rows = project_terminal_rows(rows).map_err(|_| DispatchFailure::internal())?;
     Ok(match format {
         TerminalFormat::Text => {
-            let text = terminal_text(&rows);
+            let text = terminal_text(&rows, layout);
             if text.len() > MAXIMUM_TOOL_RESPONSE_BYTES {
                 return Err(DispatchFailure::resource_limit());
             }
@@ -1122,6 +1137,7 @@ fn scrollback_output(
         resource,
         terminal_rows_data(
             format,
+            TextLayout::ScrollbackPage,
             &provenance.title,
             &page.rows,
             continuation_cursor.as_deref(),

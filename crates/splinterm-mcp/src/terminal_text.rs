@@ -32,6 +32,23 @@ impl TerminalFormat {
     }
 }
 
+/// Where the rows of a text read come from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TextLayout {
+    /// The visible main screen: wrapped rows join, and trailing empty lines
+    /// are dropped.
+    Screen,
+    /// The visible alternate screen of a full-screen program such as vim or
+    /// htop: one line per row, never joined, as Foot reflows only the main
+    /// screen. Trailing empty lines are dropped.
+    AlternateScreen,
+    /// A scrollback page: every hard line end is a `\n` and empty lines are
+    /// kept. A page whose last row wraps ends without one, partway through a
+    /// line, so an older page's text followed by the newer page's text is the
+    /// history exactly.
+    ScrollbackPage,
+}
+
 /// Joins projected rows into lines of plain text.
 ///
 /// `linebreak` is the terminal's hard line end. Every row starts with it, and
@@ -40,9 +57,9 @@ impl TerminalFormat {
 /// two make one line. A row with no content never joins, which matches the
 /// terminal's own reflow, so a blank row is always an empty line.
 ///
-/// An empty cell reads as a space and a wide character appears once. Each line
-/// loses its trailing spaces, and trailing empty lines are dropped.
-pub(crate) fn terminal_text(rows: &[ProjectedTerminalRow]) -> String {
+/// An empty cell reads as a space, a wide character appears once, and each
+/// line that ends in the rows loses its trailing spaces.
+pub(crate) fn terminal_text(rows: &[ProjectedTerminalRow], layout: TextLayout) -> String {
     let mut text = String::new();
     let mut line_start = 0;
     for row in rows {
@@ -53,7 +70,9 @@ pub(crate) fn terminal_text(rows: &[ProjectedTerminalRow]) -> String {
                 text.push_str(&cell.text);
             }
         }
-        let continues = !row.linebreak && row.cells.iter().any(|cell| !cell.text.is_empty());
+        let continues = layout != TextLayout::AlternateScreen
+            && !row.linebreak
+            && row.cells.iter().any(|cell| !cell.text.is_empty());
         if !continues {
             let line_end = line_start + text[line_start..].trim_end_matches(' ').len();
             text.truncate(line_end);
@@ -61,8 +80,10 @@ pub(crate) fn terminal_text(rows: &[ProjectedTerminalRow]) -> String {
             line_start = text.len();
         }
     }
-    let end = text.trim_end_matches([' ', '\n']).len();
-    text.truncate(end);
+    if layout != TextLayout::ScrollbackPage {
+        let end = text.trim_end_matches([' ', '\n']).len();
+        text.truncate(end);
+    }
     text
 }
 
@@ -104,8 +125,16 @@ mod tests {
         }
     }
 
+    fn laid_out(rows: &[TerminalRow], layout: TextLayout) -> String {
+        terminal_text(&project_terminal_rows(rows).unwrap(), layout)
+    }
+
     fn text_of(rows: &[TerminalRow]) -> String {
-        terminal_text(&project_terminal_rows(rows).unwrap())
+        laid_out(rows, TextLayout::Screen)
+    }
+
+    fn page_of(rows: &[TerminalRow]) -> String {
+        laid_out(rows, TextLayout::ScrollbackPage)
     }
 
     #[test]
@@ -206,6 +235,56 @@ mod tests {
         assert_eq!(text_of(&rows), "abc\ndef");
     }
 
+    #[test]
+    fn a_scrollback_page_ends_every_hard_line_and_keeps_empty_lines() {
+        let rows = [
+            row("first", 8, true),
+            row("", 8, true),
+            row("second  ", 8, true),
+            row("", 8, false),
+        ];
+        assert_eq!(page_of(&rows), "first\n\nsecond\n\n");
+        assert_eq!(page_of(&[]), "");
+    }
+
+    // Pages run older; an agent that puts each older page before the text it
+    // has must rebuild the history exactly, whichever row a page starts at.
+    #[test]
+    fn scrollback_pages_join_exactly_across_a_wrap_and_blank_lines() {
+        let history = [
+            row("$ echo hello ", 13, false),
+            row("world", 13, true),
+            row("", 13, true),
+            row("", 13, true),
+            row("abc", 3, false),
+            row("de f", 4, false),
+            row("g", 4, true),
+            row("$", 13, true),
+        ];
+        let whole = page_of(&history);
+        assert_eq!(whole, "$ echo hello world\n\n\nabcde fg\n$\n");
+        for split in 0..=history.len() {
+            let (older, newer) = history.split_at(split);
+            assert_eq!(
+                page_of(older) + &page_of(newer),
+                whole,
+                "pages split before row {split}"
+            );
+        }
+        // A page that ends mid-wrap stops partway through the line.
+        assert_eq!(page_of(&history[..1]), "$ echo hello ");
+        assert_eq!(page_of(&history[4..5]), "abc");
+    }
+
+    // Full-screen programs draw the alternate screen row by row; Foot never
+    // reflows it, so its rows are never joined.
+    #[test]
+    fn alternate_screen_rows_are_never_joined() {
+        let rows = [row("abc", 3, false), row("def", 3, true), row("", 3, true)];
+        assert_eq!(laid_out(&rows, TextLayout::AlternateScreen), "abc\ndef");
+        assert_eq!(laid_out(&rows, TextLayout::Screen), "abcdef");
+    }
+
     // A representative 70 x 134 screen: shell and tool output padded with
     // spaces to the margin, as full-screen programs draw it.
     #[test]
@@ -221,7 +300,8 @@ mod tests {
             .collect::<Vec<_>>();
         let projected = project_terminal_rows(&rows).unwrap();
         let cells = json!({"content_encoding": "unicode_scalars", "rows": projected});
-        let text = json!({"content_encoding": "text", "text": terminal_text(&projected)});
+        let text = terminal_text(&projected, TextLayout::Screen);
+        let text = json!({"content_encoding": "text", "text": text});
         let cells = serde_json::to_vec(&cells).unwrap().len();
         let text = serde_json::to_vec(&text).unwrap().len();
         eprintln!("70x134 screen: cells {cells} bytes, text {text} bytes");

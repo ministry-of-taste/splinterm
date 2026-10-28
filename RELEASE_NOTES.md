@@ -77,6 +77,9 @@ running daemon by themselves.
   ID`), which has no command palette.
 - The desktop launcher no longer restarts a daemon that may still run shells
   without asking.
+- MCP `splinterm.read_terminal` and `splinterm.read_scrollback` return
+  `data.text` by default. Pass `"format": "cells"` for the 0.1 `data.rows`
+  form (see "MCP").
 - New Dojos and Lairs start in your home directory, not the focused Splint's
   directory.
 - On Omarchy 4 with no font size in `config.ini`, the terminal follows

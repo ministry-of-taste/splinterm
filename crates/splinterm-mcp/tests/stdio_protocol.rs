@@ -1289,7 +1289,7 @@ fn terminal_tools_use_exact_scoped_requests_cursors_and_cleanup() {
     let fake = thread::spawn(move || {
         let splint_id: SplintId = "018f4d8c-2a18-4b31-8c2f-9e7c5de77103".parse().unwrap();
         let other_splint_id: SplintId = "018f4d8c-2a18-4b31-8c2f-9e7c5de77104".parse().unwrap();
-        for index in 0..9 {
+        for index in 0..10 {
             let (mut stream, _) = listener.accept().unwrap();
             assert!(matches!(
                 read_private_frame::<ClientFrame>(&mut stream),
@@ -1548,6 +1548,59 @@ fn terminal_tools_use_exact_scoped_requests_cursors_and_cleanup() {
                         },
                     },
                 ),
+                (
+                    9,
+                    Request::Attach {
+                        splint_id: requested,
+                        incarnation: None,
+                        scrollback_rows: 0,
+                    },
+                ) if requested == splint_id => {
+                    // A full-screen program on the alternate screen: a row
+                    // without a linebreak still reads as its own line.
+                    let mut snapshot = reviewed_terminal_snapshot();
+                    snapshot.rows = 2;
+                    snapshot.active_screen = ActiveScreen::Alternate;
+                    let row = |row_id, text: &str, linebreak| TerminalRow {
+                        row_id: Some(row_id),
+                        linebreak,
+                        cells: text
+                            .chars()
+                            .map(|character| TerminalCell {
+                                content: character.to_string(),
+                                spacer_remaining: None,
+                                attributes: terminal_attributes(),
+                            })
+                            .collect(),
+                    };
+                    snapshot.visible_rows = vec![row(2, "abcd", false), row(3, "ef", true)];
+                    write_private_frame(
+                        &mut stream,
+                        &ServerFrame::Response {
+                            request_id,
+                            result: Response::Attached {
+                                subscription_id: 9,
+                                provenance: reviewed_terminal_provenance(9, 3),
+                                snapshot,
+                            },
+                        },
+                    );
+                    let ClientFrame::Request {
+                        diagnostic_correlation: _,
+                        request_id,
+                        request: Request::Detach { subscription_id: 9 },
+                    } = read_private_frame(&mut stream)
+                    else {
+                        panic!("alternate-screen terminal read did not detach");
+                    };
+                    write_private_frame(
+                        &mut stream,
+                        &ServerFrame::Response {
+                            request_id,
+                            result: Response::Acknowledged,
+                        },
+                    );
+                }
                 (_, request) => panic!("unexpected terminal-tool request {index}: {request:?}"),
             }
         }
@@ -1600,7 +1653,9 @@ fn terminal_tools_use_exact_scoped_requests_cursors_and_cleanup() {
         first["structuredContent"]["data"]["content_encoding"],
         "text"
     );
-    assert_eq!(first["structuredContent"]["data"]["text"], "history");
+    // A scrollback page ends each hard line, so older pages join by
+    // plain concatenation.
+    assert_eq!(first["structuredContent"]["data"]["text"], "history\n");
     assert!(first["structuredContent"]["data"].get("rows").is_none());
 
     let resync = call_tool(
@@ -1745,6 +1800,13 @@ fn terminal_tools_use_exact_scoped_requests_cursors_and_cleanup() {
         unknown_format["structuredContent"]["error"]["code"],
         "invalid_argument"
     );
+    let alternate = call_tool(
+        &mut server,
+        44,
+        "splinterm.read_terminal",
+        json!({"splint_id": splint_id}),
+    );
+    assert_eq!(alternate["structuredContent"]["data"]["text"], "abcd\nef");
 
     server.close_input();
     assert!(server.wait().success());

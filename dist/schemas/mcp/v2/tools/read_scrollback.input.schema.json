@@ -27,7 +27,7 @@
             "cells"
           ],
           "default": "text",
-          "description": "text: the page as one plain-text string, one line per line. cells: one object per cell with its display width."
+          "description": "text: the page as one plain-text string; wrapped rows are joined, trailing spaces dropped, and every line ends with a newline except a last line that continues in the newer page, so older page text followed by newer page text is the history. cells: one object per cell with its display width."
         }
       }
     }

@@ -143,7 +143,7 @@ const REVIEWED_SCHEMA_FNV64: &[(&str, u64)] = &[
     ("tools/ping.output.schema.json", 0xaf91_1919_d5ed_5480),
     (
         "tools/read_scrollback.input.schema.json",
-        0xf5bb_83bf_4f3a_0a95,
+        0x0f87_0822_8907_a0ce,
     ),
     (
         "tools/read_scrollback.output.schema.json",
@@ -151,7 +151,7 @@ const REVIEWED_SCHEMA_FNV64: &[(&str, u64)] = &[
     ),
     (
         "tools/read_terminal.input.schema.json",
-        0x0ef4_5345_285b_671a,
+        0x1800_0280_51cd_5cdf,
     ),
     (
         "tools/read_terminal.output.schema.json",

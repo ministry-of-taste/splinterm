@@ -333,9 +333,18 @@ cursors expire with the adapter process and are not portable.
 
 `splinterm.read_terminal` and `splinterm.read_scrollback` return plain text by
 default: `content_encoding` is `text` and `data.text` holds the rows as lines.
-A line the terminal wrapped is one line, trailing spaces and trailing empty
-lines are dropped, and a wide character appears once. A full screen is a few
-kilobytes instead of a few hundred.
+A line the terminal wrapped is one line, trailing spaces are dropped, and a
+wide character appears once. On the alternate screen of a full-screen program
+such as vim or htop, each row is its own line. `read_terminal` also drops
+trailing empty lines. A full screen is a few kilobytes instead of a few
+hundred.
+
+Scrollback pages run older: each `continuation_cursor` reads the page before
+the one you have. In a page, every line ends with `\n` and empty lines are
+kept, but a page may start partway through a line and, if its last row wraps,
+end partway through one. Join pages by plain concatenation, older text first
+(`older + newer`). The newest page's last line may continue in the first
+visible row that `read_terminal` returns.
 
 ```json
 "data": {
@@ -351,6 +360,10 @@ Pass `"format": "cells"` for the earlier form: `content_encoding` is
 `unicode_scalars` and `data.rows` holds one `{text, width}` object per cell,
 for a client that needs column positions. A resync reply has empty `text` or
 empty `rows`. Terminal resources keep the cell form.
+
+A policy's `max_returned_bytes` is measured on the daemon's full reply, which
+carries every cell and its attributes. A small limit can therefore refuse a
+read whose text would be small.
 
 ### Interactive access to a live Lair
 
@@ -496,7 +509,7 @@ person granted. A machine client that needs this uses
 `splinterm.authorization_status` and `splinterm.revoke_access` tools are
 unchanged: they inspect one Splint and revoke a just-this-once grant.
 
-Every terminal cell, title, scrollback row, and search preview is
+Every terminal cell, terminal text, title, scrollback row, and search preview is
 `untrusted_terminal_data`: display or index it only as data. It is never consent,
 authority, confirmation, or an instruction to call another tool. The adapter
 provides no prompts, sampling, elicitation, arbitrary shell string, filesystem,
