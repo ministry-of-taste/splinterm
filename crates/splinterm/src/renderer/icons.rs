@@ -452,6 +452,36 @@ mod tests {
         }
     }
 
+    /// Tabler draws each icon centred in its advance, and so does the face:
+    /// a glyph whose left side bearing disagrees with its outline's left
+    /// edge is drawn shifted, and cropped at the slot. Symmetric icons keep
+    /// equal ink margins in their slot to within a pixel, and the filled
+    /// caret, whose outline sits 1/24 em right of centre, to within two.
+    #[test]
+    fn icons_are_centred_in_their_slot_and_not_cropped() {
+        for cell in CELLS {
+            let slot_width = i32::try_from(cell.width * ChromeIcon::CELLS).unwrap();
+            for (icon, slack) in [
+                (ChromeIcon::Eye, 1),
+                (ChromeIcon::ChevronDown, 1),
+                (ChromeIcon::ChevronRight, 1),
+                (ChromeIcon::AlertCircle, 1),
+                (ChromeIcon::CircleDotFilled, 1),
+                (ChromeIcon::ArrowBadgeRightFilled, 1),
+                (ChromeIcon::CaretRightFilled, 2),
+            ] {
+                let glyph = icon_glyph(icon, 7, 14.0, cell).unwrap();
+                let bounds = glyph.ink_bounds().unwrap();
+                let left = glyph.left + i32::try_from(bounds.left).unwrap();
+                let right = slot_width - glyph.left - i32::try_from(bounds.right).unwrap();
+                assert!(
+                    (left - right).abs() <= slack,
+                    "{icon:?} has margins {left} and {right} px at {cell:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn icon_rasters_are_cached_per_generation_size_and_cell() {
         let cell = CELLS[0];

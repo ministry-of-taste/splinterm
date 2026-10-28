@@ -17,7 +17,7 @@ system font and never used for terminal content.
   - `package/dist/fonts/tabler-icons-filled.ttf` (filled), SHA-256
     `08304212f3f43271ee700156044a298a081ad2a24b30e28b4f3346dd2fe7ecf9`
 - Subset file SHA-256:
-  `0007554336a3e742b7bf2fbfff0330e2b949598ec2af7673778ff2d918246571`
+  `325ccab6940b2316b7dfd7ad56e671de0232d948ef9e11a500bd78f7b86f684e`
   (5712 bytes)
 - Project: <https://tabler.io/icons>, <https://github.com/tabler/tabler-icons>
 - License: MIT, Copyright (c) 2020-2026 Paweł Kuna; see [`LICENSE`](LICENSE).
@@ -28,11 +28,21 @@ system font and never used for terminal content.
 
 Run in `package/dist/fonts` with fontTools 4.63.0
 (`nix-shell -p python3Packages.fonttools`); the output is byte-for-byte
-reproducible. The two faces share their metrics (1000 units per em, ascent
-900, descent 100) and no codepoint, so they merge into one face: subset each,
+reproducible. The two faces have the same units per em (1000) and hhea and
+typographic ascent and descent (900 and 100), and no codepoint in common, so
+they merge into one face; they differ only in the OS/2 Windows descent (104
+outline, 100 filled), where the merge keeps the larger, 104. Subset each face,
 merge them, then subset the merge once more to drop the second `.notdef`.
 `pyftmerge` stamps the merged face with the current time unless
 `SOURCE_DATE_EPOCH` is set; `0` keeps the original faces' timestamps.
+
+`pyftmerge` also recalculates each glyph's bounding box. Tabler's faces store
+a left edge of 0 for every glyph, matching its left side bearing of 0, while
+the outline sits centred in the advance. FreeType shifts a glyph left by the
+difference between its stored left edge and its left side bearing, so after
+the merge every icon would be drawn off centre. The last step sets each left
+side bearing to the recalculated left edge, which renders every icon exactly
+as the original faces do.
 
 ```sh
 pyftsubset tabler-icons.ttf \
@@ -47,9 +57,16 @@ pyftsubset tabler-icons-filled.ttf \
   --notdef-outline --drop-tables+=FFTM
 SOURCE_DATE_EPOCH=0 pyftmerge outline.ttf filled.ttf --output-file=merged.ttf
 pyftsubset merged.ttf --unicodes="*" \
-  --output-file=tabler-icons-subset.ttf \
+  --output-file=subset.ttf \
   --layout-features= --no-hinting --desubroutinize --name-IDs="*" \
   --notdef-outline --drop-tables+=FFTM
+python3 -c 'import sys
+from fontTools.ttLib import TTFont
+font = TTFont(sys.argv[1], recalcTimestamp=False)
+for name in font.getGlyphOrder():
+    advance, _ = font["hmtx"][name]
+    font["hmtx"][name] = (advance, getattr(font["glyf"][name], "xMin", 0))
+font.save(sys.argv[2])' subset.ttf tabler-icons-subset.ttf
 ```
 
 ## Codepoints

@@ -238,9 +238,10 @@ when siblings are added or removed. Search, the navigation pickers, and the
 standalone Recent Dojos picker (`splinterm dojos`) use the same labels.
 
 Each Explorer row is one line, or two with `row-lines=2` (below). On the left
-are a dot marking the current row, a chevron icon before each Lair and Dojo
-(pointing right when collapsed and down when expanded), and the name. On the
-right, fixed icon columns line up on every row:
+are an icon marking the current row (an eye unless `[explorer] current-marker`
+picks another icon), a chevron icon before each Lair and Dojo (pointing right
+when collapsed and down when expanded), and the name. On the right, fixed icon
+columns line up on every row:
 
 | Column | Shows |
 | --- | --- |

@@ -6393,7 +6393,7 @@ mod tests {
 
     /// Each painted row's second line in buffer px, with the left and right
     /// edges its detail paints between: in the tree from past the name's
-    /// dot and disclosure slot to the row's right inset, and in the agents
+    /// marker and disclosure slot to the row's right inset, and in the agents
     /// section from past the glyph column and its gap to the divider's
     /// inset.
     fn second_line_bounds(
