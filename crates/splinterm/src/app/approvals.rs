@@ -120,8 +120,9 @@ const TOO_MANY: &str = "Too many approvers or remote Windows are connected to sp
 pub(super) struct TerminalFacts {
     pub(super) stdin_terminal: bool,
     pub(super) stdout_terminal: bool,
-    /// The device number of the controlling terminal (`/dev/tty`); `None`
-    /// without one.
+    /// The device number of the session's controlling terminal, from
+    /// `tty_nr` in `/proc/self/stat` as splinterd reads it; `None` without
+    /// one.
     pub(super) controlling: Option<u64>,
     /// The character device standard input is, if it is one.
     pub(super) stdin_device: Option<u64>,
@@ -135,23 +136,36 @@ impl TerminalFacts {
     fn read() -> Self {
         let stdin = io::stdin();
         let stdout = io::stdout();
-        let controlling = rustix::fs::open(
-            "/dev/tty",
-            rustix::fs::OFlags::RDWR | rustix::fs::OFlags::NOCTTY | rustix::fs::OFlags::CLOEXEC,
-            rustix::fs::Mode::empty(),
-        )
-        .ok()
-        .and_then(|terminal| character_device(terminal.as_fd()));
         Self {
             stdin_terminal: rustix::termios::isatty(&stdin),
             stdout_terminal: rustix::termios::isatty(&stdout),
-            controlling,
+            controlling: std::fs::read("/proc/self/stat")
+                .ok()
+                .and_then(|stat| controlling_terminal(&stat)),
             stdin_device: character_device(stdin.as_fd()),
             stdout_device: character_device(stdout.as_fd()),
             foreground: rustix::termios::tcgetpgrp(&stdin)
                 .is_ok_and(|group| group == rustix::process::getpgrp()),
         }
     }
+}
+
+/// The controlling terminal's device number from `/proc/<pid>/stat`
+/// contents: the `tty_nr` field after the command name's final `)`, in the
+/// kernel's encoding, 0 for none. Opening `/dev/tty` would not do: its
+/// `fstat` reports the `/dev/tty` alias itself, never the terminal behind it.
+fn controlling_terminal(stat: &[u8]) -> Option<u64> {
+    let close = stat.iter().rposition(|&byte| byte == b')')?;
+    let rest = std::str::from_utf8(&stat[close + 1..]).ok()?;
+    // state, ppid, pgrp, session, tty_nr
+    let field = rest.split_ascii_whitespace().nth(4)?;
+    let terminal = u32::try_from(field.parse::<i32>().ok()?).ok()?;
+    if terminal == 0 {
+        return None;
+    }
+    let major = (terminal >> 8) & 0xfff;
+    let minor = (terminal & 0xff) | ((terminal >> 12) & 0xf_ff00);
+    Some(rustix::fs::makedev(major, minor))
 }
 
 fn character_device(descriptor: BorrowedFd<'_>) -> Option<u64> {
@@ -1668,7 +1682,7 @@ mod tests {
         ARMING_DELAY, AnswerResult, Approver, Attempt, BOLD, Choice, DIM, Effect, Flow, Input, Key,
         KeyDecoder, MIN_COLUMNS, REPLACED, RESET, REVERSE, SELECTION_ARMING_DELAY, Screen, Session,
         TerminalFacts, TerminalRefusal, answer_outcome, check_terminal, classify_refusal,
-        decode_keys, multiplexer_warning, paint, waiting_line,
+        controlling_terminal, decode_keys, multiplexer_warning, paint, waiting_line,
     };
 
     const GENERATION: u64 = 7;
@@ -1842,6 +1856,40 @@ mod tests {
         ] {
             assert_eq!(check_terminal(&facts), Err(refusal), "{facts:?}");
             assert!(refusal.message().starts_with("splinterm approvals"));
+        }
+    }
+
+    #[test]
+    fn it_reads_the_controlling_terminal_from_its_stat_line() {
+        // /dev/pts/3: major 136, minor 3, tty_nr 34819. The command name
+        // may hold spaces and parentheses.
+        let stat = b"4242 (a (b) c) S 1 4242 4242 34819 4242 0";
+        assert_eq!(
+            controlling_terminal(stat),
+            Some(rustix::fs::makedev(136, 3))
+        );
+        // A minor number above 255 uses the upper bits: /dev/pts/300 is
+        // tty_nr 1083436, as the kernel encodes it.
+        let stat = "1 (sh) S 1 1 1 1083436 1 0";
+        assert_eq!(
+            controlling_terminal(stat.as_bytes()),
+            Some(rustix::fs::makedev(136, 300))
+        );
+        assert_eq!(controlling_terminal(b"1 (sh) S 1 1 1 0 -1 0"), None);
+        assert_eq!(controlling_terminal(b"garbage"), None);
+    }
+
+    #[test]
+    fn its_own_controlling_terminal_is_its_standard_input_when_it_has_one() {
+        // When the test runs with standard input on its session's
+        // controlling terminal, both readings must name the same device.
+        // Comparing /dev/tty's own number (5, 0) never matched.
+        let stdin = std::io::stdin();
+        let on_controlling = rustix::termios::tcgetsid(&stdin)
+            .is_ok_and(|session| rustix::process::getsid(None).is_ok_and(|own| own == session));
+        if on_controlling {
+            let facts = TerminalFacts::read();
+            assert_eq!(facts.controlling, facts.stdin_device);
         }
     }
 
