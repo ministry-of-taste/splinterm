@@ -1047,7 +1047,9 @@ mod tests {
                 .find(|entry| entry.0 == pid)
                 .map(|&(_, parent, session, start_time)| ProcStat {
                     parent,
+                    process_group: 0,
                     session,
+                    terminal_process_group: -1,
                     start_time,
                 })
         }

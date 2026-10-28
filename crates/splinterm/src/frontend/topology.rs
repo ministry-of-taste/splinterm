@@ -233,6 +233,11 @@ pub enum WindowTopologyCommand {
         splint_id: SplintId,
         incarnation: u64,
     },
+    /// Explorer **Use app name**: undo a Splint rename so its rows show the
+    /// running app's name again (Plan 0069).
+    ResetSplintTitle {
+        splint_id: SplintId,
+    },
     /// The **Agent access** list and its revokes (ADR 0014).
     Access(WindowAccessCommand),
 }
@@ -284,7 +289,8 @@ impl WindowTopologyCommand {
             | Self::TerminateDojo { .. }
             | Self::CloseTab { .. }
             | Self::CloseTabs { .. }
-            | Self::ClearAgentStatus { .. } => true,
+            | Self::ClearAgentStatus { .. }
+            | Self::ResetSplintTitle { .. } => true,
         }
     }
 }

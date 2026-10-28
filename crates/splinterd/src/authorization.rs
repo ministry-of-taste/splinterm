@@ -197,7 +197,10 @@ pub const fn for_request(request: &Request) -> RequestAuthorization {
         | Request::SetLairRetention { .. } => {
             RequestAuthorization::policy(&[Scope::TopologyLayoutMutate])
         }
-        Request::RenameLair { .. } | Request::RenameDojo { .. } | Request::RenameSplint { .. } => {
+        Request::RenameLair { .. }
+        | Request::RenameDojo { .. }
+        | Request::RenameSplint { .. }
+        | Request::ResetSplintTitle { .. } => {
             RequestAuthorization::policy(&[Scope::TopologyNameMutate])
         }
         Request::Attach { .. } => RequestAuthorization::Conditional {

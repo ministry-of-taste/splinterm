@@ -87,7 +87,7 @@ paths. With no focused Splinterm Window, its two projection fields are null.
 | `ratio TARGET_SPLINT_ID RATIO` | Set the selected leaf's parent split ratio in thousandths. |
 | `rename-lair LAIR_ID NAME` | Rename a Lair. |
 | `rename-dojo DOJO_ID NAME` | Rename a Dojo. |
-| `rename-splint SPLINT_ID TITLE` | Rename a Splint title. |
+| `rename-splint SPLINT_ID TITLE\|--use-app-name` | Rename a Splint title, or with `--use-app-name` undo a rename so Windows show the running app's name. |
 | `dojo-focus-hint DOJO_ID SPLINT_ID` | Persist a presentation hint; it does not focus a client or Window. |
 
 `ARGV` after `--` is executed directly, never through a shell. With no explicit

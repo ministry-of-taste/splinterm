@@ -21,7 +21,7 @@ use splinterm_protocol::{
     MouseTracking, MutationPreflight, MutationTarget, PROTOCOL_VERSION, ProtocolError, Request,
     Response, ServerFrame, SplintLifecycle, SubscriptionEvent, TerminalInputModes,
     TerminalProvenance, TerminalRow, TerminalScrollbackUpdate, TerminalSnapshot, TerminalUpdate,
-    TopologyChangeKind, UnusedDojoCloseOutcome, encode_frame,
+    TopologyChangeKind, UnusedDojoCloseOutcome, encode_frame, splint_display_title,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -7323,6 +7323,159 @@ async fn a_program_in_the_foreground_counts_as_use() {
     })
     .await
     .expect("foreground program scenario timed out");
+}
+
+async fn foreground_app(connection: &mut Connection, splint_id: SplintId) -> Option<String> {
+    match connection
+        .request(Request::InspectSplint { splint_id })
+        .await
+    {
+        Response::Splint { runtime, .. } => runtime.foreground_app,
+        response => panic!("unexpected Splint inspection response: {response:?}"),
+    }
+}
+
+/// The label a window shows for the Splint, and whether its title is set.
+async fn displayed_title(connection: &mut Connection, splint_id: SplintId) -> (String, bool) {
+    let Response::Topology { snapshot } = connection.request(Request::InspectTopology).await else {
+        panic!("topology response was not returned");
+    };
+    let splint = snapshot.topology.find_splint(splint_id).unwrap();
+    let runtime = snapshot
+        .runtimes
+        .iter()
+        .find(|runtime| runtime.splint_id == splint_id);
+    (
+        splint_display_title(splint, runtime).to_owned(),
+        splint.title_set,
+    )
+}
+
+// Plan 0069: a job's name shows once it has held the terminal for the hold,
+// a short job never shows, the shell clears it, and a rename wins until the
+// person goes back to the app name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one scenario walks one Splint through every label transition in order"
+)]
+async fn foreground_app_names_follow_held_jobs_and_yield_to_a_rename() {
+    time::timeout(Duration::from_secs(60), async {
+        let daemon = Daemon::start().await;
+        let pid_file = daemon.runtime.join("foreground.pid");
+        let short_done = daemon.runtime.join("short.done");
+        // Job control gives each job its own foreground group, as an
+        // interactive shell does; `read` then keeps the shell in front.
+        let launch = LaunchParameters {
+            cwd: std::env::current_dir().unwrap(),
+            command: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                format!(
+                    "echo $$ > '{}'; set -m; sleep 1; : > '{}'; sleep 30; read line",
+                    pid_file.display(),
+                    short_done.display()
+                ),
+            ],
+            shell: None,
+            login_shell: false,
+            scrollback_lines: 100,
+        };
+        let mut admin = daemon.connect().await;
+        let target = create_lair_with(&mut admin, launch).await;
+        let splint_id = target.splint_id;
+        let revision = admin.topology_revision().await;
+        let root = wait_for_pid_file(&pid_file).await;
+
+        // A one-second job never shows, and nor does the shell.
+        while !short_done.exists() {
+            assert_eq!(foreground_app(&mut admin, splint_id).await, None);
+            time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // A job that keeps the terminal shows once it has held it for 2 s.
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(15);
+        while foreground_app(&mut admin, splint_id).await.is_none() {
+            assert!(Instant::now() < deadline, "the held job never showed");
+            time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            started.elapsed() >= Duration::from_millis(1500),
+            "the job showed before it held the terminal: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            foreground_app(&mut admin, splint_id).await.as_deref(),
+            Some("sleep")
+        );
+        assert_eq!(
+            displayed_title(&mut admin, splint_id).await,
+            ("sleep".to_owned(), false)
+        );
+        // The name lives beside the topology, never in it.
+        assert_eq!(admin.topology_revision().await, revision);
+
+        // A rename wins over the app name, and going back restores it.
+        assert!(matches!(
+            admin
+                .request(Request::RenameSplint {
+                    expected_topology_revision: revision,
+                    splint_id,
+                    title: "notes".into(),
+                })
+                .await,
+            Response::TopologyCommitted { .. }
+        ));
+        assert_eq!(
+            displayed_title(&mut admin, splint_id).await,
+            ("notes".to_owned(), true)
+        );
+        let revision = admin.topology_revision().await;
+        assert!(matches!(
+            admin
+                .request(Request::ResetSplintTitle {
+                    expected_topology_revision: revision,
+                    splint_id,
+                })
+                .await,
+            Response::TopologyCommitted { .. }
+        ));
+        assert_eq!(
+            displayed_title(&mut admin, splint_id).await,
+            ("sleep".to_owned(), false)
+        );
+        assert_eq!(
+            admin.topology().await.find_splint(splint_id).unwrap().title,
+            "shell"
+        );
+
+        // When the shell takes the terminal back, the name clears.
+        let job = foreground_group(root)
+            .filter(|group| *group != root)
+            .expect("the long job holds the terminal");
+        rustix::process::kill_process(
+            rustix::process::Pid::from_raw(i32::try_from(job).unwrap()).unwrap(),
+            rustix::process::Signal::KILL,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while foreground_app(&mut admin, splint_id).await.is_some() {
+            assert!(
+                Instant::now() < deadline,
+                "the shell never cleared the name"
+            );
+            time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(foreground_group(root), Some(root));
+        assert_eq!(
+            displayed_title(&mut admin, splint_id).await,
+            ("shell".to_owned(), false)
+        );
+        daemon.shutdown();
+    })
+    .await
+    .expect("foreground app name scenario timed out");
 }
 
 enum InputOutcome {

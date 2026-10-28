@@ -3417,6 +3417,30 @@ async fn read_root_holds_foreground(pid: u32, pidfd: &OwnedFd) -> Option<bool> {
     root_process_is_live(pidfd).then_some(foreground_group == i64::from(pid))
 }
 
+/// One incarnation's root process, for reading its `/proc` entries without
+/// holding the runtime: the daemon's foreground app sampler (Plan 0069) reads
+/// which process group holds the terminal through it.
+#[derive(Clone, Debug)]
+pub struct RootProcessProbe {
+    pid: u32,
+    pidfd: Arc<OwnedFd>,
+}
+
+impl RootProcessProbe {
+    /// Runs `read` with the root's PID, blocking the calling thread, and
+    /// keeps its result only if the root was the original process both before
+    /// and after: a readable pidfd means the root exited, and its numeric PID
+    /// may already name another process.
+    #[must_use]
+    pub fn observe<T>(&self, read: impl FnOnce(u32) -> Option<T>) -> Option<T> {
+        if !root_process_is_live(&self.pidfd) {
+            return None;
+        }
+        let value = read(self.pid)?;
+        root_process_is_live(&self.pidfd).then_some(value)
+    }
+}
+
 /// Reads `tpgid` from `/proc/PID/stat`. The command name may contain spaces
 /// and parentheses, so the fields after it are found from the last `)`.
 fn parse_stat_foreground_group(stat: &str) -> Option<i64> {
@@ -3589,6 +3613,19 @@ impl LiveSplintHandle {
     /// that cannot be observed for the original root.
     pub async fn root_holds_foreground(&self) -> Option<bool> {
         read_root_holds_foreground(self.child_pid, self.child_pidfd.as_deref()?).await
+    }
+
+    /// A probe of this incarnation's root process, or `None` once it exited
+    /// or without pidfd support, so a reused PID is never read as the root.
+    #[must_use]
+    pub fn root_process_probe(&self) -> Option<RootProcessProbe> {
+        if self.exit_status().is_some() {
+            return None;
+        }
+        Some(RootProcessProbe {
+            pid: self.child_pid,
+            pidfd: Arc::clone(self.child_pidfd.as_ref()?),
+        })
     }
 
     pub async fn resize(&self, size: PtySize) -> Result<(), LiveError> {

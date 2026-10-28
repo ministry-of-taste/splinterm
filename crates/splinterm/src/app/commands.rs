@@ -297,9 +297,15 @@ pub(in crate::app) enum Command {
         dojo_id: DojoId,
         splint_id: SplintId,
     },
+    /// Rename a Splint, or with --use-app-name undo the rename so windows show
+    /// the name of the app running in it.
     RenameSplint {
         splint_id: SplintId,
-        title: String,
+        #[arg(required_unless_present = "use_app_name")]
+        title: Option<String>,
+        /// Restore the default title instead of setting one.
+        #[arg(long, conflicts_with = "title")]
+        use_app_name: bool,
     },
     /// Relaunch an exited Splint under a new process incarnation.
     Relaunch {

@@ -533,11 +533,15 @@ pub(crate) enum SelfReportPath {
     Ancestry,
 }
 
-/// The `/proc/<pid>/stat` fields that peer location reads.
+/// The `/proc/<pid>/stat` fields that peer location and foreground app
+/// naming (`foreground_app`) read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ProcStat {
     pub(crate) parent: u32,
+    pub(crate) process_group: u32,
     pub(crate) session: u32,
+    /// The process group holding the controlling terminal, or -1 without one.
+    pub(crate) terminal_process_group: i32,
     /// Clock ticks since boot; tells a process from a later one reusing its PID.
     pub(crate) start_time: u64,
 }
@@ -553,12 +557,16 @@ fn parse_proc_stat(contents: &[u8]) -> Option<ProcStat> {
     let mut fields = rest.split_ascii_whitespace();
     let _state = fields.next()?;
     let parent = fields.next()?.parse().ok()?;
-    let _process_group = fields.next()?;
+    let process_group = fields.next()?.parse().ok()?;
     let session = fields.next()?.parse().ok()?;
+    let _terminal = fields.next()?;
+    let terminal_process_group = fields.next()?.parse().ok()?;
     let start_time = splinterd::handoff_window_carry::stat_start_time(contents)?;
     Some(ProcStat {
         parent,
+        process_group,
         session,
+        terminal_process_group,
         start_time,
     })
 }
@@ -1318,7 +1326,9 @@ mod tests {
         let parsed = |parent, session, start_time| {
             Some(ProcStat {
                 parent,
+                process_group: 4242,
                 session,
+                terminal_process_group: 4242,
                 start_time,
             })
         };
@@ -1344,7 +1354,9 @@ mod tests {
                 .find(|entry| entry.0 == pid)
                 .map(|&(_, parent, session, start_time)| ProcStat {
                     parent,
+                    process_group: 0,
                     session,
+                    terminal_process_group: -1,
                     start_time,
                 })
         }

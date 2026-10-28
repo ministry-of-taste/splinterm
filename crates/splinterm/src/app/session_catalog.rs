@@ -428,6 +428,7 @@ mod tests {
                         lifecycle: SplintLifecycle::Exited,
                         exit_status: None,
                         agent_status: None,
+                        foreground_app: None,
                     },
                 },
             ),
@@ -600,6 +601,7 @@ mod tests {
                                     lifecycle: SplintLifecycle::Exited,
                                     exit_status: None,
                                     agent_status: None,
+                                    foreground_app: None,
                                 },
                             },
                         })

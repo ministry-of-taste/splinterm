@@ -4,6 +4,7 @@ mod agent_status;
 mod audit;
 mod candidate_acquire;
 mod consent;
+mod foreground_app;
 mod handoff_requests;
 mod handoff_windows;
 mod omarchy_environment;
@@ -1219,6 +1220,7 @@ struct DaemonState {
     owner_home: Option<PathBuf>,
     development_terminal_access: bool,
     agent_status: Arc<agent_status::AgentStatusService>,
+    foreground_apps: Arc<foreground_app::ForegroundAppService>,
 }
 
 /// Read the kernel nodename once for this handshake, without environment or subprocesses.
@@ -1449,6 +1451,7 @@ struct StartedDaemon {
     listeners: ServeListeners,
     signals: DaemonSignals,
     agent_status_timer: AbortOnDrop,
+    foreground_app_sampler: AbortOnDrop,
 }
 
 /// Everything `build_daemon_state` does not create itself.
@@ -1579,6 +1582,7 @@ async fn serve_round(source: StartupSource) -> Result<RoundEnd> {
         listeners,
         mut signals,
         agent_status_timer,
+        foreground_app_sampler,
     } = match source {
         StartupSource::Fresh {
             require_workload_cgroups,
@@ -1605,6 +1609,7 @@ async fn serve_round(source: StartupSource) -> Result<RoundEnd> {
                 listeners: register_listeners(round.listeners)?,
                 signals,
                 agent_status_timer: round.agent_status_timer,
+                foreground_app_sampler: round.foreground_app_sampler,
             }
         }
     };
@@ -1612,12 +1617,14 @@ async fn serve_round(source: StartupSource) -> Result<RoundEnd> {
         ServeOutcome::Shutdown(listeners) => {
             let shutdown = ordered_shutdown(&state, listeners).await;
             drop(agent_status_timer);
+            drop(foreground_app_sampler);
             shutdown.map(|()| RoundEnd::Shutdown)
         }
         ServeOutcome::Handoff(handoff) => {
             // The timer task holds the state; it ends before the runtime
             // stops (Plan 0061 M3.1 review).
             drop(agent_status_timer);
+            drop(foreground_app_sampler);
             Ok(RoundEnd::Handoff {
                 stopped: Box::new(stop_for_handoff(state, *handoff).await),
                 signals,
@@ -2292,6 +2299,7 @@ async fn start_adopted(startup: AdoptedStartup) -> Result<StartedDaemon, Box<Can
             .store(true, Ordering::Release);
     }
     let agent_status_timer = AbortOnDrop::new(agent_status::spawn_timer(&state));
+    let foreground_app_sampler = AbortOnDrop::new(foreground_app::spawn_sampler(&state));
     info!(
         daemon_generation,
         "daemon handoff: adopted generation published"
@@ -2306,6 +2314,7 @@ async fn start_adopted(startup: AdoptedStartup) -> Result<StartedDaemon, Box<Can
         },
         signals,
         agent_status_timer,
+        foreground_app_sampler,
     })
 }
 
@@ -2938,6 +2947,7 @@ struct ResumedRound {
     state: Arc<DaemonState>,
     listeners: DaemonListeners,
     agent_status_timer: AbortOnDrop,
+    foreground_app_sampler: AbortOnDrop,
 }
 
 /// The remembered entries the previous round of this process revoked whose
@@ -3080,6 +3090,7 @@ async fn start_resumed(resumed: ResumedDaemon) -> ResumedRound {
         "daemon handoff resumed the running generation in process"
     );
     ResumedRound {
+        foreground_app_sampler: AbortOnDrop::new(foreground_app::spawn_sampler(&state)),
         state,
         listeners,
         agent_status_timer,
@@ -3308,12 +3319,14 @@ async fn start_fresh(
         carried_remembered_removals: std::collections::BTreeSet::new(),
     });
     let agent_status_timer = AbortOnDrop::new(agent_status::spawn_timer(&state));
+    let foreground_app_sampler = AbortOnDrop::new(foreground_app::spawn_sampler(&state));
     record_policy_reload(&state, &policy_generation).await;
     Ok(StartedDaemon {
         state,
         listeners: register_listeners(listeners)?,
         signals,
         agent_status_timer,
+        foreground_app_sampler,
     })
 }
 
@@ -3544,6 +3557,7 @@ fn build_daemon_state(inputs: DaemonStateInputs) -> Arc<DaemonState> {
         development_terminal_access: env::var_os("SPLINTERM_ENABLE_DEV_ATTACH").as_deref()
             == Some(std::ffi::OsStr::new("1")),
         agent_status: Arc::default(),
+        foreground_apps: Arc::default(),
     })
 }
 
@@ -5889,6 +5903,8 @@ fn prepare_preset_layout(
             let splint = Splint {
                 id: splint_id,
                 title,
+                // A preset names every pane, so its title stays.
+                title_set: true,
                 cwd: launch.cwd.clone(),
                 command: launch.command.clone(),
                 launch: Box::new(durable_launch(&launch)),
@@ -6676,6 +6692,7 @@ fn trusted_ui_request(request: &Request) -> bool {
             | Request::RenameDojo { .. }
             | Request::SetDojoDefaultFocus { .. }
             | Request::RenameSplint { .. }
+            | Request::ResetSplintTitle { .. }
             | Request::Attach { .. }
             | Request::RequestImageContent { .. }
             | Request::StartScrollbackPage { .. }
@@ -8212,6 +8229,7 @@ async fn request_policy_resources(
         | Request::RestoreSplint { splint_id, .. }
         | Request::CloseSplint { splint_id, .. }
         | Request::RenameSplint { splint_id, .. }
+        | Request::ResetSplintTitle { splint_id, .. }
         | Request::SetSplitRatio {
             target_splint_id: splint_id,
             ..
@@ -11124,6 +11142,26 @@ async fn handle_authorized_request(
             publish_topology(state, topology_revision, TopologyChangeKind::SplintRenamed).await;
             Response::TopologyCommitted { topology_revision }
         }
+        Request::ResetSplintTitle {
+            expected_topology_revision,
+            splint_id,
+        } => {
+            let _transaction = state
+                .topology_transactions
+                .acquire()
+                .await
+                .map_err(|_| internal())?;
+            let (candidate, topology_revision) = durable_topology_candidate(state, |lair| {
+                lair.reset_splint_title_at(expected_topology_revision, splint_id)
+            })
+            .await?;
+            install_topology(state, candidate).await;
+            if let Some(context) = splint_launch_context(&*state.topology.read().await, splint_id) {
+                record_dojo_organized(state, context.dojo, DojoUse::Renamed);
+            }
+            publish_topology(state, topology_revision, TopologyChangeKind::SplintRenamed).await;
+            Response::TopologyCommitted { topology_revision }
+        }
         Request::Attach {
             splint_id,
             incarnation,
@@ -12595,6 +12633,7 @@ const fn handoff_fenced(request: &Request) -> bool {
         | Request::RenameLair { .. }
         | Request::RenameDojo { .. }
         | Request::RenameSplint { .. }
+        | Request::ResetSplintTitle { .. }
         | Request::CloseSplint { .. }
         | Request::CloseDojo { .. }
         | Request::CloseUnusedDojo { .. }
@@ -14617,6 +14656,7 @@ async fn subscribe_topology(
     let live = state.runtimes.lock().await.handles();
     let mut snapshot = topology_snapshot_from(lair, &live);
     state.agent_status.attach(&mut snapshot);
+    state.foreground_apps.attach(&mut snapshot);
     let id = NEXT_SUBSCRIPTION.fetch_add(1, Ordering::Relaxed);
     let subscription = state.topology_hub.lock().await.subscribe(id, connection_id);
     drop(lair_guard);
@@ -14638,6 +14678,7 @@ async fn topology_snapshot(state: &DaemonState) -> TopologySnapshot {
     let mut snapshot = topology_snapshot_from(lair, &live);
     // Also drops statuses of retired incarnations in the publishing transaction.
     state.agent_status.attach(&mut snapshot);
+    state.foreground_apps.attach(&mut snapshot);
     snapshot
 }
 
@@ -14753,6 +14794,7 @@ fn collect_runtime_summaries(
                 lifecycle,
                 exit_status,
                 agent_status: None,
+                foreground_app: None,
             });
         }
         LayoutNode::Branch { first, second, .. } => {
@@ -17807,6 +17849,7 @@ mod tests {
             owner_home: Some(PathBuf::from("/home/test")),
             development_terminal_access,
             agent_status: Arc::default(),
+            foreground_apps: Arc::default(),
         })
     }
 
@@ -25007,6 +25050,7 @@ mod tests {
                 lifecycle: SplintLifecycle::Exited,
                 exit_status: None,
                 agent_status: None,
+                foreground_app: None,
             }],
             presentation_offers: Vec::new(),
         };

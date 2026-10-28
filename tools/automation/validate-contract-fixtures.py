@@ -211,7 +211,7 @@ EXPECTED_MCP_SCHEMAS = {
     ),
 }
 EXPECTED_MCP_SCHEMA_SHA256 = {
-    'common.schema.json': '9439060f1dca6f5993fc412c993cf5d740c887aa9dd24814ecf5c002445e2a76',
+    'common.schema.json': '381f0dbd8422fd5b1acefb568982b33bd6cf8bae06f7ced1cdb0c4136a8b7413',
     'error.schema.json': 'db5e68a6494912da6a114d055e8b5ae0426051f3f39ab9a5721d9b482e0307fe',
     'resources/control.schema.json': 'bf27457edc5eb95e7635ae4204ca462d319f1bdb64056f667a3409cf11bdcc34',
     'resources/terminal.schema.json': '54015be8b7cfa3880fb98e6c10448a93aa4750935b9f4f70ba9588bf6da302f8',
@@ -233,7 +233,7 @@ EXPECTED_MCP_SCHEMA_SHA256 = {
     'tools/inspect_audit.input.schema.json': 'c8d137b259cd0518e521326d3e56433883635de94743d6b9f2c428ff4b5e66bd',
     'tools/inspect_audit.output.schema.json': '61a80e47dd290aa22c3d4d29ee09c17db00191f4242c87630cc52fe6e61d2e8f',
     'tools/inspect_splint.input.schema.json': '902a3b772f508aa3f083f8530668c238fd3e5a8bd6716e464eb71e8017a10ed0',
-    'tools/inspect_splint.output.schema.json': '72345632f3b1e7f1d81a404aa37da9629d0b8d5b45fde58e7261ff99613254bf',
+    'tools/inspect_splint.output.schema.json': 'd60092876bda05e5371d827954d963201c690be60ae1991f38af50630156aa99',
     'tools/inspect_topology.input.schema.json': 'db3a7bd4e72d5975eaf9c19c41fc83d472f28f2df6a9775d56fa53d2207f92b5',
     'tools/inspect_topology.output.schema.json': 'dc7113be2e11d285818884cbf03d352dcb06606e6c618fec86887a680d11e580',
     'tools/kill_splint.input.schema.json': '125bef6e18229f26bc88c49b3ecf3201187ebcdf49c748fb17c6feca892a247f',
@@ -256,7 +256,7 @@ EXPECTED_MCP_SCHEMA_SHA256 = {
     'tools/rename_dojo.output.schema.json': 'e1a457e7e79fcf20067a478a519ad7239c1de00d89d5fcee2b882d86409207fa',
     'tools/rename_lair.input.schema.json': 'e7899be586d32ecdfad2261b08051bf3f95ddda46e0ff62efbe60f05801462c6',
     'tools/rename_lair.output.schema.json': 'e3b427c306ac80808dc15b08053da509132b48caaa49d0754e4604f3e32af833',
-    'tools/rename_splint.input.schema.json': '3835f78e6bc2c3381ae244e2fc79490de1aa67e7515502fb3ec108571bf571ac',
+    'tools/rename_splint.input.schema.json': 'be55780fd7d00722d4a01a2df1c879ca6b693658730cd5491226a9fa4c7c8a39',
     'tools/rename_splint.output.schema.json': '456d8be17a96531b3ecf42d804395539418e11c830bfe5156f74a630a3437237',
     'tools/report_agent_status.input.schema.json': '6f5610e21ee0eff5193bdef4aa30e705852f5c4e8ee0a15acc509155ba30d4e5',
     'tools/report_agent_status.output.schema.json': '519c75e937b7b9e7b65a32ae0d7b5186baa681ac6742186cd9445936f21d5c49',
@@ -293,6 +293,10 @@ EXPECTED_MCP_VALID_FIXTURES = {
     # Additive optional output fields keep the reviewed per-tool fixtures intact.
     "inspect_splint-agent-status.output.json",
     "inspect_topology-agent-status.output.json",
+    # Plan 0069: a foreground app name, and a rename undone with use_app_name.
+    "inspect_splint-foreground-app.output.json",
+    "inspect_topology-foreground-app.output.json",
+    "rename_splint-use-app-name.input.json",
     "report_agent_status-clear.output.json",
     # A first clear for an incarnation is a no-op the daemon numbers 0.
     "report_agent_status-first-clear.output.json",
@@ -317,6 +321,7 @@ EXPECTED_MCP_INVALID_FIXTURES = {
     "false-confirmation.json",
     "false-terminal-trust.json",
     "hostile-title-false-trust.json",
+    "inspect_splint-hostile-foreground-app.output.json",
     "input-echo.json",
     "malformed-controller-handle.json",
     "malformed-cursor.json",
@@ -333,6 +338,7 @@ EXPECTED_MCP_INVALID_FIXTURES = {
     "private-daemon-id.json",
     "query-echo.json",
     "raw-bytes-leak.json",
+    "rename_splint-title-and-use-app-name.input.json",
     "report_agent_status-control-detail.input.json",
     "report_agent_status-detail-echo.json",
     "report_agent_status-unknown-state.input.json",
@@ -652,7 +658,7 @@ def validate_mcp_schema_contract(schemas: dict[str, dict[str, Any]]) -> None:
         },
     }
     # Additive optional fields: present only when the daemon holds a value.
-    topology_optional = {"topology_splint": {"agent_status"}}
+    topology_optional = {"topology_splint": {"agent_status", "foreground_app"}}
     for definition, expected_properties in topology_shapes.items():
         topology = common_defs[definition]
         optional = topology_optional.get(definition, set())

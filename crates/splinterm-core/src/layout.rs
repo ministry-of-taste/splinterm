@@ -120,16 +120,29 @@ impl Default for SplintLaunchMetadata {
     }
 }
 
+/// The title every new Splint starts with. While a Splint keeps it unset
+/// ([`Splint::title_set`] is false), windows may show its foreground app's
+/// name instead.
+pub const DEFAULT_SPLINT_TITLE: &str = "shell";
+
 /// One terminal surface, eventually backed by a daemon-owned PTY.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `title_set` records whether a person, an agent, or a preset named the
+/// Splint. It is serialized only when it cannot be inferred: a Splint named
+/// the literal default title on purpose. Without the field a Splint is named
+/// exactly when its title differs from [`DEFAULT_SPLINT_TITLE`], which is also
+/// how Splints saved before the field existed load.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(from = "SplintRecord")]
 pub struct Splint {
     pub id: SplintId,
     pub title: String,
+    /// Whether the title was set by a rename or a preset rather than left as
+    /// the default. Always true when `title` is not the default.
+    pub title_set: bool,
     pub cwd: PathBuf,
     pub command: Vec<String>,
-    #[serde(default)]
     pub launch: Box<SplintLaunchMetadata>,
-    #[serde(default)]
     pub last_incarnation: Option<u64>,
     pub state: SplintState,
 }
@@ -139,13 +152,82 @@ impl Splint {
     pub fn shell(cwd: PathBuf) -> Self {
         Self {
             id: SplintId::new(),
-            title: "shell".into(),
+            title: DEFAULT_SPLINT_TITLE.into(),
+            title_set: false,
             cwd,
             command: Vec::new(),
             launch: Box::new(SplintLaunchMetadata::default()),
             last_incarnation: None,
             state: SplintState::Starting,
         }
+    }
+
+    /// Whether the title is the default and nobody set it, so a window may
+    /// show the foreground app's name in its place.
+    #[must_use]
+    pub fn uses_default_title(&self) -> bool {
+        !self.title_set && self.title == DEFAULT_SPLINT_TITLE
+    }
+}
+
+/// The serialized form of [`Splint`].
+#[derive(Deserialize)]
+struct SplintRecord {
+    id: SplintId,
+    title: String,
+    cwd: PathBuf,
+    command: Vec<String>,
+    #[serde(default)]
+    launch: Box<SplintLaunchMetadata>,
+    #[serde(default)]
+    last_incarnation: Option<u64>,
+    state: SplintState,
+    #[serde(default)]
+    title_set: Option<bool>,
+}
+
+impl From<SplintRecord> for Splint {
+    fn from(record: SplintRecord) -> Self {
+        let title_set = record.title_set.unwrap_or(false) || record.title != DEFAULT_SPLINT_TITLE;
+        Self {
+            id: record.id,
+            title: record.title,
+            title_set,
+            cwd: record.cwd,
+            command: record.command,
+            launch: record.launch,
+            last_incarnation: record.last_incarnation,
+            state: record.state,
+        }
+    }
+}
+
+impl Serialize for Splint {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct SplintRecordRef<'a> {
+            id: SplintId,
+            title: &'a str,
+            cwd: &'a PathBuf,
+            command: &'a [String],
+            launch: &'a SplintLaunchMetadata,
+            last_incarnation: Option<u64>,
+            state: SplintState,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            title_set: Option<bool>,
+        }
+        SplintRecordRef {
+            id: self.id,
+            title: &self.title,
+            cwd: &self.cwd,
+            command: &self.command,
+            launch: &self.launch,
+            last_incarnation: self.last_incarnation,
+            state: self.state,
+            // Present only when the title alone cannot say it was set.
+            title_set: (self.title_set && self.title == DEFAULT_SPLINT_TITLE).then_some(true),
+        }
+        .serialize(serializer)
     }
 }
 
@@ -289,6 +371,10 @@ impl LayoutNode {
         }
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "a miss hands the subtree back by value; boxing it would allocate at every level"
+    )]
     pub(crate) fn remove(self, target: SplintId) -> Result<Option<Self>, Self> {
         match self {
             Self::Leaf(splint) if splint.id == target => Ok(None),
@@ -380,6 +466,43 @@ mod tests {
         assert_eq!(SplitRatio::new(1).unwrap().get(), 1);
         assert_eq!(SplitRatio::new(999).unwrap().get(), 999);
         assert_eq!(SplitRatio::new(1000), Err(1000));
+    }
+
+    #[test]
+    fn title_set_is_inferred_when_absent_and_written_only_when_needed() {
+        let mut splint = Splint::shell(PathBuf::from("/tmp"));
+        let mut value = serde_json::to_value(&splint).unwrap();
+        // A default Splint serializes exactly as before the field existed.
+        assert!(value.get("title_set").is_none());
+        assert!(
+            serde_json::from_value::<Splint>(value.clone())
+                .unwrap()
+                .uses_default_title()
+        );
+
+        // A Splint saved with a custom title before the field existed loads
+        // as named.
+        value["title"] = serde_json::json!("logs");
+        let legacy: Splint = serde_json::from_value(value.clone()).unwrap();
+        assert!(legacy.title_set);
+        assert!(
+            serde_json::to_value(&legacy)
+                .unwrap()
+                .get("title_set")
+                .is_none()
+        );
+
+        // A custom title is always set, whatever the field says.
+        value["title_set"] = serde_json::json!(false);
+        assert!(serde_json::from_value::<Splint>(value).unwrap().title_set);
+
+        // Only a Splint pinned to the default text needs the field.
+        splint.title_set = true;
+        let pinned = serde_json::to_value(&splint).unwrap();
+        assert_eq!(pinned["title_set"], serde_json::json!(true));
+        let decoded: Splint = serde_json::from_value(pinned).unwrap();
+        assert_eq!(decoded, splint);
+        assert!(!decoded.uses_default_title());
     }
 
     #[test]

@@ -1297,6 +1297,7 @@ fn durable_topology(lair_id: LairId, stopped: &Stopped) -> Topology {
                 launch: Box::new(SplintLaunchMetadata::default()),
                 last_incarnation: Some(splint.incarnation),
                 state: SplintState::Running,
+                title_set: false,
             }),
         })
         .collect();

@@ -703,9 +703,29 @@ impl Topology {
     ) -> Result<TopologyRevision, TopologyError> {
         self.check_revision(expected)?;
         let title = normalized_name(&title.into())?;
-        self.find_splint_mut(splint_id)
-            .ok_or(TopologyError::SplintNotFound(splint_id))?
-            .title = title;
+        let splint = self
+            .find_splint_mut(splint_id)
+            .ok_or(TopologyError::SplintNotFound(splint_id))?;
+        splint.title = title;
+        // Any rename pins the title, even to the default text.
+        splint.title_set = true;
+        self.advance_revision();
+        Ok(self.revision)
+    }
+
+    /// Restores a Splint's default title and clears its rename, so windows
+    /// may show its foreground app's name again.
+    pub fn reset_splint_title_at(
+        &mut self,
+        expected: TopologyRevision,
+        splint_id: SplintId,
+    ) -> Result<TopologyRevision, TopologyError> {
+        self.check_revision(expected)?;
+        let splint = self
+            .find_splint_mut(splint_id)
+            .ok_or(TopologyError::SplintNotFound(splint_id))?;
+        crate::DEFAULT_SPLINT_TITLE.clone_into(&mut splint.title);
+        splint.title_set = false;
         self.advance_revision();
         Ok(self.revision)
     }
@@ -1278,6 +1298,51 @@ mod tests {
         assert_eq!(topology.close_splint(inserted_id).unwrap().get(), 4);
         assert!(topology.find_lair(lair_id).unwrap().dojos.is_empty());
         assert_eq!(topology.lairs().count(), 1);
+    }
+
+    #[test]
+    fn renames_pin_the_title_and_a_reset_restores_the_default() {
+        let mut topology = Topology::new();
+        let lair = topology
+            .create_lair("main", PathBuf::from("/tmp"))
+            .unwrap()
+            .clone();
+        let id = lair.dojos[0].root.find_splint_id_for_test();
+        assert!(topology.find_splint(id).unwrap().uses_default_title());
+
+        let renamed = topology
+            .rename_splint_at(topology.revision(), id, "editor")
+            .unwrap();
+        let splint = topology.find_splint(id).unwrap();
+        assert_eq!((splint.title.as_str(), splint.title_set), ("editor", true));
+
+        // Renaming to the default text pins it too.
+        topology
+            .rename_splint_at(renamed, id, crate::DEFAULT_SPLINT_TITLE)
+            .unwrap();
+        let splint = topology.find_splint(id).unwrap();
+        assert!(splint.title_set && !splint.uses_default_title());
+
+        let stale = renamed;
+        let before = topology.clone();
+        assert!(matches!(
+            topology.reset_splint_title_at(stale, id),
+            Err(TopologyError::StaleTopology { .. })
+        ));
+        assert_eq!(topology, before);
+
+        let reset = topology
+            .reset_splint_title_at(topology.revision(), id)
+            .unwrap();
+        assert!(reset > renamed);
+        let splint = topology.find_splint(id).unwrap();
+        assert_eq!(splint.title, crate::DEFAULT_SPLINT_TITLE);
+        assert!(splint.uses_default_title());
+        let missing = SplintId::new();
+        assert_eq!(
+            topology.reset_splint_title_at(topology.revision(), missing),
+            Err(TopologyError::SplintNotFound(missing))
+        );
     }
 
     #[test]

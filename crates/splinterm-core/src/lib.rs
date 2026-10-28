@@ -5,7 +5,8 @@ mod model;
 mod persistence;
 
 pub use layout::{
-    Axis, LayoutNode, Splint, SplintId, SplintLaunchMetadata, SplintState, SplitRatio, SplitSide,
+    Axis, DEFAULT_SPLINT_TITLE, LayoutNode, Splint, SplintId, SplintLaunchMetadata, SplintState,
+    SplitRatio, SplitSide,
 };
 pub use model::{
     Dojo, DojoId, Lair, LairId, LairLifetime, LairRetention, Topology, TopologyError,

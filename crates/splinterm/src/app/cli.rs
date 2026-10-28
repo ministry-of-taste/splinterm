@@ -920,17 +920,24 @@ async fn run_headless_on(
                     .await?,
             )
         }
-        Command::RenameSplint { splint_id, title } => {
+        Command::RenameSplint {
+            splint_id,
+            title,
+            use_app_name,
+        } => {
             let expected_topology_revision = connection.topology_revision().await?;
-            print_response(
-                connection
-                    .request(Request::RenameSplint {
-                        expected_topology_revision,
-                        splint_id,
-                        title,
-                    })
-                    .await?,
-            )
+            let request = match title.filter(|_| !use_app_name) {
+                Some(title) => Request::RenameSplint {
+                    expected_topology_revision,
+                    splint_id,
+                    title,
+                },
+                None => Request::ResetSplintTitle {
+                    expected_topology_revision,
+                    splint_id,
+                },
+            };
+            print_response(connection.request(request).await?)
         }
         Command::Relaunch {
             splint_id,

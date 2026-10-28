@@ -794,6 +794,52 @@ mod tests {
         assert_eq!(topology.lairs().next().unwrap().dojos[0].name, "terminal");
     }
 
+    // Plan 0069: `title_set` is additive. A document saved before it existed
+    // keeps every renamed Splint named; only the default title follows apps.
+    #[test]
+    fn saved_titles_load_as_set_unless_default_and_a_pinned_default_round_trips() {
+        let mut value = valid_v3_document();
+        let second = json!({
+            "id": SECOND_DOJO_ID,
+            "name": "logs",
+            "default_focus": SECOND_SPLINT_ID,
+            "root": leaf(SECOND_SPLINT_ID, "/var/tmp")
+        });
+        value["lairs"][0]["dojos"]
+            .as_array_mut()
+            .unwrap()
+            .push(second);
+        value["lairs"][0]["dojos"][1]["root"]["Leaf"]["title"] = json!("logs");
+        let topology = decode(&value).unwrap().into_topology().unwrap();
+        let first_id: SplintId = SPLINT_ID.parse().unwrap();
+        let second_id: SplintId = SECOND_SPLINT_ID.parse().unwrap();
+        assert!(topology.find_splint(first_id).unwrap().uses_default_title());
+        let renamed = topology.find_splint(second_id).unwrap();
+        assert!(renamed.title_set && renamed.title == "logs");
+
+        let legacy = decode(&valid_v2_document())
+            .unwrap()
+            .into_topology()
+            .unwrap();
+        assert!(legacy.find_splint(first_id).unwrap().uses_default_title());
+
+        let mut pinned = topology;
+        pinned
+            .rename_splint_at(pinned.revision(), first_id, crate::DEFAULT_SPLINT_TITLE)
+            .unwrap();
+        let encoded = TopologyDocument::from_topology(&pinned)
+            .unwrap()
+            .encode()
+            .unwrap();
+        let restored = TopologyDocument::decode(&encoded)
+            .unwrap()
+            .into_topology()
+            .unwrap();
+        let splint = restored.find_splint(first_id).unwrap();
+        assert_eq!(splint.title, crate::DEFAULT_SPLINT_TITLE);
+        assert!(splint.title_set);
+    }
+
     #[test]
     fn rejects_unknown_version_running_state_and_unsafe_path() {
         let mut value = valid_v3_document();
