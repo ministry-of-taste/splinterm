@@ -224,7 +224,7 @@ EXPECTED_MCP_SCHEMA_SHA256 = {
     'tools/close_dojo.output.schema.json': 'a921e694a1c4f6cc7b2f16b7c1cd07fd1519e9c6b23fe042670c8e009662b9f0',
     'tools/close_splint.input.schema.json': 'd4bc7afbcfa9467e4bd6610d0f2198ab65372f8f2ee81ce72a347cff9648fe5a',
     'tools/close_splint.output.schema.json': '576a0e99b94579b8b36b3ae2db3aa7f1746adac4c6320b8e0088c0e4a9cfdc2e',
-    'tools/create_lair.input.schema.json': '018143d3f5c34dbf5f98b586f6f06adef487a67823da5157dc7ceff4f961fdbe',
+    'tools/create_lair.input.schema.json': 'a7e999e49e0774f821b5a8ebcf9b29029f217890032a0273083794800519b81c',
     'tools/create_lair.output.schema.json': '557707f92f7bfd92e8210d92c3fda0a957d48611748d2b78dde348b13376f81f',
     'tools/decide_control_transfer.input.schema.json': '5a7850fa934828ce9ef9cbbf06ae45f36b988526419ec680de463776a1a66b0f',
     'tools/decide_control_transfer.output.schema.json': 'da0732232dcdfb0db30de9a288a1afd8603ce46a40d493f33c8061b90616e6d1',
@@ -240,7 +240,7 @@ EXPECTED_MCP_SCHEMA_SHA256 = {
     'tools/kill_splint.output.schema.json': 'bb5213e42d26129c1e887b0b0f84da9813b5aff7a13744217ec7dc294573249c',
     'tools/list_lairs.input.schema.json': '47a14072a82ee7f9365e50bc293c408d6ea1f19652b5ec7aa6324092b26f0a88',
     'tools/list_lairs.output.schema.json': '5192bb0f845301d7e42b95af226b5a90be5c2851dd218132c9815ee919e13ba7',
-    'tools/new_dojo.input.schema.json': '491506485cec3c450fe4f81de4bad2d9273198bbff680d1689db4601faf14f50',
+    'tools/new_dojo.input.schema.json': '3680df87054940803a8346157a5f280c876515423057651b29c3e456be1241e9',
     'tools/new_dojo.output.schema.json': 'cb7ffc4f64cccbd790c720d3d44329217c660aec417a6e77e6e9ee35352e0b3b',
     'tools/ping.input.schema.json': '5a7b4c41ee38f501c742ae046bbf3ab28324153c405660014658ec793bb27f9c',
     'tools/ping.output.schema.json': '4635778ab43ce5e096c61606986af3380b56c88f8edcec0f414e596100e84d71',
@@ -282,7 +282,7 @@ EXPECTED_MCP_SCHEMA_SHA256 = {
     'tools/set_dojo_default_focus.output.schema.json': '53c451b6fc762119283ca1baad7eb68e7ee35370e180941eb46b7b15e41541c4',
     'tools/set_split_ratio.input.schema.json': 'fc5d00996678fda87640036f94202a8b6953b656069caba79d19584387f17326',
     'tools/set_split_ratio.output.schema.json': '06563f468beaae5f723442cf0903be004af0c702b3b4f2013ea71ee4ad38a65a',
-    'tools/split_splint.input.schema.json': 'd6b3a2481174db019a1ede5b4eb09997586f2b8a41dcf9ec7fc92c18f72f0b76',
+    'tools/split_splint.input.schema.json': 'd4310853bc73451885d148644b2126a461a1658ac5b91a823aa3377d4785e4bc',
     'tools/split_splint.output.schema.json': 'e3febd6e3d5a2e8e83b920da48f682202d2afe145e5655d9fb8f056f218dc85b',
 }
 EXPECTED_MCP_VALID_FIXTURES = {

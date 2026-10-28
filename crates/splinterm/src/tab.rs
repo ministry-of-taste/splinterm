@@ -158,6 +158,26 @@ impl<T> WindowTabSet<T> {
         Ok(OpenTabOutcome::Opened)
     }
 
+    /// Appends a tab without activating it (Plan 0067 M3): the active tab,
+    /// its activation history, and so keyboard focus stay as they were.
+    /// Returns `false` when the Dojo already has a tab, which is left where
+    /// it is.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TabLimitReached`] when the Window already has
+    /// [`MAX_WINDOW_TABS`] tabs.
+    pub fn open_background(&mut self, tab: DojoTab<T>) -> Result<bool, TabLimitReached> {
+        if self.index_of(tab.dojo_id).is_some() {
+            return Ok(false);
+        }
+        if self.tabs.len() == MAX_WINDOW_TABS {
+            return Err(TabLimitReached);
+        }
+        self.tabs.push(tab);
+        Ok(true)
+    }
+
     pub fn activate(&mut self, dojo_id: DojoId) -> bool {
         let Some(index) = self.index_of(dojo_id) else {
             return false;
@@ -298,6 +318,41 @@ mod tests {
         assert_eq!(tabs.active().map(|tab| tab.dojo_id), Some(first_id));
         assert_eq!(tabs.get(first_id).map(|tab| tab.value), Some(1));
         assert_eq!(tabs.get(second_id).map(|tab| tab.value), Some(2));
+    }
+
+    #[test]
+    fn a_background_tab_keeps_the_active_tab_and_its_history() {
+        let lair_id = LairId::new();
+        let first = DojoTab::new(lair_id, DojoId::new(), 1);
+        let first_id = first.dojo_id;
+        let mut tabs = WindowTabSet::new(first);
+        let second = tab(2);
+        let second_id = second.dojo_id;
+        tabs.open_or_activate(second).unwrap();
+        tabs.activate(first_id);
+        let background = DojoTab::new(lair_id, DojoId::new(), 3);
+        let background_id = background.dojo_id;
+        assert_eq!(tabs.open_background(background), Ok(true));
+        assert_eq!(tabs.len(), 3);
+        assert_eq!(tabs.at(2).map(|tab| tab.dojo_id), Some(background_id));
+        assert_eq!(tabs.active().map(|tab| tab.dojo_id), Some(first_id));
+        // It is not in the activation history, so it is not the recent
+        // Dojo of its Lair, and closing the active tab still selects by
+        // position.
+        assert_eq!(tabs.recent_in_lair(lair_id), Some(first_id));
+        assert_eq!(tabs.selection_after_close(first_id), Some(second_id));
+        // A Dojo that already has a tab is left where it is.
+        assert_eq!(
+            tabs.open_background(DojoTab::new(lair_id, second_id, 9)),
+            Ok(false)
+        );
+        assert_eq!(tabs.get(second_id).map(|tab| tab.value), Some(2));
+        assert_eq!(tabs.active().map(|tab| tab.dojo_id), Some(first_id));
+        while tabs.len() < MAX_WINDOW_TABS {
+            tabs.open_background(tab(0)).unwrap();
+        }
+        assert_eq!(tabs.open_background(tab(0)), Err(TabLimitReached));
+        assert_eq!(tabs.active().map(|tab| tab.dojo_id), Some(first_id));
     }
 
     #[test]

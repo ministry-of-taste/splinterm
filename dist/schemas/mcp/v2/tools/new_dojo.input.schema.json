@@ -7,9 +7,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "lair_id",
-        "name",
-        "argv"
+        "lair_id"
       ],
       "properties": {
         "lair_id": {

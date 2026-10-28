@@ -18,7 +18,7 @@ use splinterm_core::{
     TopologyRevision,
 };
 
-pub const PROTOCOL_VERSION: u16 = 45;
+pub const PROTOCOL_VERSION: u16 = 46;
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_TERMINAL_TRANSACTION_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_TERMINAL_TRANSACTION_CHUNK_BYTES: usize = 8 * 1024 * 1024;
@@ -771,7 +771,11 @@ pub enum Request {
     NewDojoAutomation {
         expected_topology_revision: TopologyRevision,
         lair_id: LairId,
-        name: String,
+        /// `None` names it like a person's New Dojo: the next free 'Dojo N'.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        /// An omitted `cwd` starts in the owner's home, and an empty `argv`
+        /// runs the default shell as a login shell.
         launch: AutomationLaunch,
         /// Set only when Splinterm generated `name`; see [`Request::NewDojo`].
         #[serde(default, skip_serializing_if = "bool_is_false")]
@@ -1075,6 +1079,14 @@ pub enum Request {
         offer_id: u64,
         nonce: ConsentOfferNonce,
         decision: ConsentDecision,
+    },
+    /// Trusted UI only (Plan 0067 M3): claims one
+    /// [`TopologySnapshot::presentation_offers`] entry, so this Window opens
+    /// the Dojo as a background tab. The daemon grants each offer exactly
+    /// once; every later claim, and a claim for an expired or unknown offer,
+    /// is answered `granted: false`.
+    ClaimDojoPresentation {
+        dojo_id: DojoId,
     },
 }
 
@@ -1527,6 +1539,11 @@ pub enum Response {
     /// Result of a valid [`Request::AnswerConsentOffer`]: the answer settled
     /// the request it was offered for.
     ConsentOfferAnswered,
+    /// Result of [`Request::ClaimDojoPresentation`]: `true` only for the one
+    /// claim that took the offer.
+    DojoPresentationClaimed {
+        granted: bool,
+    },
 }
 
 /// Result of [`Request::CloseUnusedDojo`].
@@ -2076,6 +2093,26 @@ pub struct TopologySnapshot {
     pub revision: TopologyRevision,
     pub topology: Topology,
     pub runtimes: Vec<SplintRuntimeSummary>,
+    /// Plan 0067 M3: Dojos an agent just created, which a Window showing
+    /// their Lair may open as a background tab after
+    /// [`Request::ClaimDojoPresentation`]. Sent only to the trusted UI and
+    /// remote Windows, never to automation; at most
+    /// [`MAX_DOJO_PRESENTATION_OFFERS`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub presentation_offers: Vec<DojoPresentationOffer>,
+}
+
+/// The most Dojo presentation offers one daemon holds and one snapshot
+/// carries.
+pub const MAX_DOJO_PRESENTATION_OFFERS: usize = 32;
+
+/// One Dojo offered to the Windows showing its Lair; see
+/// [`TopologySnapshot::presentation_offers`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DojoPresentationOffer {
+    pub lair_id: LairId,
+    pub dojo_id: DojoId,
 }
 
 impl TopologySnapshot {
@@ -2083,7 +2120,8 @@ impl TopologySnapshot {
     ///
     /// # Errors
     ///
-    /// Returns `InvalidArgument` for duplicate, stale, or unreachable runtime entries.
+    /// Returns `InvalidArgument` for duplicate, stale, or unreachable runtime
+    /// entries, or for too many, duplicate, or misplaced presentation offers.
     pub fn validate(&self) -> Result<(), ProtocolError> {
         let mut identities = std::collections::HashSet::new();
         let runtime_count = self
@@ -2106,6 +2144,21 @@ impl TopologySnapshot {
             return Err(ProtocolError::new(
                 ErrorCode::InvalidArgument,
                 "topology runtime metadata is inconsistent",
+            ));
+        }
+        let mut offered = std::collections::HashSet::new();
+        if self.presentation_offers.len() > MAX_DOJO_PRESENTATION_OFFERS
+            || !self.presentation_offers.iter().all(|offer| {
+                let shown = self
+                    .topology
+                    .find_lair(offer.lair_id)
+                    .is_some_and(|lair| lair.dojos.iter().any(|dojo| dojo.id == offer.dojo_id));
+                offered.insert(offer.dojo_id) && shown
+            })
+        {
+            return Err(ProtocolError::new(
+                ErrorCode::InvalidArgument,
+                "topology presentation offers are inconsistent",
             ));
         }
         Ok(())
@@ -6797,7 +6850,7 @@ mod tests {
 
     #[test]
     fn first_terminal_read_requests_are_explicit_protocol_v20_shapes() {
-        assert_eq!(PROTOCOL_VERSION, 45);
+        assert_eq!(PROTOCOL_VERSION, 46);
         let splint_id = SplintId::new();
         let attach = Request::Attach {
             splint_id,
@@ -7165,6 +7218,7 @@ mod tests {
             revision: topology.revision(),
             topology,
             runtimes: vec![runtime],
+            presentation_offers: Vec::new(),
         };
         assert!(snapshot.validate().is_ok());
 
@@ -7174,6 +7228,179 @@ mod tests {
         let mut invalid = snapshot;
         invalid.runtimes[0].lifecycle = SplintLifecycle::Running;
         assert!(invalid.validate().is_err());
+    }
+
+    fn starting_snapshot(topology: Topology) -> TopologySnapshot {
+        let runtimes = topology
+            .lairs()
+            .flat_map(|lair| &lair.dojos)
+            .map(|dojo| {
+                let splinterm_core::LayoutNode::Leaf(splint) = &dojo.root else {
+                    unreachable!("test Dojos are single leaves")
+                };
+                SplintRuntimeSummary {
+                    splint_id: splint.id,
+                    live_incarnation: None,
+                    last_incarnation: splint.last_incarnation,
+                    restorable: false,
+                    lifecycle: SplintLifecycle::Starting,
+                    exit_status: None,
+                    agent_status: None,
+                }
+            })
+            .collect();
+        TopologySnapshot {
+            revision: topology.revision(),
+            topology,
+            runtimes,
+            presentation_offers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn dojo_presentation_offers_are_optional_bounded_and_placed() {
+        let mut topology = Topology::new();
+        let first = topology
+            .create_lair("first", PathBuf::from("/tmp"))
+            .unwrap()
+            .clone();
+        let second = topology
+            .create_lair("second", PathBuf::from("/tmp"))
+            .unwrap()
+            .clone();
+        let snapshot = starting_snapshot(topology.clone());
+        snapshot.validate().unwrap();
+        // No offers: the field is left out, and a snapshot without it decodes.
+        let encoded = serde_json::to_value(&snapshot).unwrap();
+        assert!(encoded.get("presentation_offers").is_none());
+        let decoded: TopologySnapshot = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, snapshot);
+
+        let offer = DojoPresentationOffer {
+            lair_id: first.id,
+            dojo_id: first.dojos[0].id,
+        };
+        let mut offered = snapshot.clone();
+        offered.presentation_offers.push(offer);
+        offered.validate().unwrap();
+        let encoded = serde_json::to_value(&offered).unwrap();
+        assert_eq!(
+            encoded["presentation_offers"],
+            serde_json::json!([{
+                "lair_id": first.id.to_string(),
+                "dojo_id": first.dojos[0].id.to_string(),
+            }])
+        );
+        assert_eq!(
+            serde_json::from_value::<TopologySnapshot>(encoded).unwrap(),
+            offered
+        );
+        assert!(
+            serde_json::from_value::<DojoPresentationOffer>(serde_json::json!({
+                "lair_id": first.id.to_string(),
+                "dojo_id": first.dojos[0].id.to_string(),
+                "focus": true,
+            }))
+            .is_err()
+        );
+
+        // A duplicate, a Dojo under another Lair, and an unknown Dojo are refused.
+        let mut duplicate = offered.clone();
+        duplicate.presentation_offers.push(offer);
+        assert!(duplicate.validate().is_err());
+        let mut misplaced = snapshot.clone();
+        misplaced.presentation_offers.push(DojoPresentationOffer {
+            lair_id: second.id,
+            dojo_id: first.dojos[0].id,
+        });
+        assert!(misplaced.validate().is_err());
+        let mut unknown = snapshot;
+        unknown.presentation_offers.push(DojoPresentationOffer {
+            lair_id: first.id,
+            dojo_id: DojoId::new(),
+        });
+        assert!(unknown.validate().is_err());
+
+        // At most MAX_DOJO_PRESENTATION_OFFERS distinct offers.
+        for index in 0..MAX_DOJO_PRESENTATION_OFFERS {
+            topology
+                .new_dojo_at(
+                    topology.revision(),
+                    first.id,
+                    splinterm_core::Dojo::with_shell(format!("extra {index}"), "/tmp".into()),
+                )
+                .unwrap();
+        }
+        let mut full = starting_snapshot(topology);
+        let offers = full
+            .topology
+            .find_lair(first.id)
+            .unwrap()
+            .dojos
+            .iter()
+            .map(|dojo| DojoPresentationOffer {
+                lair_id: first.id,
+                dojo_id: dojo.id,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(offers.len(), MAX_DOJO_PRESENTATION_OFFERS + 1);
+        full.presentation_offers = offers[..MAX_DOJO_PRESENTATION_OFFERS].to_vec();
+        full.validate().unwrap();
+        full.presentation_offers = offers;
+        assert!(full.validate().is_err());
+    }
+
+    #[test]
+    fn agent_new_dojo_defaults_and_presentation_claims_have_explicit_shapes() {
+        let lair_id = LairId::new();
+        let defaulted = Request::NewDojoAutomation {
+            expected_topology_revision: TopologyRevision::new(3),
+            lair_id,
+            name: None,
+            launch: AutomationLaunch {
+                cwd: None,
+                argv: Vec::new(),
+            },
+            generated_name: false,
+        };
+        let encoded = serde_json::to_value(&defaulted).unwrap();
+        assert_eq!(encoded["type"], "new_dojo_automation");
+        assert!(encoded.get("name").is_none());
+        assert_eq!(
+            serde_json::from_value::<Request>(encoded).unwrap(),
+            defaulted
+        );
+        let named = serde_json::json!({
+            "type": "new_dojo_automation",
+            "expected_topology_revision": 3,
+            "lair_id": lair_id.to_string(),
+            "name": "agent",
+            "launch": {"cwd": null, "argv": []},
+        });
+        assert!(matches!(
+            serde_json::from_value::<Request>(named).unwrap(),
+            Request::NewDojoAutomation { name: Some(name), .. } if name == "agent"
+        ));
+
+        let dojo_id = DojoId::new();
+        let claim = Request::ClaimDojoPresentation { dojo_id };
+        assert_eq!(
+            serde_json::to_value(&claim).unwrap(),
+            serde_json::json!({
+                "type": "claim_dojo_presentation",
+                "dojo_id": dojo_id.to_string(),
+            })
+        );
+        let granted = Response::DojoPresentationClaimed { granted: true };
+        let encoded = serde_json::to_value(&granted).unwrap();
+        assert_eq!(
+            encoded,
+            serde_json::json!({"type": "dojo_presentation_claimed", "granted": true})
+        );
+        assert_eq!(
+            serde_json::from_value::<Response>(encoded).unwrap(),
+            granted
+        );
     }
 
     fn update() -> TerminalUpdate {
@@ -8336,8 +8563,8 @@ mod tests {
         // An undeclared hello keeps its exact protocol 41 shape.
         let plain = serde_json::json!({
             "type": "hello",
-            "minimum_version": 45,
-            "maximum_version": 45,
+            "minimum_version": 46,
+            "maximum_version": 46,
             "role": "trusted_ui",
         });
         assert_eq!(serde_json::to_value(hello(false)).unwrap(), plain);

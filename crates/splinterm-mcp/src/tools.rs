@@ -123,21 +123,21 @@ const DEFINITIONS: &[ToolDefinition] = &[
     ),
     tool_definition!(
         "create_lair",
-        "Creates a logical Lair with a structured process argument vector.",
+        "Creates a logical Lair; argv defaults to the owner's login shell and cwd to their home.",
         false,
         false,
         false
     ),
     tool_definition!(
         "split_splint",
-        "Splits a logical Splint and starts a structured process.",
+        "Splits a logical Splint; argv defaults to the owner's login shell and cwd to the split pane's.",
         false,
         false,
         false
     ),
     tool_definition!(
         "new_dojo",
-        "Creates a persistent Dojo and starts a structured process.",
+        "Opens a Dojo in a Lair, as a background tab in a Window showing that Lair; name, cwd and argv default to the next \"Dojo N\", the owner's home and login shell.",
         false,
         false,
         false
@@ -838,6 +838,37 @@ mod tests {
                 "splinterm.release_control",
                 json!({"controller_handle": "ctl_too-short"}),
             ),
+        ] {
+            assert_eq!(
+                validate_arguments(name, &arguments),
+                Err(ValidationError::InvalidArgument),
+                "{name}: {arguments}"
+            );
+        }
+    }
+
+    #[test]
+    fn launch_tools_need_only_their_target_while_relaunch_keeps_its_command() {
+        let lair = "11111111-2222-4333-8444-555555555555";
+        let named = json!({"lair_id": lair, "name": "agent"});
+        let split = json!({"splint_id": lair, "axis": "vertical", "side": "after", "ratio": 0.5});
+        for (name, arguments) in [
+            ("splinterm.new_dojo", json!({"lair_id": lair})),
+            ("splinterm.new_dojo", named),
+            ("splinterm.create_lair", json!({"name": "agent"})),
+            ("splinterm.split_splint", split),
+        ] {
+            assert_eq!(
+                validate_arguments(name, &arguments),
+                Ok(()),
+                "{name}: {arguments}"
+            );
+        }
+        for (name, arguments) in [
+            ("splinterm.new_dojo", json!({})),
+            ("splinterm.new_dojo", json!({"lair_id": lair, "argv": "sh"})),
+            ("splinterm.create_lair", json!({})),
+            ("splinterm.relaunch_splint", json!({"splint_id": lair})),
         ] {
             assert_eq!(
                 validate_arguments(name, &arguments),

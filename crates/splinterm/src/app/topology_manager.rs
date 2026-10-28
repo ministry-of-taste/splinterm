@@ -36,9 +36,12 @@ use splinterm_protocol::{
 };
 use tokio::sync::{mpsc, watch};
 
+#[path = "topology_presentation.rs"]
+mod presentation;
 #[path = "topology_reconnect.rs"]
 mod reconnect;
 
+use presentation::{PresentationOfferTracker, claim_presentation_offers};
 use reconnect::{ManagedReconnect, reconnect_managed_window};
 
 use super::{
@@ -1742,6 +1745,10 @@ fn topology_edit_target<T>(tabs: &mut WindowTabSet<T>, dojo_id: DojoId) -> Optio
     tabs.get_mut(dojo_id).map(|tab| &mut tab.value)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one open path prepares, sends, acknowledges and records the tab"
+)]
 async fn finish_managed_window_open(
     factory: &ConnectionFactory,
     target: Result<ManagedWindowOpen>,
@@ -1796,6 +1803,7 @@ async fn finish_managed_window_open(
                     .map_or(prepared.dojo.default_focus, |(splint_id, _)| splint_id),
                 acknowledged,
                 explorer_target,
+                activate: true,
             })
             .await
             .is_err()
@@ -3717,6 +3725,7 @@ pub(in crate::app) async fn run_topology_manager(
     let mut poll_priority = false;
     let mut explorer_observation = ExplorerObservation::default();
     let mut agent_status_observation = AgentStatusObservation::default();
+    let mut presentation_offers = PresentationOfferTracker::default();
     let mut access = AccessMonitor::default();
     let initial_lair_id = initial_identity.lair_id;
     let initial_dojo_id = initial_identity.dojo_id;
@@ -3819,6 +3828,7 @@ pub(in crate::app) async fn run_topology_manager(
                     answered_reconnect = Some(epoch);
                     explorer_observation = ExplorerObservation::default();
                     agent_status_observation = AgentStatusObservation::default();
+                    presentation_offers = PresentationOfferTracker::default();
                     access.reset();
                     if close_window {
                         window_closing = true;
@@ -3905,6 +3915,7 @@ pub(in crate::app) async fn run_topology_manager(
                         answered_reconnect = Some(epoch);
                         explorer_observation = ExplorerObservation::default();
                         agent_status_observation = AgentStatusObservation::default();
+                        presentation_offers = PresentationOfferTracker::default();
                         access.reset();
                         if close_window {
                             window_closing = true;
@@ -3966,6 +3977,22 @@ pub(in crate::app) async fn run_topology_manager(
             break;
         }
         let Some(command) = command else {
+            // Plan 0067 M3: on a poll, open an agent's new Dojo as a
+            // background tab when this Window is the one to show it.
+            if !claim_presentation_offers(
+                &factory,
+                &mut connection,
+                &config,
+                &image_cache,
+                &updates,
+                &mut state,
+                &snapshot,
+                &mut presentation_offers,
+            )
+            .await
+            {
+                break;
+            }
             continue;
         };
         let command = match command {
@@ -4294,6 +4321,7 @@ mod tests {
                 exit_status: None,
                 agent_status: None,
             }],
+            presentation_offers: Vec::new(),
         };
         let target = NavigationExplorerSplintTarget {
             topology_revision: snapshot.revision,

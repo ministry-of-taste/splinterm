@@ -133,7 +133,9 @@ pub const fn for_request(request: &Request) -> RequestAuthorization {
         // relay connection or the approver command from the installed
         // client, by responder kind; never automation or policy.
         | Request::SubscribeConsentOffers { .. }
-        | Request::AnswerConsentOffer { .. } => RequestAuthorization::TrustedUi,
+        | Request::AnswerConsentOffer { .. }
+        // Plan 0067 M3: only a Window opens an agent's Dojo as its tab.
+        | Request::ClaimDojoPresentation { .. } => RequestAuthorization::TrustedUi,
         Request::ListLairs | Request::InspectTopology | Request::InspectSplint { .. } => {
             RequestAuthorization::policy(&[Scope::TopologyMetadataRead])
         }
@@ -419,6 +421,12 @@ mod tests {
         assert_eq!(
             for_request(&Request::PublishGraphicalFocus {
                 focused_splint_id: Some(splint_id),
+            }),
+            RequestAuthorization::TrustedUi
+        );
+        assert_eq!(
+            for_request(&Request::ClaimDojoPresentation {
+                dojo_id: splinterm_core::DojoId::new(),
             }),
             RequestAuthorization::TrustedUi
         );

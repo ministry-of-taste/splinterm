@@ -66,7 +66,7 @@ running daemon by themselves.
 
 ## Behaviour changes
 
-- Private protocol 45 (0.1.1 used 36). Old and new clients, daemons, and relays
+- Private protocol 46 (0.1.1 used 36). Old and new clients, daemons, and relays
   do not interoperate. Upgrade both ends of a remote connection, and keep
   `splinterm-mcp` at the same version.
 - The agent access prompt no longer grants on Enter: Enter denies, and only `G`
@@ -707,6 +707,12 @@ a hostile program running as your account.
   fails with `timeout`. A denied one tells the agent not to ask again or take
   the pane unless you agree. A takeover when nobody controls the pane says to
   acquire it without `takeover`.
+- `splinterm.new_dojo` needs only `lair_id`: the name, directory, and command
+  default to the next "Dojo N", your home, and your login shell, as when you
+  open a Dojo yourself. `create_lair` and `split_splint` no longer require
+  `argv` either. The agent's Dojo opens as a background tab in the Window you
+  are using when its active tab is in that Lair, or else in another Window
+  showing it; it never takes focus or switches your tab.
 
 ## Security and robustness
 

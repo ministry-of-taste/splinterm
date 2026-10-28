@@ -249,6 +249,7 @@ fn explorer_observes_detached_stop_and_restore_without_revision_change() {
             revision: topology.revision(),
             topology,
             runtimes: vec![runtime],
+            presentation_offers: Vec::new(),
         };
         snapshot.validate().unwrap();
         snapshot
@@ -301,6 +302,7 @@ fn explorer_observation_tracks_revision_and_ignores_runtime_order() {
                 agent_status: None,
             })
             .collect(),
+        presentation_offers: Vec::new(),
     };
     let mut observer = ExplorerObservation::default();
     assert!(observer.observe(&snapshot));
@@ -678,6 +680,7 @@ fn topology_response(lair: Lair) -> Response {
             revision: topology.revision(),
             topology,
             runtimes,
+            presentation_offers: Vec::new(),
         },
     }
 }
@@ -1030,6 +1033,7 @@ fn explorer_observation_ignores_agent_status_age_and_sequence_but_not_state() {
             exit_status: None,
             agent_status: Some(summary(AgentState::Working, 1, false, 0)),
         }],
+        presentation_offers: Vec::new(),
     };
     let mut observer = ExplorerObservation::default();
     assert!(observer.observe(&snapshot));
@@ -1202,6 +1206,7 @@ async fn picker_and_restore_previews_send_only_reads() {
             exit_status: None,
             agent_status: None,
         }],
+        presentation_offers: Vec::new(),
     };
     snapshot.validate().unwrap();
     let lair_guard = ExplorerContextTarget {

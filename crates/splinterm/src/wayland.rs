@@ -10752,16 +10752,7 @@ impl App {
             // picker and applies every deferred update in order first.
             let reconnected = matches!(&update, WindowTopologyUpdate::Reconnected { .. });
             let defer_for_picker = self.modal.inline_picker_open()
-                && (reconnected
-                    || matches!(
-                        &update,
-                        WindowTopologyUpdate::Apply { .. }
-                            | WindowTopologyUpdate::OpenTab { .. }
-                            | WindowTopologyUpdate::ActivateTab { .. }
-                            | WindowTopologyUpdate::ActivateSplint { .. }
-                            | WindowTopologyUpdate::RemoveTab { .. }
-                            | WindowTopologyUpdate::UpdateIdentity(_)
-                    ));
+                && (reconnected || update.defers_for_inline_picker());
             if defer_for_picker {
                 if !reconnected
                     && self.tab_state.deferred_topology_updates.len()
@@ -10844,6 +10835,7 @@ impl App {
                     focused,
                     acknowledged,
                     explorer_target,
+                    activate,
                 } => {
                     let topology_revision = identity.topology_revision;
                     let dojo_id = identity.dojo_id;
@@ -10868,6 +10860,31 @@ impl App {
                             continue;
                         }
                     };
+                    if !activate {
+                        // Plan 0067 M3: an agent's Dojo joins the strip behind
+                        // the active tab, which keeps its history and keyboard
+                        // focus; popups and tabs never take focus.
+                        let opened = self.tab_state.tabs.open_background(DojoTab::new(
+                            lair_id,
+                            dojo_id,
+                            Some(view),
+                        ));
+                        let result = opened.map(|_| ()).map_err(|error| error.to_string());
+                        let _ = acknowledged.send(result);
+                        if opened.is_ok() {
+                            self.tab_state.tab_label_cache.clear();
+                            self.presentation.full_redraw = true;
+                            changed = true;
+                            if let Some(diagnostics) = diagnostics() {
+                                diagnostics
+                                    .update_topology(topology_revision, self.tab_state.tabs.len());
+                            }
+                        }
+                        if refresh_explorer {
+                            let _ = self.refresh_lair_explorer();
+                        }
+                        continue;
+                    }
                     let previous_id = self.tab_state.active_dojo_id();
                     self.tab_state
                         .tabs

@@ -1493,13 +1493,18 @@ fn automation_launch(arguments: &Value) -> Result<AutomationLaunch, DispatchFail
         .get("cwd")
         .and_then(Value::as_str)
         .map(PathBuf::from);
-    let argv = arguments["argv"]
-        .as_array()
-        .ok_or_else(DispatchFailure::internal)?
-        .iter()
-        .map(|value| value.as_str().map(ToOwned::to_owned))
-        .collect::<Option<Vec<_>>>()
-        .ok_or_else(DispatchFailure::internal)?;
+    // Left out, argv runs the default shell as a login shell (Plan 0067 M3);
+    // the schemas that need a command require it.
+    let argv = match arguments.get("argv") {
+        None => Vec::new(),
+        Some(argv) => argv
+            .as_array()
+            .ok_or_else(DispatchFailure::internal)?
+            .iter()
+            .map(|value| value.as_str().map(ToOwned::to_owned))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(DispatchFailure::internal)?,
+    };
     let launch = AutomationLaunch { cwd, argv };
     launch.validate().map_err(|_| {
         DispatchFailure::new(
@@ -2005,14 +2010,17 @@ async fn dispatch_mutation_to(
             let preparation =
                 mutation_preflight(&mut session, MutationPreflight::NewDojo { lair_id }).await?;
             exact_lair_preparation(&preparation, lair_id)?;
-            let name = arguments["name"]
-                .as_str()
-                .ok_or_else(DispatchFailure::internal)?;
+            // Left out, the daemon names it like a person's New Dojo.
+            let name = match arguments.get("name").map(Value::as_str) {
+                None => None,
+                Some(Some(name)) => Some(name.to_owned()),
+                Some(None) => return Err(DispatchFailure::internal()),
+            };
             match session
                 .request(Request::NewDojoAutomation {
                     expected_topology_revision: preparation.topology_revision,
                     lair_id,
-                    name: name.to_owned(),
+                    name,
                     launch,
                     generated_name: false,
                 })
@@ -3217,6 +3225,7 @@ mod agent_status_tests {
                     reported_age_ms: 10,
                 }),
             }],
+            presentation_offers: Vec::new(),
         };
         let splint = |value: Value| value["lairs"][0]["dojos"][0]["splints"][0].clone();
         assert_eq!(

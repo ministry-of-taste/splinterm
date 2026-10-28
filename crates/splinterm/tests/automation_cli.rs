@@ -111,6 +111,7 @@ fn reviewed_topology() -> TopologySnapshot {
             exit_status: None,
             agent_status: None,
         }],
+        presentation_offers: Vec::new(),
     }
 }
 
@@ -713,6 +714,7 @@ fn serve_create() -> (PathBuf, thread::JoinHandle<()>) {
                     revision: TopologyRevision::new(0),
                     topology: Topology::new(),
                     runtimes: Vec::new(),
+                    presentation_offers: Vec::new(),
                 },
             },
         );
