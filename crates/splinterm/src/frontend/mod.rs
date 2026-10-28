@@ -4,6 +4,7 @@ mod action_menu;
 mod agent_access;
 mod agent_status;
 mod binding_help;
+mod control_transfer;
 pub mod dialog_text;
 mod lair_explorer;
 mod message;
@@ -45,6 +46,7 @@ pub(crate) fn agent_access_test_entry(
 pub(crate) use agent_status::state_tint;
 pub(crate) use agent_status::{AgentAggregate, AgentGlyphs, AgentSpinner, badged_tab_label};
 pub(crate) use binding_help::{BindingHelpUi, shortcut_chips};
+pub(crate) use control_transfer::{CONTROL_TRANSFER_NOTICE, control_transfer_keys};
 pub use dialog_text::{DialogIdentity, DialogLine, DialogLineRole, DialogStyle, DialogText};
 #[cfg(test)]
 pub(crate) use lair_explorer::LairExplorerRowKind;
