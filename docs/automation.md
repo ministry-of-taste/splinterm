@@ -70,6 +70,13 @@ disposable processes, and the default-focus field is only a persisted
 presentation hint. Compositor orchestration is outside the v2 automation
 contract.
 
+A Dojo that automation creates is offered to the Windows showing its Lair, and
+one of them opens it as a background tab: the Window whose active tab is in that
+Lair, or else another one shortly after. The tab never becomes active or takes
+keyboard focus, and with no Window showing the Lair, no tab opens. Automation
+never sees these offers. Such a Dojo is also never closed as unused when a
+Window closes.
+
 Request and subscription IDs are client-owned nonzero decimal strings, independent
 of private daemon protocol IDs. This avoids precision loss in JSON consumers and
 allows a one-shot invocation to use request ID `"1"` even when schema selection,

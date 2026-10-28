@@ -91,7 +91,7 @@ const REVIEWED_SCHEMA_FNV64: &[(&str, u64)] = &[
         "tools/close_splint.output.schema.json",
         0xf067_0bf7_49eb_d415,
     ),
-    ("tools/create_lair.input.schema.json", 0x81a0_812c_7013_b9a7),
+    ("tools/create_lair.input.schema.json", 0x0916_f9d5_2ed4_3c8f),
     (
         "tools/create_lair.output.schema.json",
         0x9c69_4126_cdd4_97e5,
@@ -137,7 +137,7 @@ const REVIEWED_SCHEMA_FNV64: &[(&str, u64)] = &[
     ),
     ("tools/list_lairs.input.schema.json", 0xb83a_6e8c_b692_a7b6),
     ("tools/list_lairs.output.schema.json", 0xa683_c49b_7cbb_f6e1),
-    ("tools/new_dojo.input.schema.json", 0x587d_7375_b47f_c586),
+    ("tools/new_dojo.input.schema.json", 0x76c4_e647_bbd6_8ed9),
     ("tools/new_dojo.output.schema.json", 0xfaa0_8cab_df12_f342),
     ("tools/ping.input.schema.json", 0x330d_9f93_c9bc_3dea),
     ("tools/ping.output.schema.json", 0xaf91_1919_d5ed_5480),
@@ -283,7 +283,7 @@ const REVIEWED_SCHEMA_FNV64: &[(&str, u64)] = &[
     ),
     (
         "tools/split_splint.input.schema.json",
-        0x56d6_1db2_bf5e_ba98,
+        0xfc84_1a6c_24b3_2346,
     ),
     (
         "tools/split_splint.output.schema.json",

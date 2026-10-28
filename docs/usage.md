@@ -109,8 +109,12 @@ A Window holds an ordered, client-local set of distinct Dojo tabs:
 - `Ctrl+Shift+B` toggles the Dojo tab strip without changing the tab set;
 - `Ctrl+Shift+S` opens the `dojos` picker (recent) inside the same Window;
 - choosing an already-open Dojo activates its tab rather than duplicating it;
-- choosing another running Dojo adds it without changing daemon topology; and
-- choosing New Terminal creates a fresh Lair and opens its initial Dojo.
+- choosing another running Dojo adds it without changing daemon topology;
+- choosing New Terminal creates a fresh Lair and opens its initial Dojo; and
+- a Dojo an agent or other automation creates appears as a background tab in
+  the Window you are using when its active tab is in that Lair, or else in
+  another Window showing the Lair. It never becomes the active tab or takes
+  keyboard focus, and only one Window gets it.
 
 The command palette keeps topology levels separate: **Choose Lair** lists one
 row per available Lair and switches through that Lair's most recently used Dojo,

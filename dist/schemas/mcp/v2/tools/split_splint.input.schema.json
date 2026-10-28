@@ -10,8 +10,7 @@
         "splint_id",
         "axis",
         "side",
-        "ratio",
-        "argv"
+        "ratio"
       ],
       "properties": {
         "splint_id": {

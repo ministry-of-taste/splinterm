@@ -98,6 +98,9 @@ not acquire or promote a transient owner lease. A new Lair starts with `Dojo 1`.
 `new-dojo` omits `--name`, Splinterm uses one greater than that Lair's highest
 existing exact `Dojo N` name; numeric gaps are not reused. Explicit names are
 preserved.
+With `--output json`, `new-dojo` runs as automation: the Dojo opens as a
+background tab in a Window showing its Lair, without switching to it, and is
+never closed as unused. Without it, no tab opens.
 
 ```bash
 splinterm new project --cwd "$HOME/src/project"

@@ -1087,6 +1087,7 @@ mod tests {
                 revision: topology.revision(),
                 topology,
                 runtimes: Vec::new(),
+                presentation_offers: Vec::new(),
             },
             resync_revision: None,
         }

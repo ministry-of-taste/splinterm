@@ -9,6 +9,7 @@ mod handoff_windows;
 mod omarchy_environment;
 mod pending_access;
 mod persistence;
+mod presentation_offers;
 mod remote_consent;
 
 use std::{
@@ -1098,6 +1099,10 @@ struct DaemonState {
     /// Lairs created by this daemon under a generated name and not renamed
     /// since; an unused close removes one with its last Dojo.
     generated_lairs: StdMutex<HashSet<LairId>>,
+    /// Plan 0067 M3: Dojos automation created, offered to the Windows
+    /// showing their Lair as a background tab; see
+    /// `Request::ClaimDojoPresentation`.
+    presentation_offers: StdMutex<presentation_offers::PresentationOffers>,
     attachments: AttachmentRegistry,
     transient_leases: Arc<StdMutex<TransientLeaseRegistry>>,
     graphical_focus: Mutex<Option<GraphicalFocusClaim>>,
@@ -3473,6 +3478,7 @@ fn build_daemon_state(inputs: DaemonStateInputs) -> Arc<DaemonState> {
         retiring,
         plain_dojos: StdMutex::default(),
         generated_lairs: StdMutex::default(),
+        presentation_offers: StdMutex::default(),
         attachments: AttachmentRegistry::default(),
         transient_leases: Arc::new(StdMutex::new(TransientLeaseRegistry::default())),
         graphical_focus: Mutex::new(None),
@@ -6633,6 +6639,7 @@ fn trusted_ui_request(request: &Request) -> bool {
         request,
         Request::Ping
             | Request::PublishGraphicalFocus { .. }
+            | Request::ClaimDojoPresentation { .. }
             | Request::ListLairs
             | Request::InspectTopology
             | Request::SubscribeTopology
@@ -8159,7 +8166,8 @@ async fn request_policy_resources(
         | Request::CancelAllLairAccessRequests
         | Request::AcknowledgeHandoffPrepare { .. }
         | Request::SubscribeConsentOffers { .. }
-        | Request::AnswerConsentOffer { .. } => Vec::new(),
+        | Request::AnswerConsentOffer { .. }
+        | Request::ClaimDojoPresentation { .. } => Vec::new(),
         Request::ListLairs
         | Request::InspectTopology
         | Request::SubscribeTopology
@@ -9305,16 +9313,20 @@ fn lair_default_cwd(topology: &Topology, lair_id: LairId) -> Result<PathBuf, Pro
     splint_durable_cwd(topology, dojo.default_focus)
 }
 
+/// Resolves an automation launch the way a person's launch is resolved: an
+/// empty argv runs the default shell as a login shell (Plan 0067 M3), and a
+/// direct command runs as given.
 fn resolved_automation_launch(
     launch: splinterm_protocol::AutomationLaunch,
     default_cwd: PathBuf,
 ) -> Result<splinterm_protocol::LaunchParameters, ProtocolError> {
     launch.validate()?;
+    let login_shell = launch.argv.is_empty();
     let launch = splinterm_protocol::LaunchParameters {
         cwd: launch.cwd.unwrap_or(default_cwd),
         command: launch.argv,
         shell: None,
-        login_shell: false,
+        login_shell,
         scrollback_lines: splinterm_terminal::TerminalConfig::default().scrollback_lines,
     };
     launch.validate()?;
@@ -9389,10 +9401,26 @@ async fn resolve_automation_mutation(
             launch,
             generated_name,
         } => {
-            let cwd = match launch.cwd.clone() {
-                Some(cwd) => cwd,
-                None => lair_default_cwd(&*state.topology.read().await, lair_id)?,
+            // Plan 0067 M3: what is left out defaults as a person's New Dojo
+            // does: the next free "Dojo N" and the owner's home. The handler
+            // checks the revision this name was chosen under.
+            let topology = state.topology.read().await;
+            let (name, generated_name) = match name {
+                Some(name) => (name, generated_name),
+                None => (
+                    topology
+                        .find_lair(lair_id)
+                        .ok_or_else(not_found)?
+                        .next_default_dojo_name()
+                        .map_err(model_error)?,
+                    true,
+                ),
             };
+            let cwd = match (launch.cwd.clone(), state.owner_home.clone()) {
+                (Some(cwd), _) | (None, Some(cwd)) => cwd,
+                (None, None) => lair_default_cwd(&topology, lair_id)?,
+            };
+            drop(topology);
             Request::NewDojo {
                 expected_topology_revision,
                 lair_id,
@@ -9596,12 +9624,40 @@ async fn handle_authorized_request(
                 topology_revision: lair.revision(),
             }
         }
-        Request::InspectTopology => Response::Topology {
-            snapshot: shown_topology_snapshot(
-                consistent_topology_snapshot(state).await,
+        Request::InspectTopology => {
+            let mut snapshot =
+                shown_topology_snapshot(consistent_topology_snapshot(state).await, authorization);
+            // Plan 0067 M3: only the Windows themselves see presentation
+            // offers; an automation peer never does.
+            if presentation_window(
+                trusted_ui_client,
+                remote_interactive_client,
+                peer,
                 authorization,
-            ),
-        },
+            ) {
+                let mut offers = state.presentation_offers.lock().unwrap();
+                snapshot.presentation_offers = offers.shown(&snapshot.topology, Instant::now());
+            }
+            Response::Topology { snapshot }
+        }
+        Request::ClaimDojoPresentation { dojo_id } => {
+            if !presentation_window(
+                trusted_ui_client,
+                remote_interactive_client,
+                peer,
+                authorization,
+            ) {
+                return Err(ProtocolError::new(
+                    ErrorCode::Unauthorized,
+                    "only a Window may claim a Dojo presentation offer",
+                ));
+            }
+            let topology = state.topology.read().await;
+            let mut offers = state.presentation_offers.lock().unwrap();
+            let granted = offers.claim(&topology, dojo_id, Instant::now());
+            drop(offers);
+            Response::DojoPresentationClaimed { granted }
+        }
         Request::SubscribeTopology => {
             let (id, snapshot, stream) = subscribe_topology(state, connection_id).await;
             return Ok(Handled {
@@ -10076,7 +10132,9 @@ async fn handle_authorized_request(
                 dojo_id,
                 splint_id,
                 incarnation,
-                launch.command.is_empty(),
+                // Plan 0067 M3: an agent's first Dojo is never plain.
+                launch.command.is_empty()
+                    && !agent_connection(trusted_ui_client, remote_interactive_client),
                 false,
             )
             .await;
@@ -10177,7 +10235,9 @@ async fn handle_authorized_request(
                 dojo_id,
                 splint_id,
                 incarnation,
-                launch.command.is_empty(),
+                // Plan 0067 M3: an agent's first Dojo is never plain.
+                launch.command.is_empty()
+                    && !agent_connection(trusted_ui_client, remote_interactive_client),
                 false,
             )
             .await;
@@ -10562,17 +10622,26 @@ async fn handle_authorized_request(
                     .remove_lair(lair_id)
                     .expect("authorized transient promotion retains its lease");
             }
+            // Plan 0067 M3: an agent's Dojo, told apart by the connection's
+            // role, is never plain, so closing a Window never ends it as
+            // unused; and it is offered to the Windows showing its Lair.
+            let agent_origin = agent_connection(trusted_ui_client, remote_interactive_client);
             record_plain_dojo(
                 state,
                 dojo_id,
                 splint_id,
                 incarnation,
-                launch.command.is_empty(),
+                launch.command.is_empty() && !agent_origin,
                 // A name the user chose counts as use, like a rename, even
                 // when it equals the default label.
                 !generated_name,
             )
             .await;
+            if agent_origin {
+                let topology = state.topology.read().await;
+                let mut offers = state.presentation_offers.lock().unwrap();
+                offers.offer(&topology, lair_id, dojo_id, Instant::now());
+            }
             observe_process_exit(state, handle);
             publish_topology(state, topology_revision, TopologyChangeKind::DojoCreated).await;
             Response::DojoStarted {
@@ -12461,10 +12530,11 @@ impl<'a> HandoffAdmission<'a> {
 /// - **Admitted:** read-only queries (including the mutation preflight and
 ///   image content for an existing attachment); advisory, connection-owned
 ///   state no handoff captures (the published graphical focus and agent
-///   status, which Plan 0061 D6 drops across a handoff); requests that only
-///   reduce authority (detach, release control, revoke a grant); and the
-///   handoff preparation and acknowledgement themselves, so a dry run still
-///   reports, a Window can acknowledge, and the gate answers a second
+///   status, which Plan 0061 D6 drops across a handoff, and a Window's claim
+///   on a Dojo presentation offer, which a handoff drops too); requests that
+///   only reduce authority (detach, release control, revoke a grant); and
+///   the handoff preparation and acknowledgement themselves, so a dry run
+///   still reports, a Window can acknowledge, and the gate answers a second
 ///   `Execute` itself.
 ///
 /// Admitted requests that take the topology permit (topology inspection,
@@ -12493,6 +12563,7 @@ const fn handoff_fenced(request: &Request) -> bool {
         | Request::SearchScrollback { .. }
         | Request::AuditInspect { .. }
         | Request::PublishGraphicalFocus { .. }
+        | Request::ClaimDojoPresentation { .. }
         | Request::ReportAgentStatus { .. }
         | Request::Detach { .. }
         | Request::ReleaseControl { .. }
@@ -14584,7 +14655,35 @@ fn topology_snapshot_from(
         revision: lair.revision(),
         topology: lair,
         runtimes,
+        presentation_offers: Vec::new(),
     }
+}
+
+/// Plan 0067 M3: whether a connection is an agent's rather than a Window's:
+/// neither the installed client nor a remote Window. Its Dojos are never
+/// plain, and a Dojo it opens is offered to the Windows as a background tab.
+const fn agent_connection(trusted_ui_client: bool, remote_interactive_client: bool) -> bool {
+    !trusted_ui_client && !remote_interactive_client
+}
+
+/// Plan 0067 M3: whether this connection is a Window, which alone sees and
+/// claims Dojo presentation offers: the installed client still running the
+/// executable it said `Hello` with, or a remote Window through its relay.
+/// Development access authorizes a topology read without the interactive
+/// bypass, so the role is checked here as well.
+fn presentation_window(
+    trusted_ui_client: bool,
+    remote_interactive_client: bool,
+    peer: &PeerIdentity,
+    authorization: &RequestAuthorizationContext,
+) -> bool {
+    authorization.interactive_bypass
+        || interactive_bypass(
+            trusted_ui_client,
+            peer.connection_matches_splinterm(),
+            remote_interactive_client,
+            &Request::InspectTopology,
+        )
 }
 
 /// Plan 0067: the part of a snapshot a topology read may show, at the same
@@ -14608,6 +14707,7 @@ fn shown_topology_snapshot(
         revision: snapshot.revision,
         topology,
         runtimes,
+        presentation_offers: Vec::new(),
     }
 }
 
@@ -17634,6 +17734,7 @@ mod tests {
             retiring,
             plain_dojos: StdMutex::default(),
             generated_lairs: StdMutex::default(),
+            presentation_offers: StdMutex::default(),
             attachments: AttachmentRegistry::default(),
             transient_leases: Arc::new(StdMutex::new(TransientLeaseRegistry::default())),
             graphical_focus: Mutex::new(None),
@@ -18762,6 +18863,320 @@ mod tests {
         reap_all(&state).await;
     }
 
+    /// Plan 0067 M3: a request from a connection of the given kind. A Window
+    /// (trusted UI or remote) holds the interactive bypass; automation holds
+    /// an ordinary authorization.
+    async fn request_as(
+        state: &Arc<DaemonState>,
+        connection_id: u64,
+        window: Option<bool>,
+        request: Request,
+    ) -> Result<Response, ProtocolError> {
+        let (trusted_ui_client, remote_interactive_client) = match window {
+            Some(remote) => (!remote, remote),
+            None => (false, false),
+        };
+        handle_authorized_request(
+            request,
+            state,
+            &PeerIdentity::for_test(),
+            connection_id,
+            trusted_ui_client,
+            remote_interactive_client,
+            &RequestAuthorizationContext {
+                interactive_bypass: window.is_some(),
+                ..RequestAuthorizationContext::default()
+            },
+            &mut HandoffAdmission::unfenced(),
+        )
+        .await
+        .map(|handled| handled.response)
+    }
+
+    async fn offers_seen_by(
+        state: &Arc<DaemonState>,
+        window: Option<bool>,
+    ) -> Vec<splinterm_protocol::DojoPresentationOffer> {
+        let response = request_as(state, 61, window, Request::InspectTopology)
+            .await
+            .unwrap();
+        let Response::Topology { snapshot } = response else {
+            panic!("topology was not returned");
+        };
+        snapshot.validate().unwrap();
+        snapshot.presentation_offers
+    }
+
+    #[tokio::test]
+    async fn an_agent_new_dojo_defaults_like_a_persons() {
+        let mut state = test_state(false);
+        let home = temp_dir();
+        Arc::get_mut(&mut state).unwrap().owner_home = Some(home.clone());
+        let lair = state
+            .topology
+            .write()
+            .await
+            .create_lair("agent", PathBuf::from("/lair/first"))
+            .unwrap()
+            .clone();
+        let revision = state.topology.read().await.revision();
+        let defaulted = |revision| Request::NewDojoAutomation {
+            expected_topology_revision: revision,
+            lair_id: lair.id,
+            name: None,
+            launch: splinterm_protocol::AutomationLaunch {
+                cwd: None,
+                argv: Vec::new(),
+            },
+            generated_name: false,
+        };
+        let Request::NewDojo {
+            expected_topology_revision,
+            name,
+            launch,
+            generated_name,
+            promote_transient_lair,
+            ..
+        } = resolve_automation_mutation(defaulted(revision), &state)
+            .await
+            .unwrap()
+        else {
+            panic!("the defaulted Dojo was not resolved");
+        };
+        assert_eq!(expected_topology_revision, revision);
+        assert_eq!(name, "Dojo 2");
+        assert!(generated_name);
+        assert!(!promote_transient_lair);
+        assert_eq!(launch.cwd, home);
+        assert!(launch.command.is_empty());
+        assert!(launch.shell.is_none());
+        assert!(launch.login_shell);
+
+        // A chosen name and directory are kept; a direct command is no login.
+        let Request::NewDojo {
+            name,
+            launch,
+            generated_name,
+            ..
+        } = resolve_automation_mutation(
+            Request::NewDojoAutomation {
+                expected_topology_revision: revision,
+                lair_id: lair.id,
+                name: Some("chosen".into()),
+                launch: splinterm_protocol::AutomationLaunch {
+                    cwd: Some(PathBuf::from("/chosen")),
+                    argv: vec!["/bin/true".into()],
+                },
+                generated_name: false,
+            },
+            &state,
+        )
+        .await
+        .unwrap()
+        else {
+            panic!("the named Dojo was not resolved");
+        };
+        assert_eq!(name, "chosen");
+        assert!(!generated_name);
+        assert_eq!(launch.cwd, PathBuf::from("/chosen"));
+        assert!(!launch.login_shell);
+
+        // Without a home, the Lair's own directory.
+        Arc::get_mut(&mut state).unwrap().owner_home = None;
+        let resolved = resolve_automation_mutation(defaulted(revision), &state)
+            .await
+            .unwrap();
+        let Request::NewDojo { launch, .. } = resolved else {
+            panic!("the homeless Dojo was not resolved");
+        };
+        assert_eq!(launch.cwd, PathBuf::from("/lair/first"));
+
+        // The name is chosen under the revision the request names: a stale
+        // one is refused, with nothing created or offered.
+        let outdated = TopologyRevision::default();
+        assert_ne!(outdated, revision);
+        let error = request_as(&state, 62, None, defaulted(outdated))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::StaleTopology);
+        assert_eq!(state.topology.read().await.revision(), revision);
+        assert!(offers_seen_by(&state, Some(false)).await.is_empty());
+        // An unknown Lair is not found.
+        let mut unknown = defaulted(revision);
+        if let Request::NewDojoAutomation { lair_id, .. } = &mut unknown {
+            *lair_id = LairId::new();
+        }
+        assert_eq!(
+            resolve_automation_mutation(unknown, &state)
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::NotFound
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one scenario follows an agent's Dojo from creation to the one Window that claims it"
+    )]
+    async fn an_agent_dojo_is_offered_once_to_windows_and_is_never_unused() {
+        let state = test_state_with_backend(false, test_pty_backend());
+        let Response::LairCreated { lair, .. } = trusted_request(
+            &state,
+            63,
+            Request::CreateLair {
+                expected_topology_revision: TopologyRevision::default(),
+                name: "offers".into(),
+                launch: test_launch(&["/bin/sh", "-c", "sleep 30"]),
+                generated_name: false,
+            },
+        )
+        .await
+        .unwrap() else {
+            panic!("the Lair was not created");
+        };
+        assert!(offers_seen_by(&state, Some(false)).await.is_empty());
+
+        // A person's plain Dojo stays closable while unused and is not offered.
+        let revision = state.topology.read().await.revision();
+        let Response::DojoStarted {
+            dojo_id: person, ..
+        } = trusted_request(
+            &state,
+            63,
+            Request::NewDojo {
+                expected_topology_revision: revision,
+                lair_id: lair.id,
+                name: "Dojo 2".into(),
+                launch: plain_shell_launch(),
+                promote_transient_lair: false,
+                generated_name: true,
+            },
+        )
+        .await
+        .unwrap()
+        else {
+            panic!("the person's Dojo was not created");
+        };
+        assert!(state.plain_dojos.lock().unwrap().contains_key(&person));
+        assert!(offers_seen_by(&state, Some(false)).await.is_empty());
+
+        // The same plain Dojo from automation is never closable as unused.
+        let revision = state.topology.read().await.revision();
+        let Response::DojoStarted { dojo_id: plain, .. } = request_as(
+            &state,
+            64,
+            None,
+            Request::NewDojo {
+                expected_topology_revision: revision,
+                lair_id: lair.id,
+                name: "Dojo 3".into(),
+                launch: plain_shell_launch(),
+                promote_transient_lair: false,
+                generated_name: true,
+            },
+        )
+        .await
+        .unwrap() else {
+            panic!("the agent's plain Dojo was not created");
+        };
+        assert!(!state.plain_dojos.lock().unwrap().contains_key(&plain));
+        // So is the first Dojo of an agent's Lair.
+        let revision = state.topology.read().await.revision();
+        let Response::LairCreated { lair: agents, .. } = request_as(
+            &state,
+            64,
+            None,
+            Request::CreateLair {
+                expected_topology_revision: revision,
+                name: "agent's".into(),
+                launch: plain_shell_launch(),
+                generated_name: false,
+            },
+        )
+        .await
+        .unwrap() else {
+            panic!("the agent's Lair was not created");
+        };
+        let first = agents.dojos[0].id;
+        assert!(!state.plain_dojos.lock().unwrap().contains_key(&first));
+
+        let revision = state.topology.read().await.revision();
+        let Response::DojoStarted { dojo_id, .. } = request_as(
+            &state,
+            64,
+            None,
+            Request::NewDojoAutomation {
+                expected_topology_revision: revision,
+                lair_id: lair.id,
+                name: None,
+                launch: splinterm_protocol::AutomationLaunch {
+                    cwd: Some(PathBuf::from("/tmp")),
+                    argv: vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
+                },
+                generated_name: false,
+            },
+        )
+        .await
+        .unwrap() else {
+            panic!("the agent's Dojo was not created");
+        };
+        assert_eq!(
+            state.topology.read().await.find_dojo(dojo_id).unwrap().name,
+            "Dojo 4"
+        );
+        let expected = [
+            splinterm_protocol::DojoPresentationOffer {
+                lair_id: lair.id,
+                dojo_id: plain,
+            },
+            splinterm_protocol::DojoPresentationOffer {
+                lair_id: lair.id,
+                dojo_id,
+            },
+        ];
+        // Windows see the offers; automation never does.
+        assert_eq!(offers_seen_by(&state, Some(false)).await, expected);
+        assert_eq!(offers_seen_by(&state, Some(true)).await, expected);
+        assert!(offers_seen_by(&state, None).await.is_empty());
+
+        // Only a Window claims, and only one claim is granted.
+        let claim = Request::ClaimDojoPresentation { dojo_id };
+        assert_eq!(
+            request_as(&state, 64, None, claim.clone())
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::Unauthorized
+        );
+        assert_eq!(
+            request_as(&state, 65, Some(true), claim.clone()).await,
+            Ok(Response::DojoPresentationClaimed { granted: true })
+        );
+        assert_eq!(
+            request_as(&state, 66, Some(false), claim.clone()).await,
+            Ok(Response::DojoPresentationClaimed { granted: false })
+        );
+        assert_eq!(
+            offers_seen_by(&state, Some(false)).await,
+            expected[..1].to_vec()
+        );
+        assert_eq!(
+            request_as(
+                &state,
+                66,
+                Some(false),
+                Request::ClaimDojoPresentation {
+                    dojo_id: DojoId::new(),
+                },
+            )
+            .await,
+            Ok(Response::DojoPresentationClaimed { granted: false })
+        );
+        reap_all(&state).await;
+    }
+
     // Only bytes the client flags as its own focus reports leave a runtime
     // unused; identical bytes from automation or a paste are input.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -19211,6 +19626,20 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[test]
+    fn only_a_window_claims_an_agent_dojo_as_a_tab() {
+        // Local and remote Windows both claim an agent's Dojo as a tab; a
+        // non-Window never does.
+        let claim = Request::ClaimDojoPresentation {
+            dojo_id: DojoId::new(),
+        };
+        assert!(interactive_bypass(true, true, false, &claim));
+        assert!(interactive_bypass(false, false, true, &claim));
+        assert!(!interactive_bypass(true, false, false, &claim));
+        assert!(!interactive_bypass(false, true, false, &claim));
+        assert!(!interactive_bypass(false, false, false, &claim));
     }
 
     #[test]
@@ -20266,6 +20695,7 @@ mod tests {
             Request::PublishGraphicalFocus {
                 focused_splint_id: None,
             },
+            Request::ClaimDojoPresentation { dojo_id },
             Request::ReportAgentStatus {
                 splint_id,
                 incarnation: 1,
@@ -20352,7 +20782,7 @@ mod tests {
             Request::NewDojoAutomation {
                 expected_topology_revision: revision,
                 lair_id,
-                name: "dojo".into(),
+                name: Some("dojo".into()),
                 launch: automation,
                 generated_name: false,
             },
@@ -24578,6 +25008,7 @@ mod tests {
                 exit_status: None,
                 agent_status: None,
             }],
+            presentation_offers: Vec::new(),
         };
         let rename = prepare_mutation(
             &snapshot,
@@ -24627,7 +25058,7 @@ mod tests {
             Request::NewDojoAutomation {
                 expected_topology_revision: snapshot.revision,
                 lair_id,
-                name: "dojo".to_owned(),
+                name: Some("dojo".to_owned()),
                 launch: splinterm_protocol::AutomationLaunch {
                     cwd: None,
                     argv: Vec::new(),
@@ -24636,7 +25067,12 @@ mod tests {
             },
         ] {
             let resolved = resolve_automation_mutation(request, &state).await.unwrap();
-            let is_create = matches!(resolved, Request::CreateLair { .. });
+            // A new Lair and a new Dojo start in the owner's home, as a
+            // person's do (Plan 0067 M3); a split and a relaunch inherit.
+            let is_create = matches!(
+                resolved,
+                Request::CreateLair { .. } | Request::NewDojo { .. }
+            );
             let (Request::CreateLair { launch, .. }
             | Request::SplitSplint { launch, .. }
             | Request::RelaunchSplint { launch, .. }
@@ -24654,7 +25090,8 @@ mod tests {
             );
             assert!(launch.command.is_empty());
             assert!(launch.shell.is_none());
-            assert!(!launch.login_shell);
+            // The default shell is a login shell, as a person's is.
+            assert!(launch.login_shell);
         }
 
         let explicit = resolve_automation_mutation(
@@ -24687,7 +25124,7 @@ mod tests {
             Request::NewDojoAutomation {
                 expected_topology_revision: revision,
                 lair_id,
-                name: "replacement".to_owned(),
+                name: Some("replacement".to_owned()),
                 launch: splinterm_protocol::AutomationLaunch {
                     cwd: Some(PathBuf::from("/empty-lair-override")),
                     argv: Vec::new(),
@@ -25241,6 +25678,7 @@ mod tests {
                     revision: splinterm_core::TopologyRevision::default(),
                     topology: Topology::new(),
                     runtimes: Vec::new(),
+                    presentation_offers: Vec::new(),
                 },
             });
         }

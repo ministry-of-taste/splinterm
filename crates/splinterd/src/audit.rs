@@ -25,6 +25,7 @@ pub const fn operation_for_request(request: &Request) -> AuditOperation {
         Request::ResolveLaunchDirectory { .. } => AuditOperation::ResolveLaunchDirectory,
         Request::ReadGraphicalFocus => AuditOperation::ReadGraphicalFocus,
         Request::PublishGraphicalFocus { .. } => AuditOperation::PublishGraphicalFocus,
+        Request::ClaimDojoPresentation { .. } => AuditOperation::ClaimDojoPresentation,
         Request::RequestAccess { .. } => AuditOperation::RequestAccess,
         // Cancelling is part of the workspace request's lifecycle; the audit
         // vocabulary stays closed.
@@ -234,6 +235,20 @@ fn sanitize_reason(reason: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_dojo_presentation_claim_has_its_own_operation() {
+        assert_eq!(
+            operation_for_request(&Request::ClaimDojoPresentation {
+                dojo_id: splinterm_core::DojoId::new(),
+            }),
+            AuditOperation::ClaimDojoPresentation
+        );
+        assert_eq!(
+            AuditOperation::ClaimDojoPresentation.as_str(),
+            "claim_dojo_presentation"
+        );
+    }
 
     #[test]
     fn consent_responder_requests_have_their_own_operations() {

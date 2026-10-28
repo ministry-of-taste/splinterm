@@ -310,6 +310,9 @@ pub enum WindowTopologyUpdate {
         focused: SplintId,
         acknowledged: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
         explorer_target: Option<LairExplorerActivationTarget>,
+        /// `false` appends the tab without switching to it (Plan 0067 M3): the
+        /// active tab, its history, and keyboard focus stay as they were.
+        activate: bool,
     },
     ActivateTab {
         dojo_id: DojoId,
@@ -375,6 +378,25 @@ pub enum WindowTopologyUpdate {
     Shutdown(String),
 }
 
+impl WindowTopologyUpdate {
+    /// Whether this update waits while the inline Dojo picker is open, so the
+    /// picker never acts on a layout it did not show. A background tab
+    /// (Plan 0067 M3) changes nothing the picker shows and is never deferred:
+    /// the topology manager waits for its acknowledgement.
+    #[must_use]
+    pub const fn defers_for_inline_picker(&self) -> bool {
+        matches!(
+            self,
+            Self::Apply { .. }
+                | Self::OpenTab { activate: true, .. }
+                | Self::ActivateTab { .. }
+                | Self::ActivateSplint { .. }
+                | Self::RemoveTab { .. }
+                | Self::UpdateIdentity(_)
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,6 +408,43 @@ mod tests {
             dojo_id: DojoId::new(),
             action,
         }
+    }
+
+    #[test]
+    fn only_a_background_tab_opens_under_the_inline_picker() {
+        let lair_id = LairId::new();
+        let dojo_id = DojoId::new();
+        let splint = splinterm_core::Splint::shell("/tmp".into());
+        let focused = splint.id;
+        let open = |activate| {
+            let (acknowledged, _) = tokio::sync::oneshot::channel();
+            WindowTopologyUpdate::OpenTab {
+                identity: WindowDojoIdentity {
+                    topology_revision: TopologyRevision::new(3),
+                    lair_id,
+                    dojo_id,
+                    lair_name: "agent".into(),
+                    lair_retention: LairRetention::default(),
+                    dojo_name: "Dojo 2".into(),
+                },
+                layout: LayoutNode::Leaf(splint.clone()),
+                panes: Vec::new(),
+                focused,
+                acknowledged,
+                explorer_target: None,
+                activate,
+            }
+        };
+        assert!(open(true).defers_for_inline_picker());
+        assert!(!open(false).defers_for_inline_picker());
+        assert!(
+            WindowTopologyUpdate::ActivateTab {
+                dojo_id,
+                explorer_target: None,
+            }
+            .defers_for_inline_picker()
+        );
+        assert!(!WindowTopologyUpdate::LairExplorerInvalidated.defers_for_inline_picker());
     }
 
     #[test]

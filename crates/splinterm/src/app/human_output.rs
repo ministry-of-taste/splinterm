@@ -406,6 +406,10 @@ pub(in crate::app) fn print_response(response: Response) -> Result<()> {
             println!("Subscribed to consent offers ({subscription_id}).");
         }
         Response::ConsentOfferAnswered => println!("Consent offer answered."),
+        Response::DojoPresentationClaimed { granted } => println!(
+            "Dojo presentation offer {}.",
+            if granted { "claimed" } else { "already taken" }
+        ),
     }
     io::stdout()
         .flush()

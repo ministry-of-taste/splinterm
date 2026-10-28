@@ -1014,6 +1014,7 @@ mod tests {
             revision,
             topology: model,
             runtimes: Vec::new(),
+            presentation_offers: Vec::new(),
         };
 
         let implicit = machine_new_dojo_request(&snapshot, lair_id, None, launch()).unwrap();

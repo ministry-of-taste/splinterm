@@ -217,6 +217,7 @@ fn preset_run_sends_one_atomic_tree_and_reconciles_stable_mappings() {
         revision: initial.revision(),
         topology: initial.clone(),
         runtimes: vec![runtime(invoking_splint_id, 1)],
+        presentation_offers: Vec::new(),
     };
 
     let created_dojo_id = DojoId::new();
@@ -268,6 +269,7 @@ fn preset_run_sends_one_atomic_tree_and_reconciles_stable_mappings() {
             runtime(editor_id, 2),
             runtime(review_id, 3),
         ],
+        presentation_offers: Vec::new(),
     };
 
     let server = thread::spawn(move || {

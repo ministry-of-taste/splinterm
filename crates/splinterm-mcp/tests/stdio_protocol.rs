@@ -328,6 +328,7 @@ fn reviewed_topology() -> TopologySnapshot {
             exit_status: None,
             agent_status: None,
         }],
+        presentation_offers: Vec::new(),
     }
 }
 
@@ -467,6 +468,7 @@ fn adversarial_topology(payloads: &[&str; 4]) -> TopologySnapshot {
             exit_status: None,
             agent_status: None,
         }],
+        presentation_offers: Vec::new(),
     }
 }
 
@@ -2212,6 +2214,7 @@ fn successful_output_size_is_checked_after_schema_validation() {
             revision: lair.revision(),
             topology: lair,
             runtimes,
+            presentation_offers: Vec::new(),
         };
         snapshot.validate().unwrap();
         write_private_frame(
@@ -5347,10 +5350,12 @@ fn lifecycle_mutation_tools_use_scoped_preflight_and_closed_commits() {
                     expected_topology_revision,
                     lair_id: requested,
                     launch,
-                    ..
+                    name: None,
+                    generated_name: false,
                 } if expected_topology_revision.get() == 7
                     && requested == lair_id
-                    && launch.cwd.is_none() =>
+                    && launch.cwd.is_none()
+                    && launch.argv.is_empty() =>
                 {
                     Response::DojoStarted {
                         dojo_id: new_dojo,
@@ -5535,11 +5540,11 @@ fn lifecycle_mutation_tools_use_scoped_preflight_and_closed_commits() {
         ),
         (
             "splinterm.split_splint",
-            json!({"splint_id":"018f4d8c-2a18-4b31-8c2f-9e7c5de77103","axis":"horizontal","side":"after","ratio":0.5,"argv":[]}),
+            json!({"splint_id":"018f4d8c-2a18-4b31-8c2f-9e7c5de77103","axis":"horizontal","side":"after","ratio":0.5}),
         ),
         (
             "splinterm.new_dojo",
-            json!({"lair_id":"018f4d8c-2a18-4b31-8c2f-9e7c5de77101","name":"dojo","argv":[]}),
+            json!({"lair_id":"018f4d8c-2a18-4b31-8c2f-9e7c5de77101"}),
         ),
         (
             "splinterm.relaunch_splint",

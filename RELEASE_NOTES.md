@@ -66,7 +66,7 @@ running daemon by themselves.
 
 ## Behaviour changes
 
-- Private protocol 45 (0.1.1 used 36). Old and new clients, daemons, and relays
+- Private protocol 46 (0.1.1 used 36). Old and new clients, daemons, and relays
   do not interoperate. Upgrade both ends of a remote connection, and keep
   `splinterm-mcp` at the same version.
 - The agent access prompt no longer grants on Enter: Enter denies, and only `G`
@@ -82,6 +82,13 @@ running daemon by themselves.
   form (see "MCP").
 - New Dojos and Lairs start in your home directory, not the focused Splint's
   directory.
+- A launch with no command from an agent or a JSON-mode command
+  (`create_lair`, `split_splint`, `relaunch_splint`, `new_dojo`, and the CLI
+  `--output json` forms) now starts your login shell. So a remote Window's new
+  panes and Dojos start login shells, whatever that host's
+  `login-shell = false` says, and a remote `splinterm new-dojo` without `--cwd`
+  starts in the remote owner's home, not in the directory of the Lair's first
+  Dojo.
 - On Omarchy 4 with no font size in `config.ini`, the terminal follows
   Omarchy's text size (9 pt on a stock desktop) instead of Splinterm's 14 px.
   Set a size in `config.ini` to keep your own.
@@ -707,6 +714,12 @@ a hostile program running as your account.
   fails with `timeout`. A denied one tells the agent not to ask again or take
   the pane unless you agree. A takeover when nobody controls the pane says to
   acquire it without `takeover`.
+- `splinterm.new_dojo` needs only `lair_id`: the name, directory, and command
+  default to the next "Dojo N", your home, and your login shell, as when you
+  open a Dojo yourself. `create_lair` and `split_splint` no longer require
+  `argv` either. The agent's Dojo opens as a background tab in the Window you
+  are using when its active tab is in that Lair, or else in another Window
+  showing it; it never takes focus or switches your tab.
 
 ## Security and robustness
 

@@ -121,7 +121,7 @@ pub(in crate::app) fn new_dojo_request_for(
         LaunchSemantics::RemoteInteractive => Request::NewDojoAutomation {
             expected_topology_revision,
             lair_id,
-            name,
+            name: Some(name),
             launch: automation_launch(cwd, command),
             generated_name,
         },
@@ -811,7 +811,7 @@ mod tests {
                 expected_topology_revision,
                 name,
                 ..
-            } if expected_topology_revision == revision && name == "Dojo 4"
+            } if expected_topology_revision == revision && name.as_deref() == Some("Dojo 4")
         ));
 
         let remote = new_dojo_request_for(
@@ -836,7 +836,7 @@ mod tests {
                 generated_name: false,
             } if expected_topology_revision == revision
                 && requested_lair == lair_id
-                && name == "logs"
+                && name.as_deref() == Some("logs")
                 && launch.cwd.is_none()
                 && launch.argv == ["remote"]
         ));
@@ -875,7 +875,7 @@ mod tests {
                     ..
                 }
                 | Request::NewDojoAutomation {
-                    name: sent,
+                    name: Some(sent),
                     generated_name,
                     ..
                 }) = request

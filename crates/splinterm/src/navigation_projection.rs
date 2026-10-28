@@ -1555,6 +1555,7 @@ mod tests {
             revision: topology.revision(),
             topology,
             runtimes,
+            presentation_offers: Vec::new(),
         }
     }
 

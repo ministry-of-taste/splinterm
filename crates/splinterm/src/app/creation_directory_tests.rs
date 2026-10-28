@@ -226,6 +226,7 @@ async fn new_lairs_follow_the_new_dojo_directory() {
                         revision: TopologyRevision::default(),
                         topology: Topology::default(),
                         runtimes: Vec::new(),
+                        presentation_offers: Vec::new(),
                     },
                 },
                 resolved(source, cwd),

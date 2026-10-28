@@ -4593,6 +4593,7 @@ mod tests {
                 exit_status: None,
                 agent_status: None,
             }],
+            presentation_offers: Vec::new(),
         }
     }
 
@@ -4637,6 +4638,7 @@ mod tests {
             revision: TopologyRevision::new(0),
             topology: Topology::new(),
             runtimes: Vec::new(),
+            presentation_offers: Vec::new(),
         };
         let mut expected = fixture_document(include_str!(
             "../../../tests/automation/fixtures/valid/cli-inspect-topology.json"

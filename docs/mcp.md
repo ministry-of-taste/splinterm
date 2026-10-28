@@ -559,6 +559,17 @@ MCP Dojo operations edit daemon topology; they do not map, focus, move, resize,
 or assign a native Wayland Window, and Splinterm does not provide
 semantic agent supervision, readiness, messaging, or completion.
 
+`splinterm.new_dojo` needs only `lair_id`. Left out, `name` is the next free
+"Dojo N", `cwd` is the owner's home, and `argv` runs the owner's login shell,
+as when the person opens a Dojo. `create_lair` and `split_splint` also default
+`argv` to the login shell; `relaunch_splint` still requires it.
+
+The new Dojo opens as a background tab in one Window showing its Lair: the
+Window whose active tab is in that Lair, or else, within about a second,
+another Window showing it. The tab never becomes active and never takes
+keyboard focus. With no Window showing the Lair, no tab opens, and the Dojo is
+still in the Dojos picker and the Explorer.
+
 ## Reporting agent status
 
 `splinterm.report_agent_status` lets an agent show whether it is working,

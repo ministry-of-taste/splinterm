@@ -280,7 +280,9 @@ A supported client must:
 - distinguish persistent Dojos from compositor-native Wayland Windows and
   Window-local tabs; tab attach/detach/order/activation are not topology,
   automation, policy, audit, or child-context operations, and topology mutation
-  cannot map, focus, move, or assign a native Window;
+  cannot map, focus, move, or assign a native Window (a Dojo that automation
+  creates is only offered to a Window showing its Lair, which opens it as a
+  background tab without taking focus);
 - pass launches as an argument vector after `--`; never join arguments into a
   shell string, use `eval`, or substitute terminal text into a command; and
 - use an exact least-privileged executable policy. Environment context, Unix UID,
