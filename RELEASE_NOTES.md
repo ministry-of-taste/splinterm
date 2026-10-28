@@ -701,6 +701,12 @@ a hostile program running as your account.
   text by default (`content_encoding: "text"`, one `text` string), which is
   about 50 times smaller than one object per cell. Pass `"format": "cells"` for
   the per-cell form.
+- Control errors say what to do next. A cancelled or unanswered
+  `splinterm.request_control_transfer` names `acquire_control` with
+  `takeover: true` and the Ctrl+Shift+Y accept key, and an unanswered one now
+  fails with `timeout`. A denied one tells the agent not to ask again or take
+  the pane unless you agree. A takeover when nobody controls the pane says to
+  acquire it without `takeover`.
 
 ## Security and robustness
 

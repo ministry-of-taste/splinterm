@@ -353,6 +353,19 @@ async fn daemon_request(
 /// What a tool call whose daemon connection ended says (Plan 0061 M3.12b).
 pub(crate) const CONNECTION_LOST_DURING_CALL: &str = "the splinterd connection ended during the call, as when splinterd is upgraded; it was not retried and may or may not have taken effect, so check the current state before calling again";
 
+/// What an acquire says when the Splint already has a controller
+/// (Plan 0067 M4).
+pub(crate) const ALREADY_CONTROLLED: &str = "this Splint already has a controller; ask for it with request_control_transfer, or with a Look and type or Manage grant take it with acquire_control and takeover: true (if you already hold a controller_handle for it, use that)";
+
+/// What a transfer request or a takeover says when nobody controls the
+/// Splint (Plan 0067 M4).
+pub(crate) const NOBODY_CONTROLS: &str =
+    "nobody controls this Splint; call acquire_control without takeover";
+
+/// What a transfer request says while another transfer of the Splint waits
+/// for an answer (Plan 0067 M4).
+pub(crate) const TRANSFER_ALREADY_PENDING: &str = "another control transfer of this Splint is waiting for an answer; call again once it ends (at most 15 seconds)";
+
 pub(crate) fn map_client_error(error: &Error) -> DispatchFailure {
     if let Some(reason) = request_cancellation(error) {
         return match reason {
@@ -378,7 +391,10 @@ pub(crate) fn map_client_error(error: &Error) -> DispatchFailure {
 /// The tool error for a daemon refusal: a fixed code and message per
 /// daemon code, never the daemon's own text.
 fn map_protocol_error(error: &splinterm_protocol::ProtocolError) -> DispatchFailure {
-    use splinterm_protocol::NO_WORKSPACE_GRANT;
+    use splinterm_protocol::{
+        CONTROL_TRANSFER_PENDING, NO_CONTROLLER_TO_TRANSFER, NO_WORKSPACE_GRANT,
+        SPLINT_ALREADY_CONTROLLED,
+    };
 
     let (code, message, retryable) = match error.code {
         ErrorCode::AuthenticationFailed => (
@@ -409,11 +425,22 @@ fn map_protocol_error(error: &splinterm_protocol::ProtocolError) -> DispatchFail
             "the exact policy scope or resource is not authorized",
             false,
         ),
+        // Plan 0067 M4: a control refusal with a known reason says what to
+        // do next.
+        ErrorCode::ControllerUnavailable if error.message == SPLINT_ALREADY_CONTROLLED => {
+            ("controller_unavailable", ALREADY_CONTROLLED, true)
+        }
         ErrorCode::ControllerUnavailable => (
             "controller_unavailable",
             "terminal control is unavailable",
             true,
         ),
+        ErrorCode::ControlTransferUnavailable if error.message == NO_CONTROLLER_TO_TRANSFER => {
+            ("control_transfer_unavailable", NOBODY_CONTROLS, true)
+        }
+        ErrorCode::ControlTransferUnavailable if error.message == CONTROL_TRANSFER_PENDING => {
+            ("control_transfer_unavailable", TRANSFER_ALREADY_PENDING, true)
+        }
         ErrorCode::ControlTransferUnavailable => (
             "control_transfer_unavailable",
             "control transfer is unavailable",
@@ -3036,6 +3063,49 @@ mod protocol_error_tests {
         assert_eq!(
             other.message,
             "the exact policy scope or resource is not authorized"
+        );
+    }
+
+    /// Plan 0067 M4: each control refusal with a known reason says the next
+    /// step, in fixed adapter text.
+    #[test]
+    fn control_refusals_say_the_next_step() {
+        use splinterm_protocol::{
+            CONTROL_TRANSFER_PENDING, NO_CONTROLLER_TO_TRANSFER, SPLINT_ALREADY_CONTROLLED,
+            TRANSFER_REQUESTER_CONTROLS,
+        };
+
+        let mapped =
+            |code: ErrorCode, message: &str| map_protocol_error(&ProtocolError::new(code, message));
+        let transfer = ErrorCode::ControlTransferUnavailable;
+        let controller = ErrorCode::ControllerUnavailable;
+        for (reason, message) in [
+            (NO_CONTROLLER_TO_TRANSFER, NOBODY_CONTROLS),
+            (CONTROL_TRANSFER_PENDING, TRANSFER_ALREADY_PENDING),
+        ] {
+            let failure = mapped(transfer, reason);
+            assert_eq!(failure.code, "control_transfer_unavailable");
+            assert_eq!(failure.message, message);
+            assert!(failure.retryable);
+        }
+        let held = mapped(controller, SPLINT_ALREADY_CONTROLLED);
+        assert_eq!(held.code, "controller_unavailable");
+        assert_eq!(held.message, ALREADY_CONTROLLED);
+        assert!(held.retryable);
+        assert!(NOBODY_CONTROLS.contains("without takeover"));
+        assert!(ALREADY_CONTROLLED.contains("request_control_transfer"));
+        assert!(ALREADY_CONTROLLED.contains("takeover: true"));
+        assert!(ALREADY_CONTROLLED.contains("controller_handle"));
+        // A requester that already controls a Splint cannot reach this through
+        // MCP, which connects afresh for each request; it and any other
+        // reason, as from an older splinterd, keep the general text.
+        assert_eq!(
+            mapped(transfer, TRANSFER_REQUESTER_CONTROLS).message,
+            "control transfer is unavailable"
+        );
+        assert_eq!(
+            mapped(controller, "another reason").message,
+            "terminal control is unavailable"
         );
     }
 }
