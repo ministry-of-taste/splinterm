@@ -7580,7 +7580,12 @@ async fn remembered_grant_probe() {
         .parse()
         .unwrap();
     let mut connection = Connection::connect(&socket).await;
-    let request = match std::env::var(REMEMBERED_PROBE_REQUEST).unwrap().as_str() {
+    let probe = std::env::var(REMEMBERED_PROBE_REQUEST).unwrap();
+    if let Some(outcome) = history_probe(&mut connection, splint_id, &probe).await {
+        fs::write(result, outcome).unwrap();
+        return;
+    }
+    let request = match probe.as_str() {
         "inspect" => Request::InspectSplint { splint_id },
         "rename" => Request::RenameSplint {
             expected_topology_revision: TopologyRevision::new(0),
@@ -7618,6 +7623,65 @@ async fn remembered_grant_probe() {
         _ => "authorized",
     };
     fs::write(result, outcome).unwrap();
+}
+
+/// The remembered-grant probe's history reads (Plan 0067 M5): a first page
+/// of scrollback or of search results, then the page after it, each
+/// authorized afresh. `None` for any other probe.
+async fn history_probe(
+    connection: &mut Connection,
+    splint_id: SplintId,
+    probe: &str,
+) -> Option<&'static str> {
+    let start = match probe {
+        "scrollback" => Request::StartScrollbackPage {
+            splint_id,
+            incarnation: None,
+            max_rows: 4,
+        },
+        "search" => Request::StartSearchScrollback {
+            splint_id,
+            incarnation: None,
+            query: "needle".into(),
+            case_sensitive: false,
+            max_results: 4,
+        },
+        _ => return None,
+    };
+    let next = match connection.request_result(start).await {
+        Err(error) if error.code == ErrorCode::Unauthorized => return Some("unauthorized"),
+        Ok(Response::ScrollbackPage { page, .. }) => Request::ScrollbackPage {
+            splint_id,
+            incarnation: page.incarnation,
+            terminal_revision: page.terminal_revision,
+            history_generation: page.history_generation,
+            before_row_id: page.oldest_available_row_id.unwrap_or(1),
+            max_rows: 4,
+        },
+        Ok(Response::SearchResults { page, .. }) => Request::SearchScrollback {
+            splint_id,
+            incarnation: page.incarnation,
+            terminal_revision: page.terminal_revision,
+            history_generation: page.history_generation,
+            query: "needle".into(),
+            case_sensitive: false,
+            cursor: page.next_cursor,
+            max_results: 4,
+        },
+        other => panic!("unexpected first history answer: {other:?}"),
+    };
+    let outcome = match connection.request_result(next).await {
+        Err(error) if error.code == ErrorCode::Unauthorized => "unauthorized",
+        Ok(response) => match response {
+            Response::ScrollbackPage { .. }
+            | Response::ScrollbackResyncRequired { .. }
+            | Response::SearchResults { .. }
+            | Response::SearchResyncRequired { .. } => "authorized",
+            other => panic!("unexpected next history answer: {other:?}"),
+        },
+        Err(error) => panic!("the next history page failed: {error:?}"),
+    };
+    Some(outcome)
 }
 
 /// Copies this test binary into `<target tmp>/<unique>/bin/end_to_end-agent`
@@ -7772,11 +7836,54 @@ async fn a_remembered_grant_survives_a_daemon_restart() {
             .join("agent-access.json");
         fs::write(&store, remembered_store(&agent, lair_id, "look")).unwrap();
         fs::set_permissions(&store, fs::Permissions::from_mode(0o600)).unwrap();
+        // This test's own policy also covers the Lair, so it can start a
+        // live Splint there; the agent copies are other executables.
+        let policy = daemon.policy.clone().unwrap();
+        fs::write(&policy, parent_snapshot_policy(lair_id)).unwrap();
         daemon.start_again_with_environment(&seam).await;
         assert_eq!(
             run_remembered_probe(&daemon.socket, &agent, splint_id, "inspect"),
             "authorized"
         );
+        // Look includes scrollback: the remembered grant reads and searches
+        // the history of a live Splint in its Lair, the first page and the
+        // next (Plan 0067 M5).
+        let mut connection = daemon.connect().await;
+        let revision = connection.topology_revision().await;
+        let Response::DojoStarted {
+            splint_id: live_id, ..
+        } = connection
+            .request(Request::NewDojo {
+                expected_topology_revision: revision,
+                lair_id,
+                name: "history".into(),
+                launch: LaunchParameters {
+                    cwd: daemon.runtime.clone(),
+                    command: vec!["/bin/sh".into(), "-c".into(), "sleep 300".into()],
+                    shell: None,
+                    login_shell: false,
+                    scrollback_lines: 100,
+                },
+                promote_transient_lair: false,
+                generated_name: false,
+            })
+            .await
+        else {
+            panic!("the remembered-grant setup did not start a Dojo");
+        };
+        drop(connection);
+        for history in ["scrollback", "search"] {
+            assert_eq!(
+                run_remembered_probe(&daemon.socket, &agent, live_id, history),
+                "authorized",
+                "{history}"
+            );
+            assert_eq!(
+                run_remembered_probe(&daemon.socket, &stranger, live_id, history),
+                "unauthorized",
+                "{history}"
+            );
+        }
         // Asking for Look again is answered from the remembered grant, at
         // once and with no prompt (ADR 0014).
         assert_eq!(

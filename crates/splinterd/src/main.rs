@@ -11143,7 +11143,13 @@ async fn handle_authorized_request(
                     "scrollback page request exceeds protocol bounds",
                 ));
             }
-            if !authorization.policy_authorized() {
+            // As for input: a workspace grant that authorize_request matched
+            // (once, while open, or remembered) already covers these scopes on
+            // this exact Splint incarnation in its Lair, and is matched again
+            // for every page, so a revoke stops the next one. Only a request
+            // that no policy rule or workspace grant covers needs a Splint
+            // grant here.
+            if !authorization.policy_authorized() && authorization.authorized_grant_id().is_none() {
                 let _ = authorize_scope(
                     state,
                     peer,
@@ -11176,7 +11182,7 @@ async fn handle_authorized_request(
                     "scrollback page request exceeds protocol bounds",
                 ));
             }
-            if !authorization.policy_authorized() {
+            if !authorization.policy_authorized() && authorization.authorized_grant_id().is_none() {
                 let _ = authorize_scope(
                     state,
                     peer,
@@ -11220,7 +11226,7 @@ async fn handle_authorized_request(
             {
                 return Err(invalid("search request exceeds protocol bounds"));
             }
-            if !authorization.policy_authorized() {
+            if !authorization.policy_authorized() && authorization.authorized_grant_id().is_none() {
                 let _ = authorize_scope(
                     state,
                     peer,
@@ -11263,7 +11269,7 @@ async fn handle_authorized_request(
                 return Err(invalid("search request exceeds protocol bounds"));
             }
             let from = decode_search_cursor(cursor.as_deref())?;
-            if !authorization.policy_authorized() {
+            if !authorization.policy_authorized() && authorization.authorized_grant_id().is_none() {
                 let _ = authorize_scope(
                     state,
                     peer,
@@ -29536,6 +29542,289 @@ mod tests {
             Some(&owner),
             "the owner keeps its controller"
         );
+    }
+
+    /// Every scrollback read and search, first page and continuation, as
+    /// `peer` on fresh requests: `Ok` when history or a resync came back,
+    /// else the refusal's code.
+    async fn scrollback_outcomes(
+        state: &Arc<DaemonState>,
+        peer: &PeerIdentity,
+        splint_id: SplintId,
+        incarnation: u64,
+    ) -> Vec<Result<(), ErrorCode>> {
+        let requests = [
+            Request::StartScrollbackPage {
+                splint_id,
+                incarnation: Some(incarnation),
+                max_rows: 4,
+            },
+            Request::ScrollbackPage {
+                splint_id,
+                incarnation,
+                terminal_revision: 1,
+                history_generation: 1,
+                before_row_id: 1,
+                max_rows: 4,
+            },
+            Request::StartSearchScrollback {
+                splint_id,
+                incarnation: Some(incarnation),
+                query: "needle".to_owned(),
+                case_sensitive: false,
+                max_results: 4,
+            },
+            Request::SearchScrollback {
+                splint_id,
+                incarnation,
+                terminal_revision: 1,
+                history_generation: 1,
+                query: "needle".to_owned(),
+                case_sensitive: false,
+                cursor: None,
+                max_results: 4,
+            },
+        ];
+        let mut outcomes = Vec::new();
+        for request in requests {
+            let outcome = match ask(state, peer, request).await {
+                Ok(response) => match response {
+                    Response::ScrollbackPage { .. }
+                    | Response::ScrollbackResyncRequired { .. }
+                    | Response::SearchResults { .. }
+                    | Response::SearchResyncRequired { .. } => Ok(()),
+                    response => panic!("not a history answer: {response:?}"),
+                },
+                Err(error) => Err(error.code),
+            };
+            outcomes.push(outcome);
+        }
+        outcomes
+    }
+
+    /// Plan 0067 M5: a workspace grant that lists scrollback reads and
+    /// searches history on every page, whatever its duration, as a Splint
+    /// grant does. A grant without scrollback, one for another Lair, a
+    /// revoked one, or none does not.
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "every grant source and refusal is checked against one live Splint"
+    )]
+    async fn workspace_grants_read_and_search_scrollback_on_every_page() {
+        use agent_access::{AccessLevel, GrantDuration};
+
+        let mut fixture = agent_fixture().await;
+        Arc::get_mut(&mut fixture.state).unwrap().pty_backend = test_pty_backend();
+        let state = &fixture.state;
+        let peer = &fixture.peer;
+        let handle = live_cat_splints(state, 1).await.remove(0);
+        let splint_id = handle.splint_id;
+        let incarnation = handle.incarnation.value();
+        let lair_id = splint_containment(&*state.topology.read().await, splint_id)
+            .unwrap()
+            .0;
+        let allowed: [Result<(), ErrorCode>; 4] = [Ok(()); 4];
+        let refused: [Result<(), ErrorCode>; 4] = [Err(ErrorCode::Unauthorized); 4];
+
+        // No grant at all.
+        assert_eq!(
+            scrollback_outcomes(state, peer, splint_id, incarnation).await,
+            refused
+        );
+        // Manage, but for another Lair.
+        commit_for(
+            state,
+            peer,
+            fixture.lair_id,
+            level(AccessLevel::Manage),
+            GrantDuration::Remembered,
+        )
+        .await;
+        assert_eq!(
+            scrollback_outcomes(state, peer, splint_id, incarnation).await,
+            refused
+        );
+        // This Lair, without scrollback.
+        let observe = agent_access::AccessSet::from_scopes([AccessScope::Observe]).unwrap();
+        let session = commit_for(
+            state,
+            peer,
+            lair_id,
+            observe,
+            GrantDuration::WorkspaceSession,
+        )
+        .await;
+        assert_eq!(
+            scrollback_outcomes(state, peer, splint_id, incarnation).await,
+            refused
+        );
+        assert!(revoke_session_grant(state, session.grant_id).await);
+
+        // Just this once.
+        let scopes = vec![AccessScope::Observe, AccessScope::Scrollback];
+        let mut grants = state.grants.lock().await;
+        grants.grant_lair(peer, lair_id, scopes.clone());
+        drop(grants);
+        assert_eq!(
+            scrollback_outcomes(state, peer, splint_id, incarnation).await,
+            allowed
+        );
+        let mut grants = state.grants.lock().await;
+        assert_eq!(grants.revoke_lair(lair_id, "test revoke").len(), 1);
+        drop(grants);
+        assert_eq!(
+            scrollback_outcomes(state, peer, splint_id, incarnation).await,
+            refused
+        );
+
+        // While the workspace is open.
+        let session = commit_for(
+            state,
+            peer,
+            lair_id,
+            level(AccessLevel::Look),
+            GrantDuration::WorkspaceSession,
+        )
+        .await;
+        assert_eq!(
+            scrollback_outcomes(state, peer, splint_id, incarnation).await,
+            allowed
+        );
+        assert!(revoke_session_grant(state, session.grant_id).await);
+        assert_eq!(
+            scrollback_outcomes(state, peer, splint_id, incarnation).await,
+            refused
+        );
+
+        // Remembered, as in the live probe: Manage lists scrollback_read.
+        let remembered = commit_for(
+            state,
+            peer,
+            lair_id,
+            level(AccessLevel::Manage),
+            GrantDuration::Remembered,
+        )
+        .await;
+        assert_eq!(
+            scrollback_outcomes(state, peer, splint_id, incarnation).await,
+            allowed
+        );
+        for operation in [
+            splinterm_protocol::AuditOperation::ScrollbackPage,
+            splinterm_protocol::AuditOperation::SearchScrollback,
+        ] {
+            let record = newest_audit(state, operation).await;
+            assert_eq!(record.decision, splinterm_protocol::AuditDecision::Allowed);
+            assert_eq!(record.reason, "remembered_grant");
+        }
+        // The covering grant names no other incarnation: pages and their
+        // continuations for the next one are refused.
+        assert_eq!(
+            scrollback_outcomes(state, peer, splint_id, incarnation + 1).await,
+            refused
+        );
+        let entry_id = remembered.entry_id.unwrap();
+        assert!(revoke_remembered_grant(state, &entry_id).await.is_some());
+        assert_eq!(
+            scrollback_outcomes(state, peer, splint_id, incarnation).await,
+            refused
+        );
+
+        // A Splint grant still authorizes its own incarnation.
+        let mut grants = state.grants.lock().await;
+        let pane = grants.grant(peer, splint_id, incarnation, scopes);
+        drop(grants);
+        assert_eq!(
+            scrollback_outcomes(state, peer, splint_id, incarnation).await,
+            allowed
+        );
+        let mut grants = state.grants.lock().await;
+        assert!(grants.revoke(pane.grant.grant_id).is_some());
+        drop(grants);
+        assert_eq!(
+            scrollback_outcomes(state, peer, splint_id, incarnation).await,
+            refused
+        );
+        reap_all(state).await;
+    }
+
+    /// Plan 0067 M5, from the live probe: a Manage workspace grant closes an
+    /// exited Splint and its Dojo. Once something else closed them (as the
+    /// Window of a disposable Lair does), a close of the gone Splint or Dojo
+    /// is refused exactly like one naming a resource that never existed.
+    ///
+    /// Known follow-up: a resource that exists in a Lair the peer has no
+    /// grant for is refused with another message ("no exact persistent
+    /// policy rule authorizes this request"), and
+    /// `bind_current_terminal_incarnation` answers `not_found` before
+    /// authorization for a Splint with no live process, so both still tell
+    /// existence or liveness apart.
+    #[tokio::test]
+    async fn a_workspace_grant_closes_exited_splints_until_they_are_gone() {
+        use agent_access::{AccessLevel, GrantDuration};
+
+        let mut fixture = agent_fixture().await;
+        Arc::get_mut(&mut fixture.state).unwrap().pty_backend = test_pty_backend();
+        let state = &fixture.state;
+        let peer = &fixture.peer;
+        let handle = live_cat_splints(state, 1).await.remove(0);
+        let splint_id = handle.splint_id;
+        let incarnation = handle.incarnation.value();
+        let (lair_id, dojo_id, _) =
+            splint_containment(&*state.topology.read().await, splint_id).unwrap();
+        commit_for(
+            state,
+            peer,
+            lair_id,
+            level(AccessLevel::Manage),
+            GrantDuration::Remembered,
+        )
+        .await;
+        let kill = Request::KillSplint {
+            splint_id,
+            incarnation,
+        };
+        let killed = ask(state, peer, kill).await;
+        assert!(matches!(killed, Ok(Response::SplintKilled { .. })));
+        let close_splint = |splint_id| Request::PrepareMutation {
+            mutation: splinterm_protocol::MutationPreflight::CloseSplint { splint_id },
+        };
+        let close_dojo = |dojo_id| Request::PrepareMutation {
+            mutation: splinterm_protocol::MutationPreflight::CloseDojo { dojo_id },
+        };
+        // Exited, and still there: the grant covers closing both.
+        for request in [close_splint(splint_id), close_dojo(dojo_id)] {
+            assert!(matches!(
+                ask(state, peer, request).await,
+                Ok(Response::MutationPrepared { .. })
+            ));
+        }
+
+        // The Window closes the exited pane first; it was the Dojo's only
+        // one, so the Dojo goes too.
+        let revision = state.topology.read().await.revision();
+        let closed = trusted_request(
+            state,
+            81,
+            Request::CloseSplint {
+                expected_topology_revision: revision,
+                splint_id,
+            },
+        )
+        .await;
+        assert!(matches!(closed, Ok(Response::TopologyCommitted { .. })));
+        assert!(state.topology.read().await.find_dojo(dojo_id).is_none());
+        for (gone, never) in [
+            (close_splint(splint_id), close_splint(SplintId::new())),
+            (close_dojo(dojo_id), close_dojo(DojoId::new())),
+        ] {
+            let gone = ask(state, peer, gone).await.unwrap_err();
+            let never = ask(state, peer, never).await.unwrap_err();
+            assert_eq!(gone.code, ErrorCode::Unauthorized);
+            assert_eq!((gone.code, gone.message), (never.code, never.message));
+        }
+        reap_all(state).await;
     }
 
     /// A subscription a grant authorized ends when that grant is revoked:
