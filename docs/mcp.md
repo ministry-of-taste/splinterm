@@ -369,11 +369,11 @@ read whose text would be small.
 
 `relaunch_splint`, `close_splint`, and `close_dojo` need exited Splints. On a
 running one they fail with `invalid_argument` and say to `kill_splint` it
-first; a relaunch also says `input` can restart what runs in it.
-`restore_splint` on a running Splint says there is nothing to restore.
-`restore_dojo` and `restore_lair` count a pane that is already running as
-neither restored nor failed, so `partial` and `failed_count` cover only panes
-that failed to start.
+first; a relaunch also says `acquire_control` and `input` can restart what
+runs in it. `restore_splint` on a running Splint says there is nothing to
+restore. `restore_dojo` and `restore_lair` count a pane that is already running
+or starting as neither restored nor failed, so `partial` and `failed_count`
+cover only panes that failed to start.
 
 ### Interactive access to a live Lair
 

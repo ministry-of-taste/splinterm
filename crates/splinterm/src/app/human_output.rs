@@ -27,6 +27,13 @@ fn print_restore_results(
                     result.splint_id
                 );
             }
+            // A Splint that has not exited needed no restore (Plan 0067 M5).
+            (None, Some(error))
+                if error.code == splinterm_protocol::ErrorCode::InvalidArgument
+                    && error.message == splinterm_protocol::SPLINT_NOT_EXITED =>
+            {
+                println!("  {}: already running", result.splint_id);
+            }
             (_, Some(error)) => {
                 println!("  {}: failed: {}", result.splint_id, error.message);
             }

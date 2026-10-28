@@ -5256,6 +5256,79 @@ fn mutation_response_revision_mismatch_fails_closed() {
     fs::remove_dir_all(directory).unwrap();
 }
 
+/// Plan 0067 M5: restoring a Splint that is still running says there is
+/// nothing to restore, instead of failing as `internal`.
+#[test]
+fn restoring_a_running_splint_says_it_is_already_running() {
+    let (directory, socket) = isolated_socket("restore-running");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let daemon = thread::spawn(move || {
+        let mut stream = accept_automation(&listener);
+        let ClientFrame::Request {
+            diagnostic_correlation: _,
+            request_id,
+            request: Request::PrepareMutation { mutation },
+        } = read_private_frame(&mut stream)
+        else {
+            panic!("expected restore preflight")
+        };
+        write_private_frame(
+            &mut stream,
+            &ServerFrame::Response {
+                request_id,
+                result: Response::MutationPrepared {
+                    preparation: mutation_preparation(mutation),
+                },
+            },
+        );
+        let ClientFrame::Request {
+            diagnostic_correlation: _,
+            request_id,
+            request: Request::RestoreSplint { splint_id, .. },
+        } = read_private_frame(&mut stream)
+        else {
+            panic!("expected restore")
+        };
+        write_private_frame(
+            &mut stream,
+            &ServerFrame::Response {
+                request_id,
+                result: Response::RestoreCompleted {
+                    topology_revision: TopologyRevision::new(7),
+                    results: vec![RestoreLeafResult {
+                        splint_id,
+                        incarnation: None,
+                        error: Some(ProtocolError::new(
+                            ErrorCode::InvalidArgument,
+                            splinterm_protocol::SPLINT_NOT_EXITED,
+                        )),
+                    }],
+                },
+            },
+        );
+    });
+    let mut server = Harness::spawn_with_socket(&socket, None);
+    server.initialize();
+    server.initialized();
+    let response = call_tool(
+        &mut server,
+        2,
+        "splinterm.restore_splint",
+        json!({"splint_id":"018f4d8c-2a18-4b31-8c2f-9e7c5de77103"}),
+    );
+    assert_eq!(response["isError"], true);
+    let error = &response["structuredContent"]["error"];
+    assert_eq!(error["code"], "invalid_argument");
+    assert_eq!(
+        error["message"],
+        "this Splint is already running; there is nothing to restore"
+    );
+    server.close_input();
+    assert!(server.wait().success());
+    daemon.join().unwrap();
+    fs::remove_dir_all(directory).unwrap();
+}
+
 #[test]
 #[allow(
     clippy::too_many_lines,

@@ -367,8 +367,7 @@ pub(crate) const NOBODY_CONTROLS: &str =
 pub(crate) const TRANSFER_ALREADY_PENDING: &str = "another control transfer of this Splint is waiting for an answer; call again once it ends (at most 15 seconds)";
 
 /// What a relaunch says for a Splint that has not exited (Plan 0067 M5).
-pub(crate) const STILL_RUNNING_RELAUNCH: &str =
-    "this Splint is still running; kill_splint it first, or use input to restart what runs in it";
+pub(crate) const STILL_RUNNING_RELAUNCH: &str = "this Splint is still running; kill_splint it first, or acquire_control and use input to restart what runs in it";
 
 /// What a close says for a Splint that has not exited (Plan 0067 M5).
 pub(crate) const STILL_RUNNING_CLOSE: &str =
@@ -3254,7 +3253,7 @@ mod protocol_error_tests {
             assert!(!failure.retryable);
             assert!(message.contains("kill_splint"));
         }
-        assert!(STILL_RUNNING_RELAUNCH.contains("input"));
+        assert!(STILL_RUNNING_RELAUNCH.contains("acquire_control"));
         // An older splinterd named the Splint in its reason; that keeps the
         // general text.
         let older = map_protocol_error(&ProtocolError::new(
