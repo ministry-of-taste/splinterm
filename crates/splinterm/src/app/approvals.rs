@@ -1868,9 +1868,9 @@ mod tests {
             controlling_terminal(stat),
             Some(rustix::fs::makedev(136, 3))
         );
-        // A minor number above 255 uses the upper bits: /dev/pts/300.
-        let tty_nr = (136 << 8) | (300 & 0xff) | ((300 & !0xff) << 12);
-        let stat = format!("1 (sh) S 1 1 1 {tty_nr} 1 0");
+        // A minor number above 255 uses the upper bits: /dev/pts/300 is
+        // tty_nr 1083436, as the kernel encodes it.
+        let stat = "1 (sh) S 1 1 1 1083436 1 0";
         assert_eq!(
             controlling_terminal(stat.as_bytes()),
             Some(rustix::fs::makedev(136, 300))
