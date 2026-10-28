@@ -65,16 +65,28 @@ pub(crate) struct WorkloadUnitNames {
     pub(crate) splint_scope: String,
 }
 
+/// Every Splint scope's unit name starts so.
+const SPLINT_SCOPE_PREFIX: &str = "splinterm-splint";
+
 impl WorkloadUnitNames {
     fn new(dojo_id: DojoId, splint_id: SplintId, incarnation: u64) -> Self {
         Self {
             dojo_slice: dojo_slice_name(dojo_id),
             splint_scope: format!(
-                "splinterm-splint{}-i{incarnation}.scope",
+                "{SPLINT_SCOPE_PREFIX}{}-i{incarnation}.scope",
                 compact_id(&splint_id)
             ),
         }
     }
+}
+
+/// Whether the cgroup path component `unit` names a Splint scope, as
+/// [`WorkloadUnitManager`] names them, of this daemon or an earlier one.
+#[must_use]
+pub fn is_splint_scope(unit: &str) -> bool {
+    unit.strip_prefix(SPLINT_SCOPE_PREFIX)
+        .and_then(|rest| rest.strip_suffix(".scope"))
+        .is_some_and(|rest| rest.contains("-i"))
 }
 
 fn dojo_slice_name(dojo_id: DojoId) -> String {
@@ -828,6 +840,20 @@ impl WorkloadUnitManager {
         );
     }
 
+    /// The unit name of every Dojo slice this manager counts references
+    /// for: each live Splint scope runs inside one of them.
+    ///
+    /// # Errors
+    /// Reports a poisoned state lock.
+    pub fn dojo_slices(&self) -> Result<Vec<String>, WorkloadUnitError> {
+        let state = self.state.lock().map_err(|_| WorkloadUnitError::State)?;
+        Ok(state
+            .dojo_references
+            .keys()
+            .map(|dojo_id| dojo_slice_name(*dojo_id))
+            .collect())
+    }
+
     fn clear_hold(&self, scope: &RetainedWorkloadScope) {
         lock_holds(&self.holds).remove(&scope.names.splint_scope);
     }
@@ -1568,6 +1594,27 @@ mod tests {
         drop(retained);
         drop(manager);
         assert_eq!(adapter.stops().len(), 1);
+    }
+
+    #[test]
+    fn the_manager_names_its_live_dojo_slices_and_splint_scopes() {
+        let adapter = Arc::new(FakeAdapter::default());
+        let manager = fake_manager(&adapter);
+        assert!(manager.dojo_slices().unwrap().is_empty());
+        let dojo_id = DojoId::new();
+        let placed = placed(&manager, dojo_id, 301);
+        assert_eq!(manager.dojo_slices().unwrap(), [dojo_slice_name(dojo_id)]);
+        let scope = placed.identity().splint_scope().to_owned();
+        assert!(is_splint_scope(&scope), "{scope}");
+        for other in [
+            "splinterm-splint.slice",
+            "splinterm-splintabc.scope",
+            "app-splinterm-dojoabc.slice",
+            "session-3.scope",
+        ] {
+            assert!(!is_splint_scope(other), "{other}");
+        }
+        placed.release().unwrap();
     }
 
     #[test]

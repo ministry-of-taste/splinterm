@@ -4872,6 +4872,7 @@ async fn serve_authenticated(
                     Ok(Handled {
                         response,
                         subscription,
+                        ..
                     }) => {
                         if let (Some(correlation), Some(event)) =
                             (diagnostic_correlation, diagnostic_event)
@@ -5014,6 +5015,8 @@ async fn serve_authenticated(
 struct Handled {
     response: Response,
     subscription: Option<PendingSubscription>,
+    /// The route of an accepted consent answer, for its audit (ADR 0015).
+    answered_by: Option<remote_consent::AnswerRoute>,
 }
 
 #[derive(Debug)]
@@ -7388,7 +7391,6 @@ async fn show_lair_prompt(
         &access,
         job.agent_name.clone(),
     );
-    let deadline = job.expires.saturating_duration_since(Instant::now());
     let offered = consent::offered_lair_prompt(
         &job.peer,
         job.lair_id,
@@ -7396,20 +7398,35 @@ async fn show_lair_prompt(
         job.scopes.clone(),
         details.clone(),
     );
-    let context = remote_consent::TreeContext {
-        splint_leaders: splint_leaders(state).await,
-        requester: job
-            .peer
-            .start_time()
-            .map(|start_time| remote_consent::Requester {
-                pid: job.peer.pid,
-                start_time,
-            }),
+    // Without a responder nothing is read from `/proc`, so the local dialog
+    // appears as soon as it did before remote responders existed.
+    let context = if state.consent_responders.is_empty() {
+        remote_consent::TreeContext::default()
+    } else {
+        remote_consent::TreeContext {
+            splint_leaders: splint_leaders(state).await,
+            workload_slices: workload_slices(state),
+            requester: job
+                .peer
+                .start_time()
+                .map(|start_time| remote_consent::Requester {
+                    pid: job.peer.pid,
+                    start_time,
+                }),
+        }
     };
     let mut round = state
         .consent_responders
-        .open_round(job.request_id, offered, job.expires, context)
+        .open_round(
+            job.request_id,
+            offered,
+            job.expires,
+            context,
+            Arc::clone(&job.cancel),
+        )
         .await;
+    // The dialog counts down what is left once the offers are out.
+    let deadline = job.expires.saturating_duration_since(Instant::now());
     // Responders too late to be offered it leave the prompt to expire.
     if !state.local_consent_display && round.offered() == 0 && !round.too_late() {
         return Err(Unavailable(remote_consent::NO_ROUTE).into());
@@ -7417,6 +7434,9 @@ async fn show_lair_prompt(
     // The local dialog has its own cancel, so the prompter closes it when
     // another route wins as well as when the request ends.
     let local_cancel = Arc::new(consent::PromptCancel::default());
+    // However this ends, even by the prompter being dropped or panicking,
+    // the dialog is killed at once; the normal paths below also reap it.
+    let _close_dialog = CloseDialog(Arc::clone(&local_cancel));
     let mut local = state.local_consent_display.then(|| {
         Box::pin(local_lair_prompt(
             state,
@@ -7428,7 +7448,7 @@ async fn show_lair_prompt(
         ))
     });
     let mut outstanding = round.outstanding();
-    let expiry = time::sleep(deadline);
+    let expiry = time::sleep_until(time::Instant::from_std(job.expires));
     tokio::pin!(expiry);
     let outcome = loop {
         tokio::select! {
@@ -7491,6 +7511,28 @@ async fn show_lair_prompt(
         let _ = local.await;
     }
     outcome
+}
+
+/// Kills the daemon's own consent dialog when dropped.
+struct CloseDialog(Arc<consent::PromptCancel>);
+
+impl Drop for CloseDialog {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+/// The live Dojo slices consent responders must be outside, when this
+/// daemon's workload cgroups are active (ADR 0015). Should the manager's
+/// state be unreadable, the Splint-scope check still applies: every Splint
+/// process runs in its own scope.
+fn workload_slices(state: &DaemonState) -> Option<Vec<String>> {
+    state.workload_units.as_ref().map(|units| {
+        units.dojo_slices().unwrap_or_else(|error| {
+            warn!(%error, "workload slices are unreadable; consent responders are checked by Splint scope only");
+            Vec::new()
+        })
+    })
 }
 
 /// Every Splint's session leader, which consent responders must be outside.
@@ -8877,13 +8919,15 @@ async fn append_request_result_audit(
     } else {
         splinterm_protocol::AuditDecision::Allowed
     };
+    // Which route answered a consent offer (ADR 0015); never the nonce or
+    // the decision.
+    let answered_by = result.as_ref().ok().and_then(|handled| handled.answered_by);
     let reason = if denied {
         "authorization_denied"
     } else if revoked {
         "grant_revoked"
-    } else if result.is_ok() && matches!(request, Request::AnswerConsentOffer { .. }) {
-        // Which route answered (ADR 0015); never the nonce or the decision.
-        remote_consent::answer_audit_reason(peer)
+    } else if let Some(route) = answered_by {
+        route.audit_reason()
     } else if authorization.policy_authorized() {
         "policy_match"
     } else if authorization.agent_grant == Some(agent_access::GrantDuration::WorkspaceSession) {
@@ -9260,6 +9304,7 @@ async fn handle_request(
         return result.map(|response| Handled {
             response,
             subscription: None,
+            answered_by: None,
         });
     }
     let audit_resource = request_policy_resources(&request, state)
@@ -9439,6 +9484,7 @@ async fn handle_authorized_request(
                     stream,
                     maximum_returned_bytes: authorization.maximum_returned_bytes(),
                 }),
+                answered_by: None,
             });
         }
         Request::InspectSplint { splint_id } => {
@@ -10952,6 +10998,7 @@ async fn handle_authorized_request(
                         visible_rows,
                     },
                 }),
+                answered_by: None,
             });
         }
         Request::StartScrollbackPage {
@@ -11023,6 +11070,7 @@ async fn handle_authorized_request(
                     response: scrollback_resync_response(state, splint_id, incarnation, page)
                         .await?,
                     subscription: None,
+                    answered_by: None,
                 });
             }
             scrollback_response(state, splint_id, incarnation, page).await?
@@ -11113,6 +11161,7 @@ async fn handle_authorized_request(
                 return Ok(Handled {
                     response: search_resync_response(state, splint_id, incarnation, search).await?,
                     subscription: None,
+                    answered_by: None,
                 });
             }
             search_response(state, splint_id, incarnation, search).await?
@@ -11228,6 +11277,7 @@ async fn handle_authorized_request(
                     grant_id,
                     revocations,
                 }),
+                answered_by: None,
             });
         }
         Request::RequestControlTransfer {
@@ -11617,6 +11667,7 @@ async fn handle_authorized_request(
             )?;
             let context = remote_consent::TreeContext {
                 splint_leaders: splint_leaders(state).await,
+                workload_slices: workload_slices(state),
                 requester: None,
             };
             let stream = state
@@ -11634,6 +11685,7 @@ async fn handle_authorized_request(
                     subscription_id: stream.subscription_id(),
                 },
                 subscription: Some(PendingSubscription::ConsentOffers { stream }),
+                answered_by: None,
             });
         }
         request @ Request::AnswerConsentOffer {
@@ -11649,7 +11701,7 @@ async fn handle_authorized_request(
                 &request,
             )?;
             splinterm_protocol::validate_consent_answer(daemon_generation, offer_id)?;
-            state.consent_responders.answer(
+            let route = state.consent_responders.answer(
                 connection_id,
                 peer,
                 daemon_generation,
@@ -11657,12 +11709,17 @@ async fn handle_authorized_request(
                 &nonce,
                 decision,
             )?;
-            Response::ConsentOfferAnswered
+            return Ok(Handled {
+                response: Response::ConsentOfferAnswered,
+                subscription: None,
+                answered_by: Some(route),
+            });
         }
     };
     Ok(Handled {
         response,
         subscription: None,
+        answered_by: None,
     })
 }
 
@@ -11940,6 +11997,7 @@ async fn window_acknowledgement(
             .map(|()| Handled {
                 response: Response::Acknowledged,
                 subscription: None,
+                answered_by: None,
             });
     append_request_result_audit(
         state,
@@ -22937,36 +22995,66 @@ mod tests {
         state
     }
 
-    /// A remote Window subscribed to consent offers as the daemon serves
-    /// one, with its `/proc` checks passed.
+    /// A consent responder, a remote Window or a terminal approver,
+    /// subscribed as the daemon serves one, with its `/proc` checks passed.
     struct TestResponder {
         connection_id: u64,
+        peer: PeerIdentity,
+        /// A terminal approver, as the installed client; otherwise a remote
+        /// Window, as the relay.
+        terminal: bool,
         events: tokio::sync::mpsc::Receiver<splinterm_protocol::SubscriptionEvent>,
         guard: Option<remote_consent::ResponderGuard>,
     }
 
     impl TestResponder {
+        /// A remote Window in a relay process of its own.
         async fn subscribe(state: &Arc<DaemonState>, connection_id: u64) -> Self {
+            let mut peer = PeerIdentity::for_test();
+            peer.pid = 20_000 + u32::try_from(connection_id).unwrap();
+            Self::subscribe_as(state, connection_id, peer, false).await
+        }
+
+        /// A terminal approver: the installed client, here this test
+        /// process as the pinned snapshot.
+        async fn subscribe_terminal(state: &Arc<DaemonState>, connection_id: u64) -> Self {
+            let pinned = Arc::new(consent::PinnedClientSnapshot::own_executable_for_test());
+            Self::subscribe_as(state, connection_id, pinned_window_peer(&pinned), true).await
+        }
+
+        async fn subscribe_as(
+            state: &Arc<DaemonState>,
+            connection_id: u64,
+            peer: PeerIdentity,
+            terminal: bool,
+        ) -> Self {
+            use splinterm_protocol::ConsentResponderKind;
+
             state.consent_responders.set_probe(Arc::new(|_, _| Ok(())));
+            let kind = if terminal {
+                ConsentResponderKind::Terminal
+            } else {
+                ConsentResponderKind::Window
+            };
             let handled = handle_request(
-                Request::SubscribeConsentOffers {
-                    kind: splinterm_protocol::ConsentResponderKind::Window,
-                },
+                Request::SubscribeConsentOffers { kind },
                 state,
-                &PeerIdentity::for_test(),
+                &peer,
                 connection_id,
                 0,
-                false,
-                true,
+                terminal,
+                !terminal,
             )
             .await
             .unwrap();
             let Some(PendingSubscription::ConsentOffers { stream }) = handled.subscription else {
-                panic!("a Window responder subscribes");
+                panic!("a consent responder subscribes");
             };
             let (events, guard) = stream.into_parts();
             Self {
                 connection_id,
+                peer,
+                terminal,
                 events,
                 guard: Some(guard),
             }
@@ -23014,11 +23102,11 @@ mod tests {
                     decision,
                 },
                 state,
-                &PeerIdentity::for_test(),
+                &self.peer,
                 self.connection_id,
                 1,
-                false,
-                true,
+                self.terminal,
+                !self.terminal,
             )
             .await
             .map(|handled| handled.response)
@@ -23106,6 +23194,7 @@ mod tests {
         let mut prompts = script_prompts(&state);
         let mut winner = TestResponder::subscribe(&state, 11).await;
         let mut loser = TestResponder::subscribe(&state, 12).await;
+        let mut terminal = TestResponder::subscribe_terminal(&state, 13).await;
         let waiting = spawn_ask(
             &state,
             &peer,
@@ -23115,7 +23204,9 @@ mod tests {
         let mut local = next_scripted_prompt(&mut prompts).await;
         let offer = winner.offer().await;
         let other = loser.offer().await;
+        let in_terminal = terminal.offer().await;
         assert_eq!(offer.request_id, local.request_id);
+        assert_eq!(in_terminal.request_id, local.request_id);
         assert!(offer.prompt.offers(splinterm_protocol::GrantDuration::Once));
         assert_eq!(
             winner.answer(&state, &offer, ONCE).await,
@@ -23126,19 +23217,25 @@ mod tests {
             grant.source,
             splinterm_protocol::AccessGrantSource::Ephemeral
         );
-        assert_eq!(
-            loser.withdrawn().await,
-            (
-                other.offer_id,
-                splinterm_protocol::ConsentOfferEnd::AnsweredElsewhere
-            )
-        );
+        for (responder, offer) in [(&mut loser, &other), (&mut terminal, &in_terminal)] {
+            assert_eq!(
+                responder.withdrawn().await,
+                (
+                    offer.offer_id,
+                    splinterm_protocol::ConsentOfferEnd::AnsweredElsewhere
+                )
+            );
+        }
         // The local dialog is closed.
         time::timeout(Duration::from_secs(5), local.answer.closed())
             .await
             .expect("the local dialog is killed");
         // A second answer, even the winner's again, finds nothing.
-        for (responder, offer) in [(&winner, &offer), (&loser, &other)] {
+        for (responder, offer) in [
+            (&winner, &offer),
+            (&loser, &other),
+            (&terminal, &in_terminal),
+        ] {
             assert_eq!(
                 responder
                     .answer(&state, offer, ONCE)
@@ -23212,6 +23309,59 @@ mod tests {
             finished(waiting).await.unwrap_err().code,
             ErrorCode::ConsentDenied
         );
+    }
+
+    #[tokio::test]
+    async fn a_terminal_approver_s_deny_is_audited_as_its_route() {
+        let state = headless(test_state(false));
+        let lair_id = insert_test_lair(&state, "agents").await;
+        let peer = with_start_time(PeerIdentity::for_test());
+        let mut approver = TestResponder::subscribe_terminal(&state, 11).await;
+        let mut window = TestResponder::subscribe(&state, 12).await;
+        let waiting = spawn_ask(
+            &state,
+            &peer,
+            lair_request(lair_id, &[AccessScope::Observe], 5_000),
+        );
+        let offer = approver.offer().await;
+        let other = window.offer().await;
+        assert_eq!(
+            approver.answer(&state, &offer, ConsentDecision::Deny).await,
+            Ok(Response::ConsentOfferAnswered)
+        );
+        assert_eq!(
+            finished(waiting).await.unwrap_err().code,
+            ErrorCode::ConsentDenied
+        );
+        assert_eq!(
+            window.withdrawn().await,
+            (
+                other.offer_id,
+                splinterm_protocol::ConsentOfferEnd::AnsweredElsewhere
+            )
+        );
+        // The answer is audited by route, never by nonce or decision.
+        let page = state.audit.lock().await.page(None, 16);
+        let [record] = page
+            .records
+            .iter()
+            .filter(|record| {
+                record.operation == splinterm_protocol::AuditOperation::AnswerConsentOffer
+            })
+            .collect::<Vec<_>>()[..]
+        else {
+            panic!("one answer audit record: {:?}", page.records);
+        };
+        assert_eq!(record.reason, "answered_in_terminal_approver");
+        assert_eq!(
+            record.outcome,
+            Some(splinterm_protocol::AuditOutcome::Succeeded)
+        );
+        let encoded = serde_json::to_string(record).unwrap();
+        let nonce = serde_json::to_string(&offer.nonce).unwrap();
+        let nonce = nonce.trim_matches(|c| matches!(c, '[' | ']' | '"'));
+        assert!(!encoded.contains(nonce), "{encoded}");
+        wait_until_no_request_is_pending(&state).await;
     }
 
     #[tokio::test]
@@ -23342,6 +23492,7 @@ mod tests {
             );
             let context = remote_consent::TreeContext {
                 splint_leaders: Vec::new(),
+                workload_slices: None,
                 requester: Some(remote_consent::Requester {
                     pid: 300,
                     start_time: 40,
@@ -23359,6 +23510,7 @@ mod tests {
                             offered.clone(),
                             Instant::now() + Duration::from_secs(60),
                             context.clone(),
+                            Arc::default(),
                         )
                         .await,
                 );

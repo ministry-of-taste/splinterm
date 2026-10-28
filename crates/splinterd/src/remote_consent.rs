@@ -49,6 +49,9 @@ use crate::{
 
 /// At most this many responders at once, daemon-wide.
 pub const MAX_CONSENT_RESPONDERS: usize = 16;
+/// At most this many responders per process, so one reconnecting Window
+/// cannot take every slot.
+pub const MAX_CONSENT_RESPONDERS_PER_PROCESS: usize = 2;
 /// Events queued for one responder. A prompt sends a responder at most an
 /// offer and its withdrawal, so a responder this far behind has stopped
 /// reading; it is dropped.
@@ -92,6 +95,15 @@ impl AnswerRoute {
         }
     }
 
+    /// The request audit's reason for an accepted answer on this route.
+    pub const fn audit_reason(self) -> &'static str {
+        match self {
+            Self::Local => "answered_locally",
+            Self::Window => "answered_in_remote_window",
+            Self::Terminal => "answered_in_terminal_approver",
+        }
+    }
+
     /// The grant audit's reason for a deny given on this route.
     pub const fn deny_reason(self) -> &'static str {
         match self {
@@ -99,17 +111,6 @@ impl AnswerRoute {
             Self::Window => "answered in a remote Window",
             Self::Terminal => "answered in a terminal approver",
         }
-    }
-}
-
-/// The audit reason of an accepted `AnswerConsentOffer`. Only the installed
-/// relay can hold the Window role and only the installed client the
-/// terminal one, so the executable names the route.
-pub fn answer_audit_reason(peer: &PeerIdentity) -> &'static str {
-    if peer.is_installed_relay() {
-        "answered_in_remote_window"
-    } else {
-        "answered_in_terminal_approver"
     }
 }
 
@@ -149,6 +150,11 @@ pub struct TreeContext {
     pub splint_leaders: Vec<u32>,
     /// The requesting process, for an offer.
     pub requester: Option<Requester>,
+    /// The unit name of every live Dojo slice when this daemon's workload
+    /// cgroups are active, `None` when they are not. A responder whose
+    /// cgroup is under one of them, or under any Splint scope, runs inside a
+    /// Splint however it left the Splint's process tree.
+    pub workload_slices: Option<Vec<String>>,
 }
 
 /// A requesting process: its PID and start time.
@@ -168,10 +174,15 @@ pub fn check_responder(
     context: Option<&TreeContext>,
 ) -> Result<(), Ineligible> {
     let identity = match kind {
+        // The relay still runs the file it ran at `Hello`, and the PID still
+        // names the process that said `Hello`.
         ConsentResponderKind::Window => {
             peer.is_matching_graphical_relay()
                 && consent::executable_file_identity(peer.pid)
                     .is_ok_and(|executing| executing == peer.executable_file())
+                && peer.start_time().is_some_and(|start_time| {
+                    agent_status::process_start_time(peer.pid) == Some(start_time)
+                })
         }
         ConsentResponderKind::Terminal => peer.connection_matches_splinterm(),
     };
@@ -185,7 +196,33 @@ pub fn check_responder(
     if kind == ConsentResponderKind::Terminal {
         controlling_terminal(peer.pid, start_time)?;
     }
+    if let Some(slices) = &context.workload_slices {
+        let cgroup = std::fs::read_to_string(format!("/proc/{}/cgroup", peer.pid))
+            .map_err(|_| Ineligible::Unverified)?;
+        outside_workloads(&cgroup, slices)?;
+    }
+    // Last, as its final check proves every read above described this
+    // process.
     outside_trees_with(peer.pid, start_time, context, agent_status::read_proc_stat)
+}
+
+/// Whether a process's `/proc/<pid>/cgroup` contents place it outside every
+/// workload unit of this daemon: no live Dojo slice in `slices` and no
+/// Splint scope on its unified-hierarchy path. A process detached from its
+/// Splint's tree (a terminal multiplexer's server, `setsid -f`, a double
+/// fork) keeps that cgroup. Contents without a unified path fail closed.
+fn outside_workloads(contents: &str, slices: &[String]) -> Result<(), Ineligible> {
+    let path = contents
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .filter(|path| path.starts_with('/'))
+        .ok_or(Ineligible::Unverified)?;
+    if path.split('/').any(|unit| {
+        splinterd::cgroup::is_splint_scope(unit) || slices.iter().any(|slice| slice == unit)
+    }) {
+        return Err(Ineligible::InsideSplint);
+    }
+    Ok(())
 }
 
 /// Whether the process `pid`, started at `start_time`, is outside every
@@ -214,7 +251,12 @@ fn outside_trees_with(
         let requesting = read(requester.pid)
             .filter(|process| process.start_time == requester.start_time)
             .ok_or(Ineligible::Unverified)?;
-        if inside(requester.pid) || requesting.session == ancestry.session {
+        // Its session leader too, as for a Splint: a responder the
+        // requester's session started under `setsid` is still its own.
+        if inside(requester.pid)
+            || requesting.session == ancestry.session
+            || (requesting.session > 1 && inside(requesting.session))
+        {
             return Err(Ineligible::InsideRequester);
         }
     }
@@ -372,6 +414,9 @@ struct Round {
     settled: bool,
     answer: Option<oneshot::Sender<RemoteAnswer>>,
     outstanding: watch::Sender<usize>,
+    /// The request's own cancel: once it ends, an answer finds nothing, so
+    /// the other responders see the real reason its offers end.
+    cancel: Arc<consent::PromptCancel>,
 }
 
 impl Round {
@@ -507,6 +552,11 @@ impl ConsentResponders {
         check_responder(kind, peer, context)
     }
 
+    /// Whether no responder is registered.
+    pub fn is_empty(&self) -> bool {
+        self.inner().responders.is_empty()
+    }
+
     /// How many responders are registered.
     #[cfg(test)]
     pub fn responder_count(&self) -> usize {
@@ -519,7 +569,8 @@ impl ConsentResponders {
     ///
     /// # Errors
     /// `Unauthorized` for an ineligible process; `ResourceLimit` for a
-    /// second subscription on one connection or beyond
+    /// second subscription on one connection, beyond
+    /// [`MAX_CONSENT_RESPONDERS_PER_PROCESS`] for one process, or beyond
     /// [`MAX_CONSENT_RESPONDERS`].
     pub async fn subscribe(
         self: &Arc<Self>,
@@ -554,6 +605,20 @@ impl ConsentResponders {
             return Err(ProtocolError::new(
                 ErrorCode::ResourceLimit,
                 "too many consent responders are connected",
+            ));
+        }
+        let same_process =
+            |other: &PeerIdentity| other.pid == peer.pid && other.start_time() == peer.start_time();
+        if inner
+            .responders
+            .values()
+            .filter(|responder| same_process(&responder.peer))
+            .count()
+            >= MAX_CONSENT_RESPONDERS_PER_PROCESS
+        {
+            return Err(ProtocolError::new(
+                ErrorCode::ResourceLimit,
+                "this process already has the most consent responders it may have",
             ));
         }
         inner.responders.insert(
@@ -653,6 +718,7 @@ impl ConsentResponders {
         prompt: OfferedConsentPrompt,
         expires: Instant,
         context: TreeContext,
+        cancel: Arc<consent::PromptCancel>,
     ) -> OpenRound {
         let eligible = self.eligible_responders(&prompt, context).await;
         let (answer, answered) = oneshot::channel();
@@ -717,6 +783,7 @@ impl ConsentResponders {
             settled: false,
             answer: Some(answer),
             outstanding,
+            cancel,
         };
         round.publish_outstanding();
         inner.round = Some(round);
@@ -740,7 +807,9 @@ impl ConsentResponders {
     ///
     /// # Errors
     /// `NotFound`, granting nothing, for anything but an outstanding offer
-    /// on this connection with this generation and nonce; `InvalidArgument`
+    /// on this connection with this generation and nonce, and once its
+    /// request has ended, so the other responders see the real reason
+    /// their offers end; `InvalidArgument`
     /// for a duration the prompt does not offer, which leaves the offer
     /// outstanding; `Unauthorized` once the connection no longer runs the
     /// installed relay or client.
@@ -775,7 +844,11 @@ impl ConsentResponders {
         if daemon_generation != self.daemon_generation {
             return Err(not_found());
         }
-        let Some(round) = inner.round.as_mut().filter(|round| !round.settled) else {
+        let Some(round) = inner
+            .round
+            .as_mut()
+            .filter(|round| !round.settled && !round.cancel.is_cancelled())
+        else {
             return Err(not_found());
         };
         if !round
@@ -982,6 +1055,7 @@ mod tests {
     fn splints(leaders: &[u32]) -> TreeContext {
         TreeContext {
             splint_leaders: leaders.to_vec(),
+            workload_slices: None,
             requester: None,
         }
     }
@@ -1013,6 +1087,7 @@ mod tests {
         let read = processes();
         let requester = TreeContext {
             splint_leaders: vec![100],
+            workload_slices: None,
             requester: Some(Requester {
                 pid: 300,
                 start_time: 40,
@@ -1043,6 +1118,7 @@ mod tests {
         // A requester that is no longer the process that asked fails closed.
         let gone = TreeContext {
             splint_leaders: Vec::new(),
+            workload_slices: None,
             requester: Some(Requester {
                 pid: 300,
                 start_time: 41,
@@ -1102,6 +1178,7 @@ mod tests {
         let read = agent_status::read_proc_stat;
         let requester = |pid, start_time| TreeContext {
             splint_leaders: Vec::new(),
+            workload_slices: None,
             requester: Some(Requester { pid, start_time }),
         };
         // A process this test started, as if it were the requester's.
@@ -1250,6 +1327,7 @@ mod tests {
                 prompt(),
                 Instant::now() + Duration::from_millis(2_500),
                 offer_context(),
+                Arc::default(),
             )
             .await;
         assert_eq!(round.offered(), 0);
@@ -1265,6 +1343,7 @@ mod tests {
                 prompt(),
                 Instant::now() + Duration::from_millis(2_500),
                 offer_context(),
+                Arc::default(),
             )
             .await;
         assert!(!round.too_late());
@@ -1294,6 +1373,7 @@ mod tests {
     fn offer_context() -> TreeContext {
         TreeContext {
             splint_leaders: Vec::new(),
+            workload_slices: None,
             requester: Some(Requester {
                 pid: 300,
                 start_time: 40,
@@ -1305,13 +1385,20 @@ mod tests {
         registry.set_probe(Arc::new(|_, _| Ok(())));
     }
 
+    /// A responder process of its own on `connection_id`.
+    fn responder_peer(connection_id: u64) -> PeerIdentity {
+        let mut peer = PeerIdentity::for_test();
+        peer.pid = 20_000 + u32::try_from(connection_id).unwrap();
+        peer
+    }
+
     async fn responder(registry: &Arc<ConsentResponders>, connection_id: u64) -> ResponderStream {
         registry
             .subscribe(
                 connection_id,
                 1000 + connection_id,
                 ConsentResponderKind::Window,
-                &PeerIdentity::for_test(),
+                &responder_peer(connection_id),
                 TreeContext::default(),
             )
             .await
@@ -1347,7 +1434,7 @@ mod tests {
         let expires = Instant::now() + Duration::from_secs(60);
         let shown = prompt();
         let mut round = registry
-            .open_round(42, shown.clone(), expires, offer_context())
+            .open_round(42, shown.clone(), expires, offer_context(), Arc::default())
             .await;
         assert_eq!(round.offered(), 3);
         let offers: Vec<_> = streams.iter_mut().map(offered).collect();
@@ -1420,7 +1507,7 @@ mod tests {
         let mut second = responder(&registry, 2).await;
         let expires = Instant::now() + Duration::from_secs(60);
         let mut round = registry
-            .open_round(42, prompt(), expires, offer_context())
+            .open_round(42, prompt(), expires, offer_context(), Arc::default())
             .await;
         let offer = offered(&mut first);
         let other = offered(&mut second);
@@ -1519,6 +1606,7 @@ mod tests {
                     prompt(),
                     Instant::now() + Duration::from_secs(60),
                     offer_context(),
+                    Arc::default(),
                 )
                 .await;
             let offer = offered(&mut stream);
@@ -1554,6 +1642,7 @@ mod tests {
                 prompt(),
                 Instant::now() + Duration::from_secs(60),
                 offer_context(),
+                Arc::default(),
             )
             .await;
         let offer = offered(&mut stream);
@@ -1592,7 +1681,13 @@ mod tests {
         let prompts_to_fill = u64::try_from(RESPONDER_QUEUE / 2).unwrap();
         for request_id in 1..=prompts_to_fill {
             let round = registry
-                .open_round(request_id, prompt(), expires, offer_context())
+                .open_round(
+                    request_id,
+                    prompt(),
+                    expires,
+                    offer_context(),
+                    Arc::default(),
+                )
                 .await;
             assert_eq!(round.offered(), 2);
             drop(round);
@@ -1604,7 +1699,7 @@ mod tests {
         // holds no offer and counts as no route, while the other keeps its
         // offer.
         let mut round = registry
-            .open_round(9, prompt(), expires, offer_context())
+            .open_round(9, prompt(), expires, offer_context(), Arc::default())
             .await;
         assert_eq!(round.offered(), 1);
         assert!(lagged.is_cancelled(), "its connection is closed");
@@ -1643,12 +1738,18 @@ mod tests {
         for request_id in 10..10 + prompts_to_fill {
             drop(
                 registry
-                    .open_round(request_id, prompt(), expires, offer_context())
+                    .open_round(
+                        request_id,
+                        prompt(),
+                        expires,
+                        offer_context(),
+                        Arc::default(),
+                    )
                     .await,
             );
         }
         let round = registry
-            .open_round(20, prompt(), expires, offer_context())
+            .open_round(20, prompt(), expires, offer_context(), Arc::default())
             .await;
         assert_eq!(round.offered(), 0);
         assert!(!round.too_late());
@@ -1667,6 +1768,7 @@ mod tests {
                 prompt(),
                 Instant::now() + Duration::from_secs(60),
                 offer_context(),
+                Arc::default(),
             )
             .await;
         let mut outstanding = round.outstanding();
@@ -1750,6 +1852,7 @@ mod tests {
                 prompt(),
                 Instant::now() + Duration::from_secs(60),
                 offer_context(),
+                Arc::default(),
             )
             .await;
         assert_eq!(round.offered(), 0);
@@ -1763,9 +1866,157 @@ mod tests {
                 prompt(),
                 Instant::now() + Duration::from_secs(60),
                 TreeContext::default(),
+                Arc::default(),
             )
             .await;
         assert_eq!(round.offered(), 0);
+    }
+
+    #[test]
+    fn a_responder_its_requester_s_session_started_under_setsid_is_refused() {
+        let read = table(&[
+            // A terminal session: its leader shell, and the agent in it.
+            (250, 1, 250, 5),
+            (300, 250, 250, 40),
+            // A relay the session started that left it with setsid: no
+            // descendant of the requester, nor in its session.
+            (405, 250, 250, 45),
+            (410, 405, 410, 46),
+            // A relay in a session of its own elsewhere.
+            (61, 1, 61, 4),
+        ]);
+        let context = TreeContext {
+            splint_leaders: Vec::new(),
+            workload_slices: None,
+            requester: Some(Requester {
+                pid: 300,
+                start_time: 40,
+            }),
+        };
+        assert_eq!(
+            outside_trees_with(410, 46, &context, &read),
+            Err(Ineligible::InsideRequester)
+        );
+        assert_eq!(outside_trees_with(61, 4, &context, &read), Ok(()));
+    }
+
+    #[test]
+    fn a_responder_in_a_splint_s_cgroup_is_refused_however_it_left_the_tree() {
+        let slices = ["app-splinterm-dojo0123.slice".to_owned()];
+        let user = "/user.slice/user-1000.slice/user@1000.service";
+        let splint = format!(
+            "0::{user}/app.slice/app-splinterm.slice/app-splinterm-dojo0123.slice/\
+             splinterm-splintabc-i2.scope\n"
+        );
+        // A tmux server or double fork the Splint started keeps its scope.
+        assert_eq!(
+            outside_workloads(&splint, &slices),
+            Err(Ineligible::InsideSplint)
+        );
+        // So does a process left in its Dojo slice, and one in an earlier
+        // generation's Splint scope.
+        for path in [
+            format!("0::{user}/app.slice/app-splinterm.slice/app-splinterm-dojo0123.slice\n"),
+            format!(
+                "0::{user}/app.slice/app-splinterm.slice/app-splinterm-dojo9.slice/splinterm-splintdef-i7.scope\n"
+            ),
+        ] {
+            assert_eq!(
+                outside_workloads(&path, &slices),
+                Err(Ineligible::InsideSplint),
+                "{path}"
+            );
+        }
+        // An sshd session or a terminal outside Splinterm is not.
+        for path in [
+            "0::/user.slice/user-1000.slice/session-4.scope\n".to_owned(),
+            format!("12:pids:/\n0::{user}/app.slice/app-foot-1.scope\n"),
+        ] {
+            assert_eq!(outside_workloads(&path, &slices), Ok(()), "{path}");
+        }
+        // Without a unified-hierarchy path nothing is proven.
+        for contents in ["", "12:pids:/user.slice\n", "0::relative\n"] {
+            assert_eq!(
+                outside_workloads(contents, &slices),
+                Err(Ineligible::Unverified),
+                "{contents:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn one_process_holds_at_most_two_responders() {
+        let registry = Arc::new(ConsentResponders::new(7));
+        permissive(&registry);
+        let window = responder_peer(1);
+        let subscribe = |connection_id, peer: PeerIdentity| {
+            let registry = Arc::clone(&registry);
+            async move {
+                registry
+                    .subscribe(
+                        connection_id,
+                        3000 + connection_id,
+                        ConsentResponderKind::Window,
+                        &peer,
+                        TreeContext::default(),
+                    )
+                    .await
+            }
+        };
+        let first = subscribe(1, window.clone()).await.unwrap();
+        let second = subscribe(2, window.clone()).await.unwrap();
+        assert_eq!(
+            subscribe(3, window.clone()).await.unwrap_err().code,
+            ErrorCode::ResourceLimit
+        );
+        // Another process still may.
+        let other = subscribe(3, responder_peer(3)).await.unwrap();
+        // A freed slot is free again.
+        drop(first);
+        let again = subscribe(4, window).await.unwrap();
+        assert_eq!(registry.responder_count(), 3);
+        drop((second, other, again));
+    }
+
+    #[tokio::test]
+    async fn an_answer_after_its_request_ended_finds_nothing() {
+        let registry = Arc::new(ConsentResponders::new(7));
+        permissive(&registry);
+        let mut first = responder(&registry, 1).await;
+        let mut second = responder(&registry, 2).await;
+        let cancel = Arc::new(consent::PromptCancel::default());
+        let mut round = registry
+            .open_round(
+                42,
+                prompt(),
+                Instant::now() + Duration::from_secs(60),
+                offer_context(),
+                Arc::clone(&cancel),
+            )
+            .await;
+        let offer = offered(&mut first);
+        let other = offered(&mut second);
+        // The request ends before the prompter withdraws the offers.
+        cancel.cancel();
+        assert_eq!(
+            registry
+                .answer(1, &responder_peer(1), 7, offer.offer_id, &offer.nonce, ONCE)
+                .unwrap_err()
+                .code,
+            ErrorCode::NotFound
+        );
+        assert!(!round.settled());
+        // The others then see why.
+        round.end_with(ConsentOfferEnd::Cancelled);
+        drop(round);
+        assert_eq!(
+            withdrawn(&mut second),
+            (other.offer_id, ConsentOfferEnd::Cancelled)
+        );
+        assert_eq!(
+            withdrawn(&mut first),
+            (offer.offer_id, ConsentOfferEnd::Cancelled)
+        );
     }
 
     #[test]
