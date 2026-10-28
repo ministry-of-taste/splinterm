@@ -399,8 +399,10 @@ deadline. So a request that needs a prompt becomes a bounded, cancellable
   requesting process exits, the workspace ends, **Revoke all access** runs, or
   the daemon fences for an upgrade. Its prompt closes or leaves the queue, and
   a later answer grants nothing.
-- After a deny, the same executable identity gets a 10-second cooldown for that
-  workspace. During it, new requests fail at once with the private
+- After a deny, or a prompt that expires unanswered (operator decision
+  2026-10-28), the same executable identity gets a 10-second cooldown for that
+  workspace, and a requester not waiting at that moment learns the deny or the
+  expiry once on its next call. During it, new requests fail at once with the private
   `rate_limited` error, which the CLI and MCP report as the retryable
   `resource_limit`. This keeps an agent that retries in a loop from reopening
   the prompt.

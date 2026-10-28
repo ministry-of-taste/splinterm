@@ -7684,9 +7684,13 @@ async fn settle_lair_prompt(
             if job.cancel.is_cancelled() {
                 return;
             }
-            let ended = if Instant::now() >= job.expires {
-                pending_access::cancelled("the access request expired without an answer")
-            } else if let Some(&remote_consent::Unavailable(message)) =
+            let now = Instant::now();
+            if now >= job.expires {
+                // A prompt that ran out unanswered counts like a deny.
+                state.pending_access.expire(request_id, now);
+                return;
+            }
+            let ended = if let Some(&remote_consent::Unavailable(message)) =
                 error.downcast_ref::<remote_consent::Unavailable>()
             {
                 info!(

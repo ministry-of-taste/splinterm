@@ -367,6 +367,12 @@ pub(crate) fn map_client_error(error: &Error) -> DispatchFailure {
     let Some(error) = protocol_error(error) else {
         return DispatchFailure::internal();
     };
+    map_protocol_error(error)
+}
+
+/// The tool error for a daemon refusal: a fixed code and message per
+/// daemon code, never the daemon's own text.
+fn map_protocol_error(error: &splinterm_protocol::ProtocolError) -> DispatchFailure {
     let (code, message, retryable) = match error.code {
         ErrorCode::AuthenticationFailed => (
             "authentication_failed",
@@ -435,6 +441,11 @@ pub(crate) fn map_client_error(error: &Error) -> DispatchFailure {
         ErrorCode::HandoffInProgress => (
             "resource_limit",
             "the daemon is upgrading; retry later",
+            true,
+        ),
+        ErrorCode::Cancelled if error.message == splinterm_protocol::ACCESS_REQUEST_EXPIRED => (
+            "cancelled",
+            "the access prompt expired without an answer and nothing was granted; asking again within a few seconds fails with resource_limit",
             true,
         ),
         ErrorCode::Cancelled => ("cancelled", "the daemon request was cancelled", true),
@@ -2904,6 +2915,33 @@ mod tests {
             search_output(&registry, requested, "needle", false, &provenance, &search).is_err()
         );
         assert!(registry.lock().unwrap().entries.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod protocol_error_tests {
+    use splinterm_protocol::{ACCESS_REQUEST_EXPIRED, ProtocolError};
+
+    use super::*;
+
+    #[test]
+    fn an_expired_access_prompt_is_told_apart_from_other_cancels() {
+        let expired = map_protocol_error(&ProtocolError::new(
+            ErrorCode::Cancelled,
+            ACCESS_REQUEST_EXPIRED,
+        ));
+        assert_eq!(expired.code, "cancelled");
+        assert!(
+            expired
+                .message
+                .starts_with("the access prompt expired without an answer")
+        );
+        assert!(expired.retryable);
+        let other = map_protocol_error(&ProtocolError::new(
+            ErrorCode::Cancelled,
+            "the access request was cancelled",
+        ));
+        assert_eq!(other.message, "the daemon request was cancelled");
     }
 }
 
