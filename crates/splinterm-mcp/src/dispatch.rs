@@ -366,6 +366,25 @@ pub(crate) const NOBODY_CONTROLS: &str =
 /// for an answer (Plan 0067 M4).
 pub(crate) const TRANSFER_ALREADY_PENDING: &str = "another control transfer of this Splint is waiting for an answer; call again once it ends (at most 15 seconds)";
 
+/// What a relaunch says for a Splint that has not exited (Plan 0067 M5).
+pub(crate) const STILL_RUNNING_RELAUNCH: &str = "this Splint is still running; kill_splint it first, or acquire_control and use input to restart what runs in it";
+
+/// What a close says for a Splint that has not exited (Plan 0067 M5).
+pub(crate) const STILL_RUNNING_CLOSE: &str =
+    "this Splint is still running; kill_splint it first, then close it";
+
+/// What closing a Dojo says while one of its Splints runs (Plan 0067 M5).
+pub(crate) const DOJO_STILL_RUNNING: &str =
+    "this Dojo still has a running Splint; kill_splint each running one first, then close it";
+
+/// What restoring one Splint says when it is already running
+/// (Plan 0067 M5).
+pub(crate) const ALREADY_RUNNING: DispatchFailure = DispatchFailure::new(
+    "invalid_argument",
+    "this Splint is already running; there is nothing to restore",
+    false,
+);
+
 pub(crate) fn map_client_error(error: &Error) -> DispatchFailure {
     if let Some(reason) = request_cancellation(error) {
         return match reason {
@@ -388,6 +407,23 @@ pub(crate) fn map_client_error(error: &Error) -> DispatchFailure {
     map_protocol_error(error)
 }
 
+/// A lifecycle refusal with a known reason says what to do next
+/// (Plan 0067 M5).
+fn lifecycle_refusal(error: &splinterm_protocol::ProtocolError) -> Option<DispatchFailure> {
+    use splinterm_protocol::{DOJO_STILL_LIVE, SPLINT_NOT_EXITED, SPLINT_STILL_LIVE};
+
+    if error.code != ErrorCode::InvalidArgument {
+        return None;
+    }
+    let message = match error.message.as_str() {
+        SPLINT_NOT_EXITED => STILL_RUNNING_RELAUNCH,
+        SPLINT_STILL_LIVE => STILL_RUNNING_CLOSE,
+        DOJO_STILL_LIVE => DOJO_STILL_RUNNING,
+        _ => return None,
+    };
+    Some(DispatchFailure::new("invalid_argument", message, false))
+}
+
 /// The tool error for a daemon refusal: a fixed code and message per
 /// daemon code, never the daemon's own text.
 fn map_protocol_error(error: &splinterm_protocol::ProtocolError) -> DispatchFailure {
@@ -396,6 +432,9 @@ fn map_protocol_error(error: &splinterm_protocol::ProtocolError) -> DispatchFail
         SPLINT_ALREADY_CONTROLLED,
     };
 
+    if let Some(failure) = lifecycle_refusal(error) {
+        return failure;
+    }
     let (code, message, retryable) = match error.code {
         ErrorCode::AuthenticationFailed => (
             "authentication_failed",
@@ -1673,6 +1712,12 @@ fn exact_lair_preparation(
     }
 }
 
+/// Whether a restore leaf was refused because its Splint has not exited.
+fn already_running(error: &splinterm_protocol::ProtocolError) -> bool {
+    error.code == ErrorCode::InvalidArgument
+        && error.message == splinterm_protocol::SPLINT_NOT_EXITED
+}
+
 fn aggregate_restore_output(
     tool: &str,
     preparation: &MutationPreparation,
@@ -1702,6 +1747,8 @@ fn aggregate_restore_output(
     for result in results {
         match (&result.error, result.incarnation) {
             (None, Some(incarnation)) if incarnation > 0 => restored_count += 1,
+            // Already running: nothing to restore, and nothing failed.
+            (Some(error), None) if already_running(error) => {}
             (Some(_), None) => failed_count += 1,
             _ => return Err(DispatchFailure::internal()),
         }
@@ -2101,8 +2148,12 @@ async fn dispatch_mutation_to(
                 } if results.len() == 1 && results[0].splint_id == splint_id => {
                     let revision = unchanged_topology_revision(&preparation, topology_revision)?;
                     let result = results.pop().ok_or_else(DispatchFailure::internal)?;
-                    if result.error.is_some() {
-                        return Err(DispatchFailure::internal());
+                    if let Some(error) = &result.error {
+                        return Err(if already_running(error) {
+                            ALREADY_RUNNING
+                        } else {
+                            DispatchFailure::internal()
+                        });
                     }
                     let incarnation = result
                         .incarnation
@@ -2890,8 +2941,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn aggregate_restore_requires_runtime_only_revision_and_exact_results() {
+    /// A restore of two Splints in one Dojo at topology revision 7, and its
+    /// Dojo resource.
+    fn two_splint_restore() -> (MutationPreparation, Value, SplintId, SplintId) {
         let lair_id: LairId = "018f4d8c-2a18-4b31-8c2f-9e7c5de77101".parse().unwrap();
         let dojo_id: DojoId = "018f4d8c-2a18-4b31-8c2f-9e7c5de77102".parse().unwrap();
         let first: SplintId = "018f4d8c-2a18-4b31-8c2f-9e7c5de77103".parse().unwrap();
@@ -2917,6 +2969,13 @@ mod tests {
                 },
             ],
         };
+        let resource = dojo_resource(lair_id, dojo_id, 7);
+        (preparation, resource, first, second)
+    }
+
+    #[test]
+    fn aggregate_restore_requires_runtime_only_revision_and_exact_results() {
+        let (preparation, resource, first, second) = two_splint_restore();
         let success = |splint_id, incarnation| RestoreLeafResult {
             splint_id,
             incarnation: Some(incarnation),
@@ -2931,7 +2990,6 @@ mod tests {
             )),
         };
         let revision = splinterm_core::TopologyRevision::new(7);
-        let resource = dojo_resource(lair_id, dojo_id, revision.get());
 
         let full = aggregate_restore_output(
             "splinterm.restore_dojo",
@@ -2976,6 +3034,66 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// Plan 0067 M5: a pane that is already running is neither restored nor
+    /// failed.
+    #[test]
+    fn aggregate_restore_counts_an_already_running_pane_as_neither() {
+        let (preparation, resource, first, second) = two_splint_restore();
+        let revision = splinterm_core::TopologyRevision::new(7);
+        let success = |splint_id, incarnation| RestoreLeafResult {
+            splint_id,
+            incarnation: Some(incarnation),
+            error: None,
+        };
+        let failure = |splint_id| RestoreLeafResult {
+            splint_id,
+            incarnation: None,
+            error: Some(splinterm_protocol::ProtocolError::new(
+                ErrorCode::ResourceLimit,
+                "private failure",
+            )),
+        };
+        let running = |splint_id| RestoreLeafResult {
+            splint_id,
+            incarnation: None,
+            error: Some(splinterm_protocol::ProtocolError::new(
+                ErrorCode::InvalidArgument,
+                splinterm_protocol::SPLINT_NOT_EXITED,
+            )),
+        };
+        let one_running = aggregate_restore_output(
+            "splinterm.restore_dojo",
+            &preparation,
+            resource.clone(),
+            revision,
+            &[success(first, 3), running(second)],
+        )
+        .unwrap();
+        assert_eq!(one_running["data"]["restored_count"], 1);
+        assert_eq!(one_running["data"]["failed_count"], 0);
+        assert_eq!(one_running["data"]["partial"], false);
+        let all_running = aggregate_restore_output(
+            "splinterm.restore_dojo",
+            &preparation,
+            resource.clone(),
+            revision,
+            &[running(first), running(second)],
+        )
+        .unwrap();
+        assert_eq!(all_running["data"]["restored_count"], 0);
+        assert_eq!(all_running["data"]["failed_count"], 0);
+        let mixed = aggregate_restore_output(
+            "splinterm.restore_dojo",
+            &preparation,
+            resource,
+            revision,
+            &[running(first), failure(second)],
+        )
+        .unwrap();
+        assert_eq!(mixed["data"]["failed_count"], 1);
+        assert_eq!(mixed["data"]["partial"], false);
     }
 
     #[test]
@@ -3115,6 +3233,38 @@ mod protocol_error_tests {
             mapped(controller, "another reason").message,
             "terminal control is unavailable"
         );
+    }
+
+    /// Plan 0067 M5: a relaunch or close of a Splint that has not exited says
+    /// to kill it first, in fixed adapter text.
+    #[test]
+    fn lifecycle_refusals_say_the_next_step() {
+        use splinterm_protocol::{DOJO_STILL_LIVE, SPLINT_NOT_EXITED, SPLINT_STILL_LIVE};
+
+        for (reason, message) in [
+            (SPLINT_NOT_EXITED, STILL_RUNNING_RELAUNCH),
+            (SPLINT_STILL_LIVE, STILL_RUNNING_CLOSE),
+            (DOJO_STILL_LIVE, DOJO_STILL_RUNNING),
+        ] {
+            let failure =
+                map_protocol_error(&ProtocolError::new(ErrorCode::InvalidArgument, reason));
+            assert_eq!(failure.code, "invalid_argument");
+            assert_eq!(failure.message, message);
+            assert!(!failure.retryable);
+            assert!(message.contains("kill_splint"));
+        }
+        assert!(STILL_RUNNING_RELAUNCH.contains("acquire_control"));
+        // An older splinterd named the Splint in its reason; that keeps the
+        // general text.
+        let older = map_protocol_error(&ProtocolError::new(
+            ErrorCode::InvalidArgument,
+            "Splint SplintId(1) is still live",
+        ));
+        assert_eq!(older.message, "the daemon rejected the request");
+        let not_exited = ProtocolError::new(ErrorCode::InvalidArgument, SPLINT_NOT_EXITED);
+        assert!(already_running(&not_exited));
+        let limited = ProtocolError::new(ErrorCode::ResourceLimit, SPLINT_NOT_EXITED);
+        assert!(!already_running(&limited));
     }
 }
 

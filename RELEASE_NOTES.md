@@ -720,6 +720,9 @@ a hostile program running as your account.
   `argv` either. The agent's Dojo opens as a background tab in the Window you
   are using when its active tab is in that Lair, or else in another Window
   showing it; it never takes focus or switches your tab.
+- Relaunching or closing a running Splint, or closing a Dojo with one, says to
+  `kill_splint` it first. `restore_dojo` and `restore_lair` no longer count a
+  pane that is already running as failed.
 
 ## Security and robustness
 

@@ -1143,6 +1143,19 @@ pub const CONTROL_TRANSFER_PENDING: &str = "a control transfer of this Splint is
 /// connection that already holds a controller lease.
 pub const TRANSFER_REQUESTER_CONTROLS: &str = "this connection already holds a controller lease";
 
+/// The `InvalidArgument` reason a relaunch or restore gets for a Splint that
+/// has not exited. The MCP adapter tells it apart by it; earlier daemons sent
+/// the same text.
+pub const SPLINT_NOT_EXITED: &str = "only an exited Splint can be restored";
+
+/// The `InvalidArgument` reason closing a Splint that has not exited gets.
+/// The MCP adapter tells it apart by it.
+pub const SPLINT_STILL_LIVE: &str = "the Splint is still live";
+
+/// The `InvalidArgument` reason closing a Dojo that still holds a live
+/// Splint gets. The MCP adapter tells it apart by it.
+pub const DOJO_STILL_LIVE: &str = "the Dojo still contains a live Splint";
+
 /// The `Unauthorized` reason a terminal approver gets without its session's
 /// controlling terminal on standard input and output.
 pub const CONSENT_APPROVER_NEEDS_TERMINAL: &str =

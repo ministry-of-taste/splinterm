@@ -5340,6 +5340,9 @@ fn model_error(error: TopologyError) -> ProtocolError {
         TopologyError::SplintNotFound(_)
         | TopologyError::LairNotFound(_)
         | TopologyError::DojoNotFound(_) => not_found(),
+        // Plan 0067 M5: a fixed reason, so the MCP adapter can say the next step.
+        TopologyError::SplintStillLive(_) => invalid(splinterm_protocol::SPLINT_STILL_LIVE),
+        TopologyError::DojoStillLive(_) => invalid(splinterm_protocol::DOJO_STILL_LIVE),
         other => invalid(&other.to_string()),
     }
 }
@@ -6047,7 +6050,7 @@ async fn start_exited_splint(
         let lair = state.topology.read().await;
         let splint = lair.find_splint(splint_id).ok_or_else(not_found)?;
         if !matches!(splint.state, SplintState::Exited(_)) {
-            return Err(invalid("only an exited Splint can be restored"));
+            return Err(invalid(splinterm_protocol::SPLINT_NOT_EXITED));
         }
     }
     let context =
@@ -24295,6 +24298,76 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(restored, exited);
+    }
+
+    /// Plan 0067 M5: relaunching, restoring, or closing a live Splint or Dojo
+    /// is refused with a fixed reason the MCP adapter can tell apart.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lifecycle_refusals_of_a_live_splint_name_their_reason() {
+        let state = test_state_with_backend(false, test_pty_backend());
+        let expected = state.topology.read().await.revision();
+        let Response::LairCreated { lair, .. } = trusted_request(
+            &state,
+            501,
+            Request::CreateLair {
+                expected_topology_revision: expected,
+                name: "live".into(),
+                launch: test_launch(&["/bin/sh", "-c", "sleep 30"]),
+                generated_name: false,
+            },
+        )
+        .await
+        .unwrap() else {
+            panic!("create response was not returned");
+        };
+        let dojo_id = lair.dojos[0].id;
+        let splint_id = lair.dojos[0].default_focus;
+        let refused = |message: &str| (ErrorCode::InvalidArgument, message.to_owned());
+        let reason = |error: ProtocolError| (error.code, error.message);
+        let revision = state.topology.read().await.revision();
+
+        let relaunch = Request::RelaunchSplint {
+            expected_topology_revision: revision,
+            splint_id,
+            launch: test_launch(&["/bin/sh", "-c", "true"]),
+        };
+        assert_eq!(
+            reason(trusted_request(&state, 1, relaunch).await.unwrap_err()),
+            refused(splinterm_protocol::SPLINT_NOT_EXITED)
+        );
+        let close = Request::CloseSplint {
+            expected_topology_revision: revision,
+            splint_id,
+        };
+        assert_eq!(
+            reason(trusted_request(&state, 1, close).await.unwrap_err()),
+            refused(splinterm_protocol::SPLINT_STILL_LIVE)
+        );
+        let close = Request::CloseDojo {
+            expected_topology_revision: revision,
+            dojo_id,
+        };
+        assert_eq!(
+            reason(trusted_request(&state, 1, close).await.unwrap_err()),
+            refused(splinterm_protocol::DOJO_STILL_LIVE)
+        );
+        let restore = Request::RestoreDojo {
+            expected_topology_revision: revision,
+            dojo_id,
+        };
+        let restored = trusted_request(&state, 1, restore).await.unwrap();
+        let Response::RestoreCompleted { results, .. } = restored else {
+            panic!("restore response was not returned");
+        };
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].error.clone().map(reason),
+            Some(refused(splinterm_protocol::SPLINT_NOT_EXITED))
+        );
+
+        for runtime in state.runtimes.lock().await.drain() {
+            let _ = runtime.shutdown().await;
+        }
     }
 
     #[test]

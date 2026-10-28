@@ -365,6 +365,16 @@ A policy's `max_returned_bytes` is measured on the daemon's full reply, which
 carries every cell and its attributes. A small limit can therefore refuse a
 read whose text would be small.
 
+### Relaunching, restoring, and closing
+
+`relaunch_splint`, `close_splint`, and `close_dojo` need exited Splints. On a
+running one they fail with `invalid_argument` and say to `kill_splint` it
+first; a relaunch also says `acquire_control` and `input` can restart what
+runs in it. `restore_splint` on a running Splint says there is nothing to
+restore. `restore_dojo` and `restore_lair` count a pane that is already running
+or starting as neither restored nor failed, so `partial` and `failed_count`
+cover only panes that failed to start.
+
 ### Interactive access to a live Lair
 
 Persistent policy remains the unattended/headless authorization path. For an
