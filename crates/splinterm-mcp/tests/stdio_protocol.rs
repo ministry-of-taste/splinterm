@@ -1289,7 +1289,7 @@ fn terminal_tools_use_exact_scoped_requests_cursors_and_cleanup() {
     let fake = thread::spawn(move || {
         let splint_id: SplintId = "018f4d8c-2a18-4b31-8c2f-9e7c5de77103".parse().unwrap();
         let other_splint_id: SplintId = "018f4d8c-2a18-4b31-8c2f-9e7c5de77104".parse().unwrap();
-        for index in 0..8 {
+        for index in 0..9 {
             let (mut stream, _) = listener.accept().unwrap();
             assert!(matches!(
                 read_private_frame::<ClientFrame>(&mut stream),
@@ -1318,7 +1318,7 @@ fn terminal_tools_use_exact_scoped_requests_cursors_and_cleanup() {
             };
             match (index, request) {
                 (
-                    0,
+                    0 | 8,
                     Request::Attach {
                         splint_id: requested,
                         incarnation: None,
@@ -1562,9 +1562,13 @@ fn terminal_tools_use_exact_scoped_requests_cursors_and_cleanup() {
         &mut server,
         30,
         "splinterm.read_terminal",
-        json!({"splint_id": splint_id}),
+        json!({"splint_id": splint_id, "format": "cells"}),
     );
     assert_eq!(terminal["isError"], false);
+    assert_eq!(
+        terminal["structuredContent"]["data"]["content_encoding"],
+        "unicode_scalars"
+    );
     assert_eq!(terminal["structuredContent"]["resource"]["incarnation"], 2);
     assert_eq!(
         terminal["structuredContent"]["data"]["rows"][0]["cells"],
@@ -1592,6 +1596,12 @@ fn terminal_tools_use_exact_scoped_requests_cursors_and_cleanup() {
         .to_owned();
     assert!(cursor.starts_with("cur_"));
     assert_eq!(first["structuredContent"]["truncated"], true);
+    assert_eq!(
+        first["structuredContent"]["data"]["content_encoding"],
+        "text"
+    );
+    assert_eq!(first["structuredContent"]["data"]["text"], "history");
+    assert!(first["structuredContent"]["data"].get("rows").is_none());
 
     let resync = call_tool(
         &mut server,
@@ -1600,7 +1610,8 @@ fn terminal_tools_use_exact_scoped_requests_cursors_and_cleanup() {
         json!({"splint_id": splint_id, "cursor": cursor, "max_rows": 64}),
     );
     assert_eq!(resync["structuredContent"]["data"]["resync_required"], true);
-    assert_eq!(resync["structuredContent"]["data"]["rows"], json!([]));
+    assert_eq!(resync["structuredContent"]["data"]["text"], "");
+    assert!(resync["structuredContent"]["data"].get("rows").is_none());
     assert_eq!(
         resync["structuredContent"]["resource"]["terminal_revision"],
         10
@@ -1701,6 +1712,39 @@ fn terminal_tools_use_exact_scoped_requests_cursors_and_cleanup() {
         "invalid_argument"
     );
     assert!(!oversized_query.to_string().contains('é'));
+
+    // Plan 0067 M2: the default is one plain-text string, a wide character
+    // appears once, and an unknown format never reaches the daemon.
+    let text = call_tool(
+        &mut server,
+        42,
+        "splinterm.read_terminal",
+        json!({"splint_id": splint_id}),
+    );
+    assert_eq!(text["isError"], false);
+    assert_eq!(
+        text["structuredContent"]["data"]["content_encoding"],
+        "text"
+    );
+    assert_eq!(
+        text["structuredContent"]["data"]["text"],
+        "e\u{301}界\u{fffd}"
+    );
+    assert!(text["structuredContent"]["data"].get("rows").is_none());
+    assert_eq!(
+        text["structuredContent"]["content_trust"],
+        "untrusted_terminal_data"
+    );
+    let unknown_format = call_tool(
+        &mut server,
+        43,
+        "splinterm.read_terminal",
+        json!({"splint_id": splint_id, "format": "rows"}),
+    );
+    assert_eq!(
+        unknown_format["structuredContent"]["error"]["code"],
+        "invalid_argument"
+    );
 
     server.close_input();
     assert!(server.wait().success());
@@ -1900,16 +1944,13 @@ fn prompt_injection_values_remain_inert_untrusted_data() {
         "untrusted_terminal_data"
     );
     assert_eq!(terminal["structuredContent"]["data"]["title"], PAYLOADS[3]);
-    assert_eq!(
-        terminal["structuredContent"]["data"]["rows"][0]["cells"][0]["text"],
-        PAYLOADS[2]
-    );
+    assert_eq!(terminal["structuredContent"]["data"]["text"], PAYLOADS[2]);
 
     let scrollback = call_tool(
         &mut server,
         202,
         "splinterm.read_scrollback",
-        json!({"splint_id": splint_id}),
+        json!({"splint_id": splint_id, "format": "cells"}),
     );
     assert_eq!(
         scrollback["structuredContent"]["content_trust"],

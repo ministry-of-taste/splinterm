@@ -694,6 +694,10 @@ a hostile program running as your account.
 - `splinterm.request_lair_access` asks for one of the easy agent access levels
   and can return a pending result while you have not answered yet; see "Easy
   agent access".
+- `splinterm.read_terminal` and `splinterm.read_scrollback` now return plain
+  text by default (`content_encoding: "text"`, one `text` string), which is
+  about 50 times smaller than one object per cell. Pass `"format": "cells"` for
+  the per-cell form.
 
 ## Security and robustness
 

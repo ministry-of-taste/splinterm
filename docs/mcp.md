@@ -329,6 +329,29 @@ response, four active and 32 admitted requests, 5-second default daemon deadline
 combined controller/transfer handles, and 256 process-owned cursors. Handles and
 cursors expire with the adapter process and are not portable.
 
+### Reading terminal text
+
+`splinterm.read_terminal` and `splinterm.read_scrollback` return plain text by
+default: `content_encoding` is `text` and `data.text` holds the rows as lines.
+A line the terminal wrapped is one line, trailing spaces and trailing empty
+lines are dropped, and a wide character appears once. A full screen is a few
+kilobytes instead of a few hundred.
+
+```json
+"data": {
+  "content_encoding": "text",
+  "title": "build",
+  "text": "$ cargo test\n   Compiling splinterm v0.2.0\ntest result: ok. 12 passed\n$",
+  "continuation_cursor": null,
+  "resync_required": false
+}
+```
+
+Pass `"format": "cells"` for the earlier form: `content_encoding` is
+`unicode_scalars` and `data.rows` holds one `{text, width}` object per cell,
+for a client that needs column positions. A resync reply has empty `text` or
+empty `rows`. Terminal resources keep the cell form.
+
 ### Interactive access to a live Lair
 
 Persistent policy remains the unattended/headless authorization path. For an

@@ -12,6 +12,7 @@ mod dto;
 mod limits;
 mod resources;
 mod server;
+mod terminal_text;
 mod tools;
 mod transport;
 

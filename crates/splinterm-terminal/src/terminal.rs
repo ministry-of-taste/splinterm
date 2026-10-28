@@ -3652,6 +3652,34 @@ mod tests {
         assert_eq!(terminal.grid().cursor().position(), Coordinate::new(1, 1));
     }
 
+    // The MCP text form (Plan 0067 M2) joins a row that has content and no
+    // linebreak to the next row. A row starts with a hard linebreak (true),
+    // printing keeps it, and only an autowrap clears it, on the row the text
+    // wrapped from. A full row ended by CR LF is not a wrap.
+    #[test]
+    fn linebreak_is_a_hard_line_end_that_only_an_autowrap_clears() {
+        let mut terminal = terminal(5, 6);
+        terminal.advance(b"abcdefg\r\nhi\r\n\r\n12345\r\nz");
+
+        let rows = (0..6)
+            .map(|row| {
+                let text = row_text(&terminal, row);
+                let linebreak = terminal.grid().row(row).unwrap().has_linebreak();
+                (text, linebreak)
+            })
+            .collect::<Vec<_>>();
+        let expected = [
+            ("abcde", false),
+            ("fg   ", true),
+            ("hi   ", true),
+            ("     ", true),
+            ("12345", true),
+            ("z    ", true),
+        ]
+        .map(|(text, linebreak)| (text.to_owned(), linebreak));
+        assert_eq!(rows, expected);
+    }
+
     #[test]
     fn csi_cursor_erase_and_basic_sgr_match_initial_fixtures() {
         let mut terminal = terminal(8, 3);
