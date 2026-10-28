@@ -655,7 +655,7 @@ answer. The box casts a hard shadow, as the popups inside a Window do. Each
 dialog shows the time left to answer at the right end of the top edge, such
 as `denies in 0:19`, `cancels in 0:42`, or `not now in 1:58`. When the
 access prompt's time runs out, its Allow button is disabled and nothing
-grants, then it closes and the request ends without access. The upgrade and
+grants, then it closes and the request ends unanswered. The upgrade and
 restart questions end as they always have. Trusted dialogs always use the
 default, even padding, whatever `[main] padding-*` says.
 
@@ -671,7 +671,8 @@ than the dialog. If the text still does not fit, the font gets smaller, down to
 Only below that does the dialog leave out lines. It then shows "…" where text
 is missing, and in place of the key hints it says that part of the request is
 hidden. A button label too long for its half of the dialog counts as
-hidden text too. While any text is hidden, the dialog cannot grant, proceed,
+hidden text too, and so does the access prompt's countdown when the top edge
+has no room for it beside the title. While any text is hidden, the dialog cannot grant, proceed,
 or restart: `G`, `R`, and the green button (drawn dimmed) do nothing until you
 make the window larger. `Enter`, `Escape`, `D`, and the red button still say
 no. Once all of the text shows again, and whenever the dialog is laid out again

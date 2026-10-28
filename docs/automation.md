@@ -449,23 +449,19 @@ appears as an escape such as `\u{202e}`, and a run of spaces as one space, so
 the name you approve reads the same in the list and cannot imitate the
 prompt's own wording.
 
-Every prompt names the computer first, on its `host` row: `this computer
-(wintermute)` for an agent on the computer showing it. A prompt for an agent
-on another computer is titled "remote agent access request", names that
-computer in its sentence ("'Claude Code' on neuromancer wants Look access to
-'api'"), on its `host` row with the SSH profile that reaches it
-(`neuromancer · remote, SSH profile 'neuromancer'`), and on its `process`
-row, and says "Answering here allows it on neuromancer only." The other
-computer's name is its own report, shown escaped like the other names.
+The computer comes first in the table, on the `host` row, for example
+`this computer (wintermute)`, or just `this computer` when its hostname is not
+usable.
 
 A request that a grant already covers is answered at once, without a prompt.
 Prompts appear one at a time; further requests wait their turn. If you do not
 answer right away, the request stays pending for up to two minutes, and the
 agent collects your answer by asking again, without a new prompt. The prompt
 counts the time left down at the right of its top edge, such as
-`denies in 1:42`; once it runs out nothing grants, and the prompt closes
-without access. After you deny a request, the same agent cannot ask again for
-that workspace for a few seconds. Closing the prompt denies.
+`denies in 1:42`. Once it runs out, the Allow button is disabled and nothing
+grants; the prompt then closes and the request ends unanswered, without
+access. After you deny a request, the same agent cannot ask again for that
+workspace for a few seconds. Closing the prompt denies.
 
 ### Seeing and revoking access
 

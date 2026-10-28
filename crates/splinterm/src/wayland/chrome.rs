@@ -490,7 +490,9 @@ impl App {
     }
 
     /// Draws a trusted dialog again when the time left it shows has
-    /// changed. Display only: nothing answers when the time runs out.
+    /// changed. Nothing answers when the time runs out: an access consent
+    /// then grants nothing (its redraw shows Allow disabled), and its asker
+    /// ends it unanswered; a question's asker ends it as before.
     pub(super) fn tick_trusted_countdown(&mut self, queue_handle: &QueueHandle<Self>) {
         if self
             .modal

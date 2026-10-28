@@ -240,6 +240,11 @@ fn local_hostname() -> Option<String> {
 /// person's configuration, so both are escaped as the names are; and since
 /// an agent's name is quoted and escaped, "on <host>" inside it can never
 /// pass for this prompt's own words.
+///
+/// The host row keeps up to [`MAX_DAEMON_HOSTNAME_BYTES`] characters of the
+/// escaped hostname: any plain hostname whole, but one of quote-like letters
+/// such as `ʼ`, each shown as an escape, is visibly cut with "…". The title
+/// still says remote.
 enum PromptHost {
     /// This computer, by its hostname when it has a usable one.
     Local { hostname: Option<String> },
@@ -247,8 +252,7 @@ enum PromptHost {
     Remote {
         profile: String,
         hostname: Option<String>,
-        /// Its hostname, or else its profile, as the sentence and the notes
-        /// name it, bounded as the other names are.
+        /// The host as the sentence and the notes name it ([`remote_name`]).
         named: String,
     },
 }
@@ -267,10 +271,7 @@ impl PromptHost {
                 hostname: daemon_hostname
                     .as_deref()
                     .map(|name| display_name(name, MAX_DAEMON_HOSTNAME_BYTES)),
-                named: display_name(
-                    daemon_hostname.as_deref().unwrap_or(profile),
-                    DISPLAY_NAME_CHARS,
-                ),
+                named: remote_name(profile, daemon_hostname.as_deref(), local_hostname),
             },
         }
     }
@@ -303,6 +304,24 @@ impl PromptHost {
             } => format!("{hostname} · remote, SSH profile '{profile}'"),
         };
         table_line("host", value)
+    }
+}
+
+/// A remote host as the sentence and the notes name it: its hostname, or
+/// else its profile, bounded as the other names are. When that name is
+/// this computer's own hostname (ignoring ASCII case), the profile follows
+/// it, as in "wintermute (SSH profile 'work')", so a remote prompt never
+/// reads as if it came from here.
+fn remote_name(profile: &str, hostname: Option<&str>, local_hostname: Option<&str>) -> String {
+    let name = hostname.unwrap_or(profile);
+    let shown = display_name(name, DISPLAY_NAME_CHARS);
+    let local = local_hostname.and_then(usable_daemon_hostname);
+    match usable_daemon_hostname(name).zip(local) {
+        Some((name, local)) if name.eq_ignore_ascii_case(local) => format!(
+            "{shown} (SSH profile '{}')",
+            display_name(profile, MAX_REMOTE_PROFILE_NAME_BYTES)
+        ),
+        _ => shown,
     }
 }
 
@@ -567,7 +586,8 @@ fn dialog_theme(theme: ResolvedTheme) -> ResolvedTheme {
 
 /// The consent dialog's Window at the natural size of its text, answering on
 /// `decision`. It counts down the time its asker waits, when the prompt
-/// says, and denies when that runs out; zero shows no countdown.
+/// says; zero shows no countdown. Once that runs out it grants nothing, but
+/// it never answers by itself: its asker ends it unanswered.
 fn consent_window_options(
     prompt: ConsentPrompt,
     decision: std_mpsc::Sender<ConsentDecision>,
@@ -996,8 +1016,11 @@ mod tests {
     }
 
     /// The dialog counts down the time its asker waits, which the prompt
-    /// carries, as the time it denies in; a prompt without one shows no
-    /// countdown. Running out denies (the trusted dialog's own test).
+    /// carries, as the time it "denies in"; a prompt without one shows no
+    /// countdown. Once the time is up it grants nothing and never answers
+    /// by itself: its asker ends it unanswered (the trusted dialog's own
+    /// test). Even the shortest prompts, local or remote, have room for
+    /// the countdown beside the title at their natural size.
     #[test]
     fn the_prompt_counts_down_its_askers_wait_and_none_without_one() {
         let mut prompt = manage_prompt();
@@ -1012,6 +1035,25 @@ mod tests {
         let mut splint = splint_prompt();
         splint.respond_within_seconds = 20;
         assert!(top_edge(&splint).ends_with(" denies in 0:19"));
+        // The shortest prompts: one scope, no name, a one-letter profile.
+        for origin in [
+            ConsentOrigin::Local,
+            ConsentOrigin::Remote {
+                profile: "w".to_owned(),
+                daemon_hostname: None,
+            },
+        ] {
+            let mut short = manage_prompt();
+            short.agent_name = None;
+            short.scopes = AccessLevel::Look.scopes().to_vec();
+            short.level = Some(AccessLevel::Look);
+            short.durations.truncate(1);
+            short.origin = origin;
+            short.respond_within_seconds = 20;
+            assert_eq!(short.validate(), Ok(()));
+            let top = top_edge(&short);
+            assert!(top.ends_with(" denies in 0:19"), "{top:?}");
+        }
     }
 
     /// The longest inputs a valid prompt can carry still show every fixed
@@ -1407,8 +1449,11 @@ mod tests {
     /// The longest remote prompt, with the longest profile and hostname, a
     /// long agent name and workspace name, and a countdown, fits the
     /// dialog's natural size and cuts nothing it must show: the host row
-    /// keeps the whole hostname and profile, the other mentions are bounded
-    /// as names are, and the title and countdown both fit the top edge.
+    /// keeps a longest plain hostname and the profile whole, the other
+    /// mentions are bounded as names are, and the title and countdown both
+    /// fit the top edge. A valid hostname of quote-like letters escapes to
+    /// more characters than the row keeps, so it is visibly cut with "…";
+    /// the title still says remote and nothing else is cut.
     #[test]
     fn the_longest_remote_prompt_fits_its_columns_and_cuts_nothing() {
         let (profile, hostname) = longest_origin();
@@ -1455,6 +1500,85 @@ mod tests {
             top.contains("remote agent access request") && top.ends_with(" denies in 1:59"),
             "{top:?}"
         );
+        // 127 `ʼ`, 254 bytes, escape to 1016 characters: the row keeps the
+        // first 31 escapes and an ellipsis, and still fits.
+        let mut escaping = longest_remote_prompt();
+        escaping.origin = ConsentOrigin::Remote {
+            profile: profile.clone(),
+            daemon_hostname: Some("ʼ".repeat(127)),
+        };
+        assert_eq!(escaping.validate(), Ok(()));
+        let columns = natural_columns(&self::variants(&escaping));
+        for selected in 0..escaping.durations.len() {
+            let layout = laid_out(&escaping, selected);
+            assert!(!layout.clipped);
+            assert!(
+                layout
+                    .rows
+                    .iter()
+                    .all(|line| line.chars().count() <= columns)
+            );
+            // The run of escapes is one word that wraps inside itself, so
+            // it is checked with the rows joined back: 31 escapes, then the
+            // ellipsis.
+            let joined: String = layout.rows.iter().map(|line| line.trim()).collect();
+            let cut = format!("host{}…", "\\u{02bc}".repeat(31));
+            assert!(joined.contains(&cut), "{joined}");
+            let words = words(&escaping, selected);
+            let rest = format!("… · remote, SSH profile '{profile}'");
+            assert!(words.contains(&rest), "{words}");
+        }
+        assert!(top_edge(&escaping).contains("remote agent access request"));
+    }
+
+    /// A remote host named like this computer never reads as this
+    /// computer: wherever the prompt names it in words, the profile
+    /// follows. The host row already says remote and is unchanged.
+    #[test]
+    fn a_remote_host_named_like_this_computer_names_its_profile_too() {
+        let line = |text: &splinterm::DialogText, start: &str| {
+            text.lines
+                .iter()
+                .find(|line| line.text.starts_with(start))
+                .map_or_else(
+                    || panic!("{start:?} in {:?}", text.lines),
+                    |line| line.text.clone(),
+                )
+        };
+        for (prompt, host, row) in [
+            (
+                remote_prompt("work", Some("WinterMute")),
+                "WinterMute (SSH profile 'work')",
+                "host      WinterMute · remote, SSH profile 'work'",
+            ),
+            (
+                remote_prompt("wintermute", None),
+                "wintermute (SSH profile 'wintermute')",
+                "host      remote, SSH profile 'wintermute'",
+            ),
+            (
+                remote_prompt("work", Some("neuromancer")),
+                "neuromancer",
+                "host      neuromancer · remote, SSH profile 'work'",
+            ),
+        ] {
+            assert_eq!(prompt.validate(), Ok(()));
+            let text = consent_text(&prompt, 0, Some("wintermute"));
+            assert_eq!(text.title(), "remote agent access request");
+            assert_eq!(
+                line(&text, "'Claude Code'"),
+                format!("'Claude Code' on {host} wants Manage access to 'Workspace'")
+            );
+            assert_eq!(
+                line(&text, "Answering here"),
+                format!("Answering here allows it on {host} only.")
+            );
+            assert!(line(&text, "process").ends_with(&format!(" (on {host})")));
+            assert_eq!(line(&text, "host "), row);
+        }
+        // Without a usable local hostname nothing can collide.
+        let text = consent_text(&remote_prompt("work", Some("wintermute")), 0, None);
+        assert!(line(&text, "'Claude Code'").starts_with("'Claude Code' on wintermute wants"));
     }
 
     #[test]

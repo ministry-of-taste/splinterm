@@ -292,9 +292,11 @@ impl TrustedConsentUi {
     /// ([`dialog_text::ChromeRows::body_room`]). A layout that hides part of
     /// the text, a body row or a button label, shows
     /// [`TrustedDialogKind::clipped_notice`] in place of the answer hints
-    /// and makes every yes answer inert. When the whole text shows again,
-    /// an engaged dialog arms again from `now`, so a yes counts only once
-    /// the whole text has been in view for the arming delay.
+    /// and makes every yes answer inert; so does an access consent's
+    /// countdown that the top edge has no room for, since the person must
+    /// see how long is left. When the whole text shows again, an engaged
+    /// dialog arms again from `now`, so a yes counts only once the whole
+    /// text has been in view for the arming delay.
     pub(crate) fn lay_out(&mut self, frame: DialogFrame, now: Instant) -> Option<TerminalSnapshot> {
         let variants = self.variants();
         let selected = self.selected_variant();
@@ -302,13 +304,17 @@ impl TrustedConsentUi {
         let max_rows = frame
             .max_text_rows
             .min(dialog_text::chrome_rows(frame.grid_rows).body_room);
+        let countdown_hidden = self.access.is_some()
+            && self.countdown(now).is_some_and(|countdown| {
+                !dialog_text::countdown_fits(text.title(), &countdown, frame.grid_columns)
+            });
         let layout = dialog_text::layout_hiding(
             &variants,
             selected,
             frame.wrap_columns,
             max_rows,
             Some(self.kind.clipped_notice()),
-            !text.buttons_fit(frame.grid_columns),
+            !text.buttons_fit(frame.grid_columns) || countdown_hidden,
         );
         if let Some(access) = self.access.as_mut() {
             // A click lands on a snapshot row; the body starts below the
@@ -1599,5 +1605,72 @@ mod tests {
             question.key_input(TrustedDialogKey::G, false, after),
             Some(TrustedInput::Answer(true))
         );
+    }
+
+    /// An access consent whose countdown the top edge has no room for
+    /// counts as hidden text: nothing grants until the time left shows
+    /// again. A question's countdown just goes, as before.
+    #[test]
+    fn an_access_consent_grants_nothing_while_its_countdown_is_hidden() {
+        let titled = |selected: usize| {
+            let mut text = consent_text(selected);
+            text.lines
+                .insert(0, DialogLine::title("remote agent access request"));
+            text
+        };
+        let (decision, _answers) = std::sync::mpsc::channel();
+        let mut dialog = TrustedConsentUi::access_consent(
+            decision,
+            vec![
+                (GrantDuration::Once, true),
+                (GrantDuration::WorkspaceSession, true),
+            ],
+            Box::new(titled),
+        )
+        .with_respond_within(Duration::from_secs(20));
+        let start = Instant::now();
+        dialog.deadline = Some(start + Duration::from_secs(20));
+        // 40 columns: the buttons fit their halves, but the title and
+        // "denies in 0:20" need 46 inside the frame.
+        let narrow = DialogFrame {
+            wrap_columns: 36,
+            grid_columns: 40,
+            grid_rows: 20,
+            max_text_rows: 20,
+        };
+        assert!(titled(0).buttons_fit(40));
+        let snapshot = dialog.lay_out(narrow, start).unwrap();
+        assert!(dialog.clipped());
+        assert!(!top_row(&snapshot).contains("denies in"));
+        click_inside(&mut dialog, start);
+        let armed = start + UPGRADE_ARMING_DELAY;
+        assert_eq!(dialog.key_input(TrustedDialogKey::G, false, armed), None);
+        assert_eq!(dialog.action_area_input(true, armed), None);
+        assert_eq!(
+            dialog.key_input(TrustedDialogKey::D, false, armed),
+            Some(TrustedInput::Answer(false))
+        );
+        // With room for both, it grants once armed again.
+        let wide = DialogFrame {
+            wrap_columns: 60,
+            grid_columns: 64,
+            grid_rows: 20,
+            max_text_rows: 20,
+        };
+        let top = top_row(&dialog.lay_out(wide, armed).unwrap());
+        assert!(top.ends_with(" denies in 0:20"), "{top:?}");
+        assert!(!dialog.clipped());
+        assert_eq!(dialog.key_input(TrustedDialogKey::G, false, armed), None);
+        assert_eq!(
+            dialog.key_input(TrustedDialogKey::G, false, armed + UPGRADE_ARMING_DELAY),
+            Some(TrustedInput::Answer(true))
+        );
+        // The upgrade question at the same width only drops its countdown.
+        let mut question = TrustedConsentUi::upgrade(std::sync::mpsc::channel().0)
+            .with_respond_within(Duration::from_secs(20))
+            .with_text(titled(0));
+        let snapshot = question.lay_out(narrow, Instant::now()).unwrap();
+        assert!(!question.clipped());
+        assert!(!top_row(&snapshot).contains("cancels in"));
     }
 }

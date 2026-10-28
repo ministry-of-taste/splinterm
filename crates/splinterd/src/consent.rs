@@ -1773,14 +1773,13 @@ fn consent_prompt(
     }
 }
 
-/// The whole seconds a prompt's countdown shows for `deadline`: rounded
-/// down, so it never shows more time than the daemon waits; at least one
-/// while any time is left, since zero shows none; and at most the pending
-/// request lifetime a prompt may count down.
+/// The whole seconds the countdown of a prompt the daemon is about to show
+/// counts for `deadline`: rounded down, so it never shows more time than
+/// the daemon waits, and at most the pending request lifetime a prompt may
+/// count down. Never zero, which would show no countdown and leave Allow
+/// live: with no whole second left, the dialog starts with its time
+/// already up (it counts a second short), so it grants nothing.
 fn respond_within_seconds(deadline: Duration) -> u64 {
-    if deadline.is_zero() {
-        return 0;
-    }
     deadline
         .as_secs()
         .clamp(1, splinterm_protocol::MAX_CONSENT_RESPOND_WITHIN_SECONDS)
@@ -2790,13 +2789,15 @@ mod tests {
         let shown = splint(CONSENT_DEADLINE);
         assert_eq!(shown.respond_within_seconds, 20);
         assert_eq!(shown.origin, splinterm_protocol::ConsentOrigin::Local);
-        // `prompt_lair` waits until the pending request expires.
+        // `prompt_lair` waits until the pending request expires. With no
+        // whole second left it still counts one, so its dialog starts with
+        // its time up and never shows a live Allow without a countdown.
         for (left, seconds) in [
             (Duration::from_millis(119_900), 119),
             (Duration::from_secs(45), 45),
             (Duration::from_millis(400), 1),
             (Duration::from_secs(600), 120),
-            (Duration::ZERO, 0),
+            (Duration::ZERO, 1),
         ] {
             let shown = lair(left);
             assert_eq!(shown.respond_within_seconds, seconds, "{left:?}");
