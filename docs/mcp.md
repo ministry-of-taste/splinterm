@@ -394,14 +394,17 @@ behavior.
 A control error says what to do next, in fixed adapter text:
 
 - `acquire_control` on a Splint that already has a controller fails with
-  `controller_unavailable`: ask for it with `request_control_transfer`, or take
-  it with `takeover: true`.
+  `controller_unavailable`: ask for it with `request_control_transfer` or take
+  it with `takeover: true`; if you already hold its `controller_handle`, use
+  that.
 - `request_control_transfer` waits up to 15 seconds for the pane's controller.
   In a Splinterm Window, the person accepts with Ctrl+Shift+Y in that pane and
-  denies with Ctrl+Shift+N (the default keys). A denied or cancelled transfer
-  fails with `control_transfer_unavailable`, and an unanswered one with
-  `timeout`. Each says to take the pane with `takeover: true` if the grant
-  allows it, or to ask again and have the person press Ctrl+Shift+Y.
+  denies with Ctrl+Shift+N (the default keys). A denied transfer fails with
+  `control_transfer_unavailable` and tells the agent not to ask again or take
+  the pane unless the person agrees. A cancelled one fails with
+  `control_transfer_unavailable`, and an unanswered one with `timeout`; both say
+  to take the pane with `takeover: true` if the grant allows it, or to ask
+  again and have the person press Ctrl+Shift+Y.
 - A transfer or takeover when nobody controls the Splint fails with
   `control_transfer_unavailable` and says to call `acquire_control` without
   `takeover`. A transfer while another one waits for an answer says to call

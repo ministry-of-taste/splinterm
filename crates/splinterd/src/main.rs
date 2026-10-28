@@ -122,7 +122,8 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(250);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const TERMINAL_SUBSCRIPTION_FRAME_INTERVAL: Duration = Duration::from_millis(33);
-const CONTROL_TRANSFER_TIMEOUT: Duration = Duration::from_secs(15);
+const CONTROL_TRANSFER_TIMEOUT: Duration =
+    Duration::from_secs(splinterm_protocol::CONTROL_TRANSFER_TIMEOUT_SECONDS);
 const EXIT_OBSERVER_TIMEOUT: Duration = Duration::from_secs(10);
 const CONTROL_EVENT_QUEUE: usize = 32;
 const SEARCH_DEADLINE: Duration = Duration::from_millis(10);

@@ -58,6 +58,9 @@ pub const MAX_ACCESS_SCOPES: usize = 16;
 /// The longest a `RequestLairAccess` call waits for the person before the
 /// daemon replies `pending` (ADR 0014). Larger budgets are capped to it.
 pub const MAX_CONSENT_WAIT_MILLIS: u32 = 25_000;
+/// How long splinterd waits for an answer to a control transfer before it
+/// ends the transfer and closes the requester's connection.
+pub const CONTROL_TRANSFER_TIMEOUT_SECONDS: u64 = 15;
 /// How long a pending workspace access request lives after it opens.
 pub const PENDING_ACCESS_LIFETIME_SECONDS: u64 = 120;
 /// The longest countdown a consent prompt or offer carries: a pending

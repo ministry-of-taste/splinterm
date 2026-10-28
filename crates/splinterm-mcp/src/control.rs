@@ -27,9 +27,9 @@ const SCHEMA: &str = "splinterm.mcp.v2";
 const MAXIMUM_CONTROL_HANDLES: usize = 8;
 const TRANSFER_LIFETIME: Duration = Duration::from_secs(16);
 /// How long splinterd waits for a transfer's answer before it ends the
-/// transfer and closes the requester's connection (its
-/// `CONTROL_TRANSFER_TIMEOUT`).
-const DAEMON_TRANSFER_TIMEOUT: Duration = Duration::from_secs(15);
+/// transfer and closes the requester's connection.
+const DAEMON_TRANSFER_TIMEOUT: Duration =
+    Duration::from_secs(splinterm_protocol::CONTROL_TRANSFER_TIMEOUT_SECONDS);
 
 /// How many handles that expired with their daemon connection are remembered,
 /// so using one says why it no longer works (Plan 0061 M3.12b).
@@ -47,8 +47,9 @@ macro_rules! after_unanswered_transfer {
     };
 }
 
-const TRANSFER_DENIED: &str =
-    after_unanswered_transfer!("the pane's controller denied the transfer");
+/// A denied transfer respects the person's answer (operator decision
+/// 2026-10-28): no retry or takeover unless they agree.
+const TRANSFER_DENIED: &str = "the pane's controller denied the transfer; do not ask again or take the pane unless the person tells you to. If they do: call request_control_transfer and have them press Ctrl+Shift+Y (the default key) in that pane within 15 seconds, or, with a Look and type or Manage grant, call acquire_control with takeover: true";
 const TRANSFER_CANCELLED: &str = after_unanswered_transfer!(
     "the transfer was cancelled before an answer, as when control of the pane changed"
 );
@@ -407,7 +408,8 @@ impl ControlRegistry {
                 },
                 cancellation,
             )
-            .await?
+            .await
+            .map_err(needs_takeover_grant)?
             {
                 Response::ControlSubscribed {
                     subscription_id, ..
@@ -2333,12 +2335,15 @@ mod tests {
             failure(ControlTransferOutcome::TimedOut),
             ("timeout", TRANSFER_TIMED_OUT, true)
         );
-        for message in [TRANSFER_DENIED, TRANSFER_CANCELLED, TRANSFER_TIMED_OUT] {
+        for message in [TRANSFER_CANCELLED, TRANSFER_TIMED_OUT] {
             assert!(message.contains("acquire_control with takeover: true"));
             assert!(message.contains("press Ctrl+Shift+Y"));
             assert!(message.contains("request_lair_access"));
         }
+        // The person said no: no retry and no takeover unless they agree.
         assert!(TRANSFER_DENIED.starts_with("the pane's controller denied"));
+        assert!(TRANSFER_DENIED.contains("do not ask again"));
+        assert!(TRANSFER_DENIED.contains("unless the person tells you to"));
     }
 
     /// splinterd closes the requester's connection when its 15-second timer
@@ -2469,17 +2474,30 @@ mod tests {
         takeover: bool,
         error: ProtocolError,
     ) -> dispatch::DispatchFailure {
+        refused_control_at(label, tool, takeover, false, error).await
+    }
+
+    /// As [`refused_control`]; with `refuse_subscription`, the daemon
+    /// refuses a transfer's control subscription, its first request.
+    async fn refused_control_at(
+        label: &str,
+        tool: &'static str,
+        takeover: bool,
+        refuse_subscription: bool,
+        error: ProtocolError,
+    ) -> dispatch::DispatchFailure {
         let (directory, socket) = socket(label);
         let listener = UnixListener::bind(&socket).unwrap();
         let (_, _, splint_id) = ids();
         let daemon = thread::spawn(move || {
             let mut requester = accept(&listener);
             let mut frame = read_frame::<ClientFrame>(&mut requester);
-            if let ClientFrame::Request {
-                request_id,
-                request: Request::SubscribeControl { .. },
-                ..
-            } = frame
+            if !refuse_subscription
+                && let ClientFrame::Request {
+                    request_id,
+                    request: Request::SubscribeControl { .. },
+                    ..
+                } = frame
             {
                 write_frame(
                     &mut requester,
@@ -2589,6 +2607,17 @@ mod tests {
         )
         .await;
         assert_eq!(transfer.message, TAKEOVER_NEEDS_GRANT);
+        // With no grant at all, the subscription a transfer starts with is
+        // refused first.
+        let ungranted = refused_control_at(
+            "unauth-sub",
+            "splinterm.request_control_transfer",
+            false,
+            true,
+            unauthorized(),
+        )
+        .await;
+        assert_eq!(ungranted.message, TAKEOVER_NEEDS_GRANT);
         // A plain acquire is not a takeover; its refusal stays general.
         let acquire = refused_control(
             "unauth-acquire",

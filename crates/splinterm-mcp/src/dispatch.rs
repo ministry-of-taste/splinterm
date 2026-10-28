@@ -355,7 +355,7 @@ pub(crate) const CONNECTION_LOST_DURING_CALL: &str = "the splinterd connection e
 
 /// What an acquire says when the Splint already has a controller
 /// (Plan 0067 M4).
-pub(crate) const ALREADY_CONTROLLED: &str = "this Splint already has a controller; ask for it with request_control_transfer, or with a Look and type or Manage grant take it with acquire_control and takeover: true";
+pub(crate) const ALREADY_CONTROLLED: &str = "this Splint already has a controller; ask for it with request_control_transfer, or with a Look and type or Manage grant take it with acquire_control and takeover: true (if you already hold a controller_handle for it, use that)";
 
 /// What a transfer request or a takeover says when nobody controls the
 /// Splint (Plan 0067 M4).
@@ -365,11 +365,6 @@ pub(crate) const NOBODY_CONTROLS: &str =
 /// What a transfer request says while another transfer of the Splint waits
 /// for an answer (Plan 0067 M4).
 pub(crate) const TRANSFER_ALREADY_PENDING: &str = "another control transfer of this Splint is waiting for an answer; call again once it ends (at most 15 seconds)";
-
-/// What a transfer request says from a connection that already controls a
-/// Splint (Plan 0067 M4).
-pub(crate) const REQUESTER_CONTROLS: &str =
-    "this connection already controls a Splint; call release_control first";
 
 pub(crate) fn map_client_error(error: &Error) -> DispatchFailure {
     if let Some(reason) = request_cancellation(error) {
@@ -398,7 +393,7 @@ pub(crate) fn map_client_error(error: &Error) -> DispatchFailure {
 fn map_protocol_error(error: &splinterm_protocol::ProtocolError) -> DispatchFailure {
     use splinterm_protocol::{
         CONTROL_TRANSFER_PENDING, NO_CONTROLLER_TO_TRANSFER, NO_WORKSPACE_GRANT,
-        SPLINT_ALREADY_CONTROLLED, TRANSFER_REQUESTER_CONTROLS,
+        SPLINT_ALREADY_CONTROLLED,
     };
 
     let (code, message, retryable) = match error.code {
@@ -445,9 +440,6 @@ fn map_protocol_error(error: &splinterm_protocol::ProtocolError) -> DispatchFail
         }
         ErrorCode::ControlTransferUnavailable if error.message == CONTROL_TRANSFER_PENDING => {
             ("control_transfer_unavailable", TRANSFER_ALREADY_PENDING, true)
-        }
-        ErrorCode::ControlTransferUnavailable if error.message == TRANSFER_REQUESTER_CONTROLS => {
-            ("control_transfer_unavailable", REQUESTER_CONTROLS, true)
         }
         ErrorCode::ControlTransferUnavailable => (
             "control_transfer_unavailable",
@@ -3090,7 +3082,6 @@ mod protocol_error_tests {
         for (reason, message) in [
             (NO_CONTROLLER_TO_TRANSFER, NOBODY_CONTROLS),
             (CONTROL_TRANSFER_PENDING, TRANSFER_ALREADY_PENDING),
-            (TRANSFER_REQUESTER_CONTROLS, REQUESTER_CONTROLS),
         ] {
             let failure = mapped(transfer, reason);
             assert_eq!(failure.code, "control_transfer_unavailable");
@@ -3102,12 +3093,14 @@ mod protocol_error_tests {
         assert_eq!(held.message, ALREADY_CONTROLLED);
         assert!(held.retryable);
         assert!(NOBODY_CONTROLS.contains("without takeover"));
-        assert!(REQUESTER_CONTROLS.contains("release_control"));
         assert!(ALREADY_CONTROLLED.contains("request_control_transfer"));
         assert!(ALREADY_CONTROLLED.contains("takeover: true"));
-        // Any other reason, as from an older splinterd, keeps the general text.
+        assert!(ALREADY_CONTROLLED.contains("controller_handle"));
+        // A requester that already controls a Splint cannot reach this through
+        // MCP, which connects afresh for each request; it and any other
+        // reason, as from an older splinterd, keep the general text.
         assert_eq!(
-            mapped(transfer, "another reason").message,
+            mapped(transfer, TRANSFER_REQUESTER_CONTROLS).message,
             "control transfer is unavailable"
         );
         assert_eq!(
