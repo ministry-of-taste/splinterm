@@ -229,6 +229,12 @@ a hostile program running as your account.
   exact scopes. Names and paths appear as data: a control or bidirectional
   character shows as an escape such as `\u{202e}`, the same in the prompt, the
   **Agent access** list, and `splinterm access list`.
+- Every prompt names the computer the agent runs on, first in its table:
+  `host  this computer (wintermute)`. A prompt for an agent on another computer
+  is titled "remote agent access request", names that computer in its
+  sentence and its `process` row, names it with the SSH profile that reaches
+  it on its `host` row, and says "Answering here allows it on neuromancer
+  only." That computer's name is its own report, escaped like the other names.
 - A request a grant already covers is answered at once, without a prompt.
   Prompts appear one at a time. An unanswered request stays pending for up to
   two minutes, and the agent collects your answer by asking again; the MCP tool

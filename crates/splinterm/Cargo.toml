@@ -20,7 +20,7 @@ fontdb = { workspace = true, optional = true }
 libc.workspace = true
 nix = { workspace = true, features = ["fs", "process", "user"] }
 png.workspace = true
-rustix.workspace = true
+rustix = { workspace = true, features = ["system"] }
 serde.workspace = true
 serde_json.workspace = true
 splinterd = { path = "../splinterd" }
