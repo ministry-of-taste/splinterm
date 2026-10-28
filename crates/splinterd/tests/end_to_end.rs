@@ -7183,7 +7183,7 @@ async fn dojos_count_as_used_after_input_or_rename() {
 
         // Going back to the app name of a Splint that never left it changes
         // nothing, so its Dojo stays unused (Plan 0069).
-        let untouched = create_lair_with(&mut admin, plain_shell_launch(&shell)).await;
+        let untouched = create_lair_with(&daemon, &mut admin, plain_shell_launch(&shell)).await;
         let expected_topology_revision = admin.topology_revision().await;
         assert_eq!(
             admin
@@ -7403,7 +7403,7 @@ async fn foreground_app_names_follow_held_jobs_and_yield_to_a_rename() {
             scrollback_lines: 100,
         };
         let mut admin = daemon.connect().await;
-        let target = create_lair_with(&mut admin, launch).await;
+        let target = create_lair_with(&daemon, &mut admin, launch).await;
         let splint_id = target.splint_id;
         let revision = admin.topology_revision().await;
         let root = wait_for_pid_file(&pid_file).await;

@@ -7366,6 +7366,7 @@ mod tests {
                     lifecycle: SplintLifecycle::Starting,
                     exit_status: None,
                     agent_status: None,
+                    foreground_app: None,
                 }
             })
             .collect();

@@ -752,6 +752,7 @@ mod tests {
             revision: topology.revision(),
             topology,
             runtimes: vec![runtime(live, Some(3)), runtime(exited, None)],
+            presentation_offers: Vec::new(),
         };
         service.attach(&mut snapshot);
         assert_eq!(snapshot.runtimes[0].foreground_app.as_deref(), Some("nvim"));

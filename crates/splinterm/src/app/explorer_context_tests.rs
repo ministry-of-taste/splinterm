@@ -1127,6 +1127,7 @@ fn explorer_observation_sees_a_foreground_app_change_at_the_same_revision() {
             agent_status: None,
             foreground_app: None,
         }],
+        presentation_offers: Vec::new(),
     };
     let mut observer = ExplorerObservation::default();
     assert!(observer.observe(&snapshot));
