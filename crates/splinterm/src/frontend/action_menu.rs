@@ -11,9 +11,13 @@ use crate::navigation_projection::{
 
 use super::{
     LairDirection, LairPromptKind, LairPromptTarget, SelectorKind, WindowTopologyCommand,
-    agent_access::{RevokeAccessUi, WindowAccessCommand},
+    agent_access::{RevokeAccessUi, WindowAccessCommand, prompt_name, single_line},
     text_edit::BoundedTextEditor,
 };
+
+/// A name quoted in a prompt's question is cut to this many cells, so the
+/// question keeps its count and its `?` on a 440 px prompt.
+const QUESTION_NAME_CELLS: usize = 40;
 
 const MAX_QUERY_BYTES: usize = 256;
 const MAX_QUERY_SCALARS: usize = 128;
@@ -48,12 +52,21 @@ impl RenameDojoUi {
         }
     }
 
+    #[cfg(test)]
     pub(crate) const fn target(&self) -> &DojoActionTarget {
         &self.target
     }
 
+    pub(crate) fn target_name(&self) -> &str {
+        &self.target.name
+    }
+
     pub(crate) fn input(&self) -> &str {
         self.editor.text()
+    }
+
+    pub(crate) const fn editor(&self) -> &BoundedTextEditor {
+        &self.editor
     }
 
     pub(crate) fn append_text(&mut self, text: &str) -> bool {
@@ -153,12 +166,16 @@ impl RenameLairUi {
         }
     }
 
-    pub(crate) const fn target(&self) -> &LairPromptTarget {
-        &self.target
-    }
-
     pub(crate) fn input(&self) -> &str {
         self.editor.text()
+    }
+
+    pub(crate) const fn editor(&self) -> &BoundedTextEditor {
+        &self.editor
+    }
+
+    pub(crate) fn target_name(&self) -> &str {
+        &self.target.name
     }
 
     pub(crate) fn append_text(&mut self, text: &str) -> bool {
@@ -206,7 +223,16 @@ impl RestoreLairUi {
         self.decision
     }
 
+    /// Whether nothing would be restored, every Splint of the target still
+    /// running: the prompt then says so and offers only Close.
+    pub(crate) const fn is_notice(&self) -> bool {
+        self.target.targets.is_empty()
+    }
+
     pub(crate) fn move_selection(&mut self) -> bool {
+        if self.is_notice() {
+            return false;
+        }
         self.decision = match self.decision {
             TerminationDecision::Cancel => TerminationDecision::Terminate,
             TerminationDecision::Terminate => TerminationDecision::Cancel,
@@ -215,7 +241,7 @@ impl RestoreLairUi {
     }
 
     pub(crate) fn select(&mut self, decision: TerminationDecision) -> bool {
-        if self.decision == decision {
+        if self.is_notice() || self.decision == decision {
             return false;
         }
         self.decision = decision;
@@ -223,16 +249,18 @@ impl RestoreLairUi {
     }
 
     pub(crate) fn command(&self) -> Option<WindowTopologyCommand> {
-        (self.decision == TerminationDecision::Terminate).then_some(self.target.dojo_id.map_or(
-            WindowTopologyCommand::RestoreLair {
-                expected_topology_revision: self.target.topology_revision,
-                lair_id: self.target.lair_id,
-            },
-            |dojo_id| WindowTopologyCommand::RestoreDojo {
-                expected_topology_revision: self.target.topology_revision,
-                dojo_id,
-            },
-        ))
+        (self.decision == TerminationDecision::Terminate && !self.is_notice()).then_some(
+            self.target.dojo_id.map_or(
+                WindowTopologyCommand::RestoreLair {
+                    expected_topology_revision: self.target.topology_revision,
+                    lair_id: self.target.lair_id,
+                },
+                |dojo_id| WindowTopologyCommand::RestoreDojo {
+                    expected_topology_revision: self.target.topology_revision,
+                    dojo_id,
+                },
+            ),
+        )
     }
 }
 
@@ -304,6 +332,7 @@ impl DojoPromptUi {
     pub(crate) const fn is_preview(&self) -> bool {
         match self {
             Self::PreviewLair(_) => true,
+            Self::RestoreLair(prompt) => prompt.is_notice(),
             Self::RevokeAccess(prompt) => prompt.is_notice(),
             _ => false,
         }
@@ -316,17 +345,19 @@ impl DojoPromptUi {
         )
     }
 
+    /// The title set into the prompt's frame, lowercase, and its body: the
+    /// question first, then what it means. A rename has no body: its field
+    /// holds the current name. Every name is made one line and a quoted one
+    /// cut to [`QUESTION_NAME_CELLS`], so none can add a line or a table row
+    /// or push the question's end out of the prompt.
     pub(crate) fn title_and_body(&self) -> (&'static str, String) {
         match self {
-            Self::Rename(prompt) => (
-                "RENAME DOJO",
-                format!("Name for ‘{}’", prompt.target().name),
-            ),
+            Self::Rename(_) => ("rename dojo", String::new()),
             Self::Terminate(prompt) => (
-                "TERMINATE DOJO",
+                "terminate dojo",
                 format!(
-                    "Terminate ‘{}’ and its {} pane{}?",
-                    prompt.target().name,
+                    "Terminate ‘{}’ and its {} pane{}?\nRunning programs are stopped.",
+                    prompt_name(&prompt.target().name, QUESTION_NAME_CELLS),
                     prompt.target().pane_count,
                     if prompt.target().pane_count == 1 {
                         ""
@@ -335,29 +366,49 @@ impl DojoPromptUi {
                     }
                 ),
             ),
-            Self::RenameLair(prompt) => (
-                "RENAME LAIR",
-                format!("Name for ‘{}’", prompt.target().name),
-            ),
-            Self::PreviewLair(target) => ("SAVED LAIR PREVIEW", target.preview.clone()),
-            Self::RestoreLair(prompt) => (
-                "RESTORE SAVED LAIR",
+            Self::RenameLair(_) => ("rename lair", String::new()),
+            Self::PreviewLair(target) => ("saved lair preview", target.preview.clone()),
+            Self::RestoreLair(prompt) if prompt.is_notice() => (
+                if prompt.target().dojo_id.is_some() {
+                    "restore dojo"
+                } else {
+                    "restore saved lair"
+                },
                 format!(
-                    "Restore {} captured Splint{}?\n\n{}",
+                    "Nothing to restore: every Splint in ‘{}’ is running.",
+                    prompt_name(&prompt.target().name, QUESTION_NAME_CELLS)
+                ),
+            ),
+            // The question names the count and the target, so the preview's
+            // summary line, which names them again, is left out. Its rows are
+            // the Splints the restore launches, so they match the count.
+            Self::RestoreLair(prompt) => (
+                if prompt.target().dojo_id.is_some() {
+                    "restore dojo"
+                } else {
+                    "restore saved lair"
+                },
+                format!(
+                    "Restore {} captured Splint{} into ‘{}’?\n{}",
                     prompt.target().targets.len(),
                     if prompt.target().targets.len() == 1 {
                         ""
                     } else {
                         "s"
                     },
-                    prompt.target().preview,
+                    prompt_name(&prompt.target().name, QUESTION_NAME_CELLS),
+                    prompt
+                        .target()
+                        .preview
+                        .split_once('\n')
+                        .map_or("", |(_, rows)| rows),
                 ),
             ),
             Self::TerminateLair(prompt) => (
-                "TERMINATE LAIR",
+                "terminate lair",
                 format!(
-                    "Terminate ‘{}’ and its {} captured pane{}?",
-                    prompt.target().name,
+                    "Terminate ‘{}’ and its {} captured pane{}?\nRunning programs are stopped.",
+                    prompt_name(&prompt.target().name, QUESTION_NAME_CELLS),
                     prompt.target().targets.len(),
                     if prompt.target().targets.len() == 1 {
                         ""
@@ -368,6 +419,27 @@ impl DojoPromptUi {
             ),
             Self::RevokeAccess(prompt) => prompt.title_and_body(),
         }
+    }
+
+    /// A rename's target as it is named now, made one line, for the
+    /// prompt's frame.
+    pub(crate) fn rename_target(&self) -> Option<String> {
+        match self {
+            Self::Rename(prompt) => Some(single_line(prompt.target_name())),
+            Self::RenameLair(prompt) => Some(single_line(prompt.target_name())),
+            _ => None,
+        }
+    }
+
+    /// Whether a rename's whole name is selected, as it is when the prompt
+    /// opens: the first keystroke then replaces it.
+    pub(crate) fn input_selected(&self) -> bool {
+        let editor = match self {
+            Self::Rename(prompt) => prompt.editor(),
+            Self::RenameLair(prompt) => prompt.editor(),
+            _ => return false,
+        };
+        !editor.text().is_empty() && editor.selected_text() == Some(editor.text())
     }
 
     pub(crate) fn input(&self) -> Option<&str> {
@@ -396,6 +468,7 @@ impl DojoPromptUi {
 
     pub(crate) const fn confirmation_label(&self) -> Option<&'static str> {
         match self {
+            Self::RestoreLair(prompt) if prompt.is_notice() => None,
             Self::RestoreLair(_) => Some("Restore"),
             Self::Terminate(_) | Self::TerminateLair(_) => Some("Terminate"),
             Self::RevokeAccess(prompt) => prompt.confirmation_label(),
@@ -413,6 +486,7 @@ impl DojoPromptUi {
     pub(crate) const fn decision(&self) -> Option<TerminationDecision> {
         match self {
             Self::Terminate(prompt) => Some(prompt.decision()),
+            Self::RestoreLair(prompt) if prompt.is_notice() => None,
             Self::RestoreLair(prompt) => Some(prompt.decision()),
             Self::TerminateLair(prompt) => Some(prompt.decision()),
             Self::RevokeAccess(prompt) => prompt.decision(),
@@ -3011,6 +3085,57 @@ mod tests {
     }
 
     #[test]
+    fn restore_counts_what_it_lists_and_says_when_nothing_would_be_restored() {
+        let lair_id = LairId::new();
+        let dojo_id = DojoId::new();
+        let restorable = splinterm_protocol::MutationTarget {
+            lair_id,
+            dojo_id,
+            splint_id: SplintId::new(),
+            incarnation: 3,
+        };
+        let target = LairPromptTarget {
+            topology_revision: splinterm_core::TopologyRevision::new(7),
+            lair_id,
+            dojo_id: Some(dojo_id),
+            name: "Dojo 1".to_owned(),
+            retention: LairRetention::Saved,
+            preview: "Lair 1 · saved · 1 Dojo\nDojo 1\tshell\t~".to_owned(),
+            targets: vec![restorable],
+        };
+        let restore = DojoPromptUi::restore_lair(target.clone());
+        let (title, body) = restore.title_and_body();
+        assert_eq!(title, "restore dojo");
+        assert_eq!(
+            body,
+            "Restore 1 captured Splint into ‘Dojo 1’?\nDojo 1\tshell\t~"
+        );
+        assert!(!restore.is_preview());
+        assert_eq!(restore.confirmation_label(), Some("Restore"));
+
+        // Every Splint is running: no Restore, a notice and Close only.
+        let mut notice = DojoPromptUi::restore_lair(LairPromptTarget {
+            targets: Vec::new(),
+            ..target
+        });
+        let (title, body) = notice.title_and_body();
+        assert_eq!(title, "restore dojo");
+        assert_eq!(
+            body,
+            "Nothing to restore: every Splint in ‘Dojo 1’ is running."
+        );
+        assert!(notice.is_preview());
+        assert_eq!(notice.confirmation_label(), None);
+        assert_eq!(notice.decision(), None);
+        let DojoPromptUi::RestoreLair(prompt) = &mut notice else {
+            unreachable!("a restore prompt");
+        };
+        assert!(!prompt.move_selection());
+        assert!(!prompt.select(TerminationDecision::Terminate));
+        assert_eq!(prompt.command(), None);
+    }
+
+    #[test]
     fn explorer_context_catalogs_are_closed_and_capture_exact_targets() {
         let mut view = super::super::lair_explorer::tests::view();
         let ids = |menu: &TabContextMenuUi| {
@@ -4387,7 +4512,7 @@ mod agent_access_palette_tests {
         assert_eq!(prompt.confirmation_label(), Some("Revoke all"));
         assert_eq!(prompt.decision(), Some(TerminationDecision::Cancel));
         let notice = DojoPromptUi::RevokeAccess(RevokeAccessUi::notice(
-            "REVOKE ALL ACCESS",
+            "revoke all access",
             "Nothing to revoke.",
         ));
         assert!(notice.is_preview());
@@ -4395,7 +4520,7 @@ mod agent_access_palette_tests {
         assert_eq!(notice.confirmation_label(), None);
         assert_eq!(
             notice.title_and_body(),
-            ("REVOKE ALL ACCESS", "Nothing to revoke.".to_owned())
+            ("revoke all access", "Nothing to revoke.".to_owned())
         );
     }
 }

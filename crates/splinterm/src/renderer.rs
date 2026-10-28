@@ -84,9 +84,8 @@ pub(crate) use icons::{ChromeIcon, chrome_icons_available};
 #[cfg(test)]
 use images::{KITTY_BACKGROUND_Z_THRESHOLD, SnapshotImage, compare_snapshot_images, image_tier};
 pub(crate) use overlays::actions::{
-    CommandPaletteLayout, DojoPromptLayout, PaletteBody, PaletteShape, command_palette_hit_test,
-    command_palette_layout, command_palette_row_hit_test, dojo_prompt_hit_test, dojo_prompt_layout,
-    paint_command_palette, paint_dojo_prompt,
+    CommandPaletteLayout, PaletteBody, PaletteShape, command_palette_hit_test,
+    command_palette_layout, command_palette_row_hit_test, paint_command_palette,
 };
 #[cfg(test)]
 pub(crate) use overlays::explorer::lair_explorer_layout;
@@ -120,6 +119,10 @@ pub(crate) use overlays::picker::{
 };
 pub(crate) use overlays::picker_box::{
     paint_session_picker, picker_status_line, session_picker_layout,
+};
+pub(crate) use overlays::prompt_box::{
+    DojoPromptLayout, dojo_prompt_hit_test, dojo_prompt_layout, dojo_prompt_metrics,
+    paint_dojo_prompt,
 };
 #[cfg(test)]
 use raster::pixel_index;

@@ -28,8 +28,8 @@ pub(crate) use agent_access::{
 };
 pub use agent_access::{
     AccessSnapshot, MAX_WINDOW_ACCESS_ENTRIES, RevokeAllCheck, WindowAccessCommand,
-    WindowAccessUpdate, check_revoke_all, counts_are_empty, revoke_all_summary, shown, shown_name,
-    shown_prompt_name, unsafe_display_character,
+    WindowAccessUpdate, check_revoke_all, counts_are_empty, prompt_name, revoke_all_summary, shown,
+    shown_name, shown_prompt_name, single_line, unsafe_display_character,
 };
 /// An "Always" inventory entry for `lair_id`, for tests outside `frontend`.
 #[cfg(test)]
@@ -69,7 +69,8 @@ pub use picker::{SessionPickerDecision, SessionPickerItem, SessionPickerUi};
 pub(crate) use text_edit::BoundedTextEditor;
 pub use topology::{
     ExplorerContextTarget, LairDirection, LairExplorerActivationTarget, LairPromptKind,
-    LairPromptTarget, SelectorKind, SessionPickerCatalog, SessionPickerCreationTarget,
-    SessionPickerTarget, WindowDojoIdentity, WindowTopologyCommand, WindowTopologyUpdate,
+    LairPromptTarget, NOT_RESTORABLE, SelectorKind, SessionPickerCatalog,
+    SessionPickerCreationTarget, SessionPickerTarget, WindowDojoIdentity, WindowTopologyCommand,
+    WindowTopologyUpdate,
 };
 pub(crate) use trusted_dialog::{TrustedDialogKey, TrustedDialogKind, dialog_font_step};

@@ -1378,8 +1378,20 @@ pub(crate) fn labeled_persistent_lairs<'a>(
     persistent.into_iter().zip(labels).collect()
 }
 
+/// A Lair's display label as the Explorer shows it, "Lair N" for a
+/// generated name, or `None` when `lair_id` is not a persistent Lair in
+/// `lairs`. `lairs` must be the whole catalog in topology order, since the
+/// numbers count the generated names before it.
+#[must_use]
+pub fn lair_display_label(lairs: &[Lair], lair_id: LairId) -> Option<String> {
+    labeled_persistent_lairs(lairs)
+        .into_iter()
+        .find_map(|(lair, label)| (lair.id == lair_id).then_some(label))
+}
+
 /// Display labels for a Lair's Dojos, in order: a generated name becomes "Dojo N".
-pub(crate) fn dojo_labels(lair: &Lair) -> Vec<String> {
+#[must_use]
+pub fn dojo_labels(lair: &Lair) -> Vec<String> {
     friendly_labels(lair.dojos.iter().map(|dojo| dojo.name.as_str()), "Dojo")
 }
 

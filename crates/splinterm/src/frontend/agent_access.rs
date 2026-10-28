@@ -220,6 +220,51 @@ pub fn unsafe_display_character(character: char) -> bool {
         )
 }
 
+/// Untrusted text on one line of a trusted prompt or table: control
+/// characters, tabs and newlines among them, become spaces, and every other
+/// [`unsafe_display_character`] (bidi controls, the line and paragraph
+/// separators, invisible characters) is dropped, so the text can neither add
+/// a line or a table cell nor reorder or hide the text around it.
+#[must_use]
+pub fn single_line(text: &str) -> String {
+    text.chars()
+        .filter_map(|character| {
+            if character.is_control() {
+                Some(' ')
+            } else if unsafe_display_character(character) {
+                None
+            } else {
+                Some(character)
+            }
+        })
+        .collect()
+}
+
+/// A name quoted in a trusted prompt's question: [`single_line`], then cut
+/// at its end to `maximum_cells` cells with `…`, so the question around it
+/// keeps its count and its `?`.
+#[must_use]
+pub fn prompt_name(text: &str, maximum_cells: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+
+    let line = single_line(text);
+    let width = |character: char| character.width().unwrap_or(0).min(2);
+    if line.chars().map(width).sum::<usize>() <= maximum_cells {
+        return line;
+    }
+    let mut fitted = String::new();
+    let mut used = 0_usize;
+    for character in line.chars() {
+        if used + width(character) + 1 > maximum_cells {
+            break;
+        }
+        fitted.push(character);
+        used += width(character);
+    }
+    fitted.push('…');
+    fitted
+}
+
 /// Untrusted display text, escaped and bounded: every
 /// [`unsafe_display_character`] is shown as `\u{…}`, so text can neither
 /// break a line nor reorder or hide the text around it, and long text ends
@@ -1139,7 +1184,7 @@ impl RevokeAccessUi {
                         rule_list(&entry.policy_rules)
                     );
                 }
-                ("REVOKE “ALWAYS” ACCESS", body)
+                ("revoke “always” access", body)
             }
             AccessPrompt::All { counts, recounted } => {
                 let mut body = String::new();
@@ -1152,7 +1197,7 @@ impl RevokeAccessUi {
                 body.push_str(
                     "\nEvery agent grant of every duration ends and waiting requests are cancelled. This Window keeps working.",
                 );
-                ("REVOKE ALL ACCESS", body)
+                ("revoke all access", body)
             }
             AccessPrompt::Notice { title, body } => (*title, body.clone()),
         }
@@ -1833,7 +1878,7 @@ pub(crate) mod tests {
         };
         let mut prompt = RevokeAccessUi::all(counts, false);
         let (title, body) = prompt.title_and_body();
-        assert_eq!(title, "REVOKE ALL ACCESS");
+        assert_eq!(title, "revoke all access");
         assert!(body.starts_with(
             "This removes 2 remembered grants, and ends 1 just-this-once grant, 0 while-open grants, and 1 pending request. Policy rules are not touched."
         ));
@@ -1863,7 +1908,7 @@ pub(crate) mod tests {
             revoke_all_summary(counts, true),
             "Removed 2 remembered grants, and ended 1 just-this-once grant, 0 while-open grants, and 1 pending request. Policy rules are not touched."
         );
-        let notice = RevokeAccessUi::notice("REVOKE ALL ACCESS", "Nothing to revoke.");
+        let notice = RevokeAccessUi::notice("revoke all access", "Nothing to revoke.");
         assert!(notice.is_notice());
         assert_eq!(notice.decision(), None);
         assert_eq!(notice.confirmation_label(), None);

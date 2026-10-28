@@ -8,7 +8,7 @@ use unicode_width::UnicodeWidthChar;
 use crate::{
     color::{
         TEXT_MIN_CONTRAST, contrast_corrected, contrast_corrected_toward, contrast_floor_toward,
-        contrast_ratio, mix_linear, packed_channels, relative_luminance, rgb_channels,
+        contrast_ratio, mix_encoded, mix_linear, packed_channels, relative_luminance, rgb_channels,
     },
     config::{OmarchyShellSettings, ResolvedTheme},
     geometry::Rect,
@@ -372,6 +372,18 @@ pub(crate) struct SessionPickerPalette {
     /// row's title and `›`: mixed toward the selected text until it keeps
     /// 4.5:1 there. The selected fill is opaque, so it needs no coverage.
     pub(crate) selected_accent: u32,
+    /// A field that edits a value, such as a rename: sunken, the panel
+    /// moved a fifth of the way away from the text (darker on a dark
+    /// theme, lighter on a light one), always opaque, with its text and
+    /// accent kept at 4.5:1 on it.
+    pub(crate) field: u32,
+    pub(crate) field_primary: u32,
+    pub(crate) field_accent: u32,
+    /// A selected destructive button, such as Terminate: the danger colour
+    /// as a fill, with its label in `danger_ink`, the panel moved until it
+    /// keeps 4.5:1 there.
+    pub(crate) danger_fill: u32,
+    pub(crate) danger_ink: u32,
     pub(crate) shadow: [u8; 4],
     /// Status tints on the opaque panel and on the selected fill;
     /// `None` when `[explorer] status-colors=no`.
@@ -497,6 +509,17 @@ fn panel_palette(theme: ResolvedTheme, panel: u32) -> SessionPickerPalette {
         contrast_corrected_against_all(secondary, &highlight_states).unwrap_or(secondary);
     let highlight_danger =
         contrast_corrected_against_all(danger, &highlight_states).unwrap_or(danger);
+    // Darker on a dark theme; on a light one, lighter, further, since a
+    // light panel is already near white.
+    let (away_from_text, depth) = if relative_luminance(primary) > relative_luminance(panel) {
+        (0, FIELD_DEPTH)
+    } else {
+        (0x00ff_ffff, LIGHT_FIELD_DEPTH)
+    };
+    let field = mix_encoded(panel, away_from_text, depth);
+    let field_primary = contrast_corrected(primary, field);
+    let field_accent = contrast_floor_toward(roles.accent, field_primary, field, TEXT_MIN_CONTRAST);
+    let danger_ink = contrast_corrected(panel, danger_text);
     let [panel_red, panel_green, panel_blue] = rgb_channels(panel);
     SessionPickerPalette {
         scrim: [red, green, blue, MODAL_SCRIM_ALPHA],
@@ -517,11 +540,22 @@ fn panel_palette(theme: ResolvedTheme, panel: u32) -> SessionPickerPalette {
         highlight_danger,
         accent_text,
         selected_accent,
+        field,
+        field_primary,
+        field_accent,
+        danger_fill: danger_text,
+        danger_ink,
         shadow: [0, 0, 0, 89],
         status_tints: Some(ChromeTints::on(&roles, panel)),
         selected_status_tints: Some(ChromeTints::on(&roles, selected_fill)),
     }
 }
+
+/// How far a sunken field moves from the panel away from the text: on a
+/// dark theme, toward black.
+const FIELD_DEPTH: f64 = 0.2;
+/// On a light theme, toward white.
+const LIGHT_FIELD_DEPTH: f64 = 0.45;
 
 /// How much of the scrim behind a modal panel covers the Window: one level
 /// for every modal list and prompt (the command palette, key bindings,

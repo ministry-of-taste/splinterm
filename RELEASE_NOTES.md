@@ -577,6 +577,27 @@ a hostile program running as your account.
   the current one. A menu is as wide as its widest row, and a Window too
   short for every row closes the menu rather than hide it. The palette's
   "Rename current tab…" and "Rename current Lair…" gain their ellipsis.
+- Prompts (Rename, Terminate, Restore, saved-layout Preview, Revoke) are
+  the same box too, centred and at most 440 px wide: the title in the
+  frame, lowercase, and the keys in its bottom edge
+  (`←→ choose  ↵ select  esc cancel`; a rename's `↵ save  esc cancel`).
+  Enter takes the chosen button. Buttons are bracketed, right-aligned and
+  centred on their labels, `[ Cancel ]` chosen first on the selection fill;
+  a chosen Terminate is on the danger fill, and an unchosen one keeps its
+  label in danger, so neither button disappears. A rename is a sunken field
+  with the current name selected, the accent `›` and a block cursor, names
+  what it renames in its frame, and no longer looks like a selected row. A
+  saved-layout preview is an aligned table of each pane's Dojo, launch
+  recipe and directory (keeping the directory's end, `~` for home) instead
+  of a wrapped paragraph, names the Lair as the Explorer does ("Lair 1",
+  not its internal name), and no longer lists split ratios. Restore lists
+  only the exited panes it would start, so its count matches its rows, and
+  when every pane is still running it says there is nothing to restore,
+  with only Close. A prompt is as tall as its text, so a long
+  name no longer cuts off the question; a name is shown on one line, its
+  control and invisible characters removed. Terminate says "Running
+  programs are stopped." A Window too small for a prompt, or too narrow
+  for its buttons, cancels it rather than hide it.
 - Trusted dialogs (access consent, upgrade, restart) take your theme and its
   `[colors]` keys as they open, always opaque: the frame in `warning`, the
   left "no" button's edge and label in `danger` and the right "yes" button's

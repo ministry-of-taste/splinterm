@@ -5,8 +5,8 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::{
     frontend::{
-        AgentAccessUi, BindingHelpUi, BuiltInCommandId, CommandPaletteUi, DojoPromptUi,
-        TerminationDecision, command_descriptor, shortcut_chips,
+        AgentAccessUi, BindingHelpUi, BuiltInCommandId, CommandPaletteUi, command_descriptor,
+        shortcut_chips,
     },
     geometry::Rect,
     keymap::ResolvedKeymap,
@@ -14,9 +14,7 @@ use crate::{
 
 use super::{
     super::{ChromeTextStyle, RenderContext},
-    chrome_box::{
-        BOX_CLEARANCE, BOX_EDGE, ChromeBox, ChromePainter, opaque, paint_outline, paint_scrim,
-    },
+    chrome_box::{BOX_CLEARANCE, BOX_EDGE, ChromeBox, ChromePainter, opaque, paint_scrim},
     chrome_rows::{
         GROUP_HEIGHT, LIST_MAXIMUM_ROWS, ListRow, ROW_HEIGHT, ROW_PADDING, RowState,
         paint_group_header, paint_row, row_columns, starts_group, title_match, visible_window,
@@ -53,133 +51,11 @@ const PANEL_VERTICAL_MARGIN: u32 = 16;
 /// least [`PANEL_MINIMUM_TOP`] below it.
 const PANEL_TOP_PERCENT: u32 = 15;
 const PANEL_MINIMUM_TOP: u32 = 48;
-const PROMPT_MAX_WIDTH: u32 = 520;
-const PROMPT_MARGIN: u32 = 24;
-const PROMPT_PADDING: u32 = 24;
-const PROMPT_TITLE_HEIGHT: u32 = 34;
-const PROMPT_BODY_HEIGHT: u32 = 42;
-const PREVIEW_BODY_HEIGHT: u32 = 168;
-const PREVIEW_LINE_HEIGHT: u32 = 24;
-const MAX_PREVIEW_LINES: usize = 7;
-const MAX_PREVIEW_LINE_SCALARS: usize = 120;
-const PROMPT_INPUT_HEIGHT: u32 = 38;
-const PROMPT_BUTTON_HEIGHT: u32 = 34;
-const PROMPT_GAP: u32 = 12;
 
 fn preview_text_width(text: &str) -> usize {
     text.chars()
         .map(|character| character.width().unwrap_or(0).min(2))
         .sum()
-}
-
-fn ellipsize_preview_line(line: &mut String, maximum_cells: usize) {
-    if maximum_cells == 0 {
-        line.clear();
-        return;
-    }
-    while preview_text_width(line) >= maximum_cells {
-        line.pop();
-    }
-    line.push('…');
-}
-
-fn bounded_preview_indentation(source: &str, maximum_cells: usize) -> (String, usize) {
-    let mut indentation = String::new();
-    let mut cells = 0_usize;
-    for character in source
-        .chars()
-        .take_while(|character| character.is_whitespace())
-    {
-        let width = character.width().unwrap_or(0).min(2);
-        if cells.saturating_add(width) > maximum_cells {
-            break;
-        }
-        indentation.push(character);
-        cells = cells.saturating_add(width);
-    }
-    (indentation, cells)
-}
-
-fn preview_line_rect(body: Rect, index: usize, line_height: u32) -> Option<Rect> {
-    let y = body.y.saturating_add(
-        u32::try_from(index)
-            .unwrap_or(u32::MAX)
-            .saturating_mul(line_height),
-    );
-    let bottom = body.y.saturating_add(body.height);
-    if y >= bottom {
-        return None;
-    }
-    Some(Rect {
-        y,
-        height: line_height.min(bottom.saturating_sub(y)),
-        ..body
-    })
-}
-
-fn wrap_preview_body(body: &str, maximum_cells: usize) -> Vec<String> {
-    let maximum_cells = maximum_cells.max(1);
-    let mut wrapped = Vec::with_capacity(MAX_PREVIEW_LINES);
-    let mut overflowed = false;
-
-    'source_lines: for source in body.lines() {
-        if wrapped.len() == MAX_PREVIEW_LINES {
-            overflowed = true;
-            break;
-        }
-        if source.is_empty() {
-            wrapped.push(String::new());
-            continue;
-        }
-
-        let (indentation, indentation_cells) =
-            bounded_preview_indentation(source, maximum_cells / 2);
-        let mut remaining = source.trim_start();
-
-        while !remaining.is_empty() {
-            if wrapped.len() == MAX_PREVIEW_LINES {
-                overflowed = true;
-                break 'source_lines;
-            }
-            let available = maximum_cells.saturating_sub(indentation_cells).max(1);
-            let mut used = 0_usize;
-            let mut boundary = 0_usize;
-            let mut whitespace = None;
-            for (offset, character) in remaining.char_indices() {
-                let width = character.width().unwrap_or(0).min(2);
-                if used.saturating_add(width) > available {
-                    break;
-                }
-                used = used.saturating_add(width);
-                boundary = offset.saturating_add(character.len_utf8());
-                if character.is_whitespace() {
-                    whitespace = Some(offset);
-                }
-            }
-            if boundary == remaining.len() {
-                wrapped.push(format!("{indentation}{remaining}"));
-                break;
-            }
-            if boundary == 0 {
-                let consumed = remaining
-                    .chars()
-                    .next()
-                    .map_or(remaining.len(), char::len_utf8);
-                wrapped.push(format!("{indentation}…"));
-                remaining = remaining[consumed..].trim_start();
-                continue;
-            }
-            let split = whitespace.filter(|offset| *offset > 0).unwrap_or(boundary);
-            let chunk = remaining[..split].trim_end();
-            wrapped.push(format!("{indentation}{chunk}"));
-            remaining = remaining[split..].trim_start();
-        }
-    }
-
-    if overflowed && let Some(last) = wrapped.last_mut() {
-        ellipsize_preview_line(last, maximum_cells);
-    }
-    wrapped
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -411,20 +287,6 @@ pub(crate) fn command_palette_row_hit_test(
         .map(|offset| layout.visible_start.saturating_add(offset))
 }
 
-/// An editable `value` after `prefix` with its caret, fitted to `clip_width`
-/// buffer pixels by keeping its end: the caret and the latest input stay
-/// visible and the start gives way behind `…`.
-fn editable_field_text(
-    painter: &mut ChromePainter<'_>,
-    prefix: &str,
-    value: &str,
-    clip_width: u32,
-) -> Result<String> {
-    let (cell_width, _) = painter.cell(ChromeTextStyle::Regular)?;
-    let maximum_cells = usize::try_from(clip_width / cell_width).unwrap_or(usize::MAX);
-    Ok(editable_text(prefix, value, maximum_cells))
-}
-
 /// What the palette's list shows: its commands, the key bindings, or the
 /// **Agent access** list (ADR 0014).
 #[derive(Clone, Copy, Debug)]
@@ -509,16 +371,16 @@ pub(super) fn match_count_label(shown: usize, total: usize, query: &str) -> Stri
 /// Where the input line's parts go, in buffer px: the `›`, the text, and
 /// the block cursor after it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct InputLineLayout {
-    marker: Rect,
-    text_x: u32,
+pub(super) struct InputLineLayout {
+    pub(super) marker: Rect,
+    pub(super) text_x: u32,
     /// The text's end, where the placeholder stops.
-    end: u32,
-    cell: (u32, u32),
+    pub(super) end: u32,
+    pub(super) cell: (u32, u32),
 }
 
 impl InputLineLayout {
-    fn new(input: Rect, inset: u32, cell: (u32, u32)) -> Self {
+    pub(super) fn new(input: Rect, inset: u32, cell: (u32, u32)) -> Self {
         let inset = inset.min(input.width / 2);
         let marker = Rect {
             x: input.x.saturating_add(inset),
@@ -536,7 +398,7 @@ impl InputLineLayout {
 
     /// The typed text that fits with the cursor's cell after it, keeping
     /// its end, and the cursor; `None` when not even the cursor fits.
-    fn fitted(&self, input: Rect, query: &str) -> Option<(String, Rect)> {
+    pub(super) fn fitted(&self, input: Rect, query: &str) -> Option<(String, Rect)> {
         let (cell_width, cell_height) = self.cell;
         let room = self.end.saturating_sub(self.text_x) / cell_width.max(1);
         let fitted = editable_text("", query, usize::try_from(room).unwrap_or(usize::MAX));
@@ -881,311 +743,6 @@ fn paint_command_row(
     )
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct DojoPromptLayout {
-    pub(crate) panel: Rect,
-    pub(crate) title: Rect,
-    pub(crate) body: Rect,
-    pub(crate) input: Option<Rect>,
-    pub(crate) cancel: Option<Rect>,
-    pub(crate) terminate: Option<Rect>,
-}
-
-#[must_use]
-#[allow(clippy::too_many_lines, reason = "shared bounded prompt geometry")]
-pub(crate) fn dojo_prompt_layout(content: Rect, state: &DojoPromptUi) -> Option<DojoPromptLayout> {
-    if content.width == 0 || content.height == 0 {
-        return None;
-    }
-    let margin = PROMPT_MARGIN.min(content.width / 4).min(content.height / 4);
-    let width = PROMPT_MAX_WIDTH.min(content.width.saturating_sub(margin.saturating_mul(2)));
-    let controls_height = if state.is_rename() {
-        PROMPT_INPUT_HEIGHT
-    } else {
-        PROMPT_BUTTON_HEIGHT
-    };
-    let body_height = if state.uses_layout_summary() {
-        PREVIEW_BODY_HEIGHT
-    } else {
-        PROMPT_BODY_HEIGHT
-    };
-    let height = PROMPT_PADDING
-        .saturating_mul(2)
-        .saturating_add(PROMPT_TITLE_HEIGHT)
-        .saturating_add(body_height)
-        .saturating_add(PROMPT_GAP.saturating_mul(2))
-        .saturating_add(controls_height);
-    if width < 180 || content.height < height.saturating_add(margin.saturating_mul(2)) {
-        return None;
-    }
-    let panel = Rect {
-        x: content
-            .x
-            .saturating_add(content.width.saturating_sub(width) / 2),
-        y: content
-            .y
-            .saturating_add(content.height.saturating_sub(height) / 2),
-        width,
-        height,
-    };
-    let inner_width = width.saturating_sub(PROMPT_PADDING.saturating_mul(2));
-    let title = Rect {
-        x: panel.x.saturating_add(PROMPT_PADDING),
-        y: panel.y.saturating_add(PROMPT_PADDING),
-        width: inner_width,
-        height: PROMPT_TITLE_HEIGHT,
-    };
-    let body = Rect {
-        x: title.x,
-        y: title
-            .y
-            .saturating_add(title.height)
-            .saturating_add(PROMPT_GAP),
-        width: inner_width,
-        height: body_height,
-    };
-    let controls_y = body
-        .y
-        .saturating_add(body.height)
-        .saturating_add(PROMPT_GAP);
-    let (input, cancel, terminate) = if state.is_rename() {
-        (
-            Some(Rect {
-                x: title.x,
-                y: controls_y,
-                width: inner_width,
-                height: PROMPT_INPUT_HEIGHT,
-            }),
-            None,
-            None,
-        )
-    } else if state.is_preview() {
-        (
-            None,
-            Some(Rect {
-                x: title.x,
-                y: controls_y,
-                width: inner_width,
-                height: PROMPT_BUTTON_HEIGHT,
-            }),
-            None,
-        )
-    } else {
-        let button_width = inner_width.saturating_sub(PROMPT_GAP) / 2;
-        (
-            None,
-            Some(Rect {
-                x: title.x,
-                y: controls_y,
-                width: button_width,
-                height: PROMPT_BUTTON_HEIGHT,
-            }),
-            Some(Rect {
-                x: title
-                    .x
-                    .saturating_add(button_width)
-                    .saturating_add(PROMPT_GAP),
-                y: controls_y,
-                width: button_width,
-                height: PROMPT_BUTTON_HEIGHT,
-            }),
-        )
-    };
-    Some(DojoPromptLayout {
-        panel,
-        title,
-        body,
-        input,
-        cancel,
-        terminate,
-    })
-}
-
-#[must_use]
-pub(crate) fn dojo_prompt_hit_test(
-    layout: &DojoPromptLayout,
-    point: (f64, f64),
-) -> Option<TerminationDecision> {
-    if layout.cancel.is_some_and(|rect| contains(rect, point)) {
-        Some(TerminationDecision::Cancel)
-    } else if layout.terminate.is_some_and(|rect| contains(rect, point)) {
-        Some(TerminationDecision::Terminate)
-    } else {
-        None
-    }
-}
-
-/// A Dojo prompt choice's label. The confirming choice of a prompt that
-/// ends running terminals, Terminate a Dojo or a Lair, is drawn in danger,
-/// selected or not; another prompt's, Restore or Revoke, in the accent
-/// until it is selected, as before.
-fn dojo_prompt_choice_color(
-    palette: &SessionPickerPalette,
-    state: &DojoPromptUi,
-    decision: TerminationDecision,
-    selected: bool,
-) -> u32 {
-    let confirming = decision == TerminationDecision::Terminate;
-    match (confirming && state.confirmation_destructive(), selected) {
-        (true, true) => palette.selected_danger,
-        (true, false) => palette.danger,
-        (false, true) => palette.selected_primary,
-        (false, false) if confirming => palette.selected_rail,
-        (false, false) => palette.primary,
-    }
-}
-
-#[allow(
-    clippy::too_many_arguments,
-    clippy::too_many_lines,
-    reason = "trusted Dojo prompts share one bounded painter and composition transaction"
-)]
-pub(crate) fn paint_dojo_prompt(
-    cache: &mut SessionPickerTextCache,
-    context: &RenderContext,
-    canvas: &mut [u8],
-    width: u32,
-    height: u32,
-    content_rect: Rect,
-    scale_120: u32,
-    renderer_generation: u64,
-    layout: &DojoPromptLayout,
-    palette: SessionPickerPalette,
-    state: &DojoPromptUi,
-    keyboard_focused: bool,
-) -> Result<()> {
-    let mut painter = ChromePainter::new(
-        cache,
-        context,
-        canvas,
-        width,
-        height,
-        scale_120,
-        renderer_generation,
-    );
-    let scrim = painter.buffer_rect(content_rect);
-    paint_scrim(&mut painter, scrim, &palette);
-    let panel = painter.buffer_rect(layout.panel);
-    painter.fill(panel, palette.panel_fill);
-    let border = painter.border();
-    paint_outline(
-        &mut painter,
-        panel,
-        border,
-        if keyboard_focused {
-            palette.focused_frame
-        } else {
-            palette.frame
-        },
-    );
-    let (title, body) = state.title_and_body();
-    let title_rect = painter.buffer_rect(layout.title);
-    painter.text(
-        title,
-        ChromeTextStyle::Bold,
-        title_rect,
-        PickerTextAlignment::Left,
-        palette.primary,
-    )?;
-    let body_rect = painter.buffer_rect(layout.body);
-    if state.uses_layout_summary() {
-        let line_height = painter.scaled(PREVIEW_LINE_HEIGHT);
-        let (cell_width, _) = painter.cell(ChromeTextStyle::Regular)?;
-        let maximum_cells = usize::try_from(body_rect.width / cell_width)
-            .unwrap_or(MAX_PREVIEW_LINE_SCALARS)
-            .min(MAX_PREVIEW_LINE_SCALARS);
-        for (index, line) in wrap_preview_body(&body, maximum_cells).iter().enumerate() {
-            let Some(line_rect) = preview_line_rect(body_rect, index, line_height) else {
-                break;
-            };
-            painter.text(
-                line,
-                ChromeTextStyle::Regular,
-                line_rect,
-                PickerTextAlignment::Left,
-                palette.secondary,
-            )?;
-        }
-    } else {
-        painter.text(
-            &body,
-            ChromeTextStyle::Regular,
-            body_rect,
-            PickerTextAlignment::Left,
-            palette.secondary,
-        )?;
-    }
-    if let Some(prompt_input) = state.input() {
-        let input = painter.buffer_rect(layout.input.expect("rename input exists"));
-        painter.fill(input, opaque(palette.selected_fill));
-        let inset = painter.scaled(12);
-        let input_clip = Rect {
-            x: input.x.saturating_add(inset),
-            width: input.width.saturating_sub(inset.saturating_mul(2)),
-            ..input
-        };
-        let field = editable_field_text(&mut painter, "> ", prompt_input, input_clip.width)?;
-        painter.text(
-            &field,
-            ChromeTextStyle::Regular,
-            input_clip,
-            PickerTextAlignment::Left,
-            palette.selected_primary,
-        )?;
-    } else if state.is_preview() {
-        let rect = painter.buffer_rect(layout.cancel.expect("preview close exists"));
-        painter.fill(rect, opaque(palette.selected_fill));
-        painter.text(
-            "Close",
-            ChromeTextStyle::Bold,
-            rect,
-            PickerTextAlignment::Left,
-            palette.selected_primary,
-        )?;
-    } else {
-        let selected_decision = state.decision().expect("confirmation decision exists");
-        let confirmation_label = state
-            .confirmation_label()
-            .expect("confirmation label exists");
-        for (decision, rect, label) in [
-            (
-                TerminationDecision::Cancel,
-                layout.cancel.expect("cancel exists"),
-                "Cancel",
-            ),
-            (
-                TerminationDecision::Terminate,
-                layout.terminate.expect("terminate exists"),
-                confirmation_label,
-            ),
-        ] {
-            let rect = painter.buffer_rect(rect);
-            let selected = selected_decision == decision;
-            painter.fill(
-                rect,
-                if selected {
-                    opaque(palette.selected_fill)
-                } else {
-                    palette.panel_fill
-                },
-            );
-            painter.text(
-                label,
-                if selected {
-                    ChromeTextStyle::Bold
-                } else {
-                    ChromeTextStyle::Regular
-                },
-                rect,
-                PickerTextAlignment::Left,
-                dojo_prompt_choice_color(&palette, state, decision, selected),
-            )?;
-        }
-    }
-    painter.finish();
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1267,45 +824,6 @@ mod tests {
             .pixel_width()
     }
 
-    #[test]
-    fn preview_body_wraps_to_available_cells_and_marks_bounded_overflow() {
-        let body = "Not restored: terminal/scrollback bodies, process memory, shell state, environment, clipboard, images";
-        let wrapped = wrap_preview_body(body, 48);
-        assert!(wrapped.len() > 1);
-        assert!(wrapped.iter().all(|line| preview_text_width(line) <= 48));
-        assert_eq!(wrapped.concat().replace(' ', ""), body.replace(' ', ""));
-
-        let overflow = wrap_preview_body(&format!("{body}\n").repeat(8), 24);
-        assert_eq!(overflow.len(), MAX_PREVIEW_LINES);
-        assert!(overflow.last().is_some_and(|line| line.ends_with('…')));
-        assert!(overflow.iter().all(|line| preview_text_width(line) <= 24));
-
-        let wide_indentation = wrap_preview_body("\u{3000}\u{3000}wide words here", 8);
-        assert!(
-            wide_indentation
-                .iter()
-                .all(|line| preview_text_width(line) <= 8)
-        );
-    }
-
-    #[test]
-    fn fractional_preview_line_rects_remain_inside_the_buffer_body() {
-        let body = buffer_rect(
-            Rect {
-                x: 24,
-                y: 36,
-                width: 472,
-                height: PREVIEW_BODY_HEIGHT,
-            },
-            121,
-        );
-        let line_height = PREVIEW_LINE_HEIGHT.saturating_mul(121).div_ceil(120);
-        for index in 0..MAX_PREVIEW_LINES {
-            let line = preview_line_rect(body, index, line_height).unwrap();
-            assert!(line.y >= body.y);
-            assert!(line.y.saturating_add(line.height) <= body.y.saturating_add(body.height));
-        }
-    }
     #[test]
     fn layout_is_bounded_selected_visible_and_hit_targets_are_half_open() {
         let commands = vec![
@@ -1856,22 +1374,6 @@ mod tests {
     fn editable_fields_keep_their_caret() {
         assert_eq!(editable_text("> ", "dojo", 20), "> dojo_");
         assert_eq!(editable_text("> ", "my-long-dojo-name", 12), "> …ojo-name_");
-
-        let context = RenderContext::new(u16::MAX);
-        let mut cache = SessionPickerTextCache::default();
-        for scale in [120, 150, 180, 240] {
-            let (cell, _) = cache
-                .cell_metrics(&context, ChromeTextStyle::Regular, scale, 1)
-                .unwrap();
-            let clip = cell * 12;
-            let mut canvas = vec![0_u8; 4];
-            let mut painter = ChromePainter::new(&mut cache, &context, &mut canvas, 1, 1, scale, 1);
-            let field = editable_field_text(&mut painter, "> ", "my-long-dojo-name", clip).unwrap();
-            assert_eq!(field, "> …ojo-name_", "scale {scale}");
-            let short = editable_field_text(&mut painter, "> ", "dojo", clip).unwrap();
-            assert_eq!(short, "> dojo_");
-            painter.finish();
-        }
     }
 
     /// Every fixed chrome line is tall enough for the largest UI text.
@@ -1879,163 +1381,9 @@ mod tests {
     fn fixed_chrome_lines_fit_the_largest_ui_text() {
         use super::super::super::text::CHROME_MAXIMUM_LINE_HEIGHT;
 
-        for height in [
-            ROW_HEIGHT,
-            GROUP_HEIGHT,
-            INPUT_HEIGHT,
-            DETAIL_HEIGHT,
-            PREVIEW_LINE_HEIGHT,
-            PROMPT_TITLE_HEIGHT,
-            PROMPT_INPUT_HEIGHT,
-            PROMPT_BUTTON_HEIGHT,
-        ] {
+        for height in [ROW_HEIGHT, GROUP_HEIGHT, INPUT_HEIGHT, DETAIL_HEIGHT] {
             assert!(height >= CHROME_MAXIMUM_LINE_HEIGHT);
         }
-    }
-
-    #[test]
-    #[allow(clippy::too_many_lines, reason = "one shared prompt paint scenario")]
-    fn dojo_prompts_are_bounded_default_cancel_and_half_open() {
-        let content = Rect {
-            x: 0,
-            y: 34,
-            width: 640,
-            height: 366,
-        };
-        let rename = DojoPromptUi::rename(
-            DojoId::new(),
-            "captured".to_owned(),
-            2,
-            vec![(SplintId::new(), 1), (SplintId::new(), 2)],
-        );
-        let rename_layout = dojo_prompt_layout(content, &rename).unwrap();
-        // The Dojo may be renamed from the Explorer without being open as a tab.
-        assert_eq!(rename.title_and_body().0, "RENAME DOJO");
-        assert!(rename_layout.input.is_some());
-        assert!(rename_layout.cancel.is_none());
-        assert!(contains(
-            content,
-            (
-                f64::from(rename_layout.panel.x),
-                f64::from(rename_layout.panel.y)
-            )
-        ));
-
-        let terminate = DojoPromptUi::terminate(
-            DojoId::new(),
-            "captured".to_owned(),
-            3,
-            vec![
-                (SplintId::new(), 1),
-                (SplintId::new(), 2),
-                (SplintId::new(), 3),
-            ],
-        );
-        let layout = dojo_prompt_layout(content, &terminate).unwrap();
-        let cancel = layout.cancel.unwrap();
-        let destructive = layout.terminate.unwrap();
-        assert_eq!(
-            dojo_prompt_hit_test(&layout, (f64::from(cancel.x), f64::from(cancel.y))),
-            Some(TerminationDecision::Cancel)
-        );
-        assert_eq!(
-            dojo_prompt_hit_test(
-                &layout,
-                (
-                    f64::from(destructive.x + destructive.width),
-                    f64::from(destructive.y)
-                )
-            ),
-            None
-        );
-        let mut canvas = vec![0_u8; 640 * 400 * 4];
-        let mut cache = SessionPickerTextCache::default();
-        paint_dojo_prompt(
-            &mut cache,
-            &RenderContext::new(u16::MAX),
-            &mut canvas,
-            640,
-            400,
-            content,
-            120,
-            1,
-            &layout,
-            session_picker_palette(ResolvedTheme::default()),
-            &terminate,
-            true,
-        )
-        .unwrap();
-        assert!(canvas.iter().any(|byte| *byte != 0));
-        assert!(cache.len() <= 4);
-        let DojoPromptUi::Terminate(confirmation) = terminate else {
-            unreachable!();
-        };
-        assert_eq!(confirmation.decision(), TerminationDecision::Cancel);
-
-        let target = crate::frontend::LairPromptTarget {
-            topology_revision: splinterm_core::TopologyRevision::new(9),
-            lair_id: LairId::new(),
-            dojo_id: None,
-            name: "saved".to_owned(),
-            retention: splinterm_core::LairRetention::Saved,
-            preview: format!(
-                "Lair: saved\nDojo: shell\n  Horizontal split 758/1000\n    shell — Application: /usr/bin/bash — /home/oldjobobo/Projects/splinterm\n    shell — Shell — /home/oldjobobo/Projects/splinterm\n  shell — Shell — /home/oldjobobo/Projects/splinterm\nNot restored: {}",
-                "terminal/scrollback bodies, process memory, shell state, environment, clipboard, images".repeat(4)
-            ),
-            targets: Vec::new(),
-        };
-        let preview = DojoPromptUi::preview_lair(target.clone());
-        let preview_layout = dojo_prompt_layout(content, &preview).unwrap();
-        assert!(preview_layout.cancel.is_some());
-        assert!(preview_layout.terminate.is_none());
-        assert_eq!(preview_layout.body.height, PREVIEW_BODY_HEIGHT);
-        canvas.fill(0);
-        paint_dojo_prompt(
-            &mut cache,
-            &RenderContext::new(u16::MAX),
-            &mut canvas,
-            640,
-            400,
-            content,
-            120,
-            1,
-            &preview_layout,
-            session_picker_palette(ResolvedTheme::default()),
-            &preview,
-            true,
-        )
-        .unwrap();
-        assert!(canvas.iter().any(|byte| *byte != 0));
-
-        let restore = DojoPromptUi::restore_lair(target);
-        let restore_layout = dojo_prompt_layout(content, &restore).unwrap();
-        assert!(restore_layout.cancel.is_some());
-        assert!(restore_layout.terminate.is_some());
-        assert_eq!(restore_layout.body.height, PREVIEW_BODY_HEIGHT);
-        assert!(
-            restore
-                .title_and_body()
-                .1
-                .starts_with("Restore 0 captured Splints?")
-        );
-        assert_eq!(restore.confirmation_label(), Some("Restore"));
-        canvas.fill(0);
-        paint_dojo_prompt(
-            &mut cache,
-            &RenderContext::new(u16::MAX),
-            &mut canvas,
-            640,
-            400,
-            content,
-            120,
-            1,
-            &restore_layout,
-            session_picker_palette(ResolvedTheme::default()),
-            &restore,
-            true,
-        )
-        .unwrap();
-        assert!(canvas.iter().any(|byte| *byte != 0));
     }
 
     #[test]
@@ -2373,11 +1721,11 @@ mod tests {
         assert!(text > 0, "fully covered glyph pixels stay opaque text");
     }
 
-    /// Terminate is drawn in danger in the command palette, the tab menu and
-    /// the Dojo prompt; every other row and choice keeps its colour, and
-    /// Restore and Revoke confirm in the accent, as before.
+    /// Terminate is drawn in danger in the command palette and the tab menu;
+    /// every other row keeps its colour. The prompts' buttons are pinned in
+    /// `prompt_box`.
     #[test]
-    fn only_terminate_rows_and_choices_are_drawn_in_danger() {
+    fn only_terminate_rows_are_drawn_in_danger() {
         let palette = session_picker_palette(ResolvedTheme::default());
         assert_ne!(palette.danger, palette.primary);
         for command in BuiltInCommandId::ALL.iter().copied() {
@@ -2400,54 +1748,5 @@ mod tests {
             );
             assert_eq!(action.destructive(), destructive, "{action:?}");
         }
-
-        let terminate = DojoPromptUi::terminate(
-            DojoId::new(),
-            "captured".to_owned(),
-            1,
-            vec![(SplintId::new(), 1)],
-        );
-        let target = crate::frontend::LairPromptTarget {
-            topology_revision: splinterm_core::TopologyRevision::new(9),
-            lair_id: LairId::new(),
-            dojo_id: None,
-            name: "saved".to_owned(),
-            retention: splinterm_core::LairRetention::Saved,
-            preview: "Lair: saved".to_owned(),
-            targets: Vec::new(),
-        };
-        let terminate_lair = DojoPromptUi::terminate_lair(target.clone());
-        let restore = DojoPromptUi::restore_lair(target);
-        let confirm = TerminationDecision::Terminate;
-        let cancel = TerminationDecision::Cancel;
-        for prompt in [&terminate, &terminate_lair] {
-            assert!(prompt.confirmation_destructive());
-            assert_eq!(
-                dojo_prompt_choice_color(&palette, prompt, confirm, false),
-                palette.danger
-            );
-            assert_eq!(
-                dojo_prompt_choice_color(&palette, prompt, confirm, true),
-                palette.selected_danger
-            );
-            assert_eq!(
-                dojo_prompt_choice_color(&palette, prompt, cancel, false),
-                palette.primary
-            );
-        }
-        assert!(!restore.confirmation_destructive());
-        assert_eq!(restore.confirmation_label(), Some("Restore"));
-        assert_eq!(
-            dojo_prompt_choice_color(&palette, &restore, confirm, false),
-            palette.selected_rail
-        );
-        assert_eq!(
-            dojo_prompt_choice_color(&palette, &restore, confirm, true),
-            palette.selected_primary
-        );
-        assert_eq!(
-            dojo_prompt_choice_color(&palette, &restore, cancel, true),
-            palette.selected_primary
-        );
     }
 }

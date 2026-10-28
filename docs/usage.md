@@ -219,6 +219,16 @@ Restore/Terminate require confirmation with Cancel selected initially. Escape
 cancels a menu or dialog.
 Stale targets are rejected rather than redirected to the active item.
 
+Prompts sit centred over the dimmed Window, in the same box as the palette,
+with their keys in the bottom edge. A rename is a sunken field holding the
+current name, selected so typing replaces it, and the frame names what it
+renames: Enter saves, Escape cancels. A confirmation asks its question over
+`[ Cancel ]` and the confirming button, right-aligned; the arrows or Tab
+choose, Enter takes the chosen button, Escape cancels. A chosen Terminate is
+filled in the danger colour. A saved-layout preview lists each pane as a row
+of Dojo, launch recipe and directory. A Window too small to show a prompt,
+or too narrow for its buttons, cancels it.
+
 Launcher-generated `terminal-<timestamp>-<pid>` names appear as compact **Lair 1**,
 **Lair 2**, etc. Generated or empty Dojo and pane labels similarly fall back to
 **Dojo N** and **Terminal N**. Meaningful custom names are preserved, and aliases
@@ -733,8 +743,14 @@ Retention state has a narrow meaning:
   Splint has exited. It does not mean a process is running or will start
   automatically.
 
-Preview is body-free. It identifies tree shape, ratios, working directories, and
-each leaf as a known application recipe, a shell, or lacking a restorable recipe.
+Preview is body-free. It lists each pane as a row: its Dojo, its launch recipe
+(the application's file name and arguments, `shell` for a shell, or
+`not restorable` when it has none) and its working directory, with `~` for your
+home directory, and names the Lair and its Dojos as the Explorer does. Restore
+lists only the exited panes it would start, so its count matches its rows; when
+every pane is still running, it says there is nothing to restore and offers
+only Close. The recipe comes from the saved layout, never from the title a
+program set.
 Splinterm does not infer foreground applications from `/proc`, titles, prompts,
 or terminal output and does not save process memory, PTYs, editor state, shell
 state, environment values, secrets, terminal bodies, scrollback, clipboard, or
