@@ -414,9 +414,10 @@ lasts.
 - A pending request ends without a grant if it expires, the agent cancels it,
   the adapter exits, the workspace is closed, the person uses Revoke all
   access, or the daemon upgrades.
-- A prompt that expires unanswered counts like a deny. The next call for it
-  fails once with `cancelled` ("the access prompt expired without an
-  answer"), instead of opening a new prompt.
+- A prompt that expires unanswered counts like a deny. The call waiting at
+  that moment, or else the agent's next call for it, fails once with
+  `cancelled` ("the access prompt expired without an answer"), instead of
+  opening a new prompt.
 - After a deny or an expiry, a new request for that workspace fails with the
   retryable `resource_limit` for a few seconds.
 - If nothing can show the prompt, the request fails with `consent_unavailable`

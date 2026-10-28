@@ -452,13 +452,14 @@ impl PendingAccess {
             .count()
     }
 
-    /// Admits one call: it collects its own uncollected deny, joins its
-    /// process's pending request for the same workspace and scopes, or opens
-    /// a new one. `open_pidfd` pins the requester and runs only for a new
-    /// request.
+    /// Admits one call: it collects its own uncollected deny or expiry, joins
+    /// its process's pending request for the same workspace and scopes, or
+    /// opens a new one. `open_pidfd` pins the requester and runs only for a
+    /// new request.
     ///
     /// # Errors
-    /// The requester's earlier deny (`consent_denied`, once); a different
+    /// The requester's earlier deny (`consent_denied`, once) or unanswered
+    /// expiry (`cancelled`, once); a different
     /// request already pending for this process and workspace
     /// (`resource_limit`, naming it); the deny cooldown (`rate_limited`); the
     /// daemon-wide bound (`resource_limit`); a requester that cannot be
@@ -521,7 +522,7 @@ impl PendingAccess {
         {
             return Err(ProtocolError::new(
                 ErrorCode::RateLimited,
-                "access to this workspace was just denied; retry later",
+                "access to this workspace was just denied or expired unanswered; retry later",
             ));
         }
         if inner.entries.len() >= MAX_PENDING_TOTAL {

@@ -472,8 +472,9 @@ agent collects your answer by asking again, without a new prompt. The prompt
 counts the time left down at the right of its top edge, such as
 `denies in 1:42`. Once it runs out, the Allow button is disabled and nothing
 grants; the prompt then closes and the request ends unanswered, without
-access. After you deny a request, the same agent cannot ask again for that
-workspace for a few seconds. Closing the prompt denies.
+access, and the agent learns once that it expired. After you deny a request,
+or let its prompt run out, the same agent cannot ask again for that workspace
+for a few seconds. Closing the prompt denies.
 
 If nothing can show the prompt, the request fails with `consent_unavailable`
 at once: "no Splinterm Window or approver connected to this computer can show
