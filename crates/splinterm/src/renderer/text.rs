@@ -12,7 +12,8 @@ use crate::geometry::Rect;
 use crate::theme::ChromeTint;
 
 use super::{
-    GlyphKey, RenderContext, SnapshotFrame, SnapshotGlyph, blend_glyph,
+    BOX_DRAWING_FACE, CachedGlyph, GlyphKey, RenderContext, SnapshotFrame, SnapshotGlyph,
+    blend_glyph,
     icons::{ChromeIcon, ICON_FACE, IconCell, icon_glyph},
     packed_rgb, round_to_i32, u32_to_f32,
 };
@@ -278,6 +279,38 @@ const fn chrome_attributes(style: ChromeTextStyle) -> CellAttributes {
     }
 }
 
+/// Redraws each Braille glyph of a chrome frame, such as the agent spinner,
+/// with [`crate::box_drawing::chrome_braille`]'s larger dots. The frame path
+/// draws Braille with Foot's terminal geometry, whose dots are a quarter of
+/// a chrome cell's width apart and read as specks beside chrome text.
+fn enlarge_braille(frame: &mut SnapshotFrame) {
+    let braille = 0x2800_u16..=0x28ff;
+    for placed in &frame.glyphs {
+        if placed.key.face != BOX_DRAWING_FACE || !braille.contains(&placed.key.glyph) {
+            continue;
+        }
+        let Some(character) = char::from_u32(u32::from(placed.key.glyph)) else {
+            continue;
+        };
+        let Some(mask) =
+            crate::box_drawing::chrome_braille(character, frame.cell_width, frame.cell_height)
+        else {
+            continue;
+        };
+        frame.cache.insert(
+            placed.key,
+            std::sync::Arc::new(CachedGlyph {
+                content: swash::scale::image::Content::Mask,
+                left: 0,
+                top: frame.baseline,
+                width: mask.width,
+                height: mask.height,
+                data: mask.data,
+            }),
+        );
+    }
+}
+
 /// Adds each icon to a chrome frame as a mask glyph at its slot's first cell.
 /// Icons past the frame or missing from the face leave their blank cells.
 fn place_icons(
@@ -492,6 +525,7 @@ impl ChromeText {
             context,
             maximum_cell_height,
         )?;
+        enlarge_braille(&mut frame);
         place_icons(&mut frame, icons, cell_count)?;
         Ok(Self {
             frame,
@@ -588,6 +622,31 @@ mod tests {
             0x12_34_56,
         );
         assert!(canvas.as_chunks::<4>().0.iter().any(|pixel| pixel[3] != 0));
+    }
+
+    /// The agent spinner is a Braille frame: chrome draws it with the larger
+    /// chrome dots, not Foot's terminal dots, at the chrome cell's size.
+    #[test]
+    fn chrome_text_draws_braille_with_the_larger_chrome_dots() {
+        let text = ChromeText::load("a⠋b", 120).unwrap();
+        let frame = &text.frame;
+        let placed = frame
+            .glyphs
+            .iter()
+            .find(|placed| placed.key.face == BOX_DRAWING_FACE)
+            .expect("the spinner frame is a drawn glyph");
+        assert_eq!(placed.column, 1);
+        let glyph = &frame.cache[&placed.key];
+        let expected =
+            crate::box_drawing::chrome_braille('⠋', frame.cell_width, frame.cell_height).unwrap();
+        assert_eq!(
+            (glyph.width, glyph.height, &glyph.data),
+            (expected.width, expected.height, &expected.data)
+        );
+        let terminal =
+            crate::box_drawing::generate('⠋', frame.cell_width, frame.cell_height, 1).unwrap();
+        let inked = |data: &[u8]| data.iter().filter(|alpha| **alpha != 0).count();
+        assert!(inked(&glyph.data) > inked(&terminal.data));
     }
 
     /// VM case E6: chrome once drew terminal-sized glyphs inside fixed
