@@ -19,6 +19,17 @@ pub(super) fn search_panel_damage(previous: Option<Rect>, current: Option<Rect>)
     rects
 }
 
+/// The surface damage a frame owes the control transfer notices (Plan 0067
+/// M4): each one drawn now, since its legend follows the keymap and the
+/// focused pane, and each one last drawn where none is now. A notice that
+/// moves above the search strip and back, or clears, would otherwise stay
+/// on screen where it was, as the search field would.
+pub(super) fn control_notice_damage(previous: &[Rect], current: &[Rect]) -> Vec<Rect> {
+    let mut rects = current.to_vec();
+    rects.extend(previous.iter().filter(|rect| !current.contains(rect)));
+    rects
+}
+
 pub(super) fn terminal_draw_waits_for_frame(frame_pending: bool, _buffer_available: bool) -> bool {
     frame_pending
 }
@@ -234,6 +245,36 @@ mod tests {
         assert_eq!(
             search_panel_damage(Some(at(8)), Some(at(300))),
             vec![at(300), at(8)]
+        );
+    }
+
+    #[test]
+    fn control_notice_damage_covers_each_notice_and_where_it_was() {
+        let at = |y| Rect {
+            x: 120,
+            y,
+            width: 360,
+            height: 72,
+        };
+        assert!(control_notice_damage(&[], &[]).is_empty());
+        // Shown, or still shown: the notice itself.
+        assert_eq!(control_notice_damage(&[], &[at(400)]), vec![at(400)]);
+        assert_eq!(control_notice_damage(&[at(400)], &[at(400)]), vec![at(400)]);
+        // Cleared: where it was.
+        assert_eq!(control_notice_damage(&[at(400)], &[]), vec![at(400)]);
+        // Moved above the search strip, and back when it closes.
+        assert_eq!(
+            control_notice_damage(&[at(400)], &[at(320)]),
+            vec![at(320), at(400)]
+        );
+        assert_eq!(
+            control_notice_damage(&[at(320)], &[at(400)]),
+            vec![at(400), at(320)]
+        );
+        // One pane's notice cleared while another's stays.
+        assert_eq!(
+            control_notice_damage(&[at(100), at(400)], &[at(400)]),
+            vec![at(400), at(100)]
         );
     }
 

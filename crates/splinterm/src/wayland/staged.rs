@@ -321,6 +321,7 @@ impl App {
         self.wipe_phase_input();
         // Nothing reaches the ended phase's owner any more.
         self.panes.pane.commands = None;
+        self.panes.pane.pending_control_transfer = None;
         self.panes.pane.updates = None;
         self.panes.pane.controller_active = false;
     }

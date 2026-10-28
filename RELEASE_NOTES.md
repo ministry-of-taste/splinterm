@@ -716,10 +716,11 @@ a hostile program running as your account.
   acquire it without `takeover`.
 - A pane an agent asks to control now says so: a notice at the bottom of the
   pane, in the warning colour, names the keys that accept and deny
-  (`Ctrl+Shift+Y` and `Ctrl+Shift+N`, or your own if you remapped them). It
-  never takes focus or switches your tab, and it clears once the request is
-  answered, cancelled or unanswered for about 15 seconds. The Window title now
-  names your remapped keys too.
+  (`Ctrl+Shift+Y` and `Ctrl+Shift+N`, or your own if you remapped them); a
+  pane that is not focused says to focus it first. It never takes focus or
+  switches your tab, and it clears once the request is answered, cancelled or
+  unanswered for about 15 seconds. The Window title now names your remapped
+  keys too.
 - `splinterm.new_dojo` needs only `lair_id`: the name, directory, and command
   default to the next "Dojo N", your home, and your login shell, as when you
   open a Dojo yourself. `create_lair` and `split_splint` no longer require

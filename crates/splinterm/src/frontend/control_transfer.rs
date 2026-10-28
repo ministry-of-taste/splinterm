@@ -34,7 +34,24 @@ impl ControlTransferKeys {
             .map(|(key, verb)| (key.as_str(), *verb))
             .collect()
     }
+
+    /// The legend for a pane whose keys are `answerable`. The keys answer
+    /// only the focused pane, so another pane that is asked says to focus it
+    /// first; a click there focuses the pane as any click does and never
+    /// answers.
+    #[must_use]
+    pub(crate) fn legend_for(&self, answerable: bool) -> Vec<(&str, &str)> {
+        if answerable {
+            self.legend_pairs()
+        } else {
+            vec![CONTROL_TRANSFER_FOCUS_HINT]
+        }
+    }
 }
+
+/// The legend of a pane that is asked but not focused, where the keys would
+/// answer the focused pane instead.
+const CONTROL_TRANSFER_FOCUS_HINT: (&str, &str) = ("click", "to focus, then answer");
 
 fn legend_key(display: &str) -> String {
     shortcut_chips(display).join(" ")
@@ -96,6 +113,10 @@ mod tests {
             [("ctrl shift y", "accept"), ("ctrl shift n", "deny")]
         );
         assert_eq!(keys.title, "Ctrl+Shift+Y accept / Ctrl+Shift+N deny");
+        assert_eq!(keys.legend_for(true), keys.legend_pairs());
+        // A pane that is asked but not focused says to focus it first: the
+        // keys would answer the focused pane.
+        assert_eq!(keys.legend_for(false), [("click", "to focus, then answer")]);
         assert_eq!(
             control_transfer_keys(&built_in_keymap(KeymapProfile::OmarchyTmux)),
             keys
