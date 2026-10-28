@@ -380,18 +380,23 @@ pub(in crate::app) enum Command {
     /// Answer agent access requests in this terminal.
     ///
     /// For a computer with no Splinterm Window to show the access prompt,
-    /// such as a headless host you reach over SSH. Run it in your own
-    /// terminal on the computer splinterd runs on, not inside a Splinterm
-    /// pane or a tmux or screen session started from one: splinterd refuses
-    /// it there, so agents cannot start it for themselves. Only the installed
-    /// splinterm beside the running splinterd may answer.
+    /// such as a headless host you reach over SSH. Run it directly in your
+    /// own terminal on the computer splinterd runs on, such as an SSH login,
+    /// not inside a Splinterm pane or a tmux or screen session started from
+    /// one. splinterd refuses it inside a Splint, inside the requesting
+    /// agent's process tree or session, and, when workloads run in systemd
+    /// units, inside a Splint scope or Dojo slice, and it never offers a
+    /// request to an approver in that agent's tree or session. Only the
+    /// installed splinterm beside the running splinterd may answer. Inside
+    /// tmux or screen, or a terminal with remote control, other programs can
+    /// send it keys; see ADR 0015's residual risks.
     ///
     /// Each request shows its agent, program, workspace and access, starts
     /// on Deny, and counts down. Keys typed before it appears are thrown
-    /// away, and keys count only a moment after it appears. Up/Down or j/k
-    /// choose, Enter answers; Escape, q or Ctrl+C deny. When the time runs
-    /// out nothing is sent. Ctrl+C with no request waiting quits. There is
-    /// no option that answers without you.
+    /// away, pasted text is ignored, and keys count only a moment after it
+    /// appears. Up/Down or j/k choose, Enter answers; Escape, q or Ctrl+C
+    /// deny. When the time runs out nothing is sent. Ctrl+C with no request
+    /// waiting quits. There is no option that answers without you.
     #[command(verbatim_doc_comment)]
     Approvals,
     /// Inspect or start a live daemon upgrade that keeps terminals running.
@@ -876,11 +881,12 @@ mod tests {
         let approvals = command.find_subcommand_mut("approvals").unwrap();
         let help = approvals.render_long_help().to_string();
         for expected in [
-            "not inside a Splinterm",
-            "pane or a tmux or screen session started from one",
-            "agents cannot start it for themselves",
+            "not inside a Splinterm pane or a tmux or screen session started from\none",
+            "inside a Splint scope or Dojo slice",
+            "ADR 0015's residual risks",
             "starts\non Deny",
-            "no option that answers without you",
+            "pasted text is ignored",
+            "There is no option that answers without you.",
         ] {
             assert!(help.contains(expected), "missing {expected:?} in {help}");
         }

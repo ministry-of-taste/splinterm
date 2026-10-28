@@ -7,16 +7,23 @@
 //! as text, with the same request, host row, and escaping as the dialog
 //! (`consent::consent_request_lines`).
 //!
-//! It answers only when a person at that terminal does. It refuses to start
+//! It answers only on a key read from its terminal. It refuses to start
 //! without a terminal on standard input and output that is its controlling
 //! terminal, and has no flag that answers by itself. Each prompt starts on
-//! **Deny**; the keys typed before it appeared are thrown away, and every key
-//! is ignored for [`ARMING_DELAY`] after it appears, so type-ahead cannot
-//! answer it. Moving to an Allow choice arms Enter only after
-//! [`SELECTION_ARMING_DELAY`], as choosing a duration rearms the dialog.
-//! Escape, `q`, and Ctrl+C deny. Once the countdown runs out nothing is sent.
-//! The daemon checks again that the approver runs outside every Splint and
-//! outside the requester, and refuses it otherwise.
+//! **Deny**; the keys typed before it appeared are thrown away, every key is
+//! ignored for [`ARMING_DELAY`] after it appears, and pasted text is ignored,
+//! so type-ahead cannot answer it. Moving to an Allow choice arms Enter only
+//! after [`SELECTION_ARMING_DELAY`], as choosing a duration rearms the
+//! dialog. Escape, `q`, and Ctrl+C deny. Once the countdown runs out nothing
+//! is sent.
+//!
+//! The daemon refuses the approver inside a Splint, inside the requester's
+//! process tree or session, and, with workload units, inside a Splint scope
+//! or Dojo slice; it also never offers a request to an approver inside that
+//! requester's tree or session. These checks do not stop a same-user program
+//! that sends keys to the terminal (a multiplexer's or terminal's remote
+//! control, or a write to the pseudo-terminal), nor one that starts the
+//! approver outside every tree: ADR 0015's residual risks.
 //!
 //! Rendering, key decoding and the prompt's state are pure, so they are
 //! tested without a terminal: [`Approver`] turns offers, withdrawals, keys,
@@ -50,9 +57,10 @@ use splinterm::{
     },
 };
 use splinterm_protocol::{
-    ConsentDecision, ConsentOffer, ConsentOfferEnd, ConsentOfferNonce, ConsentOrigin,
-    ConsentPrompt, ConsentResponderKind, ErrorCode, GrantDuration, MAX_DAEMON_HOSTNAME_BYTES,
-    ProtocolError, Request, Response, ServerFrame, SubscriptionEvent,
+    CONSENT_APPROVER_NEEDS_TERMINAL, CONSENT_RESPONDER_IDENTITY_CHANGED, ConsentDecision,
+    ConsentOffer, ConsentOfferEnd, ConsentOfferNonce, ConsentOrigin, ConsentPrompt,
+    ConsentResponderKind, ErrorCode, GrantDuration, MAX_DAEMON_HOSTNAME_BYTES, ProtocolError,
+    Request, Response, ServerFrame, SubscriptionEvent, TRUSTED_UI_REQUIRES_INSTALLED_CLIENT,
 };
 use tokio::{
     signal::unix::{Signal, SignalKind, signal},
@@ -76,8 +84,9 @@ const SELECTION_ARMING_DELAY: Duration = Duration::from_millis(600);
 /// How often the countdown and the terminal's size are checked.
 const TICK: Duration = Duration::from_millis(200);
 
-/// The longest the daemon gets to check and register the approver.
-const SUBSCRIBE_DEADLINE: Duration = Duration::from_secs(10);
+/// The longest connecting, the handshake, and registering the approver take
+/// together before it backs off and tries again.
+const CONNECT_DEADLINE: Duration = Duration::from_secs(10);
 
 /// The longest the daemon gets to settle an answer.
 const ANSWER_DEADLINE: Duration = Duration::from_secs(10);
@@ -89,7 +98,15 @@ const MAX_REASON_CHARS: usize = 200;
 const MIN_COLUMNS: usize = 20;
 
 /// Where an approver must run, as its refusals say.
-const OWN_TERMINAL: &str = "Run `splinterm approvals` in your own terminal on this computer, such as an SSH login or a terminal Splinterm does not own, not inside a Splinterm pane or a tmux or screen session started from one. Agents cannot start it for themselves.";
+const OWN_TERMINAL: &str = "splinterd refuses an approver inside a Splint, inside the requesting agent's process tree or session, and, when workloads run in systemd units, inside a Splint scope or Dojo slice, where a tmux or screen session started from a Splinterm pane stays. Run `splinterm approvals` directly in your own terminal on this computer, such as an SSH login, not inside a Splinterm pane or a tmux or screen session started from one.";
+
+/// The warning printed when the approver runs inside a terminal
+/// multiplexer, whose clients can send it keys.
+const MULTIPLEXER_WARNING: &str = "Running inside tmux/screen: any program you run can send keys to this approver. Prefer a plain SSH login or terminal.";
+
+/// Printed when a reconnect's handshake is refused because this client's
+/// file was replaced, typically by a package upgrade.
+const REPLACED: &str = "This splinterm was replaced since it started, for example by a package upgrade. Run `splinterm approvals` again.";
 
 /// Too many responders are connected.
 const TOO_MANY: &str = "Too many approvers or remote Windows are connected to splinterd already. Close one, then run `splinterm approvals` again.";
@@ -159,7 +176,7 @@ impl TerminalRefusal {
     pub(super) const fn message(self) -> &'static str {
         match self {
             Self::NotATerminal => {
-                "splinterm approvals answers only a person at a terminal: run it in a terminal, with standard input and output on that terminal and not redirected"
+                "splinterm approvals answers only from a terminal: run it in a terminal, with standard input and output on that terminal and not redirected"
             }
             Self::NoControllingTerminal => {
                 "splinterm approvals needs a controlling terminal: run it in a terminal you type in, such as an SSH login"
@@ -208,56 +225,114 @@ pub(super) enum Key {
     Other,
 }
 
-/// The keys in one read of raw terminal input. An arrow is `ESC [ A` or
-/// `ESC O A` (and `B`); any other escape sequence is one [`Key::Other`], and
-/// a lone ESC is [`Key::Escape`]. An ESC whose sequence was cut by the read
-/// reads as Escape, which only ever denies.
-pub(super) fn decode_keys(bytes: &[u8]) -> Vec<Key> {
-    let mut keys = Vec::new();
-    let mut index = 0;
-    while let Some(&byte) = bytes.get(index) {
-        index += 1;
-        let key = match byte {
-            0x1b => match bytes.get(index) {
-                None => Key::Escape,
-                Some(b'[') => {
-                    let start = index + 1;
-                    let end = bytes[start..]
-                        .iter()
-                        .position(|byte| (0x40..=0x7e).contains(byte))
-                        .map_or(bytes.len(), |offset| start + offset);
-                    index = (end + 1).min(bytes.len());
-                    match (bytes.get(end), end == start) {
-                        (Some(b'A'), true) => Key::Up,
-                        (Some(b'B'), true) => Key::Down,
-                        _ => Key::Other,
-                    }
+/// What a terminal in bracketed paste mode sends before and after pasted
+/// text.
+const PASTE_START: &[u8] = b"\x1b[200~";
+const PASTE_END: &[u8] = b"\x1b[201~";
+
+/// Turns raw terminal input into keys, read by read. Pasted text, between
+/// [`PASTE_START`] and [`PASTE_END`], is no key at all, so a paste can never
+/// answer; a marker cut in two by a read is still recognised.
+#[derive(Debug, Default)]
+pub(super) struct KeyDecoder {
+    pasting: bool,
+    /// The end of the last read, kept when it may be the start of a marker.
+    carry: Vec<u8>,
+}
+
+impl KeyDecoder {
+    pub(super) fn decode(&mut self, bytes: &[u8]) -> Vec<Key> {
+        let mut data = std::mem::take(&mut self.carry);
+        data.extend_from_slice(bytes);
+        let mut keys = Vec::new();
+        let mut index = 0;
+        while index < data.len() {
+            let rest = &data[index..];
+            if self.pasting {
+                if let Some(at) = rest
+                    .windows(PASTE_END.len())
+                    .position(|window| window == PASTE_END)
+                {
+                    index += at + PASTE_END.len();
+                    self.pasting = false;
+                    continue;
                 }
-                Some(b'O') => {
-                    let final_byte = bytes.get(index + 1).copied();
-                    index = (index + 2).min(bytes.len());
-                    match final_byte {
-                        Some(b'A') => Key::Up,
-                        Some(b'B') => Key::Down,
-                        _ => Key::Other,
-                    }
-                }
-                // Alt with a key.
-                Some(_) => {
-                    index += 1;
-                    Key::Other
-                }
-            },
-            b'\r' | b'\n' => Key::Enter,
-            b'k' => Key::Up,
-            b'j' => Key::Down,
-            b'q' | b'Q' => Key::Quit,
-            0x03 => Key::Interrupt,
-            _ => Key::Other,
-        };
-        keys.push(key);
+                // The end marker may be cut by this read; the rest is pasted.
+                let keep = rest.len().min(PASTE_END.len() - 1);
+                self.carry = rest[rest.len() - keep..].to_vec();
+                return keys;
+            }
+            if rest.starts_with(PASTE_START) {
+                index += PASTE_START.len();
+                self.pasting = true;
+                continue;
+            }
+            // A start marker cut by this read. A lone ESC, or ESC [, is
+            // never kept back, so Escape still answers at once.
+            if rest.len() >= 3 && rest.len() < PASTE_START.len() && PASTE_START.starts_with(rest) {
+                self.carry = rest.to_vec();
+                return keys;
+            }
+            let (key, next) = decode_key(&data, index);
+            keys.push(key);
+            index = next;
+        }
+        keys
     }
-    keys
+}
+
+/// The keys in one read of raw terminal input, as a fresh [`KeyDecoder`]
+/// reads them.
+#[cfg(test)]
+pub(super) fn decode_keys(bytes: &[u8]) -> Vec<Key> {
+    KeyDecoder::default().decode(bytes)
+}
+
+/// The key at `index` of `bytes`, and where the next one starts. An arrow is
+/// `ESC [ A` or `ESC O A` (and `B`); any other escape sequence is one
+/// [`Key::Other`], and a lone ESC is [`Key::Escape`]. An ESC whose sequence
+/// was cut by the read reads as Escape, which only ever denies.
+fn decode_key(bytes: &[u8], index: usize) -> (Key, usize) {
+    let mut index = index + 1;
+    let key = match bytes[index - 1] {
+        0x1b => match bytes.get(index) {
+            None => Key::Escape,
+            Some(b'[') => {
+                let start = index + 1;
+                let end = bytes[start..]
+                    .iter()
+                    .position(|byte| (0x40..=0x7e).contains(byte))
+                    .map_or(bytes.len(), |offset| start + offset);
+                index = (end + 1).min(bytes.len());
+                match (bytes.get(end), end == start) {
+                    (Some(b'A'), true) => Key::Up,
+                    (Some(b'B'), true) => Key::Down,
+                    _ => Key::Other,
+                }
+            }
+            Some(b'O') => {
+                let final_byte = bytes.get(index + 1).copied();
+                index = (index + 2).min(bytes.len());
+                match final_byte {
+                    Some(b'A') => Key::Up,
+                    Some(b'B') => Key::Down,
+                    _ => Key::Other,
+                }
+            }
+            // Alt with a key.
+            Some(_) => {
+                index += 1;
+                Key::Other
+            }
+        },
+        b'\r' | b'\n' => Key::Enter,
+        b'k' => Key::Up,
+        b'j' => Key::Down,
+        b'q' | b'Q' => Key::Quit,
+        0x03 => Key::Interrupt,
+        _ => Key::Other,
+    };
+    (key, index)
 }
 
 // ---------------------------------------------------------------------------
@@ -388,9 +463,12 @@ pub(super) enum AnswerResult {
     NotFound,
     /// The daemon did not accept the duration; the offer is still open.
     InvalidArgument,
-    /// The connection was lost before the daemon confirmed it.
+    /// The daemon did not confirm it: the connection ended, timed out, or
+    /// failed as a whole, or the daemon was handing off. It may or may not
+    /// have counted.
     Lost,
-    /// The daemon refused it, for this (escaped) reason.
+    /// The daemon refused this approver's answers (`Unauthorized`), for
+    /// this (escaped) reason; it commits nothing.
     Refused(String),
 }
 
@@ -422,6 +500,7 @@ impl Approver {
     }
 
     /// Whether a prompt is on screen.
+    #[cfg(test)]
     pub(super) const fn prompting(&self) -> bool {
         self.open.is_some()
     }
@@ -459,6 +538,14 @@ impl Approver {
             return vec![Effect::Print(
                 "Ignored an access request from another splinterd generation.".to_owned(),
             )];
+        }
+        // The same offer again changes nothing: no reprint, no re-arm.
+        if self
+            .open
+            .as_ref()
+            .is_some_and(|open| open.offer_id == offer.offer_id)
+        {
+            return Vec::new();
         }
         let mut effects = Vec::new();
         if self.open.is_some() {
@@ -560,6 +647,8 @@ impl Approver {
             AnswerResult::InvalidArgument => {
                 open.notice =
                     Some("splinterd did not accept that duration, and nothing was granted. Choose again.");
+                // Back to Deny, so a quick Enter cannot repeat the grant.
+                open.selected = 0;
                 open.rearm(now);
                 self.open = Some(open);
                 self.countdown = None;
@@ -570,7 +659,7 @@ impl Approver {
                     .to_owned()
             }
             AnswerResult::Refused(reason) => {
-                format!("splinterd refused the answer, and nothing was granted: {reason}")
+                format!("splinterd no longer accepts answers from this approver, and nothing was granted: {reason}")
             }
         };
         vec![Effect::Print(line)]
@@ -805,10 +894,12 @@ pub(super) fn paint(lines: &[DialogLine], columns: usize) -> Vec<String> {
     rows
 }
 
-/// How many terminal rows `rows`, painted for `columns`, take: a row of
-/// wide characters wider than the terminal wraps onto more.
+/// How many terminal rows `rows`, painted for `columns`, take, as the
+/// terminal lays them out: a character that does not fit in what is left of
+/// a row starts the next one. A character of ambiguous width counts as two
+/// cells, as a CJK terminal draws it, so the count is never too low.
 pub(super) fn terminal_rows(rows: &[String], columns: usize) -> usize {
-    use unicode_width::UnicodeWidthStr as _;
+    use unicode_width::UnicodeWidthChar as _;
 
     let columns = columns.max(1);
     rows.iter()
@@ -816,7 +907,17 @@ pub(super) fn terminal_rows(rows: &[String], columns: usize) -> usize {
             let text = [BOLD, DIM, REVERSE, RESET]
                 .iter()
                 .fold(row.clone(), |text, code| text.replace(code, ""));
-            text.width().div_ceil(columns).max(1)
+            let mut taken = 1;
+            let mut column = 0;
+            for character in text.chars() {
+                let width = character.width_cjk().unwrap_or(0).min(2);
+                if column + width > columns {
+                    taken += 1;
+                    column = 0;
+                }
+                column += width;
+            }
+            taken
         })
         .sum()
 }
@@ -835,21 +936,28 @@ pub(super) enum Attempt {
     Unavailable(String),
 }
 
-/// What a refusal of `error` tells the person.
-pub(super) fn classify(error: &anyhow::Error) -> Attempt {
+/// What a refusal of `error` tells the person. `connected_once` says
+/// whether this approver was connected before, so a refused handshake means
+/// its own file was replaced since.
+pub(super) fn classify(error: &anyhow::Error, connected_once: bool) -> Attempt {
     let Some(refusal) = protocol_error(error) else {
         return Attempt::Unavailable(format!(
             "cannot reach splinterd: {}",
             shown(&format!("{error:#}"), MAX_REASON_CHARS)
         ));
     };
-    classify_refusal(refusal)
+    classify_refusal(refusal, connected_once)
 }
 
 /// What the daemon's refusal tells the person.
-pub(super) fn classify_refusal(refusal: &ProtocolError) -> Attempt {
+pub(super) fn classify_refusal(refusal: &ProtocolError, connected_once: bool) -> Attempt {
     let reason = shown(&refusal.message, MAX_REASON_CHARS);
     match refusal.code {
+        ErrorCode::Unauthorized
+            if connected_once && refusal.message == TRUSTED_UI_REQUIRES_INSTALLED_CLIENT =>
+        {
+            Attempt::Refused(format!("{REPLACED}\n(splinterd: {reason})"))
+        }
         ErrorCode::Unauthorized => Attempt::Refused(format!(
             "{}\n(splinterd: {reason})",
             unauthorized_guidance(&refusal.message)
@@ -863,31 +971,34 @@ pub(super) fn classify_refusal(refusal: &ProtocolError) -> Attempt {
     }
 }
 
-/// The guidance for one `Unauthorized` refusal, by the daemon's reason.
+/// The guidance for one `Unauthorized` refusal, by the daemon's reason
+/// (the protocol's shared reason strings); any other reason is about where
+/// the approver runs.
 fn unauthorized_guidance(message: &str) -> &'static str {
-    if message.contains("installed graphical client") {
-        "Only the installed splinterm beside the running splinterd can answer access requests (for a package, /usr/bin/splinterm). Run that one, not a development build or a copy."
-    } else if message.contains("no longer runs the installed") {
-        "This splinterm was replaced since it started, for example by an upgrade. Run `splinterm approvals` again."
-    } else if message.contains("own terminal") {
-        "Run `splinterm approvals` directly in your own terminal, with standard input and output on it and not redirected."
-    } else {
-        OWN_TERMINAL
+    match message {
+        TRUSTED_UI_REQUIRES_INSTALLED_CLIENT => {
+            "Only the installed splinterm beside the running splinterd can answer access requests (for a package, /usr/bin/splinterm). Run that one, not a development build or a copy."
+        }
+        CONSENT_RESPONDER_IDENTITY_CHANGED => REPLACED,
+        CONSENT_APPROVER_NEEDS_TERMINAL => {
+            "Run `splinterm approvals` directly in your own terminal, with standard input and output on it and not redirected."
+        }
+        _ => OWN_TERMINAL,
     }
 }
 
 /// Connects to this computer's daemon as the installed client and
 /// subscribes as the terminal approver.
-async fn connect_approver() -> Result<(Connection, u64), Attempt> {
+async fn connect_approver(connected_once: bool) -> Result<(Connection, u64), Attempt> {
     let mut connection = Connection::connect()
         .await
-        .map_err(|error| classify(&error))?;
+        .map_err(|error| classify(&error, connected_once))?;
     match connection
         .request_with_deadline(
             Request::SubscribeConsentOffers {
                 kind: ConsentResponderKind::Terminal,
             },
-            SUBSCRIBE_DEADLINE,
+            CONNECT_DEADLINE,
         )
         .await
     {
@@ -902,25 +1013,40 @@ async fn connect_approver() -> Result<(Connection, u64), Attempt> {
                 "the connection to splinterd ended while it checked the approver".to_owned(),
             ))
         }
-        Err(error) => Err(classify(&error)),
+        Err(error) => Err(classify(&error, connected_once)),
     }
 }
 
 /// Sends one answer and waits for the daemon to settle it.
 async fn send_answer(connection: &mut Connection, answer: Answer) -> AnswerResult {
-    match connection
+    let reply = connection
         .request_with_deadline(answer.request(), ANSWER_DEADLINE)
-        .await
-    {
+        .await;
+    answer_outcome(reply, connection.is_usable())
+}
+
+/// What the daemon's reply to an answer means. `usable` says whether the
+/// connection survived it: an error that ended the connection was about the
+/// connection, not this answer. Only the three refusals of the answer itself
+/// are told apart: `NotFound`, `InvalidArgument`, and `Unauthorized`, after
+/// which this approver's answers commit nothing. Anything else, a handoff,
+/// an internal or connection-wide error (such as the close of a lagging
+/// responder), a timeout, or an unexpected response, leaves the answer
+/// unconfirmed, and the approver connects again.
+pub(super) fn answer_outcome(reply: Result<Response>, usable: bool) -> AnswerResult {
+    match reply {
         Ok(Response::ConsentOfferAnswered) => AnswerResult::Answered,
-        Ok(_) => AnswerResult::Refused("splinterd sent an unexpected response".to_owned()),
+        Ok(_) => AnswerResult::Lost,
+        Err(_) if !usable => AnswerResult::Lost,
         Err(error) => match protocol_error(&error) {
             Some(refusal) if refusal.code == ErrorCode::NotFound => AnswerResult::NotFound,
             Some(refusal) if refusal.code == ErrorCode::InvalidArgument => {
                 AnswerResult::InvalidArgument
             }
-            Some(refusal) => AnswerResult::Refused(shown(&refusal.message, MAX_REASON_CHARS)),
-            None => AnswerResult::Lost,
+            Some(refusal) if refusal.code == ErrorCode::Unauthorized => {
+                AnswerResult::Refused(shown(&refusal.message, MAX_REASON_CHARS))
+            }
+            _ => AnswerResult::Lost,
         },
     }
 }
@@ -1066,6 +1192,11 @@ impl<S: Screen> Session<S> {
     /// Keys read at `at`, up to the first one that answers or quits.
     pub(super) fn keys(&mut self, at: Instant, keys: &[Key]) -> Option<Flow> {
         for key in keys {
+            // An Allow answer counts only while the whole prompt fits: look
+            // at the size again rather than trust the last tick's.
+            if *key == Key::Enter && self.shown && self.screen.size() != self.size {
+                self.draw(at);
+            }
             let effects = self.approver.key(*key, at);
             if let Some(flow) = self.apply(effects, at) {
                 return Some(flow);
@@ -1095,7 +1226,10 @@ impl<S: Screen> Session<S> {
         let mut connected_once = false;
         let mut waiting_said = false;
         loop {
-            match connect_approver().await {
+            let Some(attempt) = self.connect(connected_once, signals).await else {
+                return Ok(());
+            };
+            match attempt {
                 Ok((mut connection, subscription_id)) => {
                     backoff = ReconnectBackoff::default();
                     if connected_once {
@@ -1133,6 +1267,40 @@ impl<S: Screen> Session<S> {
             }
             if self.pause(backoff.next_delay(), signals).await {
                 return Ok(());
+            }
+        }
+    }
+
+    /// One connection attempt, bounded by [`CONNECT_DEADLINE`]; `None` when
+    /// Ctrl+C, a signal, or the end of input quits first. In raw mode Ctrl+C
+    /// is only a key, so it must be read here too.
+    async fn connect(
+        &mut self,
+        connected_once: bool,
+        signals: &mut Signals,
+    ) -> Option<Result<(Connection, u64), Attempt>> {
+        let mut attempt = Box::pin(tokio::time::timeout(
+            CONNECT_DEADLINE,
+            connect_approver(connected_once),
+        ));
+        loop {
+            tokio::select! {
+                result = &mut attempt => {
+                    return Some(result.unwrap_or_else(|_| {
+                        Err(Attempt::Unavailable(
+                            "splinterd did not answer the approver in time".to_owned(),
+                        ))
+                    }));
+                }
+                () = signals.recv() => return None,
+                input = self.keys.recv() => match input {
+                    Some(Input::Keys(at, keys)) => {
+                        if self.keys(at, &keys) == Some(Flow::Quit) {
+                            return None;
+                        }
+                    }
+                    Some(Input::End) | None => return None,
+                },
             }
         }
     }
@@ -1193,23 +1361,26 @@ impl<S: Screen> Session<S> {
                 Some(Flow::Answer(answer)) => {
                     let result = send_answer(connection, answer).await;
                     let lost = result == AnswerResult::Lost;
-                    let refused = matches!(&result, AnswerResult::Refused(_));
+                    let refused = match &result {
+                        AnswerResult::Refused(reason) => Some(format!(
+                            "{}\n(splinterd: {reason})",
+                            unauthorized_guidance(reason)
+                        )),
+                        _ => None,
+                    };
                     let now = Instant::now();
                     let effects = self.approver.settle(result, now);
                     if self.apply(effects, now) == Some(Flow::Quit) {
                         return End::Quit;
                     }
                     if lost {
-                        return End::Lost("The connection to splinterd ended.".to_owned());
+                        return End::Lost("splinterd did not confirm the answer.".to_owned());
                     }
-                    if refused && !self.approver.prompting() {
+                    if let Some(message) = refused {
                         // The daemon no longer takes this approver's
-                        // answers, typically because the client was
-                        // replaced; a new one must start.
-                        return End::Refused(
-                            "splinterd no longer accepts answers from this approver. Run `splinterm approvals` again."
-                                .to_owned(),
-                        );
+                        // answers, for example because its file was
+                        // replaced; trying again cannot help.
+                        return End::Refused(message);
                     }
                 }
             }
@@ -1224,17 +1395,28 @@ impl<S: Screen> Session<S> {
 /// restoring on exit, on panic, and on a signal.
 static SAVED_MODES: Mutex<Option<Termios>> = Mutex::new(None);
 static ALTERNATE_SCREEN: AtomicBool = AtomicBool::new(false);
+static BRACKETED_PASTE: AtomicBool = AtomicBool::new(false);
 static PANIC_HOOK: Once = Once::new();
 
 const ENTER_SCREEN: &str = "\x1b[?1049h\x1b[?25l";
 const LEAVE_SCREEN: &str = "\x1b[?25h\x1b[?1049l";
+/// Asks the terminal to mark pasted text, so a paste is never read as keys.
+const ENABLE_PASTE_MARKS: &str = "\x1b[?2004h";
+const DISABLE_PASTE_MARKS: &str = "\x1b[?2004l";
 
-/// Puts the terminal back as it was: the main screen, the cursor, and the
-/// saved modes. Safe to call more than once.
+/// Puts the terminal back as it was: the main screen, the cursor, paste
+/// marks off, and the saved modes. Safe to call more than once.
 fn restore_terminal() {
+    let mut text = String::new();
     if ALTERNATE_SCREEN.swap(false, Ordering::SeqCst) {
+        text.push_str(LEAVE_SCREEN);
+    }
+    if BRACKETED_PASTE.swap(false, Ordering::SeqCst) {
+        text.push_str(DISABLE_PASTE_MARKS);
+    }
+    if !text.is_empty() {
         let mut stdout = io::stdout();
-        let _ = stdout.write_all(LEAVE_SCREEN.as_bytes());
+        let _ = stdout.write_all(text.as_bytes());
         let _ = stdout.flush();
     }
     let saved = SAVED_MODES.lock().map_or_else(
@@ -1260,7 +1442,9 @@ impl RawTerminal {
         raw.local_modes
             .remove(LocalModes::ICANON | LocalModes::ECHO | LocalModes::ISIG | LocalModes::IEXTEN);
         raw.input_modes.remove(InputModes::ICRNL | InputModes::IXON);
-        raw.special_codes[SpecialCodeIndex::VMIN] = 1;
+        // A read returns at once, even with nothing waiting, so a flush
+        // between the poll and the read can never leave it blocked.
+        raw.special_codes[SpecialCodeIndex::VMIN] = 0;
         raw.special_codes[SpecialCodeIndex::VTIME] = 0;
         *SAVED_MODES
             .lock()
@@ -1274,6 +1458,8 @@ impl RawTerminal {
         });
         rustix::termios::tcsetattr(&stdin, OptionalActions::Now, &raw)
             .context("cannot set the terminal's modes")?;
+        BRACKETED_PASTE.store(true, Ordering::SeqCst);
+        TtyScreen::write(ENABLE_PASTE_MARKS);
         Ok(Self)
     }
 }
@@ -1358,20 +1544,31 @@ impl KeyReader {
             .spawn(move || {
                 let stdin = io::stdin();
                 let input = stdin.as_fd();
+                let mut decoder = KeyDecoder::default();
+                let hung_up = PollFlags::HUP | PollFlags::ERR | PollFlags::NVAL;
                 while !stopping.load(Ordering::SeqCst) {
                     let mut descriptors = [PollFd::new(&input, PollFlags::IN)];
                     match poll(&mut descriptors, Some(&SLICE)) {
-                        Ok(0) | Err(rustix::io::Errno::INTR) => continue,
+                        Ok(0) | Err(rustix::io::Errno::INTR | rustix::io::Errno::AGAIN) => {
+                            continue;
+                        }
                         Ok(_) => {}
                         Err(_) => {
                             let _ = sender.blocking_send(Input::End);
                             return;
                         }
                     }
+                    let events = descriptors[0].revents();
                     let mut chunk = [0_u8; 64];
                     let read = match rustix::io::read(input, &mut chunk) {
-                        Ok(0) | Err(_) => Input::End,
-                        Ok(read) => Input::Keys(Instant::now(), decode_keys(&chunk[..read])),
+                        // With VMIN 0 an empty read is either a hang-up or
+                        // input flushed since the poll.
+                        Ok(0) if events.intersects(hung_up) => Input::End,
+                        Ok(0) | Err(rustix::io::Errno::INTR | rustix::io::Errno::AGAIN) => {
+                            continue;
+                        }
+                        Ok(read) => Input::Keys(Instant::now(), decoder.decode(&chunk[..read])),
+                        Err(_) => Input::End,
                     };
                     let end = read == Input::End;
                     if sender.blocking_send(read).is_err() || end {
@@ -1424,10 +1621,22 @@ impl Signals {
     }
 }
 
+/// The warning to print first when the approver runs inside tmux (`$TMUX`)
+/// or screen (`$STY`). It warns and goes on: the person chose the terminal.
+fn multiplexer_warning(tmux: bool, screen: bool) -> Option<&'static str> {
+    (tmux || screen).then_some(MULTIPLEXER_WARNING)
+}
+
 /// `splinterm approvals`.
 pub(super) async fn run() -> Result<()> {
     if let Err(refusal) = check_terminal(&TerminalFacts::read()) {
         bail!(refusal.message());
+    }
+    if let Some(warning) = multiplexer_warning(
+        std::env::var_os("TMUX").is_some(),
+        std::env::var_os("STY").is_some(),
+    ) {
+        println!("{warning}");
     }
     let mut signals = Signals::install()?;
     let terminal = RawTerminal::enter()?;
@@ -1444,19 +1653,22 @@ pub(super) async fn run() -> Result<()> {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use splinterm::frontend::unsafe_display_character;
+    use splinterm::{automation::response_protocol_error, frontend::unsafe_display_character};
     use splinterm_core::LairId;
     use splinterm_protocol::{
-        AccessLevel, CONSENT_OFFER_NONCE_BYTES, ConsentDecision, ConsentDurationOffer,
-        ConsentOffer, ConsentOfferEnd, ConsentOfferNonce, ConsentTarget, DurationWithheld,
-        ErrorCode, GrantDuration, OfferedConsentPrompt, ProtocolError, Request,
+        AccessLevel, CONSENT_APPROVER_NEEDS_TERMINAL, CONSENT_OFFER_NONCE_BYTES,
+        CONSENT_RESPONDER_IDENTITY_CHANGED, ConsentDecision, ConsentDurationOffer, ConsentOffer,
+        ConsentOfferEnd, ConsentOfferNonce, ConsentTarget, DurationWithheld, ErrorCode,
+        GrantDuration, OfferedConsentPrompt, ProtocolError, Request, Response,
+        TRUSTED_UI_REQUIRES_INSTALLED_CLIENT,
     };
     use tokio::sync::mpsc;
 
     use super::{
         ARMING_DELAY, AnswerResult, Approver, Attempt, BOLD, Choice, DIM, Effect, Flow, Input, Key,
-        MIN_COLUMNS, RESET, REVERSE, SELECTION_ARMING_DELAY, Screen, Session, TerminalFacts,
-        TerminalRefusal, check_terminal, classify_refusal, decode_keys, paint, waiting_line,
+        KeyDecoder, MIN_COLUMNS, REPLACED, RESET, REVERSE, SELECTION_ARMING_DELAY, Screen, Session,
+        TerminalFacts, TerminalRefusal, answer_outcome, check_terminal, classify_refusal,
+        decode_keys, multiplexer_warning, paint, waiting_line,
     };
 
     const GENERATION: u64 = 7;
@@ -2070,12 +2282,12 @@ mod tests {
 
     #[test]
     fn a_refusal_says_where_to_run_the_approver() {
-        let refused = |code, message: &str| classify_refusal(&ProtocolError::new(code, message));
+        let refused =
+            |code, message: &str| classify_refusal(&ProtocolError::new(code, message), false);
         for message in [
             "a consent responder must run outside every Splint",
             "a consent responder must run outside the requester",
             "this connection's process could not be verified",
-            "a consent responder must run outside every workload cgroup",
         ] {
             let Attempt::Refused(guidance) = refused(ErrorCode::Unauthorized, message) else {
                 panic!("{message} was not a refusal");
@@ -2086,23 +2298,29 @@ mod tests {
                 ),
                 "{guidance}"
             );
-            assert!(guidance.contains("Agents cannot start it for themselves."));
+            assert!(guidance.contains("inside a Splint scope or Dojo slice"));
+            assert!(!guidance.contains("cannot start"), "{guidance}");
             assert!(guidance.ends_with(&format!("(splinterd: {message})")));
         }
         let Attempt::Refused(installed) = refused(
             ErrorCode::Unauthorized,
-            "trusted UI role requires the installed graphical client",
+            TRUSTED_UI_REQUIRES_INSTALLED_CLIENT,
         ) else {
             panic!("not a refusal");
         };
         assert!(installed.contains("Only the installed splinterm beside the running splinterd"));
-        let Attempt::Refused(terminal) = refused(
-            ErrorCode::Unauthorized,
-            "the approver needs its own terminal on standard input and output",
-        ) else {
+        let Attempt::Refused(terminal) =
+            refused(ErrorCode::Unauthorized, CONSENT_APPROVER_NEEDS_TERMINAL)
+        else {
             panic!("not a refusal");
         };
         assert!(terminal.contains("not redirected"), "{terminal}");
+        let Attempt::Refused(changed) =
+            refused(ErrorCode::Unauthorized, CONSENT_RESPONDER_IDENTITY_CHANGED)
+        else {
+            panic!("not a refusal");
+        };
+        assert!(changed.starts_with(REPLACED), "{changed}");
         let Attempt::Refused(many) = refused(
             ErrorCode::ResourceLimit,
             "too many consent responders are connected",
@@ -2119,6 +2337,193 @@ mod tests {
             panic!("not a refusal");
         };
         assert!(!escaped.contains('\x1b'), "{escaped}");
+    }
+
+    #[test]
+    fn a_reconnect_refused_for_a_replaced_client_says_to_start_again() {
+        let refusal = ProtocolError::new(
+            ErrorCode::Unauthorized,
+            TRUSTED_UI_REQUIRES_INSTALLED_CLIENT,
+        );
+        let Attempt::Refused(again) = classify_refusal(&refusal, true) else {
+            panic!("not a refusal");
+        };
+        assert!(again.starts_with(REPLACED), "{again}");
+        assert!(again.contains("Run `splinterm approvals` again."));
+        // Before it ever connected, the same refusal means the wrong file.
+        let Attempt::Refused(first) = classify_refusal(&refusal, false) else {
+            panic!("not a refusal");
+        };
+        assert!(first.starts_with("Only the installed splinterm"), "{first}");
+    }
+
+    #[test]
+    fn only_a_refusal_of_the_answer_itself_ends_the_approver() {
+        let refusal = |code| -> anyhow::Result<Response> {
+            Err(response_protocol_error(ProtocolError::new(code, "no")))
+        };
+        assert_eq!(
+            answer_outcome(Ok(Response::ConsentOfferAnswered), true),
+            AnswerResult::Answered
+        );
+        assert_eq!(answer_outcome(Ok(Response::Pong), true), AnswerResult::Lost);
+        assert_eq!(
+            answer_outcome(refusal(ErrorCode::NotFound), true),
+            AnswerResult::NotFound
+        );
+        assert_eq!(
+            answer_outcome(refusal(ErrorCode::InvalidArgument), true),
+            AnswerResult::InvalidArgument
+        );
+        assert_eq!(
+            answer_outcome(refusal(ErrorCode::Unauthorized), true),
+            AnswerResult::Refused("no".to_owned())
+        );
+        for code in [
+            ErrorCode::HandoffInProgress,
+            ErrorCode::Internal,
+            ErrorCode::ResourceLimit,
+        ] {
+            assert_eq!(
+                answer_outcome(refusal(code), true),
+                AnswerResult::Lost,
+                "{code:?}"
+            );
+        }
+        // An error that ended the connection was about the connection, even
+        // when it says Unauthorized or NotFound.
+        for code in [ErrorCode::Unauthorized, ErrorCode::NotFound] {
+            assert_eq!(
+                answer_outcome(refusal(code), false),
+                AnswerResult::Lost,
+                "{code:?}"
+            );
+        }
+        assert_eq!(
+            answer_outcome(Err(anyhow::anyhow!("timed out")), false),
+            AnswerResult::Lost
+        );
+    }
+
+    #[test]
+    fn a_refused_duration_goes_back_to_deny() {
+        let now = Instant::now();
+        let mut approver = showing(offer(1), now);
+        let armed = now + ARMING_DELAY;
+        approver.key(Key::Down, armed);
+        let resting = armed + SELECTION_ARMING_DELAY;
+        answer(&approver.key(Key::Enter, resting));
+        approver.settle(AnswerResult::InvalidArgument, resting);
+        assert_eq!(approver.open.as_ref().map(|open| open.selected), Some(0));
+        let sent = answer(&approver.key(Key::Enter, resting + ARMING_DELAY));
+        assert_eq!(sent.decision, ConsentDecision::Deny);
+    }
+
+    #[test]
+    fn the_open_offer_sent_again_changes_nothing() {
+        let now = Instant::now();
+        let mut approver = showing(offer(1), now);
+        let armed = now + ARMING_DELAY;
+        approver.key(Key::Down, armed);
+        assert_eq!(approver.offered(offer(1), GENERATION, armed), Vec::new());
+        // Still armed, and still on the choice it moved to.
+        let sent = answer(&approver.key(Key::Enter, armed + SELECTION_ARMING_DELAY));
+        assert_eq!(
+            sent.decision,
+            ConsentDecision::Grant {
+                duration: GrantDuration::Once
+            }
+        );
+        // Another offer does replace it.
+        let mut approver = showing(offer(1), now);
+        assert_eq!(
+            approver.offered(offer(2), GENERATION, armed),
+            vec![
+                Effect::Print("The earlier request ended: a new one replaced it.".to_owned()),
+                Effect::Open
+            ]
+        );
+    }
+
+    #[test]
+    fn wide_characters_that_wrap_early_make_the_prompt_too_tall() {
+        let mut wide = offer(1);
+        wide.prompt.target = ConsentTarget::Lair {
+            lair_id: LairId::new(),
+            lair_name: "漢".repeat(40),
+        };
+        let now = Instant::now();
+        let mut approver = showing(wide.clone(), now);
+        let painted = paint(&approver.lines(now, true).expect("a prompt"), 21);
+        // Counted by characters the prompt would fit exactly; the terminal
+        // takes more rows, since a wrapped row of wide characters wraps
+        // again.
+        assert!(super::terminal_rows(&painted, 21) > painted.len());
+        let (mut session, _sender) = session((21, painted.len()));
+        let effects = session.approver.offered(wide, GENERATION, now);
+        session.apply(effects, now);
+        assert!(!session.approver.fits);
+        let armed = now + ARMING_DELAY;
+        session.keys(armed, &[Key::Down]);
+        assert_eq!(
+            session.keys(armed + SELECTION_ARMING_DELAY, &[Key::Enter]),
+            None
+        );
+    }
+
+    #[test]
+    fn enter_on_allow_looks_at_the_terminal_size_again() {
+        let now = Instant::now();
+        let (mut session, _sender) = session((120, 60));
+        let effects = session.approver.offered(offer(1), GENERATION, now);
+        session.apply(effects, now);
+        assert!(session.approver.fits);
+        let armed = now + ARMING_DELAY;
+        session.keys(armed, &[Key::Down]);
+        // The terminal shrinks, and Enter comes before the next tick.
+        session.screen.size = (120, 10);
+        assert_eq!(
+            session.keys(armed + SELECTION_ARMING_DELAY, &[Key::Enter]),
+            None
+        );
+        assert!(!session.approver.fits);
+        let Some(Op::Show(rows)) = session.screen.ops.last() else {
+            panic!("the prompt was not drawn again");
+        };
+        assert!(
+            plain(rows)
+                .iter()
+                .any(|row| row.starts_with("The terminal is too small"))
+        );
+    }
+
+    #[test]
+    fn pasted_text_is_never_read_as_keys() {
+        assert_eq!(
+            decode_keys(b"a\x1b[200~\r\x1b[B\x03q\x1b[201~\r"),
+            [Key::Other, Key::Enter]
+        );
+        // Markers cut across reads.
+        let mut decoder = KeyDecoder::default();
+        assert_eq!(decoder.decode(b"\x1b[20"), []);
+        assert_eq!(decoder.decode(b"0~\r\r\x1b[2"), []);
+        assert_eq!(decoder.decode(b"01"), []);
+        assert_eq!(decoder.decode(b"~\x1b[B"), [Key::Down]);
+        // Escape still answers at once.
+        assert_eq!(decoder.decode(b"\x1b"), [Key::Escape]);
+    }
+
+    #[test]
+    fn tmux_or_screen_gets_a_warning_and_runs() {
+        assert_eq!(multiplexer_warning(false, false), None);
+        for (tmux, screen) in [(true, false), (false, true), (true, true)] {
+            assert_eq!(
+                multiplexer_warning(tmux, screen),
+                Some(
+                    "Running inside tmux/screen: any program you run can send keys to this approver. Prefer a plain SSH login or terminal."
+                )
+            );
+        }
     }
 
     #[test]

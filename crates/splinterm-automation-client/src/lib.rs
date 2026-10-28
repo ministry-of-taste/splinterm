@@ -3417,6 +3417,15 @@ impl Connection {
         self.daemon_pid
     }
 
+    /// Whether this connection can still send requests. It cannot after a
+    /// cancelled or timed-out request, a transport failure, or a
+    /// connection-wide daemon error (one with no request ID), so a caller can
+    /// tell such an error from a refusal of its own request.
+    #[must_use]
+    pub fn is_usable(&self) -> bool {
+        self.ensure_usable().is_ok()
+    }
+
     /// Returns the bounds negotiated during the daemon handshake.
     #[must_use]
     pub const fn limits(&self) -> ServerLimits {

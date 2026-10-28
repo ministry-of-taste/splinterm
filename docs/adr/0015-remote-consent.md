@@ -185,8 +185,18 @@ opt-in by subscribing. MCP gains no tools or error codes.
     that passes the process-tree check, and can likewise see and answer every
     prompt, Always included. The net change from today is none: that key
     already gives a shell on the daemon host.
-  - Either can already edit `policy.json` or the remembered-grant store, so
-    this is the same class of risk, not a new one. Consent bounds cooperating
+  - Keys can reach a genuine approver without the person. Its arming delays
+    stop type-ahead, not a program that types: inside `tmux` or `screen`, or
+    in a terminal with remote control, a scripted sender (`tmux send-keys`,
+    `kitty @ send-text`, `wezterm cli send-text`) can move to Allow and press
+    Enter. Any same-user process can also write to the person's
+    pseudo-terminal, drawing over the prompt, and push input into it where the
+    kernel still allows `TIOCSTI`. `splinterm approvals` warns when it starts
+    inside `tmux` or `screen` and ignores bracketed paste, and the
+    documentation says to run it directly in an SSH login or a plain
+    terminal.
+  - Any of these can already edit `policy.json` or the remembered-grant store,
+    so this is the same class of risk, not a new one. Consent bounds cooperating
     agents; it is not a sandbox (ADR 0014).
   - A compromised relay or remote account can forge answers and show
     remote-labelled dialogs, but it already controls that account and

@@ -401,7 +401,7 @@ caller must explicitly resubscribe.
 | `access list` | List every agent grant of every duration, pending requests, and matching policy rules. |
 | `access revoke ID [--yes]` | Revoke one grant: a runtime grant ID or a remembered `ra_` entry ID. |
 | `access revoke --all [--dry-run] [--yes]` | Revoke every agent grant and pending request after showing the exact counts; policy rules are untouched. |
-| `approvals` | Answer agent access prompts as text in your own terminal on the daemon's computer, for one without a Window; refused inside a Splinterm pane. See [Usage](usage.md#answering-access-prompts-in-a-terminal). |
+| `approvals` | Answer agent access prompts as text in your own terminal on the daemon's computer, for one without a Window; refused inside a Splint or the requesting agent's process tree. See [Usage](usage.md#answering-access-prompts-in-a-terminal). |
 | `mcp setup claude-code\|codex\|vscode [--dry-run] [--replace]` | Add the installed `splinterm-mcp` adapter to an agent host's configuration as the `splinterm` server; grants no access and writes no policy. The VS Code form is not yet verified against a real install. |
 | `mcp remove claude-code\|codex\|vscode [--dry-run] [--force]` | Remove that entry (`--force` for one setup did not write); revokes no grant. |
 | `policy validate PATH` | Validate a policy through the daemon's secure loader without publishing it. |

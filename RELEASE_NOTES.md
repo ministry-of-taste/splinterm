@@ -243,9 +243,13 @@ a hostile program running as your account.
   the daemon's computer, for example over SSH to a headless host. It shows the
   same request and `host` row as the dialog, starts on Deny, throws away keys
   typed before a request appears and ignores keys for about a second after,
-  and sends nothing once the countdown runs out. splinterd refuses it inside a
-  Splinterm pane, a tmux or screen session started from one, or the agent's
-  own process tree, so agents cannot answer their own requests. With a Window
+  ignores pasted text, and sends nothing once the countdown runs out. splinterd
+  refuses it inside a Splint, inside the requesting agent's process tree or
+  session, and, with workload units, inside a Splint scope or Dojo slice, and
+  never offers a request to an approver inside that agent's tree or session.
+  It warns inside tmux or screen, whose other programs can send it keys; run
+  it directly in an SSH login or a plain terminal, and restart it after a
+  package upgrade. ADR 0015 lists what these checks do not stop. With a Window
   open as well, the first answer wins.
 - While a request waits, the Explorer marks its workspace **Agent asking for
   access**, the Window title ends with **AGENT ACCESS REQUEST WAITING**, and

@@ -1,4 +1,4 @@
-//! `splinterm approvals` answers only a person at a terminal: without one it
+//! `splinterm approvals` answers only from a terminal: without one it
 //! refuses before it connects to any daemon.
 
 use std::{
@@ -42,7 +42,7 @@ fn approvals_refuses_without_a_terminal_before_connecting() {
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(
-        stderr.contains("splinterm approvals answers only a person at a terminal"),
+        stderr.contains("splinterm approvals answers only from a terminal"),
         "{stderr}"
     );
     assert!(!stderr.contains("splinterd"), "it connected: {stderr}");

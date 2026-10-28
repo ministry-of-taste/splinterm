@@ -735,32 +735,46 @@ It is protected the same way as the dialog:
 
 - Each request starts on **Deny**. Up/Down or `j`/`k` choose, and Enter
   answers. Escape, `q`, or Ctrl+C deny.
-- Keys typed before a request appears are thrown away, and keys count only
-  about a second after it appears. After you move to an Allow choice, Enter
-  counts about 600 ms later.
+- Keys typed before a request appears are thrown away, pasted text is ignored,
+  and keys count only about a second after it appears. After you move to an
+  Allow choice, Enter counts about 600 ms later.
 - When the time runs out it prints `Expired: no answer sent` and sends nothing.
   A request that is cancelled, answered elsewhere, or ended by a daemon upgrade
   closes and says why.
 - While the terminal is too small to show the whole request it can only deny.
-- It answers only a person: it refuses to start unless standard input and
-  output are its own controlling terminal, and it has no option that answers
-  for you.
+- It answers only on a key read from its terminal: it refuses to start unless
+  standard input and output are its own controlling terminal, and it has no
+  option that answers for you.
 
-Run it in your own terminal, not inside a Splinterm pane or a tmux or screen
-session started from one. splinterd checks where it runs and refuses it inside
-any Splint, inside the requesting agent's session or process tree, and, with
-workload cgroups, inside any Splint's cgroup, so agents cannot start it for
-themselves. Only the installed `splinterm` beside the running `splinterd` may
-answer, as for `splinterm upgrade --now` ([CLI](cli.md#daemon-upgrade)); a
-development build is refused. If too many approvers and remote Windows are
-connected it says so.
-After a lost connection or a daemon upgrade it connects again by itself; Ctrl+C
-with no request waiting quits.
+Run it directly in your own terminal, such as an SSH login or a plain terminal
+window, not inside a Splinterm pane or a tmux or screen session started from
+one. splinterd checks where it runs. It refuses the approver inside a Splint,
+inside the requesting agent's process tree or session, and, when workloads run
+in systemd units, inside a Splint scope or Dojo slice, which is where a tmux or
+screen session started from a pane stays. It also checks each request on its
+own: it never offers a request to an approver inside that agent's process tree
+or session, and says nothing about it, so that approver simply never sees that
+agent's requests. Only the installed `splinterm` beside the running `splinterd`
+may answer, as for `splinterm upgrade --now` ([CLI](cli.md#daemon-upgrade)); a
+development build is refused. One process may hold at most 2 of the daemon's 16
+approver places; when they are full it says too many approvers and remote
+Windows are connected. After a lost connection or a daemon upgrade it connects
+again by itself; Ctrl+C with no request waiting quits. Restart it after a
+package upgrade: the running approver keeps answering until it has to connect
+again, for example after the daemon's live upgrade, and then stops with a note
+to run `splinterm approvals` again, because its replaced file no longer matches
+the installed `splinterm`.
 
-A same-user process that starts a terminal outside the process tree, for
-example with `systemd-run --user --pty`, could still run it there. That is the
-same kind of risk as an agent editing your policy file, which it can already do
-as your account.
+Avoid running it inside tmux or screen, or in a terminal that other programs
+can drive by remote control (such as kitty's or WezTerm's): a program you run
+there can type into the approver (`tmux send-keys`, `kitty @ send-text`,
+`wezterm cli send-text`), and the delays above do not stop that. It prints a
+warning when it starts inside tmux or screen. These checks do not stop a
+same-user program that deliberately leaves every process tree and cgroup, for
+example with `systemd-run --user --pty`, and runs an approver there, nor one
+that writes to your terminal. That is the same kind of risk as an agent editing
+your policy file, which it can already do as your account; see the residual
+risks in [ADR 0015](adr/0015-remote-consent.md#consequences).
 
 ## Exit, restore, and relaunch
 

@@ -4525,7 +4525,7 @@ async fn serve_authenticated(
             protocol_error(
                 None,
                 ErrorCode::Unauthorized,
-                "trusted UI role requires the installed graphical client",
+                splinterm_protocol::TRUSTED_UI_REQUIRES_INSTALLED_CLIENT,
             ),
         )
         .await?;
