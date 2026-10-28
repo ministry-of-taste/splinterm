@@ -1752,6 +1752,8 @@ async fn prompt_target(
         scopes,
         level: details.level,
         durations: details.durations,
+        respond_within_seconds: 0,
+        origin: splinterm_protocol::ConsentOrigin::Local,
     };
     tokio::task::spawn_blocking(move || prompt_blocking(&client, prompt, deadline, &cancel))
         .await

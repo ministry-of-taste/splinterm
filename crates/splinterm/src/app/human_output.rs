@@ -402,6 +402,10 @@ pub(in crate::app) fn print_response(response: Response) -> Result<()> {
                 controllers.len()
             );
         }
+        Response::ConsentOffersSubscribed { subscription_id } => {
+            println!("Subscribed to consent offers ({subscription_id}).");
+        }
+        Response::ConsentOfferAnswered => println!("Consent offer answered."),
     }
     io::stdout()
         .flush()

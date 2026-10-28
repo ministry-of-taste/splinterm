@@ -12,7 +12,7 @@ import re
 COMMIT = re.compile(r"[0-9a-f]{40}")
 VERSION = re.compile(r"[0-9A-Za-z][0-9A-Za-z.+-]{0,63}")
 KINDS = {"local-committed-head", "release-candidate", "nix-store"}
-PRIVATE_PROTOCOL = 44
+PRIVATE_PROTOCOL = 45
 HANDOFF_PROTOCOL = 1
 TERMINAL_CHECKPOINT = 2
 DESCRIPTOR_MANIFEST = 1

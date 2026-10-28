@@ -127,7 +127,9 @@
         "agent_status_report",
         "prepare_daemon_handoff",
         "claim_handoff_control",
-        "acknowledge_handoff_prepare"
+        "acknowledge_handoff_prepare",
+        "subscribe_consent_offers",
+        "answer_consent_offer"
       ]
     },
     "peer": {

@@ -128,7 +128,12 @@ pub const fn for_request(request: &Request) -> RequestAuthorization {
         | Request::ClaimHandoffControl { .. }
         | Request::AcknowledgeHandoffPrepare { .. }
         // Ending every pending workspace request is **Revoke all access**.
-        | Request::CancelAllLairAccessRequests => RequestAuthorization::TrustedUi,
+        | Request::CancelAllLairAccessRequests
+        // Consent responders are human UI only (ADR 0015): a remote Window's
+        // relay connection or the approver command from the installed
+        // client, by responder kind; never automation or policy.
+        | Request::SubscribeConsentOffers { .. }
+        | Request::AnswerConsentOffer { .. } => RequestAuthorization::TrustedUi,
         Request::ListLairs | Request::InspectTopology | Request::InspectSplint { .. } => {
             RequestAuthorization::policy(&[Scope::TopologyMetadataRead])
         }
@@ -342,6 +347,32 @@ mod tests {
             for_request(&Request::AcknowledgeHandoffPrepare {
                 daemon_generation: 1,
                 prepare_id: 1,
+            }),
+            RequestAuthorization::TrustedUi
+        );
+    }
+
+    #[test]
+    fn consent_responder_requests_are_human_ui_only() {
+        use splinterm_protocol::{
+            CONSENT_OFFER_NONCE_BYTES, ConsentDecision, ConsentOfferNonce, ConsentResponderKind,
+        };
+
+        // Never policy: neither development access nor a policy rule admits
+        // them; the role and kind checks are in the daemon's interactive
+        // bypass and handler.
+        for kind in [ConsentResponderKind::Window, ConsentResponderKind::Terminal] {
+            assert_eq!(
+                for_request(&Request::SubscribeConsentOffers { kind }),
+                RequestAuthorization::TrustedUi
+            );
+        }
+        assert_eq!(
+            for_request(&Request::AnswerConsentOffer {
+                daemon_generation: 1,
+                offer_id: 1,
+                nonce: ConsentOfferNonce::new([1; CONSENT_OFFER_NONCE_BYTES]),
+                decision: ConsentDecision::Deny,
             }),
             RequestAuthorization::TrustedUi
         );

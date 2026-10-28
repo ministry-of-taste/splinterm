@@ -565,6 +565,8 @@ mod tests {
                 offer(GrantDuration::WorkspaceSession, None),
                 offer(GrantDuration::Remembered, None),
             ],
+            respond_within_seconds: 0,
+            origin: splinterm_protocol::ConsentOrigin::Local,
         }
     }
 
@@ -794,6 +796,8 @@ mod tests {
             scopes: vec![AccessScope::Observe, AccessScope::Input],
             level: None,
             durations: vec![offer(GrantDuration::Once, None)],
+            respond_within_seconds: 0,
+            origin: splinterm_protocol::ConsentOrigin::Local,
         };
         assert_eq!(prompt.validate(), Ok(()));
         prompt

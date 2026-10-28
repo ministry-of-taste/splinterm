@@ -18,7 +18,7 @@ use splinterm_core::{
     TopologyRevision,
 };
 
-pub const PROTOCOL_VERSION: u16 = 44;
+pub const PROTOCOL_VERSION: u16 = 45;
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_TERMINAL_TRANSACTION_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_TERMINAL_TRANSACTION_CHUNK_BYTES: usize = 8 * 1024 * 1024;
@@ -60,6 +60,12 @@ pub const MAX_ACCESS_SCOPES: usize = 16;
 pub const MAX_CONSENT_WAIT_MILLIS: u32 = 25_000;
 /// How long a pending workspace access request lives after it opens.
 pub const PENDING_ACCESS_LIFETIME_SECONDS: u64 = 120;
+/// The longest countdown a consent prompt or offer carries: a pending
+/// workspace request never lives longer (ADR 0015).
+pub const MAX_CONSENT_RESPOND_WITHIN_SECONDS: u64 = PENDING_ACCESS_LIFETIME_SECONDS;
+/// Bytes in one consent offer nonce (ADR 0015). The fixed-size wire array
+/// bounds decoding.
+pub const CONSENT_OFFER_NONCE_BYTES: usize = 32;
 /// The longest host-reported agent name a request may carry, in characters.
 /// Display data only; never an identity.
 pub const MAX_AGENT_NAME_CHARS: usize = 128;
@@ -257,6 +263,23 @@ pub enum ClientFrame {
 
 /// Maximum UTF-8 byte length of informational daemon hostname metadata.
 pub const MAX_DAEMON_HOSTNAME_BYTES: usize = 255;
+
+/// The longest remote profile name, in bytes.
+pub const MAX_REMOTE_PROFILE_NAME_BYTES: usize = 64;
+
+/// Whether `name` is a usable remote profile name: 1 to
+/// [`MAX_REMOTE_PROFILE_NAME_BYTES`] bytes of ASCII letters, digits, `.`,
+/// `_`, or `-`, not starting with `-` (so it can never read as an SSH
+/// option). Such a name has no control, whitespace, or bidi characters.
+#[must_use]
+pub fn usable_remote_profile_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_REMOTE_PROFILE_NAME_BYTES
+        && !name.starts_with('-')
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
 
 /// Accept only bounded hostname-like text. Reject controls, whitespace, formatting
 /// and bidi characters rather than attempting to repair an untrusted identity.
@@ -1026,6 +1049,157 @@ pub enum Request {
         daemon_generation: u64,
         prepare_id: u64,
     },
+    /// Registers this connection as a consent responder (ADR 0015): the
+    /// daemon sends it [`SubscriptionEvent::ConsentOffered`] for each
+    /// workspace access prompt it may answer, and
+    /// [`SubscriptionEvent::ConsentOfferWithdrawn`] when one ends unanswered.
+    ///
+    /// A [`ConsentResponderKind::Window`] responder is a remote Window's
+    /// graphical relay connection; a [`ConsentResponderKind::Terminal`]
+    /// responder is the approver command from the installed client.
+    /// Automation is never a responder. Responder status belongs to this
+    /// connection only.
+    SubscribeConsentOffers {
+        kind: ConsentResponderKind,
+    },
+    /// Answers one [`ConsentOffer`] sent on this connection, echoing its
+    /// generation, id, and nonce; see [`validate_consent_answer`]. The first
+    /// valid answer from any route settles the request; every other answer,
+    /// a duplicate, a late answer, or one on another connection fails with
+    /// [`ErrorCode::NotFound`] and grants nothing.
+    AnswerConsentOffer {
+        daemon_generation: u64,
+        offer_id: u64,
+        nonce: ConsentOfferNonce,
+        decision: ConsentDecision,
+    },
+}
+
+/// Validates one [`Request::AnswerConsentOffer`]: a nonzero generation and
+/// offer id.
+///
+/// # Errors
+/// Returns `InvalidArgument` when either is zero.
+pub fn validate_consent_answer(daemon_generation: u64, offer_id: u64) -> Result<(), ProtocolError> {
+    if daemon_generation == 0 || offer_id == 0 {
+        return Err(ProtocolError::new(
+            ErrorCode::InvalidArgument,
+            "a consent answer names a zero generation or offer",
+        ));
+    }
+    Ok(())
+}
+
+/// Who answers a [`Request::SubscribeConsentOffers`] responder's offers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsentResponderKind {
+    /// A remote graphical Window over the SSH graphical relay.
+    Window,
+    /// The `splinterm approvals` command in the person's own terminal.
+    Terminal,
+}
+
+/// One single-use, offer-bound consent offer nonce (ADR 0015).
+///
+/// On the wire it is exactly [`CONSENT_OFFER_NONCE_BYTES`] bytes, so
+/// decoding rejects any other length. `Debug` never prints the bytes, and
+/// equality does not stop at the first differing byte.
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ConsentOfferNonce([u8; CONSENT_OFFER_NONCE_BYTES]);
+
+impl ConsentOfferNonce {
+    #[must_use]
+    pub const fn new(bytes: [u8; CONSENT_OFFER_NONCE_BYTES]) -> Self {
+        Self(bytes)
+    }
+
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; CONSENT_OFFER_NONCE_BYTES] {
+        &self.0
+    }
+}
+
+impl PartialEq for ConsentOfferNonce {
+    fn eq(&self, other: &Self) -> bool {
+        self.0
+            .iter()
+            .zip(other.0.iter())
+            .fold(0_u8, |difference, (left, right)| {
+                difference | (left ^ right)
+            })
+            == 0
+    }
+}
+
+impl Eq for ConsentOfferNonce {}
+
+impl std::fmt::Debug for ConsentOfferNonce {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "ConsentOfferNonce(<{CONSENT_OFFER_NONCE_BYTES} bytes redacted>)"
+        )
+    }
+}
+
+/// One workspace access prompt the daemon offers a consent responder
+/// (ADR 0015), bound to its generation, offer, nonce, and connection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsentOffer {
+    pub daemon_generation: u64,
+    /// Monotonic and never reused within a daemon generation.
+    pub offer_id: u64,
+    /// The pending request's agent-visible ID.
+    pub request_id: u64,
+    pub nonce: ConsentOfferNonce,
+    /// Seconds the responder has to answer, at least one and at most
+    /// [`MAX_CONSENT_RESPOND_WITHIN_SECONDS`].
+    pub respond_within_seconds: u64,
+    pub prompt: OfferedConsentPrompt,
+}
+
+impl ConsentOffer {
+    /// # Errors
+    /// Returns `InvalidArgument` for a zero generation or offer id, a
+    /// countdown outside one to [`MAX_CONSENT_RESPOND_WITHIN_SECONDS`]
+    /// seconds, or an invalid prompt.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.daemon_generation == 0 || self.offer_id == 0 {
+            return Err(ProtocolError::new(
+                ErrorCode::InvalidArgument,
+                "a consent offer names a zero generation or offer",
+            ));
+        }
+        if !(1..=MAX_CONSENT_RESPOND_WITHIN_SECONDS).contains(&self.respond_within_seconds) {
+            return Err(ProtocolError::new(
+                ErrorCode::InvalidArgument,
+                "a consent offer's countdown is outside the pending request lifetime",
+            ));
+        }
+        self.prompt
+            .validate()
+            .map_err(|message| ProtocolError::new(ErrorCode::InvalidArgument, message))
+    }
+}
+
+/// Why the daemon withdrew a [`ConsentOffer`] before this responder
+/// answered it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsentOfferEnd {
+    /// The agent cancelled, its process exited, or the person revoked all
+    /// access.
+    Cancelled,
+    /// The request's time ran out.
+    Expired,
+    /// The request ended otherwise, for example because its workspace ended.
+    RequestEnded,
+    /// A daemon handoff fenced the daemon.
+    Fenced,
+    /// Another route answered first.
+    AnsweredElsewhere,
 }
 
 /// The Splint a [`Request::ClaimHandoffControl`] restores a controller for:
@@ -1300,6 +1474,14 @@ pub enum Response {
         #[serde(deserialize_with = "deserialize_claimed_controllers")]
         controllers: Vec<HandoffClaimedController>,
     },
+    /// Result of [`Request::SubscribeConsentOffers`]: offers and their
+    /// withdrawals arrive as events of `subscription_id`.
+    ConsentOffersSubscribed {
+        subscription_id: u64,
+    },
+    /// Result of a valid [`Request::AnswerConsentOffer`]: the answer settled
+    /// the request it was offered for.
+    ConsentOfferAnswered,
 }
 
 /// Result of [`Request::CloseUnusedDojo`].
@@ -1398,6 +1580,19 @@ pub enum SubscriptionEvent {
         /// Generation of the daemon that is handing off.
         daemon_generation: u64,
         phase: HandoffStatusPhase,
+    },
+    /// Sent only on a consent responder subscription
+    /// ([`Request::SubscribeConsentOffers`]): a workspace access prompt this
+    /// responder may answer with [`Request::AnswerConsentOffer`].
+    ConsentOffered {
+        offer: ConsentOffer,
+    },
+    /// Sent only on a consent responder subscription: the offer ended
+    /// without this responder's answer, and the responder closes its prompt
+    /// without answering.
+    ConsentOfferWithdrawn {
+        offer_id: u64,
+        reason: ConsentOfferEnd,
     },
 }
 
@@ -2194,6 +2389,8 @@ pub enum AuditOperation {
     PrepareDaemonHandoff,
     ClaimHandoffControl,
     AcknowledgeHandoffPrepare,
+    SubscribeConsentOffers,
+    AnswerConsentOffer,
 }
 
 impl AuditOperation {
@@ -2249,6 +2446,8 @@ impl AuditOperation {
             Self::PrepareDaemonHandoff => "prepare_daemon_handoff",
             Self::ClaimHandoffControl => "claim_handoff_control",
             Self::AcknowledgeHandoffPrepare => "acknowledge_handoff_prepare",
+            Self::SubscribeConsentOffers => "subscribe_consent_offers",
+            Self::AnswerConsentOffer => "answer_consent_offer",
         }
     }
 }
@@ -2560,13 +2759,25 @@ pub fn shared_identity_line(path: &str) -> String {
     format!("Any program that runs {path} shares this access.")
 }
 
+/// One trusted consent dialog's prompt, as its launcher sends it over the
+/// private descriptor.
+///
+/// Every string in the content (`requester`, `agent_name`, a Lair target's
+/// `lair_name`, each duration's `shared_by`) is untrusted: an agent, its
+/// host, or a remote daemon chose it. Validation bounds its length only.
+/// Every responder that shows it, the dialog and the terminal approver
+/// alike, must neutralise C0 and C1 controls, ESC, and bidi and invisible
+/// formatting characters before display, exactly as the consent dialog and
+/// the **Agent access** list escape them today (`splinterm::frontend`'s
+/// `shown_name`), and quote names so they cannot pass for prompt text.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConsentPrompt {
     pub capability: Vec<u8>,
+    /// Untrusted display text; see the type documentation.
     pub requester: String,
     pub requester_pid: u32,
     pub requester_uid: u32,
-    /// The host-reported agent name: display data only.
+    /// The host-reported agent name: untrusted display data only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_name: Option<String>,
     pub target: ConsentTarget,
@@ -2579,19 +2790,107 @@ pub struct ConsentPrompt {
     /// "Just this once" first and always offered.
     #[serde(deserialize_with = "deserialize_consent_durations")]
     pub durations: Vec<ConsentDurationOffer>,
+    /// Seconds left to answer, at most
+    /// [`MAX_CONSENT_RESPOND_WITHIN_SECONDS`]; zero shows no countdown.
+    #[serde(default)]
+    pub respond_within_seconds: u64,
+    /// Where the request comes from; see [`ConsentOrigin`] for who sets it.
+    #[serde(default)]
+    pub origin: ConsentOrigin,
 }
 
-impl ConsentPrompt {
-    /// Checks every bound the trusted dialog relies on.
-    ///
+/// Where a consent prompt's request comes from (ADR 0015).
+///
+/// The process that launches the dialog sets it, never the offer it
+/// answers. The daemon's own prompts are [`ConsentOrigin::Local`]. A remote
+/// Window sets [`ConsentOrigin::Remote`] and its SSH `profile` from its own
+/// endpoint, so a remote daemon can claim any hostname but can never
+/// produce a Local origin. A Window that cannot build a valid Remote origin
+/// skips or denies the offer; it never falls back to Local.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ConsentOrigin {
+    /// This computer's daemon.
+    #[default]
+    Local,
+    /// The daemon a remote Window reaches through its SSH profile.
+    Remote {
+        /// The Window's own SSH profile name, as
+        /// [`usable_remote_profile_name`] accepts it.
+        profile: String,
+        /// The remote daemon's self-reported `Hello` hostname, as
+        /// [`usable_daemon_hostname`] accepts it: display only, never an
+        /// identity, and absent when the daemon reported none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        daemon_hostname: Option<String>,
+    },
+}
+
+impl ConsentOrigin {
     /// # Errors
-    /// A missing or oversized capability, scope list, label, or path; a
-    /// level that is not exactly the scopes; or durations that are not
-    /// "Just this once" (offered) followed by distinct longer ones in order.
+    /// A remote origin whose profile is not a usable remote profile name, or
+    /// whose hostname, when present, is not a usable daemon hostname.
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.capability.len() != CONSENT_CAPABILITY_BYTES {
-            return Err("consent capability has the wrong length");
+        let Self::Remote {
+            profile,
+            daemon_hostname,
+        } = self
+        else {
+            return Ok(());
+        };
+        if !usable_remote_profile_name(profile) {
+            return Err("consent origin profile is not a usable remote profile name");
         }
+        if daemon_hostname
+            .as_deref()
+            .is_some_and(|hostname| usable_daemon_hostname(hostname).is_none())
+        {
+            return Err("consent origin hostname is not a usable daemon hostname");
+        }
+        Ok(())
+    }
+}
+
+/// A [`ConsentPrompt`]'s content as a [`ConsentOffer`] carries it to a
+/// consent responder: without the capability, which the responder's own
+/// dialog mints; the origin, which the responder sets itself; and the
+/// countdown, which the offer carries.
+///
+/// Its strings are untrusted exactly as [`ConsentPrompt`]'s are, and every
+/// responder neutralises them the same way before display.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OfferedConsentPrompt {
+    /// Untrusted display text; see [`ConsentPrompt`].
+    pub requester: String,
+    pub requester_pid: u32,
+    pub requester_uid: u32,
+    /// The host-reported agent name: untrusted display data only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_name: Option<String>,
+    pub target: ConsentTarget,
+    #[serde(deserialize_with = "deserialize_access_scopes")]
+    pub scopes: Vec<AccessScope>,
+    /// The level whose exact bundle `scopes` is, or `None` for Custom.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<AccessLevel>,
+    /// As [`ConsentPrompt::durations`].
+    #[serde(deserialize_with = "deserialize_consent_durations")]
+    pub durations: Vec<ConsentDurationOffer>,
+}
+
+/// The prompt content both [`ConsentPrompt`] and [`OfferedConsentPrompt`]
+/// carry, borrowed so that both validate by the same rules.
+struct ConsentContent<'a> {
+    requester: &'a str,
+    agent_name: Option<&'a str>,
+    target: &'a ConsentTarget,
+    scopes: &'a [AccessScope],
+    level: Option<AccessLevel>,
+    durations: &'a [ConsentDurationOffer],
+}
+
+impl ConsentContent<'_> {
+    fn validate(&self) -> Result<(), &'static str> {
         if self.scopes.is_empty() || self.scopes.len() > MAX_ACCESS_SCOPES {
             return Err("consent scopes are empty or exceed the limit");
         }
@@ -2600,19 +2899,18 @@ impl ConsentPrompt {
         }
         if self
             .agent_name
-            .as_ref()
             .is_some_and(|name| name.chars().count() > MAX_AGENT_NAME_CHARS)
         {
             return Err("consent agent name exceeds the limit");
         }
-        if let ConsentTarget::Lair { lair_name, .. } = &self.target
+        if let ConsentTarget::Lair { lair_name, .. } = self.target
             && lair_name.chars().count() > MAX_CONSENT_PATH_CHARS
         {
             return Err("consent workspace name exceeds the limit");
         }
         if self
             .level
-            .is_some_and(|level| AccessLevel::exactly(&self.scopes) != Some(level))
+            .is_some_and(|level| AccessLevel::exactly(self.scopes) != Some(level))
         {
             return Err("consent level does not name exactly the scopes");
         }
@@ -2655,12 +2953,120 @@ impl ConsentPrompt {
         Ok(())
     }
 
-    /// Whether the prompt offers `duration`.
-    #[must_use]
-    pub fn offers(&self, duration: GrantDuration) -> bool {
+    fn offers(&self, duration: GrantDuration) -> bool {
         self.durations
             .iter()
             .any(|offer| offer.duration == duration && offer.withheld.is_none())
+    }
+}
+
+impl ConsentPrompt {
+    /// Checks every bound the trusted dialog relies on.
+    ///
+    /// # Errors
+    /// A missing or oversized capability, scope list, label, or path; a
+    /// level that is not exactly the scopes; durations that are not "Just
+    /// this once" (offered) followed by distinct longer ones in order; a
+    /// countdown longer than [`MAX_CONSENT_RESPOND_WITHIN_SECONDS`]; or an
+    /// invalid origin.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.capability.len() != CONSENT_CAPABILITY_BYTES {
+            return Err("consent capability has the wrong length");
+        }
+        self.content().validate()?;
+        if self.respond_within_seconds > MAX_CONSENT_RESPOND_WITHIN_SECONDS {
+            return Err("consent countdown exceeds the pending request lifetime");
+        }
+        self.origin.validate()
+    }
+
+    /// Whether the prompt offers `duration`.
+    #[must_use]
+    pub fn offers(&self, duration: GrantDuration) -> bool {
+        self.content().offers(duration)
+    }
+
+    /// This prompt's content as a [`ConsentOffer`] carries it.
+    #[must_use]
+    pub fn offered(&self) -> OfferedConsentPrompt {
+        OfferedConsentPrompt {
+            requester: self.requester.clone(),
+            requester_pid: self.requester_pid,
+            requester_uid: self.requester_uid,
+            agent_name: self.agent_name.clone(),
+            target: self.target.clone(),
+            scopes: self.scopes.clone(),
+            level: self.level,
+            durations: self.durations.clone(),
+        }
+    }
+
+    fn content(&self) -> ConsentContent<'_> {
+        ConsentContent {
+            requester: &self.requester,
+            agent_name: self.agent_name.as_deref(),
+            target: &self.target,
+            scopes: &self.scopes,
+            level: self.level,
+            durations: &self.durations,
+        }
+    }
+}
+
+impl OfferedConsentPrompt {
+    /// Checks the bounds of [`ConsentPrompt::validate`] that apply to the
+    /// content, and that it asks for a workspace: only Lair access is
+    /// offered to consent responders.
+    ///
+    /// # Errors
+    /// Any content error [`ConsentPrompt::validate`] reports, or a target
+    /// that is not a Lair.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if !matches!(self.target, ConsentTarget::Lair { .. }) {
+            return Err("a consent offer asks for something other than a workspace");
+        }
+        self.content().validate()
+    }
+
+    /// Whether the offered prompt offers `duration`.
+    #[must_use]
+    pub fn offers(&self, duration: GrantDuration) -> bool {
+        self.content().offers(duration)
+    }
+
+    /// The dialog prompt a responder shows for this offer, with its own
+    /// fresh `capability`, the offer's countdown, and its own `origin`.
+    #[must_use]
+    pub fn into_prompt(
+        self,
+        capability: Vec<u8>,
+        respond_within_seconds: u64,
+        origin: ConsentOrigin,
+    ) -> ConsentPrompt {
+        ConsentPrompt {
+            capability,
+            requester: self.requester,
+            requester_pid: self.requester_pid,
+            requester_uid: self.requester_uid,
+            agent_name: self.agent_name,
+            target: self.target,
+            scopes: self.scopes,
+            level: self.level,
+            durations: self.durations,
+            respond_within_seconds,
+            origin,
+        }
+    }
+
+    fn content(&self) -> ConsentContent<'_> {
+        ConsentContent {
+            requester: &self.requester,
+            agent_name: self.agent_name.as_deref(),
+            target: &self.target,
+            scopes: &self.scopes,
+            level: self.level,
+            durations: &self.durations,
+        }
     }
 }
 
@@ -5093,6 +5499,8 @@ mod tests {
             AuditOperation::PrepareDaemonHandoff,
             AuditOperation::ClaimHandoffControl,
             AuditOperation::AcknowledgeHandoffPrepare,
+            AuditOperation::SubscribeConsentOffers,
+            AuditOperation::AnswerConsentOffer,
         ] {
             assert_eq!(
                 serde_json::to_string(&operation).unwrap(),
@@ -5984,6 +6392,8 @@ mod tests {
                 ),
                 remembered,
             ],
+            respond_within_seconds: 0,
+            origin: ConsentOrigin::Local,
         }
     }
 
@@ -6342,7 +6752,7 @@ mod tests {
 
     #[test]
     fn first_terminal_read_requests_are_explicit_protocol_v20_shapes() {
-        assert_eq!(PROTOCOL_VERSION, 44);
+        assert_eq!(PROTOCOL_VERSION, 45);
         let splint_id = SplintId::new();
         let attach = Request::Attach {
             splint_id,
@@ -7881,8 +8291,8 @@ mod tests {
         // An undeclared hello keeps its exact protocol 41 shape.
         let plain = serde_json::json!({
             "type": "hello",
-            "minimum_version": 44,
-            "maximum_version": 44,
+            "minimum_version": 45,
+            "maximum_version": 45,
             "role": "trusted_ui",
         });
         assert_eq!(serde_json::to_value(hello(false)).unwrap(), plain);
@@ -8119,5 +8529,508 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    fn consent_offer() -> ConsentOffer {
+        ConsentOffer {
+            daemon_generation: 3,
+            offer_id: 7,
+            request_id: 11,
+            nonce: ConsentOfferNonce::new([0xa5; CONSENT_OFFER_NONCE_BYTES]),
+            respond_within_seconds: 118,
+            prompt: consent_prompt().offered(),
+        }
+    }
+
+    fn round_trip_request(request: &Request) -> serde_json::Value {
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(
+            &serde_json::from_value::<Request>(value.clone()).unwrap(),
+            request
+        );
+        let frame = ClientFrame::Request {
+            request_id: 5,
+            diagnostic_correlation: None,
+            request: request.clone(),
+        };
+        let encoded = serde_json::to_vec(&frame).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<ClientFrame>(&encoded).unwrap(),
+            frame
+        );
+        value
+    }
+
+    #[test]
+    fn consent_responder_requests_round_trip() {
+        for (kind, name) in [
+            (ConsentResponderKind::Window, "window"),
+            (ConsentResponderKind::Terminal, "terminal"),
+        ] {
+            let value = round_trip_request(&Request::SubscribeConsentOffers { kind });
+            assert_eq!(
+                value,
+                serde_json::json!({"type": "subscribe_consent_offers", "kind": name})
+            );
+        }
+        // An unknown responder kind never decodes.
+        assert!(
+            serde_json::from_value::<Request>(serde_json::json!({
+                "type": "subscribe_consent_offers",
+                "kind": "automation",
+            }))
+            .is_err()
+        );
+
+        for decision in [
+            ConsentDecision::Deny,
+            ConsentDecision::Grant {
+                duration: GrantDuration::Remembered,
+            },
+        ] {
+            let answer = Request::AnswerConsentOffer {
+                daemon_generation: 3,
+                offer_id: 7,
+                nonce: ConsentOfferNonce::new([0xa5; CONSENT_OFFER_NONCE_BYTES]),
+                decision,
+            };
+            let value = round_trip_request(&answer);
+            assert_eq!(value["type"], "answer_consent_offer");
+            assert_eq!(
+                value["nonce"],
+                serde_json::json!(vec![0xa5_u8; CONSENT_OFFER_NONCE_BYTES]),
+                "the nonce keeps the plain fixed-size array wire shape"
+            );
+            assert_eq!(validate_consent_answer(3, 7), Ok(()));
+        }
+    }
+
+    #[test]
+    fn consent_responder_responses_and_events_round_trip() {
+        for (result, expected) in [
+            (
+                Response::ConsentOffersSubscribed { subscription_id: 9 },
+                serde_json::json!({"type": "consent_offers_subscribed", "subscription_id": 9}),
+            ),
+            (
+                Response::ConsentOfferAnswered,
+                serde_json::json!({"type": "consent_offer_answered"}),
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(&result).unwrap(), expected);
+            assert_eq!(
+                serde_json::from_value::<Response>(expected).unwrap(),
+                result
+            );
+            let frame = ServerFrame::Response {
+                request_id: 5,
+                result,
+            };
+            let encoded = serde_json::to_vec(&frame).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<ServerFrame>(&encoded).unwrap(),
+                frame
+            );
+        }
+
+        let offer = consent_offer();
+        assert_eq!(offer.validate(), Ok(()));
+        let mut events = vec![SubscriptionEvent::ConsentOffered {
+            offer: offer.clone(),
+        }];
+        for (reason, name) in [
+            (ConsentOfferEnd::Cancelled, "cancelled"),
+            (ConsentOfferEnd::Expired, "expired"),
+            (ConsentOfferEnd::RequestEnded, "request_ended"),
+            (ConsentOfferEnd::Fenced, "fenced"),
+            (ConsentOfferEnd::AnsweredElsewhere, "answered_elsewhere"),
+        ] {
+            assert_eq!(serde_json::to_value(reason).unwrap(), name);
+            events.push(SubscriptionEvent::ConsentOfferWithdrawn {
+                offer_id: offer.offer_id,
+                reason,
+            });
+        }
+        for event in events {
+            let value = serde_json::to_value(&event).unwrap();
+            assert_eq!(
+                serde_json::from_value::<SubscriptionEvent>(value).unwrap(),
+                event
+            );
+            let frame = ServerFrame::Event {
+                subscription_id: 9,
+                sequence: 1,
+                event,
+            };
+            let encoded = serde_json::to_vec(&frame).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<ServerFrame>(&encoded).unwrap(),
+                frame
+            );
+        }
+        let value = serde_json::to_value(SubscriptionEvent::ConsentOffered {
+            offer: offer.clone(),
+        })
+        .unwrap();
+        assert_eq!(value["type"], "consent_offered");
+        assert_eq!(value["offer"]["request_id"], 11);
+        assert_eq!(value["offer"]["respond_within_seconds"], 118);
+        // The offered prompt carries no capability, origin, or countdown.
+        for absent in ["capability", "origin", "respond_within_seconds"] {
+            assert!(value["offer"]["prompt"].get(absent).is_none(), "{absent}");
+        }
+        assert_eq!(
+            serde_json::to_value(SubscriptionEvent::ConsentOfferWithdrawn {
+                offer_id: 7,
+                reason: ConsentOfferEnd::AnsweredElsewhere,
+            })
+            .unwrap(),
+            serde_json::json!({
+                "type": "consent_offer_withdrawn",
+                "offer_id": 7,
+                "reason": "answered_elsewhere",
+            })
+        );
+        for (kind, name) in [
+            (ConsentResponderKind::Window, "window"),
+            (ConsentResponderKind::Terminal, "terminal"),
+        ] {
+            assert_eq!(serde_json::to_value(kind).unwrap(), name);
+        }
+    }
+
+    #[test]
+    fn consent_offer_nonce_is_exactly_its_length_and_never_printed() {
+        let nonce = ConsentOfferNonce::new([0xa5; CONSENT_OFFER_NONCE_BYTES]);
+        let answer = Request::AnswerConsentOffer {
+            daemon_generation: 3,
+            offer_id: 7,
+            nonce,
+            decision: ConsentDecision::Deny,
+        };
+        for debug in [
+            format!("{nonce:?}"),
+            format!("{answer:?}"),
+            format!("{answer:#?}"),
+        ] {
+            assert!(debug.contains("32 bytes redacted"), "{debug}");
+            assert!(!debug.contains("165"), "{debug}");
+            assert!(!debug.to_ascii_lowercase().contains("a5"), "{debug}");
+        }
+        let offered = SubscriptionEvent::ConsentOffered {
+            offer: consent_offer(),
+        };
+        for debug in [format!("{offered:?}"), format!("{offered:#?}")] {
+            assert!(debug.contains("32 bytes redacted"), "{debug}");
+            assert!(!debug.contains("165, 165"), "{debug}");
+            assert!(!debug.contains("165,\n"), "{debug}");
+        }
+
+        // Equality compares every byte.
+        let mut last = [0xa5; CONSENT_OFFER_NONCE_BYTES];
+        last[CONSENT_OFFER_NONCE_BYTES - 1] = 0;
+        assert_eq!(
+            nonce,
+            ConsentOfferNonce::new([0xa5; CONSENT_OFFER_NONCE_BYTES])
+        );
+        assert_ne!(nonce, ConsentOfferNonce::new(last));
+        assert_ne!(
+            nonce,
+            ConsentOfferNonce::new([0; CONSENT_OFFER_NONCE_BYTES])
+        );
+        assert_eq!(nonce.as_bytes(), &[0xa5; CONSENT_OFFER_NONCE_BYTES]);
+
+        let event = serde_json::to_value(&offered).unwrap();
+        for length in [
+            0,
+            CONSENT_OFFER_NONCE_BYTES - 1,
+            CONSENT_OFFER_NONCE_BYTES + 1,
+            4096,
+        ] {
+            assert!(
+                serde_json::from_value::<Request>(serde_json::json!({
+                    "type": "answer_consent_offer",
+                    "daemon_generation": 3,
+                    "offer_id": 7,
+                    "nonce": vec![1_u8; length],
+                    "decision": {"decision": "deny"},
+                }))
+                .is_err(),
+                "a {length}-byte answer nonce is rejected while decoding"
+            );
+            let mut wrong = event.clone();
+            wrong["offer"]["nonce"] = serde_json::json!(vec![1_u8; length]);
+            assert!(
+                serde_json::from_value::<SubscriptionEvent>(wrong).is_err(),
+                "a {length}-byte offer nonce is rejected while decoding"
+            );
+        }
+    }
+
+    #[test]
+    fn consent_prompt_countdown_and_origin_are_additive() {
+        let prompt = consent_prompt();
+        let encoded = serde_json::to_value(&prompt).unwrap();
+        assert_eq!(encoded["respond_within_seconds"], 0);
+        assert_eq!(encoded["origin"], serde_json::json!({"kind": "local"}));
+
+        // A protocol 44 prompt, without either field, decodes with no
+        // countdown and the local origin.
+        let mut old = encoded.clone();
+        let fields = old.as_object_mut().unwrap();
+        fields.remove("respond_within_seconds").unwrap();
+        fields.remove("origin").unwrap();
+        let decoded = serde_json::from_value::<ConsentPrompt>(old).unwrap();
+        assert_eq!(decoded, prompt);
+        assert_eq!(decoded.respond_within_seconds, 0);
+        assert_eq!(decoded.origin, ConsentOrigin::Local);
+
+        // A newer prompt's unknown field still decodes.
+        let mut newer = encoded;
+        newer["a_later_field"] = serde_json::json!({"anything": [1, 2, 3]});
+        assert_eq!(
+            serde_json::from_value::<ConsentPrompt>(newer).unwrap(),
+            prompt
+        );
+
+        let mut remote = consent_prompt();
+        remote.respond_within_seconds = MAX_CONSENT_RESPOND_WITHIN_SECONDS;
+        remote.origin = ConsentOrigin::Remote {
+            profile: "neuromancer".to_owned(),
+            daemon_hostname: Some("neuromancer.lan".to_owned()),
+        };
+        assert_eq!(remote.validate(), Ok(()));
+        let encoded = serde_json::to_value(&remote).unwrap();
+        assert_eq!(
+            encoded["origin"],
+            serde_json::json!({
+                "kind": "remote",
+                "profile": "neuromancer",
+                "daemon_hostname": "neuromancer.lan",
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<ConsentPrompt>(encoded).unwrap(),
+            remote
+        );
+        assert!(
+            serde_json::from_value::<ConsentOrigin>(serde_json::json!({"kind": "elsewhere"}))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn offered_prompts_share_prompt_validation() {
+        let prompt = consent_prompt();
+        let offered = prompt.offered();
+        assert_eq!(offered.validate(), Ok(()));
+        for duration in GrantDuration::ALL {
+            assert_eq!(offered.offers(duration), prompt.offers(duration));
+        }
+        // A responder rebuilds the dialog prompt with its own capability,
+        // the offer's countdown, and its own origin.
+        let origin = ConsentOrigin::Remote {
+            profile: "loop".to_owned(),
+            daemon_hostname: Some("localhost".to_owned()),
+        };
+        let rebuilt =
+            offered
+                .clone()
+                .into_prompt(vec![9; CONSENT_CAPABILITY_BYTES], 30, origin.clone());
+        assert_eq!(rebuilt.validate(), Ok(()));
+        assert_eq!(rebuilt.offered(), offered);
+        assert_eq!(rebuilt.capability, vec![9; CONSENT_CAPABILITY_BYTES]);
+        assert_eq!(rebuilt.respond_within_seconds, 30);
+        assert_eq!(rebuilt.origin, origin);
+        assert_eq!(
+            serde_json::from_value::<OfferedConsentPrompt>(serde_json::to_value(&offered).unwrap())
+                .unwrap(),
+            offered
+        );
+
+        // The same content rules reject the same prompts, capability aside.
+        let invalid = |change: fn(&mut ConsentPrompt)| {
+            let mut prompt = consent_prompt();
+            change(&mut prompt);
+            let offered = prompt.offered();
+            assert_eq!(prompt.validate().is_err(), offered.validate().is_err());
+            offered.validate()
+        };
+        assert!(invalid(|prompt| prompt.scopes.clear()).is_err());
+        assert!(invalid(|prompt| prompt.level = Some(AccessLevel::Look)).is_err());
+        assert!(invalid(|prompt| prompt.durations.swap(1, 2)).is_err());
+        assert!(
+            invalid(|prompt| prompt.agent_name = Some("a".repeat(MAX_AGENT_NAME_CHARS + 1)))
+                .is_err()
+        );
+        assert!(
+            invalid(|prompt| prompt.requester = "r".repeat(MAX_CONSENT_PATH_CHARS + 1)).is_err()
+        );
+        // The capability is not part of the offered content.
+        let mut no_capability = consent_prompt();
+        no_capability.capability.clear();
+        assert!(no_capability.validate().is_err());
+        assert_eq!(no_capability.offered().validate(), Ok(()));
+
+        // Only workspace access is offered to responders.
+        let mut splint = consent_prompt().offered();
+        splint.target = ConsentTarget::Splint {
+            splint_id: SplintId::new(),
+            incarnation: 1,
+        };
+        assert!(splint.validate().is_err());
+        let mut offer = consent_offer();
+        offer.prompt = splint;
+        assert_eq!(
+            offer.validate().unwrap_err().code,
+            ErrorCode::InvalidArgument
+        );
+        let mut offer = consent_offer();
+        offer.prompt.durations.clear();
+        assert_eq!(
+            offer.validate().unwrap_err().code,
+            ErrorCode::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn consent_responder_bounds_reject_out_of_range_values() {
+        // Countdowns: at most the pending request lifetime.
+        assert_eq!(MAX_CONSENT_RESPOND_WITHIN_SECONDS, 120);
+        let mut prompt = consent_prompt();
+        prompt.respond_within_seconds = MAX_CONSENT_RESPOND_WITHIN_SECONDS;
+        assert_eq!(prompt.validate(), Ok(()));
+        prompt.respond_within_seconds = MAX_CONSENT_RESPOND_WITHIN_SECONDS + 1;
+        assert!(prompt.validate().is_err());
+        for seconds in [0, MAX_CONSENT_RESPOND_WITHIN_SECONDS + 1, u64::MAX] {
+            let mut offer = consent_offer();
+            offer.respond_within_seconds = seconds;
+            assert_eq!(
+                offer.validate().unwrap_err().code,
+                ErrorCode::InvalidArgument,
+                "{seconds}"
+            );
+        }
+        for seconds in [1, MAX_CONSENT_RESPOND_WITHIN_SECONDS] {
+            let mut offer = consent_offer();
+            offer.respond_within_seconds = seconds;
+            assert_eq!(offer.validate(), Ok(()));
+        }
+        let mut offer = consent_offer();
+        offer.daemon_generation = 0;
+        assert!(offer.validate().is_err());
+        let mut offer = consent_offer();
+        offer.offer_id = 0;
+        assert!(offer.validate().is_err());
+
+        // An answer names a nonzero generation and offer.
+        assert_eq!(validate_consent_answer(3, 7), Ok(()));
+        for (daemon_generation, offer_id) in [(0, 7), (3, 0), (0, 0)] {
+            assert_eq!(
+                validate_consent_answer(daemon_generation, offer_id)
+                    .unwrap_err()
+                    .code,
+                ErrorCode::InvalidArgument,
+                "{daemon_generation} {offer_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn consent_origins_name_a_usable_profile_and_hostname() {
+        let remote = |profile: &str, daemon_hostname: Option<&str>| ConsentOrigin::Remote {
+            profile: profile.to_owned(),
+            daemon_hostname: daemon_hostname.map(str::to_owned),
+        };
+        assert_eq!(ConsentOrigin::Local.validate(), Ok(()));
+        assert_eq!(
+            remote("work-box_2.lan", Some("neuromancer")).validate(),
+            Ok(())
+        );
+        assert_eq!(
+            remote(&"p".repeat(MAX_REMOTE_PROFILE_NAME_BYTES), Some("h")).validate(),
+            Ok(())
+        );
+        let longest_host = "h".repeat(MAX_DAEMON_HOSTNAME_BYTES);
+        assert_eq!(remote("p", Some(&longest_host)).validate(), Ok(()));
+        let long_profile = "p".repeat(MAX_REMOTE_PROFILE_NAME_BYTES + 1);
+        let long_host = "h".repeat(MAX_DAEMON_HOSTNAME_BYTES + 1);
+        for (profile, daemon_hostname) in [
+            ("", Some("neuromancer")),
+            ("", None),
+            ("-oProxyCommand", None),
+            ("two words", Some("neuromancer")),
+            ("tab\there", Some("neuromancer")),
+            ("bidi\u{202e}", Some("neuromancer")),
+            ("caf\u{e9}", Some("neuromancer")),
+            (long_profile.as_str(), Some("neuromancer")),
+            ("neuromancer", Some("")),
+            ("neuromancer", Some("two words")),
+            ("neuromancer", Some("line\nbreak")),
+            ("neuromancer", Some("bidi\u{2066}host")),
+            ("neuromancer", Some(long_host.as_str())),
+        ] {
+            assert_eq!(
+                usable_remote_profile_name(profile),
+                profile == "neuromancer",
+                "{profile:?}"
+            );
+            let origin = remote(profile, daemon_hostname);
+            assert!(origin.validate().is_err(), "{origin:?}");
+            let mut prompt = consent_prompt();
+            prompt.origin = origin;
+            assert!(prompt.validate().is_err(), "{prompt:?}");
+        }
+    }
+
+    #[test]
+    fn a_remote_origin_may_omit_the_hostname_and_is_never_local() {
+        // A daemon that reported no usable hostname still yields a valid
+        // remote origin from the Window's own profile.
+        let profile_only = ConsentOrigin::Remote {
+            profile: "loop".to_owned(),
+            daemon_hostname: None,
+        };
+        assert_eq!(profile_only.validate(), Ok(()));
+        let encoded = serde_json::to_value(&profile_only).unwrap();
+        assert_eq!(
+            encoded,
+            serde_json::json!({"kind": "remote", "profile": "loop"})
+        );
+        assert_eq!(
+            serde_json::from_value::<ConsentOrigin>(encoded).unwrap(),
+            profile_only
+        );
+        let mut prompt = consent_prompt();
+        prompt.origin = profile_only.clone();
+        assert_eq!(prompt.validate(), Ok(()));
+
+        // A remote origin, valid or not, never equals, encodes as, or
+        // decodes to the local one, whatever hostname it claims.
+        let local = serde_json::to_value(ConsentOrigin::Local).unwrap();
+        assert_eq!(local, serde_json::json!({"kind": "local"}));
+        for daemon_hostname in [None, Some("localhost"), Some("this-computer"), Some("")] {
+            let remote = ConsentOrigin::Remote {
+                profile: "loop".to_owned(),
+                daemon_hostname: daemon_hostname.map(str::to_owned),
+            };
+            assert_ne!(remote, ConsentOrigin::Local);
+            let encoded = serde_json::to_value(&remote).unwrap();
+            assert_eq!(encoded["kind"], "remote");
+            assert_ne!(encoded, local);
+            assert_ne!(
+                serde_json::from_value::<ConsentOrigin>(encoded).unwrap(),
+                ConsentOrigin::Local
+            );
+            assert!(!format!("{remote:?}").starts_with("Local"));
+        }
+        // A remote origin without its profile never decodes, and so never
+        // degrades to the local default.
+        assert!(
+            serde_json::from_value::<ConsentOrigin>(serde_json::json!({"kind": "remote"})).is_err()
+        );
+        let mut missing = serde_json::to_value(consent_prompt()).unwrap();
+        missing["origin"] = serde_json::json!({"kind": "remote", "daemon_hostname": "h"});
+        assert!(serde_json::from_value::<ConsentPrompt>(missing).is_err());
     }
 }

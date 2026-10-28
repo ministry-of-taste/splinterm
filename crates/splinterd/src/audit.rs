@@ -124,6 +124,8 @@ pub const fn operation_for_request(request: &Request) -> AuditOperation {
         Request::PrepareDaemonHandoff { .. } => AuditOperation::PrepareDaemonHandoff,
         Request::ClaimHandoffControl { .. } => AuditOperation::ClaimHandoffControl,
         Request::AcknowledgeHandoffPrepare { .. } => AuditOperation::AcknowledgeHandoffPrepare,
+        Request::SubscribeConsentOffers { .. } => AuditOperation::SubscribeConsentOffers,
+        Request::AnswerConsentOffer { .. } => AuditOperation::AnswerConsentOffer,
     }
 }
 
@@ -232,6 +234,37 @@ fn sanitize_reason(reason: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn consent_responder_requests_have_their_own_operations() {
+        use splinterm_protocol::{
+            CONSENT_OFFER_NONCE_BYTES, ConsentDecision, ConsentOfferNonce, ConsentResponderKind,
+        };
+
+        for kind in [ConsentResponderKind::Window, ConsentResponderKind::Terminal] {
+            assert_eq!(
+                operation_for_request(&Request::SubscribeConsentOffers { kind }),
+                AuditOperation::SubscribeConsentOffers
+            );
+        }
+        assert_eq!(
+            operation_for_request(&Request::AnswerConsentOffer {
+                daemon_generation: 1,
+                offer_id: 1,
+                nonce: ConsentOfferNonce::new([1; CONSENT_OFFER_NONCE_BYTES]),
+                decision: ConsentDecision::Deny,
+            }),
+            AuditOperation::AnswerConsentOffer
+        );
+        assert_eq!(
+            AuditOperation::SubscribeConsentOffers.as_str(),
+            "subscribe_consent_offers"
+        );
+        assert_eq!(
+            AuditOperation::AnswerConsentOffer.as_str(),
+            "answer_consent_offer"
+        );
+    }
 
     fn peer() -> AuditPeer {
         AuditPeer {
