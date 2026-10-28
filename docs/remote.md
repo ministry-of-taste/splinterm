@@ -444,8 +444,11 @@ Window (ADR 0015). The prompt is the same trusted dialog as a local one, started
 by the Window itself, and it says that the request is remote: its title, and a
 host row naming the SSH profile and the hostname that computer reports. Every
 connected Window shows the prompt at once, beside that computer's own dialog
-when it has one; the first answer counts and the other dialogs close. A prompt
-nobody answers closes when the request's time runs out, without answering.
+when it has one; the first answer counts and the other dialogs close. This
+holds per Window: with three Windows open to the same computer, each prompt
+shows three identical dialogs, and answering any one of them closes the others.
+A prompt nobody answers closes when the request's time runs out, without
+answering.
 
 The Window keeps one relay channel for this, and subscribes again by itself
 after the remote daemon is upgraded live. Set

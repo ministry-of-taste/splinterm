@@ -18,15 +18,19 @@
 //! and the loss of the connection. Only an answer is ever sent: a withdrawal,
 //! a lost connection, or the deadline kills and reaps the dialog and sends
 //! nothing, so the dialog never denies by itself. A second offer while one
-//! shows, or an offer that fails validation, is a protocol fault: the dialog
-//! goes and the Window subscribes again on a fresh connection.
+//! shows, or an offer that fails validation or makes no valid prompt, is a
+//! protocol fault: the dialog goes and the Window subscribes again on a fresh
+//! connection. Dialogs launch at least a second apart, so a daemon cannot
+//! make the Window launch them back to back.
 //!
 //! The responder lives as long as its Window. It subscribes again, with a
 //! bounded backoff, after its connection ends, as when the remote daemon is
 //! upgraded live (nothing about responders survives a handoff), and it
-//! waits while the Window itself reconnects. The viewer's
-//! `[integration] remote-agent-prompts = no` stops it, at once on Reload
-//! configuration, and `yes` starts it again.
+//! waits while the Window itself reconnects. Refused as a responder
+//! (`Unauthorized`, `UnsupportedOperation`), it waits for the Window's
+//! handoff status or the viewer's settings to change before it asks again.
+//! The viewer's `[integration] remote-agent-prompts = no` stops it, at once
+//! on Reload configuration, and `yes` starts it again.
 
 use std::{convert::Infallible, future::Future, process::Command, time::Duration};
 
@@ -63,6 +67,10 @@ const REQUEST_DEADLINE: Duration = Duration::from_secs(15);
 /// Added to the dialog's own read bound, so the offer's deadline, which the
 /// responder enforces itself, always ends an unanswered dialog first.
 const DIALOG_BUDGET_SLACK: Duration = Duration::from_secs(5);
+/// The shortest time between two dialog launches, so a daemon that offers and
+/// withdraws in a loop, or whose offers fail at once, cannot make the Window
+/// launch dialogs back to back.
+const MIN_DIALOG_GAP: Duration = Duration::from_secs(1);
 
 /// Where the responder's daemon connections come from.
 pub(in crate::app) trait ResponderLink: Send + Sync + 'static {
@@ -71,6 +79,8 @@ pub(in crate::app) trait ResponderLink: Send + Sync + 'static {
     /// Whether the Window is reconnecting to its daemon now, as after a live
     /// upgrade; the responder subscribes again once it is done.
     fn window_reconnecting(&self) -> bool;
+    /// A number that changes whenever the Window's handoff status does.
+    fn handoff_revision(&self) -> u64;
 }
 
 impl ResponderLink for ConnectionFactory {
@@ -83,6 +93,10 @@ impl ResponderLink for ConnectionFactory {
             self.handoff_status().view().phase,
             WindowHandoffPhase::Reconnecting | WindowHandoffPhase::Continuing
         )
+    }
+
+    fn handoff_revision(&self) -> u64 {
+        self.handoff_status().view().revision
     }
 }
 
@@ -166,6 +180,7 @@ pub(in crate::app) fn spawn_remote_consent_responder(
         ProcessDialog,
         origin,
         settings,
+        |error| eprintln!("splinterm: remote agent prompts: subscribing again: {error:#}"),
     )))
 }
 
@@ -185,6 +200,20 @@ impl std::error::Error for ProtocolFault {}
 fn fault(reason: &'static str) -> anyhow::Error {
     anyhow::Error::new(ProtocolFault(reason))
 }
+
+/// The daemon refused this Window as a responder (`Unauthorized`, or
+/// `UnsupportedOperation`): subscribing again cannot help until something
+/// changed.
+#[derive(Debug)]
+struct SubscribeRefused;
+
+impl std::fmt::Display for SubscribeRefused {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("the daemon refused this Window as a prompt responder")
+    }
+}
+
+impl std::error::Error for SubscribeRefused {}
 
 /// The pause before the attempt after `failures` failed ones.
 fn resubscribe_delay(failures: u32) -> Duration {
@@ -227,22 +256,47 @@ async fn pause<L: ResponderLink>(link: &L, delay: Duration) {
     }
 }
 
+/// Waits until the Window's handoff status changes, as when it reconnects
+/// to its daemon or a live upgrade starts or ends.
+async fn until_window_changes<L: ResponderLink>(link: &L) {
+    let seen = link.handoff_revision();
+    while link.handoff_revision() == seen {
+        tokio::time::sleep(WINDOW_RECONNECT_POLL).await;
+    }
+}
+
+/// How a refused responder waits: until the Window's handoff status or the
+/// viewer's settings change. `true` once the Window is gone.
+async fn until_refusal_may_change<L: ResponderLink>(
+    link: &L,
+    settings: &mut watch::Receiver<TopologyReloadSettings>,
+) -> bool {
+    tokio::select! {
+        () = until_window_changes(link) => false,
+        changed = settings.changed() => changed.is_err(),
+    }
+}
+
 /// The responder's life: one subscription at a time, again after each one
-/// ends, while the viewer allows it and the Window lasts.
+/// ends, while the viewer allows it and the Window lasts. `report` logs why
+/// a subscription ended, once per run of failures.
 async fn run_responder<L: ResponderLink, D: ConsentDialog>(
     link: L,
     dialog: D,
     origin: ConsentOrigin,
     mut settings: watch::Receiver<TopologyReloadSettings>,
+    mut report: impl FnMut(&anyhow::Error) + Send,
 ) {
     let mut failures = 0_u32;
+    // The last dialog launch, for the gap between launches (`show`).
+    let mut last_launch = None;
     loop {
         if !until_enabled(&mut settings).await {
             return;
         }
         let started = Instant::now();
         let error = tokio::select! {
-            ended = run_subscription(&link, &dialog, &origin) => match ended {
+            ended = run_subscription(&link, &dialog, &origin, &mut last_launch) => match ended {
                 Ok(never) => match never {},
                 Err(error) => error,
             },
@@ -257,11 +311,21 @@ async fn run_responder<L: ResponderLink, D: ConsentDialog>(
         if started.elapsed() >= STABLE_SUBSCRIPTION {
             failures = 0;
         }
-        if failures == 0 || error.downcast_ref::<ProtocolFault>().is_some() {
-            eprintln!("splinterm: remote agent prompts: subscribing again: {error:#}");
+        // A daemon that faults on every offer, or keeps refusing, is
+        // reported once until a subscription lasts, not once per attempt.
+        if failures == 0 {
+            report(&error);
         }
-        let delay = resubscribe_delay(failures);
         failures = failures.saturating_add(1);
+        if error.is::<SubscribeRefused>() {
+            // Retrying cannot help until something about this Window or
+            // the viewer's settings changed.
+            if until_refusal_may_change(&link, &mut settings).await {
+                return;
+            }
+            continue;
+        }
+        let delay = resubscribe_delay(failures - 1);
         tokio::select! {
             () = pause(&link, delay) => {}
             closed = until_disabled(&mut settings) => {
@@ -365,14 +429,25 @@ impl Subscription {
     }
 }
 
-/// The dialog prompt for `offer`: its content, a fresh random capability
-/// that is never the offer's nonce, its countdown, and this Window's own
-/// `origin`.
-fn offer_prompt(offer: &ConsentOffer, origin: &ConsentOrigin) -> Result<ConsentPrompt> {
+/// A fresh random dialog capability for `offer`, never its nonce. Only a
+/// failure of the system's randomness, never anything the daemon sent,
+/// makes this fail.
+fn offer_capability(offer: &ConsentOffer) -> Result<Vec<u8>> {
     let capability = dialog_capability()?;
     if capability.as_slice() == offer.nonce.as_bytes() {
         return Err(anyhow!("the dialog capability matched the offer nonce"));
     }
+    Ok(capability)
+}
+
+/// The dialog prompt for `offer`: its content, `capability`, its countdown,
+/// and this Window's own `origin`. An offer that passed its own validation
+/// but still makes no valid prompt is a protocol fault.
+fn offer_prompt(
+    offer: &ConsentOffer,
+    capability: Vec<u8>,
+    origin: &ConsentOrigin,
+) -> Result<ConsentPrompt> {
     let respond_within = offer
         .respond_within_seconds
         .clamp(1, MAX_CONSENT_RESPOND_WITHIN_SECONDS);
@@ -380,18 +455,21 @@ fn offer_prompt(offer: &ConsentOffer, origin: &ConsentOrigin) -> Result<ConsentP
         .prompt
         .clone()
         .into_prompt(capability, respond_within, origin.clone());
-    prompt
-        .validate()
-        .map_err(|reason| anyhow!("the offer cannot be shown: {reason}"))?;
-    Ok(prompt)
+    match prompt.validate() {
+        Ok(()) => Ok(prompt),
+        Err(reason) => Err(fault("an offer that makes no valid prompt")
+            .context(format!("the offer cannot be shown: {reason}"))),
+    }
 }
 
 /// Subscribes on a new connection and answers its offers until the
-/// connection ends or the daemon breaks the contract.
+/// connection ends or the daemon breaks the contract. `last_launch` is the
+/// responder's last dialog launch.
 async fn run_subscription<L: ResponderLink, D: ConsentDialog>(
     link: &L,
     dialog: &D,
     origin: &ConsentOrigin,
+    last_launch: &mut Option<Instant>,
 ) -> Result<Infallible> {
     let mut connection = link.connect().await?;
     let subscribed = connection
@@ -401,7 +479,15 @@ async fn run_subscription<L: ResponderLink, D: ConsentDialog>(
             },
             REQUEST_DEADLINE,
         )
-        .await?;
+        .await
+        .map_err(
+            |error| match protocol_error(&error).map(|error| error.code) {
+                Some(ErrorCode::Unauthorized | ErrorCode::UnsupportedOperation) => {
+                    error.context(SubscribeRefused)
+                }
+                _ => error,
+            },
+        )?;
     let Response::ConsentOffersSubscribed { subscription_id } = subscribed else {
         return Err(fault("an unexpected answer to subscribing"));
     };
@@ -413,8 +499,8 @@ async fn run_subscription<L: ResponderLink, D: ConsentDialog>(
             OfferEvent::Offered(offer) => {
                 let arrived = Instant::now();
                 subscription.accept(&offer)?;
-                let prompt = match offer_prompt(&offer, origin) {
-                    Ok(prompt) => prompt,
+                let capability = match offer_capability(&offer) {
+                    Ok(capability) => capability,
                     Err(error) => {
                         // Skipped, never shown as anything else; the daemon
                         // withdraws it in time.
@@ -422,6 +508,7 @@ async fn run_subscription<L: ResponderLink, D: ConsentDialog>(
                         continue;
                     }
                 };
+                let prompt = offer_prompt(&offer, capability, origin)?;
                 show(
                     &mut connection,
                     &mut subscription,
@@ -429,6 +516,7 @@ async fn run_subscription<L: ResponderLink, D: ConsentDialog>(
                     &offer,
                     prompt,
                     arrived,
+                    last_launch,
                 )
                 .await?;
             }
@@ -436,10 +524,31 @@ async fn run_subscription<L: ResponderLink, D: ConsentDialog>(
     }
 }
 
+/// How `frame`, read while `offer` waits or shows, ends it: `Ok` quietly
+/// (its withdrawal), `Err` with the subscription (anything else).
+fn offer_ended_by(
+    frame: Result<ServerFrame>,
+    subscription: &mut Subscription,
+    offer: &ConsentOffer,
+) -> Result<()> {
+    match frame.and_then(|frame| subscription.event(frame))? {
+        OfferEvent::Withdrawn { offer_id } if offer_id == offer.offer_id => {
+            subscription.awaiting_withdrawal = None;
+            Ok(())
+        }
+        OfferEvent::Withdrawn { .. } => Err(fault("a withdrawal of another offer while one shows")),
+        OfferEvent::Offered(_) => Err(fault("a second offer while one shows")),
+    }
+}
+
 /// Shows one offer's dialog and races its answer against the offer's
 /// withdrawal, its deadline (counted from `arrived`), and the connection.
 /// Only an answer is sent. An error ends the subscription; the dialog is
 /// gone, and reaped, whenever this returns.
+///
+/// The dialog launches no sooner than [`MIN_DIALOG_GAP`] after
+/// `last_launch`, which this updates; until then the offer can still be
+/// withdrawn or run out, and then it never launches.
 async fn show<D: ConsentDialog>(
     connection: &mut Connection,
     subscription: &mut Subscription,
@@ -447,8 +556,20 @@ async fn show<D: ConsentDialog>(
     offer: &ConsentOffer,
     prompt: ConsentPrompt,
     arrived: Instant,
+    last_launch: &mut Option<Instant>,
 ) -> Result<()> {
     let deadline = arrived + Duration::from_secs(prompt.respond_within_seconds);
+    if let Some(earliest) = last_launch.map(|launched| launched + MIN_DIALOG_GAP) {
+        tokio::select! {
+            biased;
+            () = tokio::time::sleep_until(deadline) => return Ok(()),
+            frame = connection.next_server_frame() => {
+                return offer_ended_by(frame, subscription, offer);
+            }
+            () = tokio::time::sleep_until(earliest) => {}
+        }
+    }
+    *last_launch = Some(Instant::now());
     let budget = deadline.saturating_duration_since(Instant::now()) + DIALOG_BUDGET_SLACK;
     let cancel = CancellationToken::new();
     let asked = dialog.ask(prompt, budget, cancel.clone());
@@ -466,19 +587,8 @@ async fn show<D: ConsentDialog>(
                 ended = Some(Ok(()));
             }
             frame = connection.next_server_frame(), if ended.is_none() => {
-                let end = match frame.and_then(|frame| subscription.event(frame)) {
-                    Ok(OfferEvent::Withdrawn { offer_id }) if offer_id == offer.offer_id => {
-                        subscription.awaiting_withdrawal = None;
-                        Ok(())
-                    }
-                    Ok(OfferEvent::Withdrawn { .. }) => {
-                        Err(fault("a withdrawal of another offer while one shows"))
-                    }
-                    Ok(OfferEvent::Offered(_)) => Err(fault("a second offer while one shows")),
-                    Err(error) => Err(error),
-                };
                 cancel.cancel();
-                ended = Some(end);
+                ended = Some(offer_ended_by(frame, subscription, offer));
             }
             outcome = &mut asked => break outcome,
         }
@@ -549,7 +659,7 @@ mod tests {
         pin::Pin,
         sync::{
             Arc, Mutex,
-            atomic::{AtomicBool, AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         },
     };
 
@@ -664,6 +774,22 @@ mod tests {
 
         /// Answers the hello and the subscription.
         async fn subscribe(&mut self) {
+            let request_id = self.subscription_request().await;
+            self.respond(
+                request_id,
+                Response::ConsentOffersSubscribed { subscription_id: 5 },
+            )
+            .await;
+        }
+
+        /// Answers the hello and refuses the subscription with `code`.
+        async fn refuse_subscription(&mut self, code: ErrorCode) {
+            let request_id = self.subscription_request().await;
+            self.refuse(request_id, code).await;
+        }
+
+        /// Answers the hello and returns the subscription request's ID.
+        async fn subscription_request(&mut self) -> u64 {
             let Some(ClientFrame::Hello { .. }) = self.next().await else {
                 panic!("expected the client hello");
             };
@@ -684,11 +810,7 @@ mod tests {
             else {
                 panic!("expected a Window consent subscription");
             };
-            self.respond(
-                request_id,
-                Response::ConsentOffersSubscribed { subscription_id: 5 },
-            )
-            .await;
+            request_id
         }
 
         async fn event(&mut self, sequence: u64, event: SubscriptionEvent) {
@@ -738,6 +860,10 @@ mod tests {
         open: Arc<Mutex<Vec<Arc<AtomicBool>>>>,
         reconnecting: Arc<AtomicBool>,
         daemons: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+        /// The Window's handoff status revision.
+        revision: Arc<AtomicU64>,
+        /// What the responder reported, one entry per report.
+        reports: Arc<Mutex<Vec<String>>>,
     }
 
     impl FakeLink {
@@ -813,6 +939,10 @@ mod tests {
         fn window_reconnecting(&self) -> bool {
             self.reconnecting.load(Ordering::SeqCst)
         }
+
+        fn handoff_revision(&self) -> u64 {
+            self.revision.load(Ordering::SeqCst)
+        }
     }
 
     // ---- the fake dialog ----
@@ -842,6 +972,8 @@ mod tests {
         people: Arc<Mutex<VecDeque<Person>>>,
         prompts: Arc<Mutex<Vec<ConsentPrompt>>>,
         ended: Arc<Mutex<Vec<Shown>>>,
+        /// When each dialog launched.
+        launched: Arc<Mutex<Vec<Instant>>>,
     }
 
     /// Records a fake dialog dropped before it ended.
@@ -905,6 +1037,7 @@ mod tests {
             _budget: Duration,
             cancel: CancellationToken,
         ) -> Result<DialogOutcome<ConsentReply>> {
+            self.launched.lock().unwrap().push(Instant::now());
             self.prompts.lock().unwrap().push(prompt.clone());
             let person = self.people.lock().unwrap().pop_front();
             let mut showing = Showing {
@@ -959,12 +1092,28 @@ mod tests {
         watch::Sender<TopologyReloadSettings>,
         tokio::task::JoinHandle<()>,
     ) {
+        start_as(link, dialog, enabled, origin())
+    }
+
+    /// [`start`] with the prompt origin `origin`. What the responder reports
+    /// goes to the link's `reports`.
+    fn start_as(
+        link: &FakeLink,
+        dialog: &FakeDialog,
+        enabled: bool,
+        origin: ConsentOrigin,
+    ) -> (
+        watch::Sender<TopologyReloadSettings>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let (sender, receiver) = settings(enabled);
+        let reports = Arc::clone(&link.reports);
         let task = tokio::spawn(run_responder(
             link.clone(),
             dialog.clone(),
-            origin(),
+            origin,
             receiver,
+            move |error| reports.lock().unwrap().push(format!("{error:#}")),
         ));
         (sender, task)
     }
@@ -972,6 +1121,11 @@ mod tests {
     const GRANT_ONCE: ConsentDecision = ConsentDecision::Grant {
         duration: GrantDuration::Once,
     };
+
+    /// The prompt this Window builds for `offer`.
+    fn prompt_for(offer: &ConsentOffer) -> Result<ConsentPrompt> {
+        offer_prompt(offer, offer_capability(offer)?, &origin())
+    }
 
     // ---- the tests ----
 
@@ -1002,7 +1156,7 @@ mod tests {
         }
         assert_eq!(responder_origin(&enabled, Some("bad host\u{202e}")), None);
         // Built from the offer, the prompt still carries only that origin.
-        let prompt = offer_prompt(&offer(1, 30), &origin()).unwrap();
+        let prompt = prompt_for(&offer(1, 30)).unwrap();
         assert_eq!(prompt.origin, origin());
         assert_ne!(prompt.origin, ConsentOrigin::Local);
     }
@@ -1023,8 +1177,8 @@ mod tests {
     #[test]
     fn every_prompt_gets_a_fresh_capability_that_is_never_the_nonce() {
         let offer = offer(1, 30);
-        let first = offer_prompt(&offer, &origin()).unwrap();
-        let second = offer_prompt(&offer, &origin()).unwrap();
+        let first = prompt_for(&offer).unwrap();
+        let second = prompt_for(&offer).unwrap();
         assert_eq!(first.capability.len(), CONSENT_CAPABILITY_BYTES);
         assert_ne!(first.capability.as_slice(), offer.nonce.as_bytes());
         assert_ne!(second.capability.as_slice(), offer.nonce.as_bytes());
@@ -1041,12 +1195,7 @@ mod tests {
             let mut subscription = Subscription::new(5, GENERATION);
             let offer = offer(1, seconds);
             subscription.accept(&offer).unwrap();
-            assert_eq!(
-                offer_prompt(&offer, &origin())
-                    .unwrap()
-                    .respond_within_seconds,
-                seconds
-            );
+            assert_eq!(prompt_for(&offer).unwrap().respond_within_seconds, seconds);
         }
         let faults = |offer: ConsentOffer| {
             Subscription::new(5, GENERATION)
@@ -1482,6 +1631,200 @@ mod tests {
         link.finished().await;
     }
 
+    /// A daemon that offers and withdraws as fast as it can launches at
+    /// most one dialog a second; an offer withdrawn while it waits for its
+    /// launch never launches.
+    #[tokio::test]
+    async fn dialog_launches_are_paced_at_least_a_second_apart() {
+        let link = FakeLink::default();
+        let dialog = FakeDialog::default();
+        let watched = dialog.clone();
+        link.script(move |mut daemon| async move {
+            daemon.subscribe().await;
+            let mut sequence = 1;
+            for offer_id in 1..=3 {
+                daemon.offer(sequence, offer(offer_id, 60)).await;
+                watched.showing().await;
+                daemon.withdraw(sequence + 1, offer_id).await;
+                watched.ended_count(watched.prompts().len()).await;
+                sequence += 2;
+            }
+            // At once after a launch: withdrawn before its own could come.
+            daemon.offer(sequence, offer(4, 60)).await;
+            daemon.withdraw(sequence + 1, 4).await;
+            daemon.offer(sequence + 2, offer(5, 60)).await;
+            watched.showing().await;
+            daemon.withdraw(sequence + 3, 5).await;
+            watched.ended_count(4).await;
+        });
+        let (_settings, task) = start(&link, &dialog, true);
+        link.finished().await;
+        assert_eq!(dialog.prompts().len(), 4, "the fourth offer never launched");
+        let launched = dialog.launched.lock().unwrap().clone();
+        for pair in launched.windows(2) {
+            assert!(pair[1] - pair[0] >= MIN_DIALOG_GAP, "{launched:?}");
+        }
+        assert_eq!(link.connects(), 1);
+        task.abort();
+    }
+
+    /// An offer that passes its own validation but makes no valid prompt
+    /// with this Window's origin is a protocol fault: nothing shows and the
+    /// Window subscribes again, reporting it once.
+    #[tokio::test]
+    async fn an_offer_that_makes_no_valid_prompt_is_a_protocol_fault() {
+        let link = FakeLink::default();
+        let dialog = FakeDialog::default();
+        for _ in 0..2 {
+            link.script(|mut daemon| async move {
+                daemon.subscribe().await;
+                daemon.offer(1, offer(1, 30)).await;
+                daemon.closed_without_requests().await;
+            });
+        }
+        link.script(|mut daemon| async move {
+            daemon.subscribe().await;
+        });
+        let unusable = ConsentOrigin::Remote {
+            profile: "two words".to_owned(),
+            daemon_hostname: None,
+        };
+        let (_settings, task) = start_as(&link, &dialog, true, unusable);
+        link.finished().await;
+        assert!(dialog.prompts().is_empty());
+        let reports = link.reports.lock().unwrap().clone();
+        assert_eq!(reports.len(), 1, "{reports:?}");
+        assert!(reports[0].contains("makes no valid prompt"), "{reports:?}");
+        task.abort();
+    }
+
+    /// A refused subscription shows nothing and is reported once. Refused
+    /// as `Unauthorized` or `UnsupportedOperation`, the Window waits for its
+    /// handoff status or the viewer's settings to change before it asks
+    /// again; refused for a limit, it backs off.
+    #[tokio::test]
+    async fn a_refused_subscription_backs_off_quietly() {
+        let link = FakeLink::default();
+        let dialog = FakeDialog::default();
+        for code in [
+            ErrorCode::Unauthorized,
+            ErrorCode::UnsupportedOperation,
+            ErrorCode::ResourceLimit,
+            ErrorCode::ResourceLimit,
+        ] {
+            link.script(move |mut daemon| async move {
+                daemon.refuse_subscription(code).await;
+                daemon.closed_without_requests().await;
+            });
+        }
+        link.script(|mut daemon| async move {
+            daemon.subscribe().await;
+        });
+        let (settings, task) = start(&link, &dialog, true);
+        link.connected(1).await;
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert_eq!(link.connects(), 1, "an unauthorized responder kept asking");
+        // The Window reconnects, as after a live upgrade.
+        link.revision.fetch_add(1, Ordering::SeqCst);
+        link.connected(2).await;
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert_eq!(link.connects(), 2, "a refused responder kept asking");
+        // A Reload republishes the settings.
+        settings.send_modify(|_| {});
+        link.finished().await;
+        assert_eq!(link.connects(), 5);
+        assert!(dialog.prompts().is_empty());
+        let reports = link.reports.lock().unwrap().clone();
+        assert_eq!(reports.len(), 1, "{reports:?}");
+        assert!(reports[0].contains("refused this Window"), "{reports:?}");
+        task.abort();
+    }
+
+    /// An error frame for no request, such as a daemon limit, ends the
+    /// subscription: the dialog goes, nothing is sent, and the Window
+    /// subscribes again.
+    #[tokio::test]
+    async fn an_unrequested_error_while_a_dialog_shows_resubscribes() {
+        let link = FakeLink::default();
+        let dialog = FakeDialog::with([Person::Waits]);
+        let watched = dialog.clone();
+        link.script(move |mut daemon| async move {
+            daemon.subscribe().await;
+            daemon.offer(1, offer(1, 60)).await;
+            watched.showing().await;
+            daemon
+                .send(&ServerFrame::Error {
+                    request_id: None,
+                    error: ProtocolError::new(ErrorCode::ResourceLimit, "fixture limit"),
+                })
+                .await;
+            daemon.closed_without_requests().await;
+            assert_eq!(watched.ended(), vec![Shown::Cancelled]);
+        });
+        link.script(|mut daemon| async move {
+            daemon.subscribe().await;
+        });
+        let (_settings, task) = start(&link, &dialog, true);
+        link.finished().await;
+        assert_eq!(link.connects(), 2);
+        assert_eq!(dialog.prompts().len(), 1);
+        task.abort();
+    }
+
+    /// An answer refused because the daemon is handing off closes the
+    /// offer quietly; its `fenced` withdrawal follows and the subscription
+    /// goes on.
+    #[tokio::test]
+    async fn an_answer_refused_during_a_handoff_keeps_the_subscription() {
+        let link = FakeLink::default();
+        let dialog = FakeDialog::with([
+            Person::Answers(GRANT_ONCE, Duration::ZERO),
+            Person::Answers(GRANT_ONCE, Duration::ZERO),
+        ]);
+        link.script(|mut daemon| async move {
+            daemon.subscribe().await;
+            daemon.offer(1, offer(1, 30)).await;
+            let Some((request_id, Request::AnswerConsentOffer { offer_id: 1, .. })) =
+                daemon.request().await
+            else {
+                panic!("expected an answer");
+            };
+            daemon
+                .refuse(request_id, ErrorCode::HandoffInProgress)
+                .await;
+            daemon
+                .event(
+                    2,
+                    SubscriptionEvent::ConsentOfferWithdrawn {
+                        offer_id: 1,
+                        reason: ConsentOfferEnd::Fenced,
+                    },
+                )
+                .await;
+            daemon.offer(3, offer(2, 30)).await;
+            let Some((request_id, Request::AnswerConsentOffer { offer_id: 2, .. })) =
+                daemon.request().await
+            else {
+                panic!("expected the second answer");
+            };
+            daemon
+                .respond(request_id, Response::ConsentOfferAnswered)
+                .await;
+        });
+        let (_settings, task) = start(&link, &dialog, true);
+        link.finished().await;
+        assert_eq!(link.connects(), 1);
+        // Only the fixture's close, once its script ended, may be reported.
+        let reports = link.reports.lock().unwrap().clone();
+        assert!(
+            reports
+                .iter()
+                .all(|report| !report.contains("fixture refusal")),
+            "{reports:?}"
+        );
+        task.abort();
+    }
+
     /// End to end over the remote transport a Window uses: a fake OpenSSH
     /// child speaking the graphical relay framing to a fixture daemon,
     /// which offers a prompt as the daemon does. The scripted dialog shows
@@ -1529,6 +1872,7 @@ mod tests {
             dialog.clone(),
             origin.clone(),
             receiver,
+            |error| panic!("the responder ended a subscription: {error:#}"),
         ));
 
         assert_eq!(

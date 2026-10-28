@@ -295,6 +295,11 @@ where
     let wake = parent
         .try_clone()
         .context("duplicate private dialog descriptor")?;
+    // The dialog ties itself to this parent with PR_SET_PDEATHSIG, which
+    // follows the spawning THREAD, not the process: it fires when the thread
+    // that forked exits. This spawn must therefore run on a thread that lives
+    // until the child is reaped, as a runtime worker does, and never move to
+    // `spawn_blocking` or another short-lived thread.
     let mut process = command
         .stdin(Stdio::from(OwnedFd::from(child_read)))
         .stdout(Stdio::from(OwnedFd::from(child)))

@@ -573,12 +573,17 @@ async fn run_configured_command(
             }
         }
         Command::Consent => {
-            // Dies with whoever asked: the daemon, or a remote Window
-            // (`remote_consent`), so a dialog never outlives its asker.
+            // Dies with whoever asked, the daemon or a remote Window
+            // (`remote_consent`): the death signal follows the asker's
+            // spawning thread from here on, and the client checks after
+            // reading the request that this asker is still its parent and
+            // still holds its end of the socket, which catches one that went
+            // before the tie.
+            let asker = rustix::process::getppid();
             tie_dialog_to_parent()?;
             let theme = configure_dialog_renderer(&config)?;
             let shortcut = config.dialog_shortcut;
-            tokio::task::spawn_blocking(move || run_consent_client(shortcut, theme))
+            tokio::task::spawn_blocking(move || run_consent_client(asker, shortcut, theme))
                 .await
                 .context("trusted consent task failed")?
         }

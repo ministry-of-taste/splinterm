@@ -253,10 +253,10 @@ a hostile program running as your account.
   open as well, the first answer wins.
 - A remote Window (`splinterm --remote`) shows the agent access prompts of the
   computer it is connected to, in its own trusted dialog titled as a remote
-  request and naming that computer's SSH profile and hostname. Every connected
-  Window shows the prompt at once, beside that computer's own dialog; the first
-  answer counts and the others close. `[integration] remote-agent-prompts = no`
-  turns this off for a viewer.
+  request and naming the SSH profile you connected with and the hostname that
+  computer reports. Every connected Window shows the prompt at once, beside that
+  computer's own dialog; the first answer counts and the others close.
+  `[integration] remote-agent-prompts = no` turns this off for a viewer.
 - While a request waits, the Explorer marks its workspace **Agent asking for
   access**, the Window title ends with **AGENT ACCESS REQUEST WAITING**, and
   **Agent access** in the palette shows how many wait.
