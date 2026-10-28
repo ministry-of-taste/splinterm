@@ -588,22 +588,30 @@ returns it to live output and sends no PTY bytes; a later Enter pressed while
 already live submits normally. `Ctrl+Shift+F` opens local literal scrollback
 search. Enter submits, `Ctrl+N` and
 `Ctrl+P` navigate matches, and Escape closes the trusted search surface. Search
-queries are not injected into the terminal. The search box sits at the bottom
-left of the terminal area with the current match and the count in its frame
-(*2 / 17*) and its keys in the bottom edge; the current match is selected and
-outlined in the accent. The daemon searches a few milliseconds of history per
-request so a busy terminal never stalls; until a match turns up, the Window
-keeps asking for the next stretch and the frame shows *searching…*. Paging through matches already in history keeps
-working while the terminal prints. When history is replaced, for example after
-a resize reflows it or the program clears it, or when a page's match on the
-visible screen has changed, the results clear and Enter searches again. History paging remains bounded and preserves
-follow-live behavior when returning with `Shift+End`, which does nothing when
-the pane is already live. While a pane shows history, a box at the top right
-of the terminal area says how far back it is and how many rows arrived since
-(*↑ 17 / 351  +4 new*), with the return keys as chips; clicking that end of
-the box returns to live output. During an upgrade a banner at the top centre
-shows a spinner while it runs, turns to the danger colour if the connection is
-lost, and settles with a check mark when the old daemon resumes.
+queries are not injected into the terminal.
+
+The search box sits at the bottom left of the terminal area. Its frame holds
+the current match and the count (*2/17*), and its bottom edge its keys. The
+current match is selected and outlined in the accent. The daemon searches a
+few milliseconds of history per request, so a busy terminal never stalls.
+Until a new query is answered, or while no match has turned up, the frame
+shows *searching…* and the Window keeps asking for the next stretch. Paging
+through matches already in history keeps working while the terminal prints.
+The results clear and Enter searches again when history is replaced, for
+example after a resize reflows it or the program clears it, or when a page's
+match on the visible screen has changed.
+
+History paging remains bounded and preserves follow-live behavior when
+returning with `Shift+End`, which does nothing when the pane is already live.
+While a pane shows history, a box at the top right of the terminal area says
+how far back it is and how many rows arrived since (*↑ 17/351  +4 new*), with
+the return keys as chips. A click anywhere on the box returns to live output.
+
+During an upgrade, a banner at the top centre of the terminal area, or below
+the history box in a narrow Window, shows a spinner while the upgrade runs. It
+turns to the danger colour if the connection is lost, and settles on `!` in
+the warning colour when the upgrade is cancelled or rolls back to the old
+daemon.
 
 The CLI can also read bounded history pages and search without mapping a Window:
 

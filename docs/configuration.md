@@ -907,7 +907,7 @@ accent=#8c6c3e
 | Key | Painted today | Without the key |
 | --- | --- | --- |
 | `surface` | the tab strip and the Explorer panel; darkened 80% toward black, the scrim behind a modal picker | the terminal background |
-| `surface-raised` | menus, pickers, the command palette, the tab menu, the Dojo prompt, the history overlay and other popups, and the selected Dojo tab body | the theme's ([role table](#native-omarchy-theme-integration)), else `text` mixed 8% over `surface` in encoded sRGB; for the selected tab, Foot `bright0` when the theme names none |
+| `surface-raised` | menus, pickers, the command palette, the tab menu, the Dojo prompt, search, history, the upgrade banner and other popups, and the selected Dojo tab body | the theme's ([role table](#native-omarchy-theme-integration)), else `text` mixed 8% over `surface` in encoded sRGB; for the selected tab, Foot `bright0` when the theme names none |
 | `surface-sunken` | nothing yet | the theme's |
 | `selection` | the selected row of menus, pickers and the Explorer | the theme's |
 | `divider` | pane borders and frames, menu and picker frames, the tab strip border | the theme's |
@@ -915,10 +915,10 @@ accent=#8c6c3e
 | `text` | tab labels, menu, picker and Explorer text, and trusted dialog text, which those panels and dialogs raise to 4.5:1 | the terminal foreground |
 | `text-muted` | inactive tab labels, and the secondary text of menus, pickers and the Explorer, raised to 4.5:1 there | the theme's, ramped from `text` |
 | `text-faint` | through `status-stale` only | `text` mixed 55% toward `surface` |
-| `accent` | the active tab underline, selection rails, the history overlay | the theme's |
+| `accent` | the active tab underline, selection rails, the search `›`, cursor and match outline, and the history `↑` | the theme's |
 | `danger` | Terminate in the command palette, the tab menu and the Dojo prompt, raised to 4.5:1 there; a trusted dialog's red (no) button; and through `status-needs-input` and `status-error` | the theme's |
-| `warning` | the "Asking" marker, a trusted dialog's frame, the upgrade banner's frame and spinner while it runs, and through `status-working` | the theme's |
-| `success` | a trusted dialog's green (yes) button, the upgrade banner's check mark, and through `status-idle` | the theme's |
+| `warning` | the "Asking" marker, a trusted dialog's frame, the upgrade banner's frame and spinner while it runs and its `!` after a cancelled or rolled-back upgrade, and through `status-working` | the theme's |
+| `success` | a trusted dialog's green (yes) button, and through `status-idle` | the theme's |
 | `info` | through `status-done` only | the theme's |
 | `status-needs-input` | the needs-input status glyph | `danger` |
 | `status-error` | the error status glyph | `danger` |
@@ -1069,11 +1069,11 @@ Panels follow the shell's own card alpha:
 | Splinterm panel | Follows | Omarchy default |
 | --- | --- | --- |
 | Action palette, Dojo and session picker | `[menu] background-alpha` | 1.0 |
-| Tab context menu, Dojo prompt, search bar, history overlay | `[popups] background-alpha` | 1.0 |
+| Tab context menu, Dojo prompt, search, history, upgrade banner | `[popups] background-alpha` | 1.0 |
 
 The action palette and pickers are list cards with a selected row, like the
-shell's menus. The tab context menu, the Dojo prompt, the search bar and the
-history overlay are small flyouts and status cards, which the shell draws with
+shell's menus. The tab context menu, the Dojo prompt, search, history and the
+upgrade banner are small flyouts and status cards, which the shell draws with
 `[popups]`.
 
 A panel uses the theme background, the same colour as the window's own glass,
@@ -1198,9 +1198,9 @@ Window chrome is the text Splinterm draws itself: the tab strip (labels, agent
 status badges, the close and new-tab glyphs and the remote tag), the Lair
 Explorer, the command palette and its lists (key binding help, the Agent access
 list, Revoke all access), menus, the Recent Dojos and remote pickers, Dojo
-prompts and confirmations, frame titles, the scrollback search bar and the
-upgrade banner. It uses the terminal's font family and icons at its own size,
-in logical pixels:
+prompts and confirmations, frame titles, scrollback search, the history
+indicator and the upgrade banner. It uses the terminal's font family and icons
+at its own size, in logical pixels:
 
 1. `main.ui-font-pixelsize`, when `config.ini` sets it.
 2. Otherwise Omarchy's text size, `[font] base-size`, read from the same

@@ -153,14 +153,14 @@ use crate::pane::{
     directional_resize_ratio, split_fits, split_ratio_at, split_ratio_mut,
 };
 use crate::renderer::{
-    ChromeSource, ChromeSurface, ChromeText, ChromeTextStyle, CommandPaletteLayout,
-    CursorPresentation, DojoPromptLayout, HistoryOverlayStatus, LairExplorerAction,
-    LairExplorerLayout, LairExplorerMetrics, LairExplorerPresentationMode, PaletteBody,
-    PaletteShape, PickerHitTarget, RenderContext, SearchStrip, SessionPickerPurpose,
+    BannerMarks, ChromeSource, ChromeSurface, ChromeText, ChromeTextStyle, CommandPaletteLayout,
+    CursorPresentation, DojoPromptLayout, HistoryOverlayLayout, HistoryOverlayStatus,
+    LairExplorerAction, LairExplorerLayout, LairExplorerMetrics, LairExplorerPresentationMode,
+    PaletteBody, PaletteShape, PickerHitTarget, RenderContext, SearchStrip, SessionPickerPurpose,
     SessionPickerTextCache, SnapshotFrame, SnapshotOverlays, TabContextMenuLayout, TextRow,
     background_bgra, chrome_panel_palette, clear_snapshot_caches, command_palette_hit_test,
     command_palette_layout, command_palette_row_hit_test, dojo_prompt_hit_test, dojo_prompt_layout,
-    dojo_prompt_metrics, explorer_minimum_docked_terminal_width, fill_rect, history_overlay_layout,
+    dojo_prompt_metrics, explorer_minimum_docked_terminal_width, fill_rect,
     lair_explorer_action_hit_test, lair_explorer_agent_hit_test,
     lair_explorer_agents_label_hit_test, lair_explorer_chrome_cell_width,
     lair_explorer_disclosure_hit_test, lair_explorer_filter_hit_test,
@@ -1175,6 +1175,7 @@ fn assemble_app(
                 image_sources: options.image_sources,
                 scrollback_viewport: ScrollbackViewport::default(),
                 painted_history_status: None,
+                painted_history: None,
                 history_page_pending: false,
                 resync_pending: false,
                 history_page_top: None,
@@ -1525,6 +1526,10 @@ struct PaneView {
     image_sources: ImageContentLeaseSet,
     scrollback_viewport: ScrollbackViewport,
     painted_history_status: Option<HistoryOverlayStatus>,
+    /// Where the last draw put the history strip, buffer px: the Window
+    /// damages it when the strip moves or goes, and a click on it returns
+    /// to live.
+    painted_history: Option<HistoryOverlayLayout>,
     /// A return-to-live resynchronization was sent and its authoritative
     /// snapshot has not arrived; another would only queue behind it.
     resync_pending: bool,
@@ -1812,6 +1817,7 @@ impl PaneView {
             image_sources: options.image_sources,
             scrollback_viewport: ScrollbackViewport::default(),
             painted_history_status: None,
+            painted_history: None,
             history_page_pending: false,
             resync_pending: false,
             history_page_top: None,
@@ -12436,6 +12442,8 @@ impl App {
     )]
     fn draw(&mut self, queue_handle: &QueueHandle<Self>) -> Result<()> {
         self.scheduling.redraw_pending = false;
+        // Where the history strip was, which this draw damages if it moves.
+        let history_before = self.panes.pane.painted_history;
         // A trusted dialog's text is laid out for this size before it is
         // drawn, so drawing and hit testing share one layout.
         self.relayout_trusted_dialog()?;
@@ -12761,6 +12769,8 @@ impl App {
             self.scheduling.terminal_redraw_pending = terminal_priority;
             return Ok(());
         };
+        // This draw records the history strip anew.
+        self.panes.pane.painted_history = None;
         // While part of a dialog's text is hidden it cannot say yes, and
         // its green area is dimmed.
         let proceed_enabled = self
@@ -13032,7 +13042,7 @@ impl App {
                 let return_keys = crate::frontend::shortcut_chips(
                     self.input.keymap.primary_shortcut(ActionId::ReturnToLive),
                 );
-                paint_history_overlay(
+                self.panes.pane.painted_history = paint_history_overlay(
                     &mut self.presentation.history_text_cache,
                     &self.presentation.render_context,
                     canvas,
@@ -13167,6 +13177,7 @@ impl App {
                         matches: self.panes.pane.search.matches.len(),
                         selected: self.panes.pane.search.selected,
                         searching: self.panes.pane.search.searching,
+                        pending: self.panes.pane.search.in_flight > 0,
                     },
                     self.input.keyboard_focused,
                 )?;
@@ -13178,30 +13189,25 @@ impl App {
         self.handoff.painted_banner = None;
         if let Some(banner) = self.handoff.banner() {
             if let Some(terminal) = search_paint_rect(content_rect, explorer_layout.as_ref()) {
-                let history = history_overlay_status(
-                    &self.panes.pane.scrollback_viewport,
-                    self.panes.pane.snapshot.as_ref(),
-                )
-                .and_then(|_| {
-                    history_overlay_layout(
-                        content_buffer_rect.width,
-                        content_buffer_rect.height,
+                // The history strip this draw painted, with its shadow.
+                let history = self.panes.pane.painted_history.map(|layout| {
+                    let (x, y, width, height) = layout.panel;
+                    strip_bounds(
+                        Rect {
+                            x: u32::try_from(x).unwrap_or(0),
+                            y: u32::try_from(y).unwrap_or(0),
+                            width,
+                            height,
+                        },
                         self.surface.scale_120,
                     )
-                })
-                .map(|layout| {
-                    let (x, y, width, height) = layout.panel;
-                    Rect {
-                        x: content_buffer_rect
-                            .x
-                            .saturating_add(u32::try_from(x).unwrap_or(0)),
-                        y: content_buffer_rect
-                            .y
-                            .saturating_add(u32::try_from(y).unwrap_or(0)),
-                        width,
-                        height,
-                    }
                 });
+                let marks = BannerMarks {
+                    spinner: self.tab_state.agent.spinner().glyph(),
+                    lost: self
+                        .handoff
+                        .lost_mark(self.presentation.renderer_generation),
+                };
                 self.handoff.painted_banner = paint_handoff_banner(
                     &mut self.handoff.text_cache,
                     &self.presentation.render_context,
@@ -13214,7 +13220,7 @@ impl App {
                     self.presentation.renderer_generation,
                     chrome_panel_palette(self.presentation.theme, ChromeSurface::Popup),
                     banner,
-                    self.tab_state.agent.spinner().glyph(),
+                    marks,
                 )?
                 .map(|panel| strip_bounds(panel, self.surface.scale_120));
             }
@@ -13424,17 +13430,19 @@ impl App {
                 );
             }
         }
-        if history_status != self.panes.pane.painted_history_status {
-            let content = Self::buffer_rect(self.content_rect(), self.surface.scale_120)?;
-            if let Some(layout) =
-                history_overlay_layout(content.width, content.height, self.surface.scale_120)
+        if history_status != self.panes.pane.painted_history_status
+            || history_before != self.panes.pane.painted_history
+        {
+            // The strip and its shadow, where it was and where it is.
+            for layout in [history_before, self.panes.pane.painted_history]
+                .into_iter()
+                .flatten()
             {
-                // The strip and its shadow.
                 let (x, y, overlay_width, overlay_height) = layout.panel;
                 let bounds = strip_bounds(
                     Rect {
-                        x: content.x.saturating_add(u32::try_from(x).unwrap_or(0)),
-                        y: content.y.saturating_add(u32::try_from(y).unwrap_or(0)),
+                        x: u32::try_from(x).unwrap_or(0),
+                        y: u32::try_from(y).unwrap_or(0),
                         width: overlay_width,
                         height: overlay_height,
                     },
@@ -18932,6 +18940,72 @@ mod tests {
         assert!(title.contains("CONTROL REQUEST"));
         assert!(title.contains("SEARCH: needlespoof [1 match(es)"));
         assert!(!title.contains('\n'));
+    }
+
+    /// The current match is outlined only while the strip is open and
+    /// the selection is exactly that match, in its history generation:
+    /// the anchor at its first column and the end at its last.
+    #[test]
+    fn search_outlines_only_the_selection_that_is_the_current_match() {
+        let endpoint = |generation, column| SelectionEndpoint {
+            active_screen: ActiveScreen::Normal,
+            history_generation: generation,
+            row_id: 7,
+            column,
+        };
+        let exact = Selection {
+            anchor: endpoint(3, 2),
+            end: endpoint(3, 5),
+        };
+        let mut search = SearchUiState {
+            page_generation: 3,
+            ..SearchUiState::default()
+        };
+        search.matches.push(SearchMatch {
+            row_id: 7,
+            start_column: 2,
+            end_column: 6,
+            preview: "word".into(),
+        });
+        // The strip is closed.
+        assert!(!search.selects_current_match(Some(exact)));
+        search.input = Some(new_search_editor());
+        assert!(search.selects_current_match(Some(exact)));
+        assert!(!search.selects_current_match(None));
+        // Another history generation.
+        let stale = Selection {
+            anchor: endpoint(2, 2),
+            end: endpoint(2, 5),
+        };
+        assert!(!search.selects_current_match(Some(stale)));
+        // A column off by one at either end.
+        for (anchor, end) in [(1, 5), (3, 5), (2, 4), (2, 6)] {
+            let off = Selection {
+                anchor: endpoint(3, anchor),
+                end: endpoint(3, end),
+            };
+            assert!(!search.selects_current_match(Some(off)), "{anchor}..{end}");
+        }
+        // Another row, or the alternate screen.
+        let other_row = Selection {
+            end: SelectionEndpoint {
+                row_id: 8,
+                ..exact.end
+            },
+            ..exact
+        };
+        assert!(!search.selects_current_match(Some(other_row)));
+        let alternate = Selection {
+            anchor: SelectionEndpoint {
+                active_screen: ActiveScreen::Alternate,
+                ..exact.anchor
+            },
+            ..exact
+        };
+        assert!(!search.selects_current_match(Some(alternate)));
+        // No current match.
+        search.selected = 1;
+        assert!(!search.selects_current_match(Some(exact)));
     }
 
     #[test]

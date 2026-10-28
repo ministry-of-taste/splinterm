@@ -167,7 +167,8 @@ impl PointerHandler for App {
                     if button == BTN_LEFT
                         && history_return_to_live_hit(
                             event.position,
-                            self.content_rect(),
+                            self.panes.pane.painted_history,
+                            self.surface.scale_120,
                             !self.panes.pane.scrollback_viewport.is_live(),
                         )
                     {

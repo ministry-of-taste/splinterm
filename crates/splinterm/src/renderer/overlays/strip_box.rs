@@ -3,12 +3,13 @@
 //! right and the upgrade banner at its top centre, each one row of content
 //! in the shared box with its hard shadow and no scrim.
 //!
-//! Search takes keys, so its frame is the focused one, with the match count
-//! in the frame and its keys in the bottom edge. History is passive: a muted
-//! title over the divider frame, its position as text and the return chips,
-//! which keep the click that returns to live. The banner's frame says how
-//! the upgrade is going: warning with a spinner while it runs, danger once
-//! the connection is lost, the divider once it has settled.
+//! Search takes keys, so its frame is the focused one while the Window has
+//! focus, with the match count in the frame and its keys in the bottom edge.
+//! History is passive: a muted title over the divider frame, its position as
+//! text and the return chips, sized to what it shows; a click anywhere on it
+//! returns to live. The banner's frame says how the upgrade is going:
+//! warning with a spinner while it runs, danger once the connection is lost,
+//! the divider once it has settled.
 
 use anyhow::Result;
 
@@ -21,7 +22,7 @@ use super::{
     super::{ChromeTextStyle, RenderContext},
     actions::InputLineLayout,
     chrome_box::{BOX_EDGE, BOX_SHADOW_OFFSET, ChromeBox, ChromePainter, opaque},
-    chrome_rows::{ROW_HEIGHT, ROW_PADDING, paint_key_chips, text_cells},
+    chrome_rows::{ROW_HEIGHT, ROW_PADDING, chips_width, paint_key_chips, text_cells},
     picker::{PickerTextAlignment, SessionPickerPalette, SessionPickerTextCache},
 };
 
@@ -39,12 +40,15 @@ const STRIP_INSET: u32 = BOX_EDGE + ROW_PADDING;
 const SEARCH_WIDTH: u32 = 440;
 /// A search strip narrower than this is not shown.
 const SEARCH_MINIMUM_WIDTH: u32 = 160;
-/// The history strip's width, logical px.
-const HISTORY_WIDTH: u32 = 340;
+/// The history strip is at least this wide, logical px.
+const HISTORY_WIDTH: u32 = 240;
 /// A history strip narrower than this is not shown.
 const HISTORY_MINIMUM_WIDTH: u32 = 180;
-/// The room the history strip's return chips take, logical px.
-const RETURN_WIDTH: u32 = 96;
+/// The longest position the history strip shows, which sizes it: counts
+/// clamp at 999.
+const HISTORY_WORST_TEXT: &str = "↑ 999/999  +999 new";
+/// What the history strip shows to return to live without a binding.
+const RETURN_LIVE: &str = "↓ live";
 /// A banner narrower than this is not shown.
 const BANNER_MINIMUM_WIDTH: u32 = 160;
 
@@ -124,6 +128,9 @@ pub(crate) struct SearchStrip<'a> {
     pub(crate) selected: usize,
     /// Older history is still being searched.
     pub(crate) searching: bool,
+    /// A search was sent and is not answered yet: the results shown are
+    /// an earlier query's.
+    pub(crate) pending: bool,
 }
 
 impl SearchStrip<'_> {
@@ -132,26 +139,27 @@ impl SearchStrip<'_> {
         !self.searched_query.is_empty() && self.input == self.searched_query
     }
 
-    /// The count in the frame: the current match and how many, once the
-    /// typed query is searched; nothing before.
+    /// The count in the frame: the current match and how many, as the
+    /// palette counts (`2/17`), once the typed query is searched; nothing
+    /// before, and `searching…` while an answer is due, so an earlier
+    /// query's count never shows under a new one.
     fn count(&self) -> Option<String> {
         if !self.searched() {
             return None;
         }
-        Some(match (self.matches, self.searching) {
-            (0, true) => "searching…".to_owned(),
+        Some(match (self.matches, self.searching || self.pending) {
+            (_, true) => "searching…".to_owned(),
             (0, false) => "no matches".to_owned(),
-            (matches, _) => format!(
-                "{} / {matches}",
-                self.selected.saturating_add(1).min(matches)
-            ),
+            (matches, false) => {
+                format!("{}/{matches}", self.selected.saturating_add(1).min(matches))
+            }
         })
     }
 
-    /// The keys in the bottom frame: moving between matches once searched,
-    /// searching before.
+    /// The keys in the bottom frame: moving between matches once searched
+    /// and answered, searching before.
     fn legend(&self) -> &'static [(&'static str, &'static str)] {
-        if self.searched() && self.matches > 0 {
+        if self.searched() && self.matches > 0 && !self.searching && !self.pending {
             &[("ctrl n", "next"), ("ctrl p", "prev"), ("esc", "close")]
         } else {
             &[("↵", "search"), ("esc", "close")]
@@ -235,7 +243,7 @@ pub(crate) fn paint_search_overlay(
         if query.is_empty() {
             let after = cursor.x.saturating_add(cursor.width);
             painter.text(
-                "search the scrollback",
+                "search scrollback",
                 ChromeTextStyle::Regular,
                 Rect {
                     x: after,
@@ -264,9 +272,10 @@ pub(crate) fn paint_search_overlay(
 /// relative to it, in the same px as those.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct HistoryOverlayLayout {
+    /// The strip; a click anywhere on it returns to live, so a click on
+    /// it never starts a selection in the terminal it hides.
     pub(crate) panel: (i32, i32, u32, u32),
-    /// The return chips' end of the strip, its full height: a click there
-    /// returns to live.
+    /// The return chips' end of the strip, its full height.
     pub(crate) return_to_live: (i32, i32, u32, u32),
 }
 
@@ -278,15 +287,30 @@ pub(crate) struct HistoryOverlayStatus {
     pub(crate) unseen_rows: usize,
 }
 
+/// The history strip's return content, buffer px wide: `return_keys` as
+/// chips with `cell` (the chrome text cell), or `↓ live` without a binding.
+#[must_use]
+fn history_return_width(return_keys: &[String], cell: (u32, u32), scale_120: u32) -> u32 {
+    if return_keys.is_empty() {
+        cells_px(text_cells(RETURN_LIVE), cell.0)
+    } else {
+        chips_width(return_keys, cell, scale_120)
+    }
+}
+
 /// The history strip at the top right of a `width` by `height` content
-/// area at `scale_120`; `None` when the area is too small for it. A pure
-/// function of its arguments, so the pointer's hit test and the painter
-/// agree.
+/// area at `scale_120`, sized to its content: the longest position it can
+/// show in `cell_width` cells, a cell's gap, and its return content
+/// `return_width` wide ([`history_return_width`]), all buffer px. `None`
+/// when the area is too small for it. A pure function of its arguments,
+/// so the painter and the Window's damage agree.
 #[must_use]
 pub(crate) fn history_overlay_layout(
     width: u32,
     height: u32,
     scale_120: u32,
+    cell_width: u32,
+    return_width: u32,
 ) -> Option<HistoryOverlayLayout> {
     if width == 0 || height == 0 || scale_120 == 0 {
         return None;
@@ -294,8 +318,17 @@ pub(crate) fn history_overlay_layout(
     let margin = scaled(STRIP_MARGIN, scale_120)
         .min(width / 4)
         .min(height / 4);
-    let panel_width =
-        scaled(HISTORY_WIDTH, scale_120).min(width.saturating_sub(margin.saturating_mul(2)));
+    let inset = scaled(STRIP_INSET, scale_120);
+    // The return area: its content and the inset at the panel's end.
+    let return_area = return_width.saturating_add(inset);
+    let content = inset
+        .saturating_mul(2)
+        .saturating_add(cells_px(text_cells(HISTORY_WORST_TEXT), cell_width))
+        .saturating_add(cell_width)
+        .saturating_add(return_area);
+    let panel_width = scaled(HISTORY_WIDTH, scale_120)
+        .max(content)
+        .min(width.saturating_sub(margin.saturating_mul(2)));
     let panel_height = scaled(STRIP_HEIGHT, scale_120);
     if panel_width < scaled(HISTORY_MINIMUM_WIDTH, scale_120)
         || height < panel_height.saturating_add(margin.saturating_mul(2))
@@ -303,7 +336,7 @@ pub(crate) fn history_overlay_layout(
         return None;
     }
     let x = width.saturating_sub(margin).saturating_sub(panel_width);
-    let action_width = scaled(RETURN_WIDTH + STRIP_INSET, scale_120).min(panel_width / 2);
+    let action_width = return_area.min(panel_width);
     Some(HistoryOverlayLayout {
         panel: (
             i32::try_from(x).ok()?,
@@ -329,11 +362,24 @@ fn tuple_rect((x, y, width, height): (i32, i32, u32, u32)) -> Rect {
     }
 }
 
+/// The history position in at most `room_cells` cells, whole or not at all:
+/// `17/351`, then `17` once the total does not fit, then nothing.
+fn history_position(status: HistoryOverlayStatus, room_cells: u32) -> Option<String> {
+    let offset = status.offset_from_bottom.min(999);
+    [
+        format!("{offset}/{}", status.available_rows.min(999)),
+        offset.to_string(),
+    ]
+    .into_iter()
+    .find(|text| text_cells(text) <= room_cells)
+}
+
 /// Paints the history strip over `area`, the content area (buffer px): a muted `history`
 /// title over the divider frame, the accent `↑`, how far back the view
 /// is, how many rows arrived since in muted text when they fit, and
-/// `return_keys` as chips at its right end, or `↓ live` with no binding.
-/// Returns its layout, offset into the canvas.
+/// `return_keys` as chips at its right end, or `↓ live` with no binding
+/// or when the chips do not fit whole. Returns its layout, offset into the
+/// canvas.
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -352,17 +398,12 @@ pub(crate) fn paint_history_overlay(
     status: HistoryOverlayStatus,
     return_keys: &[String],
 ) -> Result<Option<HistoryOverlayLayout>> {
-    let Some(mut layout) = history_overlay_layout(area.width, area.height, scale_120) else {
+    if scale_120 == 0 {
         return Ok(None);
-    };
+    }
     let (Ok(offset_x), Ok(offset_y)) = (i32::try_from(area.x), i32::try_from(area.y)) else {
         return Ok(None);
     };
-    for rect in [&mut layout.panel, &mut layout.return_to_live] {
-        rect.0 = rect.0.saturating_add(offset_x);
-        rect.1 = rect.1.saturating_add(offset_y);
-    }
-    let panel = tuple_rect(layout.panel);
     let mut painter = ChromePainter::new(
         cache,
         context,
@@ -372,6 +413,23 @@ pub(crate) fn paint_history_overlay(
         scale_120,
         renderer_generation,
     );
+    let regular = painter.cell(ChromeTextStyle::Regular)?;
+    let cell_width = regular.0.max(1);
+    let Some(mut layout) = history_overlay_layout(
+        area.width,
+        area.height,
+        scale_120,
+        cell_width,
+        history_return_width(return_keys, regular, scale_120),
+    ) else {
+        painter.finish();
+        return Ok(None);
+    };
+    for rect in [&mut layout.panel, &mut layout.return_to_live] {
+        rect.0 = rect.0.saturating_add(offset_x);
+        rect.1 = rect.1.saturating_add(offset_y);
+    }
+    let panel = tuple_rect(layout.panel);
     let cell = painter.box_cell()?;
     let chrome = ChromeBox {
         title: "history",
@@ -382,68 +440,70 @@ pub(crate) fn paint_history_overlay(
     .layout(panel, scale_120, cell);
     chrome.paint_surface(&mut painter, &palette);
     let row = content_row(panel, scale_120);
-    let (cell_width, _) = painter.cell(ChromeTextStyle::Regular)?;
     let row_right = row.x.saturating_add(row.width);
     let action = tuple_rect(layout.return_to_live);
     let room = Rect {
-        x: action.x,
-        width: row_right.saturating_sub(action.x),
+        x: action.x.max(row.x),
+        width: row_right.saturating_sub(action.x.max(row.x)),
         ..row
     };
-    let chips_start = if return_keys.is_empty() {
-        None
-    } else {
+    // Chips only whole: a `… end` would hide which keys return.
+    let chips_fit =
+        !return_keys.is_empty() && chips_width(return_keys, regular, scale_120) <= room.width;
+    let chips_start = if chips_fit {
         paint_key_chips(&mut painter, &palette, return_keys, room, true)?
+    } else {
+        None
     };
-    if chips_start.is_none() {
+    if chips_start.is_none() && cells_px(text_cells(RETURN_LIVE), cell_width) <= room.width {
         painter.text(
-            "↓ live",
+            RETURN_LIVE,
             ChromeTextStyle::Regular,
             room,
             PickerTextAlignment::Right,
             palette.accent_text,
         )?;
     }
-    let text_end = action.x.saturating_sub(cell_width);
+    let text_end = room.x.saturating_sub(cell_width);
+    let room_cells = |from: u32| text_end.saturating_sub(from) / cell_width;
     let at = |cells: u32| row.x.saturating_add(cells_px(cells, cell_width));
     let clip = |from: u32, cells: u32| Rect {
         x: from,
-        width: cells_px(cells, cell_width).min(text_end.saturating_sub(from)),
+        width: cells_px(cells, cell_width),
         ..row
     };
-    painter.text(
-        "↑",
-        ChromeTextStyle::Regular,
-        clip(row.x, 1),
-        PickerTextAlignment::Left,
-        palette.accent_text,
-    )?;
-    let position = format!(
-        "{} / {}",
-        status.offset_from_bottom.min(999),
-        status.available_rows.min(999)
-    );
-    let position_cells = text_cells(&position);
-    painter.text(
-        &position,
-        ChromeTextStyle::Regular,
-        clip(at(2), position_cells),
-        PickerTextAlignment::Left,
-        palette.primary,
-    )?;
-    if status.unseen_rows > 0 {
-        let unseen = format!("+{} new", status.unseen_rows.min(999));
-        let from = at(2 + position_cells + 2);
-        let unseen_cells = text_cells(&unseen);
-        // Shown whole or not at all.
-        if from.saturating_add(cells_px(unseen_cells, cell_width)) <= text_end {
-            painter.text(
-                &unseen,
-                ChromeTextStyle::Regular,
-                clip(from, unseen_cells),
-                PickerTextAlignment::Left,
-                palette.secondary,
-            )?;
+    if room_cells(row.x) >= 1 {
+        painter.text(
+            "↑",
+            ChromeTextStyle::Regular,
+            clip(row.x, 1),
+            PickerTextAlignment::Left,
+            palette.accent_text,
+        )?;
+    }
+    // Each part is shown whole or not at all, the total dropped first.
+    if let Some(position) = history_position(status, room_cells(at(2))) {
+        let position_cells = text_cells(&position);
+        painter.text(
+            &position,
+            ChromeTextStyle::Regular,
+            clip(at(2), position_cells),
+            PickerTextAlignment::Left,
+            palette.primary,
+        )?;
+        if status.unseen_rows > 0 {
+            let unseen = format!("+{} new", status.unseen_rows.min(999));
+            let from = at(2 + position_cells + 2);
+            let unseen_cells = text_cells(&unseen);
+            if unseen_cells <= room_cells(from) {
+                painter.text(
+                    &unseen,
+                    ChromeTextStyle::Regular,
+                    clip(from, unseen_cells),
+                    PickerTextAlignment::Left,
+                    palette.secondary,
+                )?;
+            }
         }
     }
     chrome.paint_frame_titled(
@@ -457,9 +517,10 @@ pub(crate) fn paint_history_overlay(
 }
 
 /// Where the banner goes in buffer pixels, its content `content_width`
-/// buffer px wide, inside `terminal` and left of `avoid` (the history
-/// strip) when that shares the banner's band. `None` when the terminal is
-/// too small for a legible banner.
+/// buffer px wide, inside `terminal` and clear of `avoid` (the history
+/// strip): left of it when that shares the banner's band and leaves a
+/// legible banner room, else in the band below it. `None` when the
+/// terminal is too small for a legible banner.
 #[must_use]
 pub(crate) fn handoff_banner_layout(
     terminal: Rect,
@@ -475,7 +536,8 @@ pub(crate) fn handoff_banner_layout(
     if terminal.height < height.saturating_add(margin.saturating_mul(2)) {
         return None;
     }
-    let y = terminal.y.saturating_add(margin);
+    let minimum = scaled(BANNER_MINIMUM_WIDTH, scale_120);
+    let mut y = terminal.y.saturating_add(margin);
     let left = terminal.x.saturating_add(margin);
     let mut right = terminal
         .x
@@ -484,12 +546,23 @@ pub(crate) fn handoff_banner_layout(
     if let Some(avoid) = avoid {
         let band = y..y.saturating_add(height);
         let shares_band = avoid.y < band.end && avoid.y.saturating_add(avoid.height) > band.start;
-        if shares_band && avoid.x > left && avoid.x < right {
-            right = avoid.x.saturating_sub(margin).max(left);
+        let overlaps = avoid.x < right && avoid.x.saturating_add(avoid.width) > left;
+        if shares_band && overlaps {
+            let beside = avoid.x.saturating_sub(margin);
+            if avoid.x > left && beside.saturating_sub(left) >= minimum {
+                right = beside;
+            } else {
+                // Too narrow beside it, or it spans the band: below it.
+                y = avoid.y.saturating_add(avoid.height).saturating_add(margin);
+            }
         }
     }
+    let bottom = terminal
+        .y
+        .saturating_add(terminal.height)
+        .saturating_sub(margin);
     let available = right.saturating_sub(left);
-    if available < scaled(BANNER_MINIMUM_WIDTH, scale_120) {
+    if available < minimum || y.saturating_add(height) > bottom {
         return None;
     }
     let width = content_width
@@ -503,6 +576,22 @@ pub(crate) fn handoff_banner_layout(
     })
 }
 
+/// The banner's marks: the spinner's frame while the upgrade runs, and
+/// the lost connection's cross, `✕` where the interface font draws it and
+/// `x` where it does not ([`BannerMarks::LOST`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BannerMarks {
+    pub(crate) spinner: char,
+    pub(crate) lost: char,
+}
+
+impl BannerMarks {
+    /// The lost connection's cross, when the interface font draws it.
+    pub(crate) const LOST: char = '✕';
+    /// Its ASCII stand-in otherwise.
+    pub(crate) const LOST_ASCII: char = 'x';
+}
+
 /// How a banner looks: its frame, its mark and the mark's colour.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct BannerLook {
@@ -511,44 +600,41 @@ struct BannerLook {
     mark_color: u32,
 }
 
-/// Running, the banner is in the warning colour with `spinner` as its
-/// mark; lost, in danger with `✕`; settled, on the divider with `✓` in
-/// success when the old daemon came back or `!` in warning when the
-/// upgrade was cancelled.
+/// Running, the banner is in the warning colour with the spinner as its
+/// mark; lost, in danger with the cross; settled, on the divider with `!`
+/// in warning, since a rolled-back upgrade failed (the old daemon came
+/// back) and a cancelled one did not happen.
 const fn banner_look(
     banner: HandoffBanner,
     palette: &SessionPickerPalette,
-    spinner: char,
+    marks: BannerMarks,
 ) -> BannerLook {
     match banner {
         HandoffBanner::Preparing | HandoffBanner::InputPaused | HandoffBanner::Reconnecting => {
             BannerLook {
                 frame: palette.warning,
-                mark: spinner,
+                mark: marks.spinner,
                 mark_color: palette.warning,
             }
         }
         HandoffBanner::Lost => BannerLook {
             frame: palette.danger,
-            mark: '✕',
+            mark: marks.lost,
             mark_color: palette.danger,
         },
-        HandoffBanner::Notice(HandoffNotice::RolledBack) => BannerLook {
-            frame: palette.frame,
-            mark: '✓',
-            mark_color: palette.success,
-        },
-        HandoffBanner::Notice(HandoffNotice::Cancelled(_)) => BannerLook {
-            frame: palette.frame,
-            mark: '!',
-            mark_color: palette.warning,
-        },
+        HandoffBanner::Notice(HandoffNotice::RolledBack | HandoffNotice::Cancelled(_)) => {
+            BannerLook {
+                frame: palette.frame,
+                mark: '!',
+                mark_color: palette.warning,
+            }
+        }
     }
 }
 
 /// Paints the upgrade banner and returns its panel, or `None` when the
-/// terminal is too small for it: no title, its mark (`spinner` while the
-/// upgrade runs) and label centred in the frame its state colours.
+/// terminal is too small for it: no title, its mark (from `marks`) and
+/// label centred in the frame its state colours.
 #[allow(
     clippy::too_many_arguments,
     reason = "trusted strip painting keeps geometry, palette, and cache explicit"
@@ -565,7 +651,7 @@ pub(crate) fn paint_handoff_banner(
     renderer_generation: u64,
     palette: SessionPickerPalette,
     banner: HandoffBanner,
-    spinner: char,
+    marks: BannerMarks,
 ) -> Result<Option<Rect>> {
     if scale_120 == 0 {
         return Ok(None);
@@ -592,7 +678,7 @@ pub(crate) fn paint_handoff_banner(
         painter.finish();
         return Ok(None);
     };
-    let look = banner_look(banner, &palette, spinner);
+    let look = banner_look(banner, &palette, marks);
     let cell = painter.box_cell()?;
     let chrome = ChromeBox {
         title: "",
@@ -711,11 +797,12 @@ mod tests {
         matches: 3,
         selected: 1,
         searching: false,
+        pending: false,
     };
 
     /// The search strip sits at the bottom left of the terminal area in
-    /// the box: a four-edge focused frame, `search` and the match count in
-    /// it, the query after the accent `›`, and its keys in the bottom edge.
+    /// the box: the focused frame while the Window has focus, `search` and
+    /// the match count (`2/3`, as the palette counts) in it, the query after the accent `›`, and its keys in the bottom edge.
     /// Nothing is drawn outside the strip and its shadow, which the Window
     /// damages.
     #[test]
@@ -731,7 +818,7 @@ mod tests {
         assert!(painted_inside(&canvas, strip_bounds(panel, 120)));
         assert!(!painted_inside(&canvas, panel), "the shadow");
         for text in [
-            "search", "2 / 3", "›", "alpha", "ctrl n", "next", "ctrl p", "esc",
+            "search", "2/3", "›", "alpha", "ctrl n", "next", "ctrl p", "esc",
         ] {
             assert!(cache.contains_source(text), "{text} was not drawn");
         }
@@ -758,7 +845,31 @@ mod tests {
             },
             true,
         );
-        assert!(fresh.contains_source("↵") && !fresh.contains_source("2 / 3"));
+        assert!(fresh.contains_source("↵") && !fresh.contains_source("2/3"));
+        // Enter on a new query: until it is answered, the earlier query's
+        // count and its next/prev keys do not show under it.
+        let mut fresh = SessionPickerTextCache::default();
+        search(
+            &mut fresh,
+            SearchStrip {
+                pending: true,
+                ..SEARCHED
+            },
+            true,
+        );
+        assert!(fresh.contains_source("searching…"));
+        assert!(!fresh.contains_source("2/3") && !fresh.contains_source("ctrl n"));
+        // An empty field says what it searches.
+        let mut fresh = SessionPickerTextCache::default();
+        search(
+            &mut fresh,
+            SearchStrip {
+                input: "",
+                ..SEARCHED
+            },
+            true,
+        );
+        assert!(fresh.contains_source("search scrollback"));
         for (matches, searching, count) in [(0, true, "searching…"), (0, false, "no matches")] {
             let mut fresh = SessionPickerTextCache::default();
             search(
@@ -807,6 +918,7 @@ mod tests {
         cache: &mut SessionPickerTextCache,
         status: HistoryOverlayStatus,
         keys: &[String],
+        scale_120: u32,
     ) -> (Option<HistoryOverlayLayout>, Vec<u8>) {
         let mut canvas = vec![0_u8; usize::try_from(WIDTH * HEIGHT * 4).unwrap()];
         let layout = paint_history_overlay(
@@ -816,7 +928,7 @@ mod tests {
             WIDTH,
             HEIGHT,
             TERMINAL,
-            120,
+            scale_120,
             1,
             session_picker_palette(ResolvedTheme::default()),
             status,
@@ -827,24 +939,26 @@ mod tests {
     }
 
     /// The history strip is passive text at the top right: `history` over
-    /// the divider frame, the accent `↑`, the position, the rows that
-    /// arrived since, and the return chips at its right end, whose end of
-    /// the strip is the click target. Counts clamp at 999.
+    /// the divider frame, the accent `↑`, the position (`17/351`, as the
+    /// palette counts), the rows that arrived since, and the return chips at
+    /// its right end, inside its return area. It is sized to its content:
+    /// the longest position, a cell, and the return area. Counts clamp at
+    /// 999.
     #[test]
-    fn history_is_passive_text_with_its_return_chips() {
+    fn history_is_passive_text_sized_to_its_content() {
         let palette = session_picker_palette(ResolvedTheme::default());
-        let layout = history_overlay_layout(960, 600, 120).unwrap();
-        assert_eq!(layout.panel, (960 - 8 - 340, 8, 340, STRIP_HEIGHT));
-        let (x, y, width, height) = layout.return_to_live;
-        assert_eq!((y, height), (8, STRIP_HEIGHT));
-        assert_eq!(
-            i64::from(x) + i64::from(width),
-            i64::from(layout.panel.0) + 340
-        );
-        assert_eq!(width, RETURN_WIDTH + STRIP_INSET);
-        assert!(history_overlay_layout(150, 600, 120).is_none());
-        assert!(history_overlay_layout(960, 70, 120).is_none());
-        assert!(history_overlay_layout(960, 600, 0).is_none());
+        // 2·20 inset + 19 cells × 8 + 8 + (60 return + 20 inset) = 280.
+        let layout = history_overlay_layout(960, 600, 120, 8, 60).unwrap();
+        assert_eq!(layout.panel, (960 - 8 - 280, 8, 280, STRIP_HEIGHT));
+        assert_eq!(layout.return_to_live, (960 - 8 - 80, 8, 80, STRIP_HEIGHT));
+        // Never narrower than 240, and capped by the area.
+        let narrow = history_overlay_layout(960, 600, 120, 2, 10).unwrap();
+        assert_eq!(narrow.panel.2, 240);
+        let capped = history_overlay_layout(260, 600, 120, 8, 60).unwrap();
+        assert_eq!(capped.panel, (8, 8, 244, STRIP_HEIGHT));
+        assert!(history_overlay_layout(150, 600, 120, 8, 60).is_none());
+        assert!(history_overlay_layout(960, 70, 120, 8, 60).is_none());
+        assert!(history_overlay_layout(960, 600, 0, 8, 60).is_none());
 
         let mut cache = SessionPickerTextCache::default();
         let keys = vec!["shift".to_owned(), "end".to_owned()];
@@ -853,13 +967,14 @@ mod tests {
             available_rows: 351,
             unseen_rows: 4,
         };
-        let (painted, canvas) = history(&mut cache, status, &keys);
+        let (painted, canvas) = history(&mut cache, status, &keys, 120);
         let painted = painted.unwrap();
-        for text in ["history", "↑", "17 / 351", "+4 new", "shift", "end"] {
+        for text in ["history", "↑", "17/351", "+4 new", "shift", "end"] {
             assert!(cache.contains_source(text), "{text} was not drawn");
         }
+        assert!(!cache.contains_source("…"), "the chips are whole");
         let panel = tuple_rect(painted.panel);
-        assert_eq!(panel.x, TERMINAL.x + TERMINAL.width - 8 - 340);
+        assert_eq!(panel.x + panel.width, TERMINAL.x + TERMINAL.width - 8);
         assert_eq!(panel.y, TERMINAL.y + 8);
         assert!(painted_inside(&canvas, strip_bounds(panel, 120)));
         assert_eq!(
@@ -867,8 +982,38 @@ mod tests {
             rgb(palette.frame),
             "a passive frame"
         );
+        // The painted chips lie inside the return area.
         let action = tuple_rect(painted.return_to_live);
         assert_eq!(action.x + action.width, panel.x + panel.width);
+        let row = content_row(panel, 120);
+        let room = Rect {
+            x: action.x,
+            width: row.x + row.width - action.x,
+            ..row
+        };
+        let mut scratch = vec![0_u8; usize::try_from(WIDTH * HEIGHT * 4).unwrap()];
+        let cell = ChromePainter::new(
+            &mut cache,
+            &RenderContext::new(u16::MAX),
+            &mut scratch,
+            WIDTH,
+            HEIGHT,
+            120,
+            1,
+        )
+        .cell(ChromeTextStyle::Regular)
+        .unwrap();
+        let chips = super::super::chrome_rows::chip_layout(&keys, room, cell, 120, true);
+        assert_eq!((chips.first, chips.ellipsis), (0, None));
+        for chip in &chips.chips {
+            assert!(chip.x >= action.x && chip.x + chip.width <= action.x + action.width);
+            let (x, y) = (chip.x + chip.width / 2, chip.y + 1);
+            assert_ne!(
+                pixel(&canvas, x, y),
+                rgb(palette.panel),
+                "a chip at {x},{y}"
+            );
+        }
 
         let mut fresh = SessionPickerTextCache::default();
         history(
@@ -879,10 +1024,77 @@ mod tests {
                 unseen_rows: 1_000,
             },
             &[],
+            120,
         );
-        for text in ["999 / 999", "↓ live"] {
+        for text in ["999/999", "+999 new", "↓ live"] {
             assert!(fresh.contains_source(text), "{text} was not drawn");
         }
+    }
+
+    /// The position is whole or not there, its total dropped first; at a
+    /// large chrome font the strip grows so its chips stay whole.
+    #[test]
+    fn history_text_is_whole_and_its_chips_never_cut() {
+        let status = HistoryOverlayStatus {
+            offset_from_bottom: 999,
+            available_rows: 999,
+            unseen_rows: 0,
+        };
+        assert_eq!(history_position(status, 7).as_deref(), Some("999/999"));
+        assert_eq!(history_position(status, 6).as_deref(), Some("999"));
+        assert_eq!(history_position(status, 2), None);
+        let keys = vec!["ctrl".to_owned(), "shift".to_owned(), "end".to_owned()];
+        for cell in [(7, 14), (12, 22), (16, 24)] {
+            let chips = chips_width(&keys, cell, 120);
+            let layout = history_overlay_layout(1_600, 600, 120, cell.0, chips).unwrap();
+            let panel = tuple_rect(layout.panel);
+            let row = content_row(panel, 120);
+            let action = tuple_rect(layout.return_to_live);
+            let room = Rect {
+                x: action.x,
+                width: row.x + row.width - action.x,
+                ..row
+            };
+            let placed = super::super::chrome_rows::chip_layout(&keys, room, cell, 120, true);
+            assert_eq!((placed.first, placed.ellipsis), (0, None), "{cell:?}");
+            // The longest position fits left of the chips with a cell's gap.
+            let text = cells_px(text_cells(HISTORY_WORST_TEXT), cell.0);
+            assert!(row.x + text + cell.0 <= action.x, "{cell:?}");
+        }
+    }
+
+    /// At a fractional scale the strip and its return area stay inside
+    /// the area, right-anchored, as tall as the scaled strip.
+    #[test]
+    fn history_layout_holds_at_fractional_scales() {
+        for scale in [150, 180] {
+            let cell = (8 * scale / 120, 16 * scale / 120);
+            let keys = vec!["shift".to_owned(), "end".to_owned()];
+            let chips = chips_width(&keys, cell, scale);
+            let layout = history_overlay_layout(1_440, 900, scale, cell.0, chips).unwrap();
+            let panel = tuple_rect(layout.panel);
+            let margin = scaled(STRIP_MARGIN, scale);
+            assert_eq!(panel.x + panel.width, 1_440 - margin, "{scale}");
+            assert_eq!(panel.height, scaled(STRIP_HEIGHT, scale), "{scale}");
+            assert!(panel.width >= scaled(HISTORY_WIDTH, scale), "{scale}");
+            let action = tuple_rect(layout.return_to_live);
+            assert_eq!(action.x + action.width, panel.x + panel.width, "{scale}");
+            assert_eq!(action.width, chips + scaled(STRIP_INSET, scale), "{scale}");
+        }
+        let mut cache = SessionPickerTextCache::default();
+        let (painted, canvas) = history(
+            &mut cache,
+            HistoryOverlayStatus {
+                offset_from_bottom: 3,
+                available_rows: 40,
+                unseen_rows: 0,
+            },
+            &["end".to_owned()],
+            180,
+        );
+        let panel = tuple_rect(painted.unwrap().panel);
+        assert!(painted_inside(&canvas, strip_bounds(panel, 180)));
+        assert!(cache.contains_source("3/40"));
     }
 
     fn banner(
@@ -903,7 +1115,10 @@ mod tests {
             1,
             session_picker_palette(ResolvedTheme::default()),
             banner,
-            '⠙',
+            BannerMarks {
+                spinner: '⠙',
+                lost: BannerMarks::LOST,
+            },
         )
         .unwrap();
         (panel, canvas)
@@ -944,9 +1159,81 @@ mod tests {
         assert_eq!(handoff_banner_layout(TERMINAL, None, 100, 0), None);
     }
 
+    /// In a narrow terminal, where the band left of history leaves no
+    /// legible banner, or where history spans the band, the banner goes in
+    /// the band below history instead of vanishing or covering it; with no
+    /// room below either, there is none.
+    #[test]
+    fn a_narrow_banner_goes_below_history() {
+        let narrow = Rect {
+            x: 0,
+            y: 0,
+            width: 420,
+            height: 300,
+        };
+        let history = Rect {
+            x: narrow.width - 8 - 280,
+            y: 8,
+            width: 280,
+            height: STRIP_HEIGHT,
+        };
+        let below = handoff_banner_layout(narrow, Some(history), 200, 120).unwrap();
+        assert_eq!(below.y, history.y + history.height + 8);
+        assert_eq!(below.x + below.width / 2, narrow.width / 2);
+        let spanning = Rect {
+            x: 8,
+            width: narrow.width - 16,
+            ..history
+        };
+        let under = handoff_banner_layout(narrow, Some(spanning), 200, 120).unwrap();
+        assert_eq!(under.y, spanning.y + spanning.height + 8);
+        assert!(under.y >= spanning.y + spanning.height);
+        let short = Rect {
+            height: STRIP_HEIGHT * 2 + 16,
+            ..narrow
+        };
+        assert_eq!(handoff_banner_layout(short, Some(history), 200, 120), None);
+        // At a fractional scale too.
+        let scale = 150;
+        let wide_history = Rect {
+            x: 8 * scale / 120,
+            y: 10,
+            width: 600,
+            height: scaled(STRIP_HEIGHT, scale),
+        };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 640,
+            height: 400,
+        };
+        let placed = handoff_banner_layout(area, Some(wide_history), 300, scale).unwrap();
+        assert_eq!(
+            placed.y,
+            wide_history.y + wide_history.height + scaled(STRIP_MARGIN, scale)
+        );
+        assert_eq!(placed.height, scaled(STRIP_HEIGHT, scale));
+        let beside = handoff_banner_layout(
+            Rect {
+                width: 1_600,
+                ..area
+            },
+            Some(Rect {
+                x: 1_600 - 12 - 420,
+                ..wide_history
+            }),
+            300,
+            scale,
+        )
+        .unwrap();
+        assert_eq!(beside.y, scaled(STRIP_MARGIN, scale));
+        assert!(beside.x + beside.width + scaled(STRIP_MARGIN, scale) <= 1_600 - 12 - 420);
+    }
+
     /// A running upgrade's banner is framed in the warning colour with the
-    /// spinner in place of its `…`; a lost one in danger with `✕`; a settled
-    /// one on the divider with `✓` or `!`.
+    /// spinner in place of its `…`; a lost one in danger with `✕`; a
+    /// rolled-back or cancelled one on the divider with `!`, since neither
+    /// upgraded.
     #[test]
     fn the_banner_frame_and_mark_follow_the_upgrade() {
         let palette = session_picker_palette(ResolvedTheme::default());
@@ -973,7 +1260,7 @@ mod tests {
             (
                 HandoffBanner::Notice(HandoffNotice::RolledBack),
                 palette.frame,
-                "✓",
+                "!",
                 "Rolled back",
             ),
             (
@@ -996,6 +1283,20 @@ mod tests {
             assert!(cache.contains_source(label), "{label}");
             assert!(!cache.contains_source("Preparing upgrade…"));
         }
+        let ascii = BannerMarks {
+            spinner: '⠙',
+            lost: BannerMarks::LOST_ASCII,
+        };
+        assert_eq!(banner_look(HandoffBanner::Lost, &palette, ascii).mark, 'x');
+        let rolled_back = banner_look(
+            HandoffBanner::Notice(HandoffNotice::RolledBack),
+            &palette,
+            ascii,
+        );
+        assert_eq!(
+            (rolled_back.frame, rolled_back.mark, rolled_back.mark_color),
+            (palette.frame, '!', palette.warning)
+        );
     }
 
     /// Every strip row is tall enough for the largest UI text.

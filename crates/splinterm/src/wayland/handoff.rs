@@ -22,7 +22,7 @@ use crate::{
     handoff_status::{
         HandoffBanner, HandoffPresentation, HandoffStatusHub, HandoffTransition, WindowHandoffPhase,
     },
-    renderer::SessionPickerTextCache,
+    renderer::{BannerMarks, SessionPickerTextCache, chrome_primary_faces_cover},
 };
 
 use splinterm_core::DojoId;
@@ -72,6 +72,9 @@ pub(super) struct HandoffFrontend {
     /// Where the last draw put the banner and its shadow, buffer px: a
     /// spinner frame damages it.
     pub(super) painted_banner: Option<Rect>,
+    /// The lost connection's mark for the renderer generation that chose
+    /// it: the font is checked once per generation, not every draw.
+    lost_mark: Option<(u64, char)>,
 }
 
 impl HandoffFrontend {
@@ -176,11 +179,33 @@ impl HandoffFrontend {
         self.presentation.banner()
     }
 
-    /// Whether the banner shows a running upgrade, whose spinner moves.
+    /// Whether the banner shows a running upgrade, whose spinner moves:
+    /// only while the last draw painted it, so a banner the Window has no
+    /// room for does not keep the event loop waking.
     pub(super) fn banner_working(&self) -> bool {
-        self.presentation
-            .banner()
-            .is_some_and(HandoffBanner::is_working)
+        self.painted_banner.is_some()
+            && self
+                .presentation
+                .banner()
+                .is_some_and(HandoffBanner::is_working)
+    }
+
+    /// The lost connection's mark at renderer `generation`: `✕` when the
+    /// interface font's own faces draw it, else `x`, never a replacement
+    /// glyph. Checked once per generation.
+    pub(super) fn lost_mark(&mut self, generation: u64) -> char {
+        match self.lost_mark {
+            Some((checked, mark)) if checked == generation => mark,
+            _ => {
+                let mark = if chrome_primary_faces_cover(&BannerMarks::LOST.to_string()) {
+                    BannerMarks::LOST
+                } else {
+                    BannerMarks::LOST_ASCII
+                };
+                self.lost_mark = Some((generation, mark));
+                mark
+            }
+        }
     }
 
     /// How long the event loop may sleep before an outcome notice expires.

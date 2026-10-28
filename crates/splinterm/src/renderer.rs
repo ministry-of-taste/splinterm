@@ -120,7 +120,7 @@ pub(crate) use overlays::prompt_box::{
     paint_dojo_prompt,
 };
 pub(crate) use overlays::strip_box::{
-    HistoryOverlayStatus, SearchStrip, history_overlay_layout, paint_handoff_banner,
+    BannerMarks, HistoryOverlayLayout, HistoryOverlayStatus, SearchStrip, paint_handoff_banner,
     paint_history_overlay, paint_search_overlay, search_overlay_panel, strip_bounds,
 };
 use raster::{alpha_u8, blend_glyph, blend_rect, premultiplied_rgba};
