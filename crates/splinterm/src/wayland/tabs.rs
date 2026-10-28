@@ -577,6 +577,7 @@ impl DojoTabView {
                 );
                 pane.controller_active = false;
                 pane.commands = None;
+                pane.pending_control_transfer = None;
                 pane.updates = None;
                 held = true;
             }

@@ -208,8 +208,8 @@ use clipboard::{
     write_clipboard_with_deadline,
 };
 use damage::{
-    BackingDamage, pending_draw_waits_for_frame, search_panel_damage, sync_backing_damage,
-    take_full_surface_damage, terminal_draw_waits_for_frame,
+    BackingDamage, control_notice_damage, pending_draw_waits_for_frame, search_panel_damage,
+    sync_backing_damage, take_full_surface_damage, terminal_draw_waits_for_frame,
 };
 use file_drop::{
     FileDropTarget, URI_LIST_MIME, accepted_uri_list_mime, copy_action_supported,
@@ -1113,7 +1113,9 @@ fn assemble_app(
             explorer_text_cache: SessionPickerTextCache::default(),
             search_text_cache: SessionPickerTextCache::default(),
             history_text_cache: SessionPickerTextCache::default(),
+            control_notice_text_cache: SessionPickerTextCache::default(),
             painted_search_panel: None,
+            painted_control_notices: Vec::new(),
             explorer_visible_start: 0,
             explorer_agents_start: 0,
             explorer_pressed: None,
@@ -2171,8 +2173,11 @@ impl PaneView {
                 self.controller_active = active;
                 Ok(BackgroundUpdateImpact::VISUAL)
             }
+            // A pane that lost its stream cannot answer, so it is not asked.
             WindowUpdate::ControlTransferRequested(transfer_id) => {
-                self.pending_control_transfer = Some(transfer_id);
+                if self.commands.is_some() {
+                    self.pending_control_transfer = Some(transfer_id);
+                }
                 Ok(BackgroundUpdateImpact::VISUAL)
             }
             WindowUpdate::ControlTransferResolved(_) => {
@@ -2203,6 +2208,7 @@ impl PaneView {
             WindowUpdate::Exited { .. } | WindowUpdate::Shutdown => {
                 self.controller_active = false;
                 self.commands = None;
+                self.pending_control_transfer = None;
                 self.updates = None;
                 Ok(BackgroundUpdateImpact::VISUAL)
             }
@@ -2445,10 +2451,15 @@ struct PresentationState {
     explorer_text_cache: SessionPickerTextCache,
     search_text_cache: SessionPickerTextCache,
     history_text_cache: SessionPickerTextCache,
+    control_notice_text_cache: SessionPickerTextCache,
     /// Where the last committed frame drew the terminal search strip and its
     /// shadow, in buffer pixels; the next frame damages it if the strip
     /// closes or moves.
     painted_search_panel: Option<Rect>,
+    /// Where the last committed frame drew the control transfer notices
+    /// and their shadows, buffer px; the next frame damages any that clear
+    /// or move (Plan 0067 M4).
+    painted_control_notices: Vec<Rect>,
     explorer_visible_start: usize,
     /// The agents section's first row in view, kept as the tree's start is.
     explorer_agents_start: usize,
@@ -3535,6 +3546,61 @@ fn reduced_motion_requested() -> bool {
         .is_some_and(|value| matches!(value.to_str(), Some("1" | "true" | "yes")))
 }
 
+/// Plan 0067 M4: where the control transfer notices go, logical px: each
+/// pane of the shown `layout` with a pending transfer, or `content` when
+/// the Window shows its one, `focused` pane. Each says whether it is the
+/// `focused` pane, the one the keys answer. A pane that is closed, hidden
+/// in another tab, or zoomed out of the layout shows none, and a daemon
+/// handoff, which pauses the answer, shows none while `paused`.
+fn control_transfer_notice_rects<'a>(
+    panes: impl IntoIterator<Item = &'a PaneView>,
+    paused: bool,
+    layout: Option<&PaneLayout>,
+    focused: Option<SplintId>,
+    content: Rect,
+) -> Vec<(Rect, bool)> {
+    if paused {
+        return Vec::new();
+    }
+    let offered = panes
+        .into_iter()
+        .filter(|pane| pane.pending_control_transfer.is_some())
+        .filter_map(|pane| pane.snapshot.as_ref().map(|snapshot| snapshot.splint_id));
+    match layout {
+        Some(layout) => offered
+            .filter_map(|splint_id| {
+                layout
+                    .rect(splint_id)
+                    .map(|rect| (rect, focused == Some(splint_id)))
+            })
+            .collect(),
+        None => offered
+            .filter(|splint_id| focused == Some(*splint_id))
+            .map(|_| (content, true))
+            .collect(),
+    }
+}
+
+/// Where `first` and `second` overlap, if they do.
+fn rect_intersection(first: Rect, second: Rect) -> Option<Rect> {
+    let left = first.x.max(second.x);
+    let top = first.y.max(second.y);
+    let right = first
+        .x
+        .saturating_add(first.width)
+        .min(second.x.saturating_add(second.width));
+    let bottom = first
+        .y
+        .saturating_add(first.height)
+        .min(second.y.saturating_add(second.height));
+    (left < right && top < bottom).then(|| Rect {
+        x: left,
+        y: top,
+        width: right - left,
+        height: bottom - top,
+    })
+}
+
 fn search_paint_rect(content: Rect, explorer: Option<&LairExplorerLayout>) -> Option<Rect> {
     let Some(explorer) =
         explorer.filter(|layout| layout.mode == LairExplorerPresentationMode::Drawer)
@@ -3624,7 +3690,7 @@ fn initial_window_title(options: &WindowOptions) -> String {
             options.controlled && options.commands.is_some() && options.controller_title,
             options.local_endpoint,
             &options.authority,
-            false,
+            None,
             None,
         )
     }
@@ -3637,7 +3703,8 @@ fn window_title(
     controller_active: bool,
     local_endpoint: bool,
     authority: &AuthorityStatus,
-    control_transfer_pending: bool,
+    // The keys that answer a pending control transfer, while one is offered.
+    control_transfer: Option<&str>,
     search: Option<&SearchUiState>,
 ) -> String {
     let base = match snapshot_title.map(str::trim) {
@@ -3662,10 +3729,9 @@ fn window_title(
         (None, Some(authority)) => format!("{base} — {authority}"),
         (None, None) => base,
     };
-    let title = if control_transfer_pending {
-        format!("{title} — CONTROL REQUEST: Ctrl+Shift+Y accept / Ctrl+Shift+N deny")
-    } else {
-        title
+    let title = match control_transfer {
+        Some(keys) => format!("{title} — CONTROL REQUEST: {keys}"),
+        None => title,
     };
     if let Some(search) = search.filter(|search| search.input.is_some()) {
         let query = search.input.as_ref().map_or("", BoundedTextEditor::text);
@@ -4422,6 +4488,7 @@ impl App {
                 pane.controller_active = false;
                 pane.control_release_pending = false;
                 pane.commands = None;
+                pane.pending_control_transfer = None;
             }
         }
     }
@@ -4460,6 +4527,7 @@ impl App {
                 pane.controller_active = false;
                 pane.pending_focus_report = None;
                 pane.commands = None;
+                pane.pending_control_transfer = None;
             }
         }
     }
@@ -6822,6 +6890,9 @@ impl App {
                 for _ in loaded.diagnostics {
                     eprintln!("splinterm configuration warning");
                 }
+                // A pending control request's title names the new keys, as
+                // its notice does from the next frame.
+                self.update_window_title();
             }
             Err(_) => eprintln!("splinterm config reload rejected"),
         }
@@ -8290,6 +8361,7 @@ impl App {
         self.presentation.explorer_text_cache.clear();
         self.presentation.search_text_cache.clear();
         self.presentation.history_text_cache.clear();
+        self.presentation.control_notice_text_cache.clear();
         self.modal.command_palette_text_cache.clear();
         self.modal.dojo_prompt_text_cache.clear();
         self.modal.tab_context_menu_text_cache.clear();
@@ -9676,9 +9748,52 @@ impl App {
         }
     }
 
+    /// Answers the focused pane's pending control transfer, if it has one.
+    /// Its notice and the title's offer clear at once (Plan 0067 M4).
+    fn answer_control_transfer(
+        &mut self,
+        decision: ControlTransferDecision,
+        queue_handle: &QueueHandle<Self>,
+    ) {
+        let Some(transfer_id) = self.panes.pane.pending_control_transfer.take() else {
+            return;
+        };
+        self.send_command(WindowCommand::DecideControlTransfer {
+            transfer_id,
+            decision,
+        });
+        self.update_window_title();
+        self.presentation.full_redraw = true;
+        if let Err(error) = self.schedule_draw(queue_handle) {
+            self.scheduling.fail(error);
+        }
+    }
+
+    /// Plan 0067 M4: whether `pane`'s pending control transfer is offered.
+    /// Accepting or denying waits out a daemon handoff, so neither the title
+    /// nor the pane's notice offers it while paused.
+    const fn control_transfer_offered(&self, pane: &PaneView) -> bool {
+        pane.pending_control_transfer.is_some() && !self.handoff_paused()
+    }
+
+    /// Plan 0067 M4: the visible panes, logical px, whose control transfer is
+    /// offered; see [`control_transfer_notice_rects`].
+    fn control_transfer_notice_panes(&self, layout: Option<&PaneLayout>) -> Vec<(Rect, bool)> {
+        control_transfer_notice_rects(
+            std::iter::once(&self.panes.pane).chain(self.panes.inactive_panes.iter()),
+            self.handoff_paused(),
+            layout,
+            self.panes.focused_splint(),
+            self.content_rect(),
+        )
+    }
+
     /// The focused pane's terminal title, or `None` before it has a snapshot.
     fn terminal_window_title(&self) -> Option<String> {
         let snapshot = self.panes.pane.snapshot.as_ref()?;
+        let control_transfer = self
+            .control_transfer_offered(&self.panes.pane)
+            .then(|| crate::frontend::control_transfer_keys(&self.input.keymap).title);
         let title = window_title(
             self.presentation
                 .title
@@ -9688,9 +9803,8 @@ impl App {
             self.panes.pane.controller_active && self.presentation.title.controller_label,
             self.clipboard.local_endpoint,
             &self.panes.pane.authority,
-            // Accepting or denying waits out a daemon handoff, so the title
-            // offers neither while paused.
-            self.panes.pane.pending_control_transfer.is_some() && !self.handoff_paused(),
+            // It names the bound keys, as the pane's notice does.
+            control_transfer.as_deref(),
             Some(&self.panes.pane.search),
         );
         // A queued access prompt is announced, never shown with focus
@@ -10288,21 +10402,11 @@ impl App {
                 return;
             }
             Some(ActionId::AcceptControlTransfer) => {
-                if let Some(transfer_id) = self.panes.pane.pending_control_transfer.take() {
-                    self.send_command(WindowCommand::DecideControlTransfer {
-                        transfer_id,
-                        decision: ControlTransferDecision::Accept,
-                    });
-                }
+                self.answer_control_transfer(ControlTransferDecision::Accept, queue_handle);
                 return;
             }
             Some(ActionId::DenyControlTransfer) => {
-                if let Some(transfer_id) = self.panes.pane.pending_control_transfer.take() {
-                    self.send_command(WindowCommand::DecideControlTransfer {
-                        transfer_id,
-                        decision: ControlTransferDecision::Deny,
-                    });
-                }
+                self.answer_control_transfer(ControlTransferDecision::Deny, queue_handle);
                 return;
             }
             Some(ActionId::ReleaseControl) => {
@@ -11285,6 +11389,7 @@ impl App {
             if disconnected {
                 pane.controller_active = false;
                 pane.commands = None;
+                pane.pending_control_transfer = None;
                 pane.updates = None;
                 drain.changed = true;
             }
@@ -11303,6 +11408,7 @@ impl App {
                         );
                         pane.controller_active = false;
                         pane.commands = None;
+                        pane.pending_control_transfer = None;
                         pane.updates = None;
                         drain.exited.push(splint_id);
                         drain.changed = true;
@@ -11420,6 +11526,7 @@ impl App {
             // this pane with a resnapshotted one.
             self.panes.pane.controller_active = false;
             self.panes.pane.commands = None;
+            self.panes.pane.pending_control_transfer = None;
             self.panes.pane.updates = None;
             self.handoff.hold(HeldFailure::PaneStream);
         } else if disconnected && !pane_stream_has_terminal_notice(&pending) {
@@ -11825,13 +11932,21 @@ impl App {
                     focused_visual_changed = true;
                     self.presentation.full_redraw = true;
                 }
+                // The pane's notice shows and clears with the title (Plan 0067
+                // M4); neither moves focus or the active tab.
                 WindowUpdate::ControlTransferRequested(transfer_id) => {
-                    self.panes.pane.pending_control_transfer = Some(transfer_id);
+                    if self.panes.pane.commands.is_some() {
+                        self.panes.pane.pending_control_transfer = Some(transfer_id);
+                    }
                     title_changed = true;
+                    visual_changed = true;
+                    self.presentation.full_redraw = true;
                 }
                 WindowUpdate::ControlTransferResolved(_) => {
                     self.panes.pane.pending_control_transfer = None;
                     title_changed = true;
+                    visual_changed = true;
+                    self.presentation.full_redraw = true;
                 }
                 WindowUpdate::SearchResults(page) => {
                     if let Some(cursor) = self.panes.pane.search.take_page(page) {
@@ -11875,6 +11990,7 @@ impl App {
                         self.panes.pending_exited_splints.insert(splint_id);
                         self.panes.pane.controller_active = false;
                         self.panes.pane.commands = None;
+                        self.panes.pane.pending_control_transfer = None;
                         self.panes.pane.updates = None;
                         title_changed = true;
                         visual_changed = true;
@@ -11890,6 +12006,7 @@ impl App {
                     if self.panes.layout.is_some() {
                         self.panes.pane.controller_active = false;
                         self.panes.pane.commands = None;
+                        self.panes.pane.pending_control_transfer = None;
                         self.panes.pane.updates = None;
                         title_changed = true;
                         visual_changed = true;
@@ -12577,6 +12694,8 @@ impl App {
             .explorer_layout
             .clone_from(&explorer_layout);
         let pane_layout = self.computed_pane_layout();
+        // Plan 0067 M4: where this draw puts control transfer notices.
+        let notice_panes = self.control_transfer_notice_panes(pane_layout.as_ref());
         let (pane_cell_width, pane_cell_height) = self
             .panes
             .pane
@@ -13183,6 +13302,50 @@ impl App {
             )?;
             self.surface.buffers[buffer_index].stale.mark_full();
         }
+        // Plan 0067 M4: a visible pane an agent asks to control says so, with
+        // the keys that answer, until the transfer resolves. It is only drawn:
+        // it takes no keys, no focus and no clicks, and the search strip, the
+        // banner and every popup draw over it. The keys answer the focused
+        // pane, so another pane asked says to focus it first.
+        let mut control_notices = Vec::new();
+        if !notice_panes.is_empty()
+            && let Some(terminal) = search_paint_rect(content_rect, explorer_layout.as_ref())
+        {
+            let scale_120 = self.surface.scale_120;
+            let keys = crate::frontend::control_transfer_keys(&self.input.keymap);
+            let search = if self.panes.pane.search.input.is_some() {
+                search_overlay_panel(Self::buffer_rect(terminal, scale_120)?, scale_120)
+                    .map(|panel| strip_bounds(panel, scale_120))
+            } else {
+                None
+            };
+            for (pane, answerable) in notice_panes {
+                let Some(pane) = rect_intersection(pane, terminal) else {
+                    continue;
+                };
+                let legend = keys.legend_for(answerable);
+                let panel = crate::renderer::paint_control_transfer_notice(
+                    &mut self.presentation.control_notice_text_cache,
+                    &self.presentation.render_context,
+                    canvas,
+                    width,
+                    height,
+                    Self::buffer_rect(pane, scale_120)?,
+                    search,
+                    scale_120,
+                    self.presentation.renderer_generation,
+                    chrome_panel_palette(self.presentation.theme, ChromeSurface::Popup),
+                    crate::renderer::ControlTransferStrip {
+                        label: crate::frontend::CONTROL_TRANSFER_NOTICE,
+                        legend: &legend,
+                    },
+                )?;
+                control_notices.extend(panel.map(|panel| strip_bounds(panel, scale_120)));
+            }
+            self.surface.buffers[buffer_index]
+                .stale
+                .mark_regions(&control_notices);
+        }
         let mut search_panel = None;
         if let Some(input) = self.panes.pane.search.input.as_ref() {
             if let Some(terminal) = search_paint_rect(content_rect, explorer_layout.as_ref()) {
@@ -13485,10 +13648,16 @@ impl App {
             }
         }
         self.panes.pane.painted_history_status = history_status;
-        // The search field is chrome over the terminal: partial damage covers
-        // only changed rows, so damage where it is and where it was.
+        // The search field and the control notices are chrome over the
+        // terminal: partial damage covers only changed rows, so damage where
+        // they are and where they were.
         if !damage_full_surface {
             for region in search_panel_damage(self.presentation.painted_search_panel, search_panel)
+                .into_iter()
+                .chain(control_notice_damage(
+                    &self.presentation.painted_control_notices,
+                    &control_notices,
+                ))
             {
                 self.surface.window.wl_surface().damage_buffer(
                     i32::try_from(region.x).unwrap_or(i32::MAX),
@@ -13499,6 +13668,7 @@ impl App {
             }
         }
         self.presentation.painted_search_panel = search_panel;
+        self.presentation.painted_control_notices = control_notices;
         self.panes.pane.raster_dirty_rows.fill(false);
         self.panes.pane.surface_dirty_rows.fill(false);
         self.panes.pane.pending_scrolls.clear();
@@ -18556,7 +18726,7 @@ mod tests {
             Some(" Splinterm "),
         ] {
             assert_eq!(
-                window_title(title, false, true, &authority, false, None),
+                window_title(title, false, true, &authority, None, None),
                 "Splinterm"
             );
         }
@@ -18569,7 +18739,7 @@ mod tests {
             ("作業", "Splinterm — 作業"),
         ] {
             assert_eq!(
-                window_title(Some(title), false, true, &authority, false, None),
+                window_title(Some(title), false, true, &authority, None, None),
                 expected
             );
         }
@@ -18606,7 +18776,7 @@ mod tests {
                         controller_active,
                         true,
                         &authority,
-                        false,
+                        None,
                         None
                     ),
                     format!("Splinterm — shell{controller}{label}")
@@ -18617,7 +18787,7 @@ mod tests {
                     controller_active,
                     false,
                     &authority,
-                    false,
+                    None,
                     None,
                 );
                 assert!(!remote.contains("local"), "{remote}");
@@ -18963,11 +19133,186 @@ mod tests {
             end_column: 2,
             preview: "needle".into(),
         });
-        let title = window_title(Some("shell"), true, true, &authority, true, Some(&search));
+        // The title names the keys the keymap binds (Plan 0067 M4).
+        let keys = "Ctrl+Alt+A accept / Ctrl+Shift+N deny";
+        let title = window_title(
+            Some("shell"),
+            true,
+            true,
+            &authority,
+            Some(keys),
+            Some(&search),
+        );
         assert!(title.starts_with("Splinterm — shell — local controller"));
-        assert!(title.contains("CONTROL REQUEST"));
+        assert!(title.contains("CONTROL REQUEST: Ctrl+Alt+A accept / Ctrl+Shift+N deny"));
         assert!(title.contains("SEARCH: needlespoof [1 match(es)"));
         assert!(!title.contains('\n'));
+    }
+
+    /// Plan 0067 M4: a pending control transfer shows its notice in its
+    /// pane until it resolves, whichever way it resolves; it never claims
+    /// focus, control or a focus report, and a handoff hides it.
+    #[test]
+    fn a_control_transfer_notice_shows_until_the_transfer_resolves() {
+        use splinterm_protocol::ControlTransferOutcome;
+
+        let theme = ResolvedTheme::default();
+        let splint_id = SplintId::new();
+        let content = Rect {
+            x: 0,
+            y: 30,
+            width: 800,
+            height: 500,
+        };
+        let mut pane = PaneView::from_options(pane_options(splint_id), SCALE_DENOMINATOR).unwrap();
+        let notices = |pane: &PaneView, paused| {
+            control_transfer_notice_rects([pane], paused, None, Some(splint_id), content)
+        };
+        assert!(notices(&pane, false).is_empty());
+        for outcome in [
+            ControlTransferOutcome::Granted,
+            ControlTransferOutcome::Denied,
+            ControlTransferOutcome::TimedOut,
+            ControlTransferOutcome::Cancelled,
+        ] {
+            let impact = pane
+                .apply_background_update(
+                    WindowUpdate::ControlTransferRequested(7),
+                    theme,
+                    "visible-inactive",
+                )
+                .unwrap();
+            assert_eq!(impact, BackgroundUpdateImpact::VISUAL, "{outcome:?}");
+            assert_eq!(notices(&pane, false), [(content, true)], "{outcome:?}");
+            assert!(notices(&pane, true).is_empty(), "{outcome:?}");
+            assert!(!pane.controller_active);
+            assert!(pane.pending_focus_report.is_none());
+            assert!(pane.search.input.is_none());
+            pane.apply_background_update(
+                WindowUpdate::ControlTransferResolved(outcome),
+                theme,
+                "visible-inactive",
+            )
+            .unwrap();
+            assert!(notices(&pane, false).is_empty(), "{outcome:?}");
+            assert!(!pane.controller_active);
+        }
+        // A single pane that is not the focused one shows none.
+        pane.apply_background_update(
+            WindowUpdate::ControlTransferRequested(8),
+            theme,
+            "visible-inactive",
+        )
+        .unwrap();
+        assert!(
+            control_transfer_notice_rects([&pane], false, None, Some(SplintId::new()), content)
+                .is_empty()
+        );
+        // A pane whose stream ends cannot answer: its notice clears, and a
+        // request still queued behind the end does not bring it back.
+        assert_eq!(notices(&pane, false), [(content, true)]);
+        pane.apply_background_update(WindowUpdate::Shutdown, theme, "visible-inactive")
+            .unwrap();
+        assert!(notices(&pane, false).is_empty());
+        pane.apply_background_update(
+            WindowUpdate::ControlTransferRequested(9),
+            theme,
+            "visible-inactive",
+        )
+        .unwrap();
+        assert!(notices(&pane, false).is_empty());
+        let mut exited =
+            PaneView::from_options(pane_options(splint_id), SCALE_DENOMINATOR).unwrap();
+        exited
+            .apply_background_update(
+                WindowUpdate::ControlTransferRequested(10),
+                theme,
+                "visible-inactive",
+            )
+            .unwrap();
+        exited
+            .apply_background_update(
+                WindowUpdate::Exited { splint_id },
+                theme,
+                "visible-inactive",
+            )
+            .unwrap();
+        assert!(notices(&exited, false).is_empty());
+    }
+
+    /// Plan 0067 M4: in a split, only the panes asking show the notice, each
+    /// in its own pane, and only the focused one, which the keys answer, is
+    /// marked answerable; a closed pane or one zoomed out of the layout
+    /// shows none.
+    #[test]
+    fn control_transfer_notices_go_in_their_own_panes() {
+        let theme = ResolvedTheme::default();
+        let (first, second) = (
+            Splint::shell(PathBuf::from("/")),
+            Splint::shell(PathBuf::from("/")),
+        );
+        let (first_id, second_id) = (first.id, second.id);
+        let root = LayoutNode::Branch {
+            axis: Axis::Horizontal,
+            ratio: SplitRatio::new(500).unwrap(),
+            first: Box::new(LayoutNode::Leaf(first.clone())),
+            second: Box::new(LayoutNode::Leaf(second)),
+        };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 400,
+        };
+        let layout = PaneLayout::compute(&root, area, 1, 40, 40).unwrap();
+        let focused = PaneView::from_options(pane_options(first_id), SCALE_DENOMINATOR).unwrap();
+        let mut asking =
+            PaneView::from_options(pane_options(second_id), SCALE_DENOMINATOR).unwrap();
+        asking
+            .apply_background_update(
+                WindowUpdate::ControlTransferRequested(3),
+                theme,
+                "visible-inactive",
+            )
+            .unwrap();
+        assert_eq!(
+            control_transfer_notice_rects(
+                [&focused, &asking],
+                false,
+                Some(&layout),
+                Some(first_id),
+                area
+            ),
+            [(layout.rect(second_id).unwrap(), false)]
+        );
+        // Focused, the asking pane's keys answer it; its notice names them.
+        assert_eq!(
+            control_transfer_notice_rects(
+                [&focused, &asking],
+                false,
+                Some(&layout),
+                Some(second_id),
+                area
+            ),
+            [(layout.rect(second_id).unwrap(), true)]
+        );
+        // Closed: the pane is gone from the Window.
+        assert!(
+            control_transfer_notice_rects([&focused], false, Some(&layout), Some(first_id), area)
+                .is_empty()
+        );
+        // Zoomed to the first pane, the second is not shown.
+        let zoomed = PaneLayout::compute(&LayoutNode::Leaf(first), area, 1, 40, 40).unwrap();
+        assert!(
+            control_transfer_notice_rects(
+                [&focused, &asking],
+                false,
+                Some(&zoomed),
+                Some(first_id),
+                area
+            )
+            .is_empty()
+        );
     }
 
     /// The current match is outlined only while the strip is open and

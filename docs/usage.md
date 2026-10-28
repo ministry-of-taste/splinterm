@@ -653,6 +653,24 @@ observers. Request/release/accept/deny operations are explicit, and forced
 takeover is a separate trusted-local confirmation. A remote graphical Window may
 request normal control but cannot use trusted-only forced takeover.
 
+When an agent asks to control a pane (MCP `splinterm.request_control_transfer`),
+that pane shows a notice at its bottom centre until you answer or the request
+ends: **An agent asks to control this pane**, framed in the theme's warning
+colour, with the keys that answer in its bottom edge (`ctrl shift y accept`,
+`ctrl shift n deny` by default, or the keys your keymap binds to
+`control.accept-transfer` and `control.deny-transfer`; an unbound one says
+`unbound`). The keys answer the focused pane, so a pane that is asked but not
+focused says **click to focus, then answer** instead. Focus the pane and press a
+key to answer; the notice itself takes no keys and no focus, a click on it only
+focuses its pane as any click does, and it never switches your tab or pane. It
+clears when you accept or deny, when the agent cancels, after about 15 seconds
+unanswered, or when the pane closes or loses its connection. The Window title also shows the request
+while the focused pane has one, and both hide while a daemon upgrade pauses
+input. If the focused pane is too small for the notice, the title still shows
+the request; a smaller pane that is not focused shows nothing until you focus
+it. A remote Window gets the request over the same pane connection as a local
+one, so it shows the notice too.
+
 Closing a controlling Window releases its connection-owned lease. A later client
 must acquire control explicitly; observation never silently becomes input
 authority.

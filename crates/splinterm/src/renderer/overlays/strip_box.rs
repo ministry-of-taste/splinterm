@@ -10,6 +10,10 @@
 //! returns to live. The banner's frame says how the upgrade is going:
 //! warning with a spinner while it runs, danger once the connection is lost,
 //! the divider once it has settled.
+//!
+//! A pane an agent asks to control shows the control transfer notice at
+//! its bottom centre (Plan 0067 M4): the warning frame, the request and the
+//! keys that answer it. Like the banner it is only a picture.
 
 use anyhow::Result;
 
@@ -723,6 +727,161 @@ pub(crate) fn paint_handoff_banner(
     Ok(Some(panel))
 }
 
+/// What a pane an agent asks to control shows (Plan 0067 M4): the notice
+/// and the keys that answer it, as `(key, verb)` pairs.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ControlTransferStrip<'a> {
+    pub(crate) label: &'a str,
+    pub(crate) legend: &'a [(&'a str, &'a str)],
+}
+
+/// Where the control transfer notice goes in `pane` (buffer px), its
+/// content `content_width` buffer px wide: centred at the bottom of the
+/// pane, or above `avoid` (the search strip) when that shares its band.
+/// `None` when the pane is too small for a legible notice; the Window
+/// title still names the request.
+#[must_use]
+pub(crate) fn control_transfer_notice_layout(
+    pane: Rect,
+    avoid: Option<Rect>,
+    content_width: u32,
+    scale_120: u32,
+) -> Option<Rect> {
+    if scale_120 == 0 || pane.width == 0 || pane.height == 0 {
+        return None;
+    }
+    let margin = scaled(STRIP_MARGIN, scale_120);
+    let height = scaled(STRIP_HEIGHT, scale_120);
+    let left = pane.x.saturating_add(margin);
+    let right = pane.x.saturating_add(pane.width).saturating_sub(margin);
+    let available = right.saturating_sub(left);
+    let top = pane.y.saturating_add(margin);
+    let mut y = pane
+        .y
+        .saturating_add(pane.height)
+        .saturating_sub(margin)
+        .saturating_sub(height);
+    if let Some(avoid) = avoid {
+        let shares_band =
+            avoid.y < y.saturating_add(height) && avoid.y.saturating_add(avoid.height) > y;
+        let overlaps = avoid.x < right && avoid.x.saturating_add(avoid.width) > left;
+        if shares_band && overlaps {
+            y = avoid.y.saturating_sub(margin).saturating_sub(height);
+        }
+    }
+    if available < scaled(BANNER_MINIMUM_WIDTH, scale_120)
+        || y < top
+        || pane.height < height.saturating_add(margin.saturating_mul(2))
+    {
+        return None;
+    }
+    let width = content_width
+        .saturating_add(scaled(STRIP_INSET, scale_120).saturating_mul(2))
+        .min(available);
+    Some(Rect {
+        x: left.saturating_add(available.saturating_sub(width) / 2),
+        y,
+        width,
+        height,
+    })
+}
+
+/// Paints the control transfer notice in `pane` and returns its panel, or
+/// `None` when the pane is too small for it: `control` in the frame, the
+/// warning `!` and the notice, and the answering keys in the bottom edge,
+/// on the popup surface with the frame in the theme's warning colour. It is
+/// a picture only: it takes no keys and no clicks.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "trusted strip painting keeps geometry, palette, and cache explicit"
+)]
+pub(crate) fn paint_control_transfer_notice(
+    cache: &mut SessionPickerTextCache,
+    context: &RenderContext,
+    canvas: &mut [u8],
+    canvas_width: u32,
+    canvas_height: u32,
+    pane: Rect,
+    avoid: Option<Rect>,
+    scale_120: u32,
+    renderer_generation: u64,
+    palette: SessionPickerPalette,
+    notice: ControlTransferStrip<'_>,
+) -> Result<Option<Rect>> {
+    if scale_120 == 0 {
+        return Ok(None);
+    }
+    let mut painter = ChromePainter::new(
+        cache,
+        context,
+        canvas,
+        canvas_width,
+        canvas_height,
+        scale_120,
+        renderer_generation,
+    );
+    let (cell_width, _) = painter.cell(ChromeTextStyle::Regular)?;
+    let (box_cell_width, _) = painter.box_cell()?;
+    // The mark, a space, the notice; the legend's pairs, a space inside
+    // each and two cells between them, clear of the frame's corners.
+    let content_cells = text_cells(notice.label).saturating_add(2);
+    let legend_cells = notice
+        .legend
+        .iter()
+        .map(|(key, verb)| text_cells(key) + 1 + text_cells(verb))
+        .sum::<u32>()
+        + 2 * u32::try_from(notice.legend.len().saturating_sub(1)).unwrap_or(0);
+    let content_width = cells_px(content_cells, cell_width).max(
+        cells_px(legend_cells, box_cell_width).saturating_add(scaled(2 * BOX_EDGE, scale_120)),
+    );
+    let Some(panel) = control_transfer_notice_layout(pane, avoid, content_width, scale_120) else {
+        painter.finish();
+        return Ok(None);
+    };
+    let cell = painter.box_cell()?;
+    let chrome = ChromeBox {
+        title: "control",
+        right_label: &[],
+        right_active: None,
+        legend: notice.legend,
+    }
+    .layout(panel, scale_120, cell);
+    chrome.paint_surface(&mut painter, &palette);
+    let row = content_row(panel, scale_120);
+    let row_right = row.x.saturating_add(row.width);
+    let start = row.x.saturating_add(
+        row.width
+            .saturating_sub(cells_px(content_cells, cell_width))
+            / 2,
+    );
+    painter.text(
+        "!",
+        ChromeTextStyle::Bold,
+        Rect {
+            x: start,
+            width: cell_width.min(row_right.saturating_sub(start)),
+            ..row
+        },
+        PickerTextAlignment::Left,
+        palette.warning,
+    )?;
+    let label_x = start.saturating_add(cells_px(2, cell_width));
+    painter.text(
+        notice.label,
+        ChromeTextStyle::Regular,
+        Rect {
+            x: label_x,
+            width: row_right.saturating_sub(label_x),
+            ..row
+        },
+        PickerTextAlignment::Left,
+        palette.primary,
+    )?;
+    chrome.paint_frame(&mut painter, &palette, palette.warning)?;
+    painter.finish();
+    Ok(Some(panel))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1306,5 +1465,87 @@ mod tests {
 
         const { assert!(ROW_HEIGHT >= CHROME_MAXIMUM_LINE_HEIGHT) };
         assert_eq!(STRIP_HEIGHT, 68);
+    }
+
+    /// Plan 0067 M4: the control transfer notice sits centred at the bottom
+    /// of its pane, above the search strip when that shares its band; a
+    /// pane too small or too narrow for it gets none, and so does one with
+    /// no room above the search strip.
+    #[test]
+    fn the_control_notice_is_centred_at_the_bottom_of_its_pane() {
+        let panel = control_transfer_notice_layout(TERMINAL, None, 240, 120).unwrap();
+        assert_eq!((panel.width, panel.height), (240 + 40, STRIP_HEIGHT));
+        assert_eq!(panel.y + panel.height, TERMINAL.y + TERMINAL.height - 8);
+        assert_eq!(panel.x + panel.width / 2, TERMINAL.x + TERMINAL.width / 2);
+        let wide = control_transfer_notice_layout(TERMINAL, None, 5_000, 120).unwrap();
+        assert_eq!(wide.width, TERMINAL.width - 16);
+        let search = strip_bounds(search_overlay_panel(TERMINAL, 120).unwrap(), 120);
+        let above = control_transfer_notice_layout(TERMINAL, Some(search), 240, 120).unwrap();
+        assert_eq!(above.y + above.height + 8, search.y);
+        assert_eq!(above.x, panel.x);
+        let tiny = Rect {
+            height: STRIP_HEIGHT,
+            ..TERMINAL
+        };
+        assert_eq!(control_transfer_notice_layout(tiny, None, 100, 120), None);
+        let narrow = Rect {
+            width: 100,
+            ..TERMINAL
+        };
+        assert_eq!(control_transfer_notice_layout(narrow, None, 100, 120), None);
+        let short = Rect {
+            height: STRIP_HEIGHT + 30,
+            ..TERMINAL
+        };
+        let short_search = strip_bounds(search_overlay_panel(short, 120).unwrap(), 120);
+        assert_eq!(
+            control_transfer_notice_layout(short, Some(short_search), 100, 120),
+            None
+        );
+        assert_eq!(control_transfer_notice_layout(TERMINAL, None, 100, 0), None);
+    }
+
+    /// Plan 0067 M4: the notice draws only inside its strip, in the
+    /// warning frame, with the request, `control` and the answering keys.
+    #[test]
+    fn the_control_notice_paints_its_keys_in_the_warning_frame() {
+        let palette = session_picker_palette(ResolvedTheme::default());
+        let mut cache = SessionPickerTextCache::default();
+        let mut canvas = vec![0_u8; usize::try_from(WIDTH * HEIGHT * 4).unwrap()];
+        let legend = [("ctrl shift y", "accept"), ("ctrl shift n", "deny")];
+        let panel = paint_control_transfer_notice(
+            &mut cache,
+            &RenderContext::new(u16::MAX),
+            &mut canvas,
+            WIDTH,
+            HEIGHT,
+            TERMINAL,
+            None,
+            120,
+            1,
+            palette,
+            ControlTransferStrip {
+                label: "An agent asks to control this pane",
+                legend: &legend,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert!(painted_inside(&canvas, strip_bounds(panel, 120)));
+        assert_eq!(
+            pixel(&canvas, panel.x + 9, panel.y + 34),
+            rgb(palette.warning)
+        );
+        for text in [
+            "An agent asks to control this pane",
+            "control",
+            "!",
+            "ctrl shift y",
+            "accept",
+            "ctrl shift n",
+            "deny",
+        ] {
+            assert!(cache.contains_source(text), "{text} was not drawn");
+        }
     }
 }
