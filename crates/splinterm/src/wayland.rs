@@ -1090,6 +1090,7 @@ fn assemble_app(
             tab_strip_border: options.tab_strip_border,
             explorer_full_height: options.explorer_full_height,
             explorer_collapsed: options.explorer_collapsed,
+            explorer_current_marker: options.explorer_current_marker,
             explorer_chrome_cell: std::cell::Cell::new(None),
             title: TitleSettings {
                 text: options.title,
@@ -2414,6 +2415,8 @@ struct PresentationState {
     /// collapses or expands the Explorer; one that keeps it leaves the
     /// Window's own toggles alone.
     explorer_collapsed: bool,
+    /// `[explorer] current-marker`, which configuration reload replaces.
+    explorer_current_marker: crate::config::ExplorerCurrentMarker,
     /// One regular chrome cell's width in buffer px, keyed by the renderer
     /// generation and scale it was measured at: the collapsed rail's width
     /// follows it.
@@ -6772,6 +6775,13 @@ impl App {
                 }
                 if self.presentation.tab_strip_border != loaded.config.tab_strip_border {
                     self.presentation.tab_strip_border = loaded.config.tab_strip_border;
+                    self.presentation.full_redraw = true;
+                }
+                if self.presentation.explorer_current_marker
+                    != loaded.config.explorer_current_marker
+                {
+                    self.presentation.explorer_current_marker =
+                        loaded.config.explorer_current_marker;
                     self.presentation.full_redraw = true;
                 }
                 if self.presentation.explorer_full_height != loaded.config.explorer_full_height {
@@ -13152,6 +13162,7 @@ impl App {
                 self.explorer.focused(),
                 self.explorer.filter(),
                 self.explorer.search_active(),
+                self.presentation.explorer_current_marker,
             )?;
             self.surface.buffers[buffer_index].stale.mark_full();
         }

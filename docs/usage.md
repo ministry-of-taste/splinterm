@@ -305,7 +305,8 @@ included, for example *Agent connected · Running · Saved · 1 working*.
 
 Parent rows summarize runtime state independently of retention and window
 attachment. A saved Lair can still be running, and a Dojo not open in this
-Window can be running too. The current-row dot marks the active Dojo, the
+Window can be running too. The current-row marker (an eye unless
+`[explorer] current-marker` picks another icon) marks the active Dojo, the
 footer says *open here* for another Dojo attached to this Window as a tab,
 and it says nothing about attachment otherwise. Assistive technology reads
 **Current**, **Open here**, or **Not open here** for every Dojo. A stopped

@@ -1,6 +1,6 @@
 //! Responsive layout and CPU composition for the non-modal Lair explorer.
 //!
-//! One line per row: the current-row dot, the disclosure chevron, and the
+//! One line per row: the current-row marker, the disclosure chevron, and the
 //! name on the left, and fixed, right-aligned icon columns for agent access,
 //! agent status, live state, and retention. With `[explorer] row-lines=2`
 //! every row of the expanded tree and of the agents section is two lines
@@ -26,7 +26,7 @@ use anyhow::Result;
 use unicode_width::UnicodeWidthChar;
 
 use crate::{
-    config::ResolvedTheme,
+    config::{ExplorerCurrentMarker, ResolvedTheme},
     frontend::{
         LairExplorerAccess, LairExplorerAgentRow, LairExplorerDetail, LairExplorerFilter,
         LairExplorerRow,
@@ -1060,10 +1060,11 @@ pub(crate) fn lair_explorer_shows_working(
 }
 
 /// The logical width from a row's left edge that toggles its disclosure: the
-/// row's indent and the current-row dot and chevron after it, with room for
-/// the largest chrome cell.
-fn disclosure_width(level: usize) -> u32 {
-    LEVEL_INDENT.saturating_mul(u32::try_from(level).unwrap_or(u32::MAX).saturating_add(3))
+/// row's indent and the current-row marker and chevron after it, with room
+/// for the largest chrome cell.
+fn disclosure_width(level: usize, icons: bool) -> u32 {
+    let level = u32::try_from(level).unwrap_or(u32::MAX);
+    LEVEL_INDENT.saturating_mul(level.saturating_add(marker_cells(icons) + ChromeIcon::CELLS))
 }
 
 #[must_use]
@@ -1076,6 +1077,7 @@ pub(crate) fn lair_explorer_disclosure_hit_test(
     if layout.rail {
         return None;
     }
+    let icons = chrome_icons_available();
     layout
         .rows
         .iter()
@@ -1083,12 +1085,8 @@ pub(crate) fn lair_explorer_disclosure_hit_test(
         .find_map(|(layout_row, row)| {
             row.expanded?;
             let bottom = f64::from(layout_row.rect.y.saturating_add(layout_row.rect.height));
-            let right = f64::from(
-                layout_row
-                    .rect
-                    .x
-                    .saturating_add(disclosure_width(row.level).min(layout_row.rect.width)),
-            );
+            let width = disclosure_width(row.level, icons).min(layout_row.rect.width);
+            let right = f64::from(layout_row.rect.x.saturating_add(width));
             (position.0 >= f64::from(layout_row.rect.x)
                 && position.0 < right
                 && position.1 >= f64::from(layout_row.rect.y)
@@ -1097,21 +1095,35 @@ pub(crate) fn lair_explorer_disclosure_hit_test(
         })
 }
 
-/// A row's name: a current-row dot, a two-cell disclosure slot, and the
-/// label. The disclosure chevrons are icons; ASCII `>` and `v` stand in only
-/// if the embedded icon face fails.
-fn row_name_source(row: &LairExplorerRow, icons: bool) -> ChromeSource {
+/// The cells of the current-row marker before a row's disclosure slot: the
+/// `[explorer] current-marker` icon, or a one-cell `●` when the embedded
+/// icon face fails.
+const fn marker_cells(icons: bool) -> u32 {
+    if icons { ChromeIcon::CELLS } else { 1 }
+}
+
+/// A row's name: the current-row marker, a two-cell disclosure slot, and the
+/// label. The marker is the `marker` icon and the disclosure chevrons are
+/// icons; a one-cell `●` and ASCII `>` and `v` stand in only if the embedded
+/// icon face fails. A row that is not current leaves the marker's cells
+/// blank, so every row's label starts at the same cell.
+fn row_name_source(row: &LairExplorerRow, icons: bool, marker: ChromeIcon) -> ChromeSource {
     let mut source = ChromeSource::default();
+    let push_marker = |source: &mut ChromeSource, current: bool| {
+        match (current, icons) {
+            (true, true) => source.push_icon(marker),
+            (true, false) => source.push_str("●"),
+            (false, true) => source.push_str("  "),
+            (false, false) => source.push_str(" "),
+        };
+    };
     if row.pending {
-        source.push_str("  …");
+        push_marker(&mut source, false);
+        source.push_str(" …");
     } else {
-        source.push_str(if row.current && row.expanded.is_some() {
-            "●"
-        } else {
-            " "
-        });
         match (row.expanded, icons) {
             (Some(expanded), true) => {
+                push_marker(&mut source, row.current);
                 source.push_icon(if expanded {
                     ChromeIcon::ChevronDown
                 } else {
@@ -1119,10 +1131,17 @@ fn row_name_source(row: &LairExplorerRow, icons: bool) -> ChromeSource {
                 });
             }
             (Some(expanded), false) => {
+                push_marker(&mut source, row.current);
                 source.push_str(if expanded { " v" } else { " >" });
             }
-            // A Splint has no disclosure; its current dot sits in the slot.
-            (None, _) => {
+            // A Splint has no disclosure: its current marker sits in the
+            // slot, the one-cell dot in the slot's second cell.
+            (None, true) => {
+                push_marker(&mut source, false);
+                push_marker(&mut source, row.current);
+            }
+            (None, false) => {
+                push_marker(&mut source, false);
                 source.push_str(if row.current { " ●" } else { "  " });
             }
         }
@@ -1451,6 +1470,7 @@ pub(crate) fn paint_lair_explorer(
     focused: bool,
     filter: LairExplorerFilter,
     searching: bool,
+    current_marker: ExplorerCurrentMarker,
 ) -> Result<()> {
     let panel = buffer_rect(layout.panel, scale_120);
     fill_rect(
@@ -1612,6 +1632,7 @@ pub(crate) fn paint_lair_explorer(
     }
 
     let icons = chrome_icons_available();
+    let marker = ChromeIcon::from(current_marker);
     let columns = ExplorerColumns::of(rows);
     for (layout_row, row) in layout
         .rows
@@ -1643,11 +1664,11 @@ pub(crate) fn paint_lair_explorer(
         );
         let primary = row_primary(palette, is_selected, row.enabled);
         if let (Some(detail), Some(line)) = (&row.detail, second_line) {
-            // Under the name, past its dot and disclosure slot, to the
+            // Under the name, past its marker and disclosure slot, to the
             // row's right inset: the icon columns are on the first line.
             let left = name_clip
                 .x
-                .saturating_add(cell_width.saturating_mul(ROW_NAME_PREFIX_CELLS))
+                .saturating_add(cell_width.saturating_mul(row_name_prefix_cells(icons)))
                 .min(name_clip.x.saturating_add(name_clip.width));
             let end = columns_clip.x.saturating_add(columns_clip.width);
             paint_row_detail(
@@ -1674,7 +1695,7 @@ pub(crate) fn paint_lair_explorer(
             canvas,
             canvas_width,
             canvas_height,
-            &row_name_source(row, icons),
+            &row_name_source(row, icons, marker),
             ChromeTextStyle::Regular,
             scale_120,
             renderer_generation,
@@ -1879,10 +1900,12 @@ fn paint_row_glyphs(
     )
 }
 
-/// The cells of a row's name before its label: the current-row dot, the
+/// The cells of a row's name before its label: the current-row marker, the
 /// two-cell disclosure slot, and a space. A second line starts under the
 /// label.
-const ROW_NAME_PREFIX_CELLS: u32 = 4;
+const fn row_name_prefix_cells(icons: bool) -> u32 {
+    marker_cells(icons) + ChromeIcon::CELLS + 1
+}
 
 /// A row's text lines in buffer px, from its logical `row`: when it has a
 /// `second` line and is taller than one line, its first [`ROW_HEIGHT`] for
@@ -2662,6 +2685,7 @@ mod tests {
             focused,
             filter,
             false,
+            ExplorerCurrentMarker::default(),
         )
         .unwrap();
     }
@@ -3299,6 +3323,7 @@ mod tests {
                     false,
                     LairExplorerFilter::Live,
                     false,
+                    ExplorerCurrentMarker::default(),
                 )
                 .unwrap();
                 canvas
@@ -4304,7 +4329,7 @@ mod tests {
         for context in contexts {
             for scale in [120, 150, 180, 240] {
                 let name = ChromeText::load_source_styled_with_context(
-                    &row_name_source(&rows[0], true),
+                    &row_name_source(&rows[0], true, ChromeIcon::Eye),
                     scale,
                     ChromeTextStyle::Regular,
                     &context,
@@ -4405,6 +4430,16 @@ mod tests {
         painted: LairExplorerRow,
         scale: u32,
     ) -> (Vec<u8>, u32, Rect, Rect, u32) {
+        paint_row_marked(context, painted, scale, ExplorerCurrentMarker::default())
+    }
+
+    /// [`paint_row`] with the current-row `marker`.
+    fn paint_row_marked(
+        context: &RenderContext,
+        painted: LairExplorerRow,
+        scale: u32,
+        marker: ExplorerCurrentMarker,
+    ) -> (Vec<u8>, u32, Rect, Rect, u32) {
         use super::super::picker::session_picker_palette;
         use crate::config::ResolvedTheme;
 
@@ -4419,19 +4454,27 @@ mod tests {
         let canvas_width = surface.width * scale / 120 + 1;
         let canvas_height = surface.height * scale / 120 + 1;
         let mut canvas = vec![0; (canvas_width * canvas_height * 4) as usize];
-        paint(
+        paint_lair_explorer(
+            &mut SessionPickerTextCache::default(),
             context,
             &mut canvas,
             canvas_width,
             canvas_height,
             scale,
+            1,
             &layout,
             session_picker_palette(ResolvedTheme::default()),
             &rows,
             None,
+            (&[], None),
+            "",
+            None,
             false,
             LairExplorerFilter::All,
-        );
+            false,
+            marker,
+        )
+        .unwrap();
         let cell = chrome_cell_width(context, scale);
         let inset = LEVEL_INDENT.saturating_mul(scale).div_ceil(120);
         let (columns, first_mark) = row_columns_source(&rows[0], ExplorerColumns::of(&rows), true);
@@ -4718,35 +4761,115 @@ mod tests {
                 );
                 let what = format!("expanded={expanded} at scale {scale}");
                 let changed =
-                    changed_only_in_cells(&painted, &blank, width, label, cell, 1..3, &what);
+                    changed_only_in_cells(&painted, &blank, width, label, cell, 2..4, &what);
                 assert!(changed > 0, "{what} painted nothing");
                 chevrons.push(painted);
             }
             assert_ne!(chevrons[0], chevrons[1]);
-            // The current-row dot keeps the cell before the chevron: its edge
-            // antialiasing may reach the slot, but never the chevron's ink.
-            let (current, _, _, _, _) = paint_row(
-                &context,
-                LairExplorerRow {
-                    current: true,
-                    ..base.clone()
-                },
-                scale,
+            // Every current-row marker keeps the two cells before the
+            // chevron, and a current Splint's keeps the slot, so the label
+            // and the chevron stay where they are on every row.
+            let mut markers = Vec::new();
+            for marker in ExplorerCurrentMarker::ALL {
+                let what = format!("{} marker at scale {scale}", marker.name());
+                let (current, _, _, _, _) = paint_row_marked(
+                    &context,
+                    LairExplorerRow {
+                        current: true,
+                        ..base.clone()
+                    },
+                    scale,
+                    marker,
+                );
+                let changed =
+                    changed_only_in_cells(&current, &chevrons[0], width, label, cell, 0..2, &what);
+                assert!(changed > 0, "{what} painted nothing");
+                let (splint, _, _, _, _) = paint_row_marked(
+                    &context,
+                    LairExplorerRow {
+                        current: true,
+                        expanded: None,
+                        ..base.clone()
+                    },
+                    scale,
+                    marker,
+                );
+                let what = format!("{what} on a Splint");
+                let changed =
+                    changed_only_in_cells(&splint, &blank, width, label, cell, 2..4, &what);
+                assert!(changed > 0, "{what} painted nothing");
+                markers.push(current);
+            }
+            let mut distinct = markers.clone();
+            distinct.sort_unstable();
+            distinct.dedup();
+            assert_eq!(distinct.len(), markers.len(), "scale {scale}");
+        }
+    }
+
+    /// With the icon face, the current-row marker is a two-cell icon and a
+    /// row that is not current leaves both cells blank; without it, the
+    /// one-cell `●` and its spacing are as before. Either way every row's
+    /// label starts at the same cell.
+    #[test]
+    fn current_marker_marks_only_current_rows_and_keeps_labels_aligned() {
+        let lair = row(NavigationNodeId::Lair(LairId::new()));
+        let splint = LairExplorerRow {
+            expanded: None,
+            ..lair.clone()
+        };
+        let pending = LairExplorerRow {
+            pending: true,
+            ..lair.clone()
+        };
+        let current = |row: &LairExplorerRow| LairExplorerRow {
+            current: true,
+            ..row.clone()
+        };
+        let label = |source: &ChromeSource| source.cells() - text_cells("work");
+        for marker in ExplorerCurrentMarker::ALL {
+            let icon = ChromeIcon::from(marker);
+            let name = icon.name();
+            let cases = [
+                (&lair, "  [chevron-right] work".to_owned()),
+                (&current(&lair), format!("[{name}][chevron-right] work")),
+                (&splint, "     work".to_owned()),
+                (&current(&splint), format!("  [{name}] work")),
+                (&pending, "   … work".to_owned()),
+                (&current(&pending), "   … work".to_owned()),
+            ];
+            for (row, described) in cases {
+                let source = row_name_source(row, true, icon);
+                assert_eq!(source.describe(), described);
+                assert_eq!(label(&source), 5, "{described}");
+            }
+            let expanded = LairExplorerRow {
+                expanded: Some(true),
+                ..current(&lair)
+            };
+            assert_eq!(
+                row_name_source(&expanded, true, icon).describe(),
+                format!("[{name}][chevron-down] work")
             );
-            let what = format!("current dot at scale {scale}");
-            let changed =
-                changed_only_in_cells(&current, &chevrons[0], width, label, cell, 0..2, &what);
-            assert!(changed > 0, "{what} painted nothing");
-            for ((dot, chevron), plain) in current
-                .chunks_exact(4)
-                .zip(chevrons[0].chunks_exact(4))
-                .zip(blank.chunks_exact(4))
-            {
-                if chevron != plain {
-                    assert_eq!(dot, chevron, "{what} overlaps the chevron");
-                }
+            let fallback = [
+                (&lair, "  > work"),
+                (&current(&lair), "● > work"),
+                (&expanded, "● v work"),
+                (&splint, "    work"),
+                (&current(&splint), "  ● work"),
+                (&pending, "  … work"),
+            ];
+            for (row, text) in fallback {
+                let source = row_name_source(row, false, icon);
+                assert_eq!(source.text(), text);
+                assert_eq!(source.describe(), text);
+                assert_eq!(label(&source), 4, "{text}");
             }
         }
+        assert_eq!(row_name_prefix_cells(true), 5);
+        assert_eq!(row_name_prefix_cells(false), 4);
+        assert_eq!(disclosure_width(1, false), LEVEL_INDENT * 4);
+        assert_eq!(disclosure_width(1, true), LEVEL_INDENT * 5);
     }
 
     /// The selected row's short status fills the footer's context line in
@@ -4995,6 +5118,7 @@ mod tests {
                     true,
                     LairExplorerFilter::All,
                     false,
+                    ExplorerCurrentMarker::default(),
                 )
                 .unwrap();
                 canvas
@@ -5742,6 +5866,7 @@ mod tests {
                     true,
                     LairExplorerFilter::All,
                     false,
+                    ExplorerCurrentMarker::default(),
                 )
                 .unwrap();
                 canvas
@@ -6201,6 +6326,7 @@ mod tests {
                     true,
                     LairExplorerFilter::All,
                     false,
+                    ExplorerCurrentMarker::default(),
                 )
                 .unwrap();
                 canvas
@@ -6289,7 +6415,8 @@ mod tests {
             let (source, first_mark) = row_columns_source(row, columns, chrome_icons_available());
             let (name, column_clip) =
                 row_text_clips(first, row.level, inset, cell, source.cells(), first_mark);
-            let left = (name.x + cell * ROW_NAME_PREFIX_CELLS).min(name.x + name.width);
+            let left = (name.x + cell * row_name_prefix_cells(chrome_icons_available()))
+                .min(name.x + name.width);
             bounds.push((second.unwrap(), left, column_clip.x + column_clip.width));
         }
         if let Some(section) = &layout.agents {

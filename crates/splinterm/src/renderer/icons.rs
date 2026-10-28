@@ -1,8 +1,9 @@
 //! Embedded Tabler interface icons for trusted chrome text.
 //!
-//! The subset face is compiled into the executable, copied once into a sealed
-//! mapping, and rasterized through the same `FreeType` grayscale path as chrome
-//! text. Icons are placed only by trusted interface code through
+//! One subset face holds icons from Tabler's outline webfont and, for the
+//! `-filled` current-row markers, its filled webfont. The face is compiled
+//! into the executable, copied once into a sealed mapping, and rasterized
+//! through the same `FreeType` grayscale path as chrome text. Icons are placed only by trusted interface code through
 //! [`super::ChromeSource`]; their Tabler-assigned codepoints, mostly
 //! private-use, are never interpreted in labels, titles, agent detail, or
 //! terminal content. Provenance, hashes,
@@ -19,6 +20,7 @@ use splinterm_freetype::{MAX_PIXEL_SIZE_26_6, MIN_PIXEL_SIZE_26_6, RasterFace};
 use swash::{FontRef, scale::image::Content};
 
 use super::{CachedGlyph, round_to_i32, u32_to_f32};
+use crate::config::ExplorerCurrentMarker;
 
 static ICON_FONT: &[u8] = include_bytes!("../../assets/icons/tabler-icons-subset.ttf");
 
@@ -48,10 +50,23 @@ pub(crate) enum ChromeIcon {
     PlugConnected,
     /// An agent is asking for access.
     LockQuestion,
+    // The `[explorer] current-marker` choices; the last five come from the
+    // filled face.
+    Eye,
+    CurrentLocation,
+    Focus2,
+    Crosshair,
+    ArrowNarrowRight,
+    CornerDownRight,
+    CaretRightFilled,
+    ArrowBadgeRightFilled,
+    PlayerPlayFilled,
+    MapPinFilled,
+    CircleDotFilled,
 }
 
 impl ChromeIcon {
-    pub(crate) const ALL: [Self; 12] = [
+    pub(crate) const ALL: [Self; 23] = [
         Self::MessageQuestion,
         Self::AlertCircle,
         Self::CircleCheck,
@@ -64,6 +79,17 @@ impl ChromeIcon {
         Self::Plug,
         Self::PlugConnected,
         Self::LockQuestion,
+        Self::Eye,
+        Self::CurrentLocation,
+        Self::Focus2,
+        Self::Crosshair,
+        Self::ArrowNarrowRight,
+        Self::CornerDownRight,
+        Self::CaretRightFilled,
+        Self::ArrowBadgeRightFilled,
+        Self::PlayerPlayFilled,
+        Self::MapPinFilled,
+        Self::CircleDotFilled,
     ];
 
     /// Chrome cells one icon occupies. Icons are square, so a two-cell slot
@@ -86,10 +112,22 @@ impl ChromeIcon {
             Self::Plug => "plug",
             Self::PlugConnected => "plug-connected",
             Self::LockQuestion => "lock-question",
+            Self::Eye => "eye",
+            Self::CurrentLocation => "current-location",
+            Self::Focus2 => "focus-2",
+            Self::Crosshair => "crosshair",
+            Self::ArrowNarrowRight => "arrow-narrow-right",
+            Self::CornerDownRight => "corner-down-right",
+            Self::CaretRightFilled => "caret-right-filled",
+            Self::ArrowBadgeRightFilled => "arrow-badge-right-filled",
+            Self::PlayerPlayFilled => "player-play-filled",
+            Self::MapPinFilled => "map-pin-filled",
+            Self::CircleDotFilled => "circle-dot-filled",
         }
     }
 
-    /// Codepoint in `@tabler/icons-webfont` 3.49.0.
+    /// Codepoint in `@tabler/icons-webfont` 3.49.0: in its outline face, or
+    /// in its filled face for the `-filled` icons. No codepoint is in both.
     const fn codepoint(self) -> char {
         match self {
             Self::MessageQuestion => '\u{f98b}',
@@ -104,6 +142,35 @@ impl ChromeIcon {
             Self::Plug => '\u{ebd9}',
             Self::PlugConnected => '\u{f00a}',
             Self::LockQuestion => '\u{f931}',
+            Self::Eye => '\u{ea9a}',
+            Self::CurrentLocation => '\u{ecef}',
+            Self::Focus2 => '\u{ebd3}',
+            Self::Crosshair => '\u{ec3e}',
+            Self::ArrowNarrowRight => '\u{ea1c}',
+            Self::CornerDownRight => '\u{ea7d}',
+            Self::CaretRightFilled => '\u{fb2c}',
+            Self::ArrowBadgeRightFilled => '\u{f7d8}',
+            Self::PlayerPlayFilled => '\u{f691}',
+            Self::MapPinFilled => '\u{f680}',
+            Self::CircleDotFilled => '\u{f705}',
+        }
+    }
+}
+
+impl From<ExplorerCurrentMarker> for ChromeIcon {
+    fn from(marker: ExplorerCurrentMarker) -> Self {
+        match marker {
+            ExplorerCurrentMarker::Eye => Self::Eye,
+            ExplorerCurrentMarker::CurrentLocation => Self::CurrentLocation,
+            ExplorerCurrentMarker::Focus2 => Self::Focus2,
+            ExplorerCurrentMarker::Crosshair => Self::Crosshair,
+            ExplorerCurrentMarker::ArrowNarrowRight => Self::ArrowNarrowRight,
+            ExplorerCurrentMarker::CornerDownRight => Self::CornerDownRight,
+            ExplorerCurrentMarker::CaretRightFilled => Self::CaretRightFilled,
+            ExplorerCurrentMarker::ArrowBadgeRightFilled => Self::ArrowBadgeRightFilled,
+            ExplorerCurrentMarker::PlayerPlayFilled => Self::PlayerPlayFilled,
+            ExplorerCurrentMarker::MapPinFilled => Self::MapPinFilled,
+            ExplorerCurrentMarker::CircleDotFilled => Self::CircleDotFilled,
         }
     }
 }
@@ -202,12 +269,16 @@ fn rasterize_icon(icon: ChromeIcon, cell: IconCell) -> Option<CachedGlyph> {
     let slot_width = cell.width.checked_mul(ChromeIcon::CELLS)?;
     // Tabler draws within 20 of its 24 em units, so an em of 6/5 of the text
     // ascent puts the icon's ink on the ascender height, bounded by the slot.
-    // Chevrons fill only 14 of the 24 units, so they are drawn a third larger
-    // to read at a similar size, with an em up to 3/2 of the slot that still
-    // keeps their ink inside it.
+    // Chevrons and the filled caret fill only 14 of the 24 units, and the
+    // badge arrow 12, so they are drawn a third larger to read at a similar
+    // size, with an em up to 3/2 of the slot that still keeps their ink
+    // inside it.
     let em = cell.ascent.saturating_mul(6) / 5;
     let em = match icon {
-        ChromeIcon::ChevronRight | ChromeIcon::ChevronDown => {
+        ChromeIcon::ChevronRight
+        | ChromeIcon::ChevronDown
+        | ChromeIcon::CaretRightFilled
+        | ChromeIcon::ArrowBadgeRightFilled => {
             (em.saturating_mul(4) / 3).min(slot_width.min(cell.height).saturating_mul(3) / 2)
         }
         _ => em.min(cell.height).min(slot_width),
@@ -310,8 +381,28 @@ mod tests {
         glyphs.sort_unstable();
         glyphs.dedup();
         assert_eq!(glyphs.len(), ChromeIcon::ALL.len());
-        // Text characters are not in the icon face.
-        assert_eq!(face.glyph_index('?'), 0);
+        // Text characters are not in the icon face, nor are the stars and
+        // bookmarks of either Tabler face, kept for other uses.
+        for absent in ['?', '\u{eb2e}', '\u{ea3a}', '\u{f6a6}', '\u{fa88}'] {
+            assert_eq!(face.glyph_index(absent), 0, "{absent:?}");
+        }
+    }
+
+    #[test]
+    fn every_current_marker_is_its_own_icon_under_its_tabler_name() {
+        let icons = ExplorerCurrentMarker::ALL.map(ChromeIcon::from);
+        for (marker, icon) in ExplorerCurrentMarker::ALL.into_iter().zip(icons) {
+            assert_eq!(marker.name(), icon.name());
+            assert!(ChromeIcon::ALL.contains(&icon), "{icon:?}");
+        }
+        let mut distinct = icons.to_vec();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(distinct.len(), ExplorerCurrentMarker::ALL.len());
+        assert_eq!(
+            ChromeIcon::from(ExplorerCurrentMarker::default()),
+            ChromeIcon::Eye
+        );
     }
 
     #[test]
@@ -344,7 +435,13 @@ mod tests {
                         "{icon:?} is {ink}px at {cell:?}"
                     );
                 }
-                let chevron = matches!(icon, ChromeIcon::ChevronRight | ChromeIcon::ChevronDown);
+                let chevron = matches!(
+                    icon,
+                    ChromeIcon::ChevronRight
+                        | ChromeIcon::ChevronDown
+                        | ChromeIcon::CaretRightFilled
+                        | ChromeIcon::ArrowBadgeRightFilled
+                );
                 if chevron && cell.width * 2 * 5 >= cell.ascent * 8 {
                     // Enlarged chevrons read at over half of the ascent.
                     let bounds = glyph.ink_bounds().unwrap();

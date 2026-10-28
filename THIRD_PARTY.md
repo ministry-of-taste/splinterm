@@ -170,11 +170,11 @@ classification without FFI or unsafe code.
 
 ## Tabler Icons
 
-The graphical client embeds a twelve-glyph subset of the Tabler Icons outline
-webfont in the `splinterm` executable for agent status, agent access, Lair
-retention, and Explorer disclosure icons. The subset is drawn only by trusted
-interface code; it is not installed as a font and never renders terminal
-content.
+The graphical client embeds a 23-glyph subset of the Tabler Icons outline and
+filled webfonts in the `splinterm` executable for agent status, agent access,
+Lair retention, Explorer disclosure, and Explorer current-row marker icons.
+The subset is drawn only by trusted interface code; it is not installed as a
+font and never renders terminal content.
 
 - Source: <https://github.com/tabler/tabler-icons>, npm package
   `@tabler/icons-webfont`
