@@ -533,26 +533,7 @@ pub(super) fn paint_row(
         } else {
             columns.trailing
         };
-        let chips = chip_layout(row.chips, room, cell, scale_120, !row.chip_column);
-        if let Some(ellipsis) = chips.ellipsis {
-            painter.text(
-                "…",
-                ChromeTextStyle::Regular,
-                ellipsis,
-                PickerTextAlignment::Center,
-                colors.secondary,
-            )?;
-        }
-        for (chip, token) in chips.chips.iter().zip(&row.chips[chips.first..]) {
-            painter.blend(*chip, colors.chip);
-            painter.text(
-                token,
-                ChromeTextStyle::Regular,
-                *chip,
-                PickerTextAlignment::Center,
-                colors.chip_text,
-            )?;
-        }
+        paint_chips(painter, &colors, row.chips, room, cell, !row.chip_column)?;
     }
     if !trailing_chips && !row.trailing.is_empty() {
         painter.text(
@@ -568,6 +549,57 @@ pub(super) fn paint_row(
         )?;
     }
     Ok(())
+}
+
+/// `tokens` as chips in `room` (buffer px), from its left or
+/// right-aligned, as [`chip_layout`] places them; returns where the first
+/// drawn one (or its `…`) starts, `None` when none fit.
+fn paint_chips(
+    painter: &mut ChromePainter<'_>,
+    colors: &RowColors,
+    tokens: &[String],
+    room: Rect,
+    cell: (u32, u32),
+    right_aligned: bool,
+) -> Result<Option<u32>> {
+    let chips = chip_layout(tokens, room, cell, painter.scale_120, right_aligned);
+    if let Some(ellipsis) = chips.ellipsis {
+        painter.text(
+            "…",
+            ChromeTextStyle::Regular,
+            ellipsis,
+            PickerTextAlignment::Center,
+            colors.secondary,
+        )?;
+    }
+    for (chip, token) in chips.chips.iter().zip(&tokens[chips.first..]) {
+        painter.blend(*chip, colors.chip);
+        painter.text(
+            token,
+            ChromeTextStyle::Regular,
+            *chip,
+            PickerTextAlignment::Center,
+            colors.chip_text,
+        )?;
+    }
+    Ok(chips
+        .ellipsis
+        .or_else(|| chips.chips.first().copied())
+        .map(|rect| rect.x))
+}
+
+/// A binding's keys as chips outside any row, on the panel, such as the
+/// history strip's return chips; see [`paint_chips`].
+pub(super) fn paint_key_chips(
+    painter: &mut ChromePainter<'_>,
+    palette: &SessionPickerPalette,
+    tokens: &[String],
+    room: Rect,
+    right_aligned: bool,
+) -> Result<Option<u32>> {
+    let colors = row_colors(palette, RowState::default());
+    let cell = painter.cell(ChromeTextStyle::Regular)?;
+    paint_chips(painter, &colors, tokens, room, cell, right_aligned)
 }
 
 /// The title in `clip`: one run, or the matched characters in the accent

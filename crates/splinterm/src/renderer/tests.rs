@@ -1295,6 +1295,7 @@ fn empty_overlays_leave_compositor_border_area_untouched() {
             selection_foreground: 0x00eb_ebeb,
             url_color: 0x0078_beff,
             accent_color: 0x0078_d2ff,
+            search_match: false,
         },
     );
     paint_snapshot_overlays(
@@ -1312,6 +1313,7 @@ fn empty_overlays_leave_compositor_border_area_untouched() {
             selection_foreground: 0x00eb_ebeb,
             url_color: 0x0078_beff,
             accent_color: 0x0078_d2ff,
+            search_match: false,
         },
     );
     assert_eq!(&focused[..4], &[0, 0, 0, 0]);
@@ -2160,6 +2162,10 @@ fn add_selection_foreground_fixture(frame: &mut SnapshotFrame) {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one overlay ordering scenario, with the search match outline"
+)]
 fn cursor_and_selection_overlay_remain_above_nonnegative_images() {
     let mut frame = damage_test_frame();
     frame.images = vec![test_snapshot_image(
@@ -2217,6 +2223,7 @@ fn cursor_and_selection_overlay_remain_above_nonnegative_images() {
             selection_foreground: 0x0011_2233,
             url_color: 0,
             accent_color: 0,
+            search_match: false,
         },
     );
     assert_eq!(
@@ -2238,6 +2245,30 @@ fn cursor_and_selection_overlay_remain_above_nonnegative_images() {
         &canvas[12..16],
         &[0x33, 0x22, 0x11, 0xff],
         "the complete selected decoration span uses selection foreground"
+    );
+    // The search's current match is outlined in the accent on its fill.
+    paint_snapshot_overlays(
+        &mut canvas,
+        2,
+        6,
+        &frame,
+        &geometry,
+        SnapshotOverlays {
+            selection: Some(((0, 0), (0, 0))),
+            hovered_url: None,
+            dirty_rows: None,
+            focused: true,
+            selection_color: 0x00f2_3888,
+            selection_foreground: 0x0011_2233,
+            url_color: 0,
+            accent_color: 0x00aa_bbcc,
+            search_match: true,
+        },
+    );
+    assert_eq!(
+        &canvas[0..4],
+        &[0xcc, 0xbb, 0xaa, 0xff],
+        "the accent outline"
     );
 }
 
@@ -2300,6 +2331,7 @@ fn selection_repaint_preserves_foot_right_to_left_glyph_overlap_order() {
         selection_foreground: 0x00ff_ffff,
         url_color: 0,
         accent_color: 0,
+        search_match: false,
     };
     let mut actual = vec![0; 2 * 6 * 4];
     paint_snapshot_overlays(&mut actual, 2, 6, &frame, &geometry, overlays);
@@ -3230,6 +3262,7 @@ fn live_shaping_overhanging_and_merged_glyph_ink_is_clipped_by_selection_and_cur
                 selection_foreground: 0x0011_2233,
                 url_color: 0,
                 accent_color: 0,
+                search_match: false,
             },
         );
         for x in 0..6 {

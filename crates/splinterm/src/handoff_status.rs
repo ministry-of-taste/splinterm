@@ -130,6 +130,29 @@ impl HandoffBanner {
             Self::Notice(HandoffNotice::RolledBack) => "Rolled back".to_owned(),
         }
     }
+
+    /// Whether the handoff is still under way: preparing, paused or
+    /// reconnecting. The banner then shows a spinner, which says what
+    /// the text's trailing `…` does.
+    #[must_use]
+    pub const fn is_working(self) -> bool {
+        matches!(
+            self,
+            Self::Preparing | Self::InputPaused | Self::Reconnecting
+        )
+    }
+
+    /// The banner's label beside its mark: [`Self::text`], without the
+    /// trailing `…` a spinner takes the place of.
+    #[must_use]
+    pub fn label(self) -> String {
+        let text = self.text();
+        if self.is_working() {
+            text.trim_end_matches('…').to_owned()
+        } else {
+            text
+        }
+    }
 }
 /// Why an upgrade was cancelled, in plain words.
 #[must_use]
@@ -1124,6 +1147,16 @@ mod tests {
     #[test]
     fn banner_text_per_state() {
         assert_eq!(HandoffBanner::Preparing.text(), "Preparing upgrade…");
+        // Beside the spinner a running upgrade drops its `…`.
+        assert_eq!(HandoffBanner::Preparing.label(), "Preparing upgrade");
+        assert_eq!(HandoffBanner::Reconnecting.label(), "Reconnecting");
+        assert!(HandoffBanner::InputPaused.is_working());
+        assert!(!HandoffBanner::Lost.is_working());
+        assert_eq!(
+            HandoffBanner::Lost.label(),
+            "Lost connection to splinterd — reopen from the launcher"
+        );
+        assert!(!HandoffBanner::Notice(HandoffNotice::RolledBack).is_working());
         assert_eq!(
             HandoffBanner::InputPaused.text(),
             "Upgrading — input paused"

@@ -11,8 +11,7 @@ use splinterm_protocol::{MouseTracking, TerminalInputModes, TerminalSnapshot};
 
 use crate::{
     frontend::PickerHitTarget,
-    geometry::Rect,
-    renderer::{HistoryOverlayStatus, history_overlay_layout},
+    renderer::{HistoryOverlayLayout, HistoryOverlayStatus},
     viewport::ScrollbackViewport,
 };
 
@@ -98,24 +97,27 @@ pub(in crate::wayland) fn pointer_axis_focus_target(
         .filter(|target| Some(*target) != focused_pane)
 }
 
+/// Whether a press at `position` (logical px) is on the history strip the
+/// last draw painted (`painted`, buffer px at `scale_120`) while the view
+/// is `detached` from live: anywhere on the strip returns to live, so a
+/// click on it never starts a selection in the terminal it hides.
 pub(in crate::wayland) fn history_return_to_live_hit(
     position: (f64, f64),
-    content: Rect,
+    painted: Option<HistoryOverlayLayout>,
+    scale_120: u32,
     detached: bool,
 ) -> bool {
-    if !detached || !position.0.is_finite() || !position.1.is_finite() {
+    if !detached || !position.0.is_finite() || !position.1.is_finite() || scale_120 == 0 {
         return false;
     }
-    let Some(layout) = history_overlay_layout(content.width, content.height, 120) else {
+    let Some(layout) = painted else {
         return false;
     };
-    let (x, y, width, height) = layout.return_to_live;
-    let x = f64::from(content.x) + f64::from(x);
-    let y = f64::from(content.y) + f64::from(y);
-    position.0 >= x
-        && position.1 >= y
-        && position.0 < x + f64::from(width)
-        && position.1 < y + f64::from(height)
+    let scale = f64::from(scale_120) / 120.0;
+    let (x, y) = (position.0 * scale, position.1 * scale);
+    let (left, top, width, height) = layout.panel;
+    let (left, top) = (f64::from(left), f64::from(top));
+    x >= left && y >= top && x < left + f64::from(width) && y < top + f64::from(height)
 }
 
 fn mouse_button_code(button: u32) -> Option<u8> {
@@ -432,27 +434,47 @@ mod tests {
     }
 
     #[test]
-    fn trusted_history_return_target_is_half_open_and_detached_only() {
-        let content = Rect {
-            x: 0,
-            y: 0,
-            width: 960,
-            height: 600,
-        };
-        let layout = history_overlay_layout(960, 600, 120).expect("overlay layout");
-        let (x, y, width, height) = layout.return_to_live;
-        let inside = (f64::from(x) + 1.0, f64::from(y) + 1.0);
-        assert!(history_return_to_live_hit(inside, content, true));
-        assert!(!history_return_to_live_hit(inside, content, false));
+    fn trusted_history_return_target_is_the_painted_strip_half_open_and_detached_only() {
+        let painted = Some(HistoryOverlayLayout {
+            panel: (600, 8, 300, 68),
+            return_to_live: (820, 8, 80, 68),
+        });
+        // The whole strip, not only its chips.
+        let inside = (601.0, 9.0);
+        assert!(history_return_to_live_hit(inside, painted, 120, true));
+        assert!(!history_return_to_live_hit(inside, painted, 120, false));
+        assert!(!history_return_to_live_hit(inside, None, 120, true));
         assert!(!history_return_to_live_hit(
-            (f64::from(x) + f64::from(width), f64::from(y) + 1.0),
-            content,
-            true,
+            (900.0, 9.0),
+            painted,
+            120,
+            true
         ));
         assert!(!history_return_to_live_hit(
-            (f64::from(x) + 1.0, f64::from(y) + f64::from(height)),
-            content,
-            true,
+            (601.0, 76.0),
+            painted,
+            120,
+            true
+        ));
+        assert!(!history_return_to_live_hit(
+            (599.0, 9.0),
+            painted,
+            120,
+            true
+        ));
+        // Logical positions map to buffer px at the Window's scale.
+        assert!(history_return_to_live_hit((401.0, 6.0), painted, 180, true));
+        assert!(!history_return_to_live_hit(
+            (399.0, 6.0),
+            painted,
+            180,
+            true
+        ));
+        assert!(!history_return_to_live_hit(
+            (f64::NAN, 9.0),
+            painted,
+            120,
+            true
         ));
     }
 

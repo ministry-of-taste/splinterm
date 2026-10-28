@@ -16,7 +16,7 @@ use crate::{
 };
 
 use super::super::{
-    ChromeSource, ChromeText, ChromeTextStyle, RenderContext, fill_rect, raster::premultiplied_rgba,
+    ChromeSource, ChromeText, ChromeTextStyle, RenderContext, raster::premultiplied_rgba,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -168,6 +168,8 @@ impl ChromeSurface {
                     palette.danger,
                     palette.accent_text,
                     palette.selected_rail,
+                    palette.warning,
+                    palette.success,
                 ],
             },
         }];
@@ -290,6 +292,7 @@ fn configured_panel_coverage(shell_alpha: u16, window_alpha: u16) -> f64 {
 /// `background-alpha` (`shell_alpha`) over a window whose background has
 /// `window_alpha`, with `text` painted straight on it. See
 /// `chrome_panel_fill_layers`.
+#[cfg(test)]
 pub(crate) fn chrome_panel_fill(
     panel: u32,
     shell_alpha: u16,
@@ -384,6 +387,12 @@ pub(crate) struct SessionPickerPalette {
     /// keeps 4.5:1 there.
     pub(crate) danger_fill: u32,
     pub(crate) danger_ink: u32,
+    /// The warning and success roles as text and marks on the panel, such
+    /// as the upgrade banner's frame and spinner: mixed toward the primary
+    /// text until they keep 4.5:1 there, and on a translucent panel until
+    /// they read at the primary text's coverage.
+    pub(crate) warning: u32,
+    pub(crate) success: u32,
     pub(crate) shadow: [u8; 4],
     /// Status tints on the opaque panel and on the selected fill;
     /// `None` when `[explorer] status-colors=no`.
@@ -545,6 +554,8 @@ fn panel_palette(theme: ResolvedTheme, panel: u32) -> SessionPickerPalette {
         field_accent,
         danger_fill: danger_text,
         danger_ink,
+        warning: contrast_floor_toward(roles.warning, primary, panel, TEXT_MIN_CONTRAST),
+        success: contrast_floor_toward(roles.success, primary, panel, TEXT_MIN_CONTRAST),
         shadow: [0, 0, 0, 89],
         status_tints: Some(ChromeTints::on(&roles, panel)),
         selected_status_tints: Some(ChromeTints::on(&roles, selected_fill)),
@@ -660,6 +671,8 @@ fn keep_secondary_text_within_primary_coverage(
     };
     palette.secondary = mixed_until_readable(palette.secondary, palette.primary, plain);
     palette.danger = mixed_until_readable(palette.danger, palette.primary, plain);
+    palette.warning = mixed_until_readable(palette.warning, palette.primary, plain);
+    palette.success = mixed_until_readable(palette.success, palette.primary, plain);
     palette.accent_text = mixed_until_readable(palette.accent_text, palette.primary, plain);
     palette.highlight_secondary = mixed_until_readable(
         palette.highlight_secondary,
@@ -817,20 +830,6 @@ pub(super) fn picker_buffer_rect(rect: Rect, scale_120: u32) -> Rect {
     }
 }
 
-fn rect_tuple(rect: Rect) -> (i32, i32, u32, u32) {
-    (
-        i32::try_from(rect.x).unwrap_or(i32::MAX),
-        i32::try_from(rect.y).unwrap_or(i32::MAX),
-        rect.width,
-        rect.height,
-    )
-}
-
-fn opaque_rgba(color: u32) -> [u8; 4] {
-    let [red, green, blue] = rgb_channels(color);
-    [red, green, blue, 0xff]
-}
-
 #[derive(Clone, Copy)]
 pub(super) enum PickerTextAlignment {
     Left,
@@ -878,10 +877,6 @@ fn truncate_picker_source(source: &ChromeSource, maximum_cells: usize) -> Chrome
         .sum::<usize>()
         .saturating_sub(1);
     source.with_prefix_text(text, kept)
-}
-
-fn editable_search_text(query: &str, maximum_cells: usize) -> String {
-    editable_text("Search: ", query, maximum_cells)
 }
 
 /// An editable `query` after `label` with a trailing `_` caret, within
@@ -1166,351 +1161,37 @@ pub(super) fn picker_cell_width(
     Ok(width)
 }
 
-/// The terminal search field's panel, in buffer pixels, at the bottom left
-/// of `terminal`; `None` when the terminal is too small to show it. The
-/// painter and the Window's surface damage both use it, so a frame that
-/// removes or moves the field damages exactly where it was drawn.
-#[must_use]
-pub(crate) fn search_overlay_panel(terminal: Rect, scale_120: u32) -> Option<Rect> {
-    if scale_120 == 0 {
-        return None;
-    }
-    let scaled = |logical: u32| logical.saturating_mul(scale_120).div_ceil(120).max(1);
-    let margin = scaled(8);
-    let width = terminal
-        .width
-        .saturating_sub(margin.saturating_mul(2))
-        .min(scaled(440));
-    let height = terminal
-        .height
-        .saturating_sub(margin.saturating_mul(2))
-        .min(scaled(48));
-    if width < scaled(96) || height < scaled(28) {
-        return None;
-    }
-    Some(Rect {
-        x: terminal.x.saturating_add(margin),
-        y: terminal.y.saturating_add(
-            terminal
-                .height
-                .saturating_sub(margin)
-                .saturating_sub(height),
-        ),
-        width,
-        height,
-    })
-}
-
-/// Paint a bounded terminal search field inside the terminal side of any Explorer split.
-/// The compositor title alone is not a visible search surface on every desktop.
-#[allow(
-    clippy::too_many_arguments,
-    clippy::too_many_lines,
-    reason = "the bounded search field keeps geometry and two text rows in one paint seam"
-)]
-pub(crate) fn paint_search_overlay(
-    cache: &mut SessionPickerTextCache,
-    context: &RenderContext,
-    canvas: &mut [u8],
-    canvas_width: u32,
-    canvas_height: u32,
-    terminal: Rect,
-    scale_120: u32,
-    renderer_generation: u64,
-    palette: SessionPickerPalette,
-    input: &str,
-    searched_query: &str,
-    matches: usize,
-    selected: usize,
-    searching: bool,
-) -> Result<bool> {
-    let Some(panel) = search_overlay_panel(terminal, scale_120) else {
-        return Ok(false);
-    };
-    let scaled = |logical: u32| logical.saturating_mul(scale_120).div_ceil(120).max(1);
-    let height = panel.height;
-    fill_rect(
-        canvas,
-        canvas_width,
-        canvas_height,
-        rect_tuple(panel),
-        palette.panel_fill,
-    );
-    let border = scale_120.div_ceil(120).max(1);
-    for stripe in [
-        (panel.x, panel.y, panel.width, border),
-        (panel.x, panel.y, border, panel.height),
-    ] {
-        fill_rect(
-            canvas,
-            canvas_width,
-            canvas_height,
-            (
-                i32::try_from(stripe.0).unwrap_or(i32::MAX),
-                i32::try_from(stripe.1).unwrap_or(i32::MAX),
-                stripe.2,
-                stripe.3,
-            ),
-            opaque_rgba(palette.focused_frame),
-        );
-    }
-    let padding = scaled(10);
-    let inner = Rect {
-        x: panel.x.saturating_add(padding),
-        y: panel.y,
-        width: panel.width.saturating_sub(padding.saturating_mul(2)),
-        height: panel.height,
-    };
-    let query = input
-        .chars()
-        .filter(|ch| !ch.is_control())
-        .take(256)
-        .collect::<String>();
-    let single_line = height < scaled(40);
-    let query_clip = Rect {
-        height: if single_line {
-            inner.height
-        } else {
-            inner.height / 2
-        },
-        ..inner
-    };
-    let cell_width =
-        ChromeText::load_styled_with_context("_", scale_120, ChromeTextStyle::Regular, context)?
-            .frame
-            .cell_width
-            .max(1);
-    let maximum_cells = usize::try_from(query_clip.width / cell_width).unwrap_or(usize::MAX);
-    let display = editable_search_text(&query, maximum_cells);
-    let mut used = HashSet::new();
-    paint_picker_text(
-        cache,
-        context,
-        &mut used,
-        canvas,
-        canvas_width,
-        canvas_height,
-        &display,
-        ChromeTextStyle::Regular,
-        scale_120,
-        renderer_generation,
-        query_clip,
-        PickerTextAlignment::Left,
-        palette.primary,
-    )?;
-    if !single_line {
-        let status = if input == searched_query && searching && matches == 0 {
-            "Searching older history… · Esc close".to_owned()
-        } else if input == searched_query {
-            format!(
-                "{}/{} matches · Ctrl+N/P next/prev · Esc close",
-                selected.saturating_add(1).min(matches),
-                matches
-            )
-        } else {
-            "Enter to search · Esc close".to_owned()
-        };
-        let status_clip = Rect {
-            y: inner.y.saturating_add(query_clip.height),
-            height: inner.height.saturating_sub(query_clip.height),
-            ..inner
-        };
-        paint_picker_text(
-            cache,
-            context,
-            &mut used,
-            canvas,
-            canvas_width,
-            canvas_height,
-            &status,
-            ChromeTextStyle::Regular,
-            scale_120,
-            renderer_generation,
-            status_clip,
-            PickerTextAlignment::Left,
-            palette.secondary,
-        )?;
-    }
-    cache.finish_frame(used);
-    Ok(true)
-}
 #[cfg(test)]
 mod tests {
-    use super::super::super::pixel_index;
     use super::*;
     use crate::color::mix_encoded;
     use crate::theme::ChromeRoles;
 
     #[test]
-    fn scrollback_search_paints_query_inside_terminal_when_explorer_is_open() {
-        let content = Rect {
-            x: 260,
-            y: 40,
-            width: 600,
-            height: 360,
-        };
-        let palette = session_picker_palette(ResolvedTheme::default());
-        let render = |query: &str| {
-            let mut canvas = vec![0_u8; 900 * 480 * 4];
-            let mut cache = SessionPickerTextCache::default();
-            assert!(
-                paint_search_overlay(
-                    &mut cache,
-                    &RenderContext::new(u16::MAX),
-                    &mut canvas,
-                    900,
-                    480,
-                    content,
-                    120,
-                    1,
-                    palette,
-                    query,
-                    query,
-                    3,
-                    0,
-                    false,
-                )
-                .unwrap()
-            );
-            assert!(cache.len() > 0);
-            canvas
-        };
-        let alpha = render("alpha");
-        let bravo = render("bravo");
-        assert_ne!(
-            alpha, bravo,
-            "changing the search text must change painted pixels"
-        );
-        let long = "abcdef".repeat(15);
-        assert_ne!(
-            render(&format!("{long}x")),
-            render(&format!("{long}y")),
-            "editing the clipped query tail must change painted pixels"
-        );
-        // Every painted pixel lies inside `search_overlay_panel`, the rect
-        // the Window damages when the field closes or moves, and that rect
-        // sits at the bottom left of the terminal.
-        let panel = search_overlay_panel(content, 120).unwrap();
-        assert_eq!(panel.x, content.x + 8);
-        assert_eq!(panel.y + panel.height, content.y + content.height - 8);
-        let mut painted_inside = false;
-        for y in 0..480 {
-            for x in 0..900 {
-                let pixel = pixel_index(
-                    900,
-                    480,
-                    i32::try_from(x).unwrap(),
-                    i32::try_from(y).unwrap(),
-                )
-                .unwrap();
-                if x >= panel.x
-                    && x < panel.x + panel.width
-                    && y >= panel.y
-                    && y < panel.y + panel.height
-                {
-                    painted_inside |= alpha[pixel..pixel + 4] != [0; 4];
-                    continue;
-                }
-                assert_eq!(
-                    &alpha[pixel..pixel + 4],
-                    &[0; 4],
-                    "paint escaped the damaged search panel at {x},{y}"
-                );
-            }
-        }
-        assert!(painted_inside);
-    }
-
-    #[test]
-    fn scrollback_search_clips_oversized_input_and_skips_unusable_geometry() {
-        let mut canvas = vec![0_u8; 900 * 480 * 4];
-        let mut cache = SessionPickerTextCache::default();
-        let context = RenderContext::new(u16::MAX);
-        let palette = session_picker_palette(ResolvedTheme::default());
-        let tiny = Rect {
-            x: 260,
-            y: 40,
-            width: 60,
-            height: 50,
-        };
-        assert!(
-            !paint_search_overlay(
-                &mut cache,
-                &context,
-                &mut canvas,
-                900,
-                480,
-                tiny,
-                120,
-                1,
-                palette,
-                "needle",
-                "needle",
-                0,
-                0,
-                false,
-            )
-            .unwrap()
-        );
-        assert!(canvas.iter().all(|byte| *byte == 0));
-        assert_eq!(search_overlay_panel(tiny, 120), None);
-        assert_eq!(search_overlay_panel(tiny, 0), None);
-        let terminal = Rect {
-            x: 260,
-            y: 40,
-            width: 600,
-            height: 360,
-        };
-        assert!(
-            paint_search_overlay(
-                &mut cache,
-                &context,
-                &mut canvas,
-                900,
-                480,
-                terminal,
-                180,
-                1,
-                palette,
-                &format!("{}\n", "x".repeat(2_000)),
-                "",
-                0,
-                0,
-                false,
-            )
-            .unwrap()
-        );
-        assert!(
-            cache
-                .entries
-                .keys()
-                .all(|key| key.source.text().len() <= 270 && !key.source.text().contains('\n'))
-        );
-        assert!(cache.len() <= 2);
-    }
-
-    #[test]
-    fn editable_search_keeps_tail_and_cursor_in_narrow_fields() {
-        assert_eq!(editable_search_text("abc", 20), "Search: abc_");
+    fn editable_text_keeps_tail_and_cursor_in_narrow_fields() {
+        assert_eq!(editable_text("Search: ", "abc", 20), "Search: abc_");
         assert_eq!(
-            editable_search_text("abcdefghijklmnopqrstuvwxyz", 14),
+            editable_text("Search: ", "abcdefghijklmnopqrstuvwxyz", 14),
             "Search: …wxyz_"
         );
         assert_eq!(
-            editable_search_text("abcdefghijklmnopqrstuvwxyz", 8),
+            editable_text("Search: ", "abcdefghijklmnopqrstuvwxyz", 8),
             "…uvwxyz_"
         );
-        assert_eq!(editable_search_text("abc", 4), "abc_");
-        assert_eq!(editable_search_text("abc", 2), "…_");
-        assert_eq!(editable_search_text("abc", 1), "_");
-        assert_eq!(editable_search_text("abc", 0), "");
-        assert_eq!(editable_search_text("ab界e\u{301}新", 6), "…e\u{301}新_");
+        assert_eq!(editable_text("Search: ", "abc", 4), "abc_");
+        assert_eq!(editable_text("Search: ", "abc", 2), "…_");
+        assert_eq!(editable_text("Search: ", "abc", 1), "_");
+        assert_eq!(editable_text("Search: ", "abc", 0), "");
         assert_eq!(
-            editable_search_text("ab界e\u{301}新", 12),
+            editable_text("Search: ", "ab界e\u{301}新", 6),
+            "…e\u{301}新_"
+        );
+        assert_eq!(
+            editable_text("Search: ", "ab界e\u{301}新", 12),
             "ab界e\u{301}新_"
         );
         assert_eq!(
-            editable_search_text("ab界e\u{301}新abcd新", 12),
+            editable_text("Search: ", "ab界e\u{301}新abcd新", 12),
             "Search: …新_"
         );
     }
