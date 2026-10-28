@@ -414,8 +414,9 @@ lasts.
   access, or the daemon upgrades.
 - After a deny, a new request for that workspace fails with the retryable
   `resource_limit` for a few seconds.
-- If no trusted graphical session can show the prompt, the request fails with
-  `consent_unavailable` at once.
+- If nothing can show the prompt, the request fails with `consent_unavailable`
+  at once, with the message "no Splinterm Window or approver can show the
+  access prompt".
 
 **Who shares a grant.** A "while this workspace is open" or "always" grant
 belongs to the adapter executable, not to one process, connection, or MCP host.

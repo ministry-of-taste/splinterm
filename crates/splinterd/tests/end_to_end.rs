@@ -533,14 +533,16 @@ impl Connection {
     }
 }
 
-async fn write_frame(stream: &mut UnixStream, frame: &ClientFrame) {
+async fn write_frame(stream: &mut (impl tokio::io::AsyncWrite + Unpin), frame: &ClientFrame) {
     stream
         .write_all(&encode_frame(frame).unwrap())
         .await
         .unwrap();
 }
 
-async fn read_frame_or_eof(stream: &mut UnixStream) -> Option<ServerFrame> {
+async fn read_frame_or_eof(
+    stream: &mut (impl tokio::io::AsyncRead + Unpin),
+) -> Option<ServerFrame> {
     let mut length = [0_u8; 4];
     match time::timeout(TEST_TIMEOUT, stream.read_exact(&mut length))
         .await
@@ -564,7 +566,7 @@ async fn read_frame_or_eof(stream: &mut UnixStream) -> Option<ServerFrame> {
     Some(serde_json::from_slice(&body).unwrap())
 }
 
-async fn read_frame(stream: &mut UnixStream) -> ServerFrame {
+async fn read_frame(stream: &mut (impl tokio::io::AsyncRead + Unpin)) -> ServerFrame {
     read_frame_or_eof(stream)
         .await
         .expect("connection closed before the expected frame")
@@ -7841,4 +7843,330 @@ async fn a_remembered_grant_survives_a_daemon_restart() {
     })
     .await
     .unwrap();
+}
+
+// ---- ADR 0015 remote consent (Plan 0066 M4) ----
+
+const REMOTE_CONSENT_PROBE_SOCKET: &str = "SPLINTERM_REMOTE_CONSENT_PROBE_SOCKET";
+const REMOTE_CONSENT_PROBE_LAIR: &str = "SPLINTERM_REMOTE_CONSENT_PROBE_LAIR";
+const REMOTE_CONSENT_PROBE_RESULT: &str = "SPLINTERM_REMOTE_CONSENT_PROBE_RESULT";
+
+/// Not a scenario of its own: the remote consent scenario runs this test
+/// binary as the agent asking for access. It leads a session of its own, so
+/// the relay the scenario started is outside its process tree, and records
+/// how its one waiting request ended.
+#[tokio::test(flavor = "current_thread")]
+async fn remote_consent_requester_probe() {
+    let Some(result) = std::env::var_os(REMOTE_CONSENT_PROBE_RESULT) else {
+        return;
+    };
+    rustix::process::setsid().expect("the requester leads a session of its own");
+    let socket = PathBuf::from(std::env::var_os(REMOTE_CONSENT_PROBE_SOCKET).unwrap());
+    let lair_id: LairId = std::env::var(REMOTE_CONSENT_PROBE_LAIR)
+        .unwrap()
+        .parse()
+        .unwrap();
+    let mut connection = Connection::connect(&socket).await;
+    let outcome = match connection
+        .request_result(Request::RequestLairAccess {
+            lair_id,
+            level: Some(splinterm_protocol::AccessLevel::Look),
+            scopes: Vec::new(),
+            wait_millis: 15_000,
+            agent_name: Some("remote consent agent".into()),
+        })
+        .await
+    {
+        Ok(Response::LairAccessGranted { grant, .. }) => format!("granted:{:?}", grant.source),
+        Ok(response) => format!("unexpected:{response:?}"),
+        Err(error) => format!("error:{:?}:{}", error.code, error.message),
+    };
+    let pending = PathBuf::from(&result).with_extension("pending");
+    fs::write(&pending, outcome).unwrap();
+    fs::rename(&pending, result).unwrap();
+}
+
+/// A process the scenario started, killed and reaped when it ends.
+struct ReapOnDrop(Child);
+
+impl Drop for ReapOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// One daemon connection carried by the real graphical relay, as a remote
+/// Window's is: its requests' replies, with the events that arrive between
+/// them kept in order.
+struct RelayedConnection {
+    channel: splinterm_graphical_relay::LogicalChannel,
+    request_id: u64,
+    events: std::collections::VecDeque<(u64, SubscriptionEvent)>,
+}
+
+impl RelayedConnection {
+    async fn open(relay: &splinterm_graphical_relay::ClientMultiplexer) -> Self {
+        let mut channel = relay.open_channel().await.unwrap();
+        write_frame(
+            &mut channel,
+            &ClientFrame::Hello {
+                minimum_version: PROTOCOL_VERSION,
+                maximum_version: PROTOCOL_VERSION,
+                role: ClientRole::RemoteInteractive,
+                handoff_window: false,
+            },
+        )
+        .await;
+        match read_frame(&mut channel).await {
+            ServerFrame::Hello {
+                version: PROTOCOL_VERSION,
+                ..
+            } => {}
+            frame => panic!("the relayed Window was not admitted: {frame:?}"),
+        }
+        Self {
+            channel,
+            request_id: 1,
+            events: std::collections::VecDeque::new(),
+        }
+    }
+
+    async fn request(&mut self, request: Request) -> Result<Response, ProtocolError> {
+        let request_id = self.request_id;
+        self.request_id += 1;
+        write_frame(
+            &mut self.channel,
+            &ClientFrame::Request {
+                request_id,
+                diagnostic_correlation: None,
+                request,
+            },
+        )
+        .await;
+        loop {
+            match read_frame(&mut self.channel).await {
+                ServerFrame::Response {
+                    request_id: response_id,
+                    result,
+                } if response_id == request_id => return Ok(result),
+                ServerFrame::Error {
+                    request_id: Some(response_id),
+                    error,
+                } if response_id == request_id => return Err(error),
+                ServerFrame::Event {
+                    subscription_id,
+                    event,
+                    ..
+                } => self.events.push_back((subscription_id, event)),
+                frame => panic!("unexpected relayed frame: {frame:?}"),
+            }
+        }
+    }
+
+    async fn next_event(&mut self) -> (u64, SubscriptionEvent) {
+        if let Some(event) = self.events.pop_front() {
+            return event;
+        }
+        match read_frame(&mut self.channel).await {
+            ServerFrame::Event {
+                subscription_id,
+                event,
+                ..
+            } => (subscription_id, event),
+            frame => panic!("unexpected relayed frame: {frame:?}"),
+        }
+    }
+}
+
+async fn wait_for_probe_result(result: &Path) -> String {
+    let deadline = Instant::now() + Duration::from_secs(25);
+    loop {
+        if let Ok(outcome) = fs::read_to_string(result) {
+            return outcome;
+        }
+        assert!(Instant::now() < deadline, "the requester did not finish");
+        time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// ADR 0015: a remote Window, connected through the real installed-layout
+/// `splinterm-relay --graphical-stdio`, is offered an automation client's
+/// workspace access prompt by a daemon with no display of its own, and its
+/// answer grants the access.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one scenario follows a prompt from request to remote answer to grant"
+)]
+async fn a_remote_window_answers_a_workspace_access_prompt_through_the_real_relay() {
+    let relay_binary = Path::new(DAEMON).with_file_name("splinterm-relay");
+    assert!(
+        relay_binary.is_file(),
+        "{} is missing; build it first with `cargo build -p splinterm-relay --bin \
+         splinterm-relay`",
+        relay_binary.display()
+    );
+    time::timeout(Duration::from_secs(60), async {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let runtime =
+            std::env::temp_dir().join(format!("spremote-{}-{nonce:x}", std::process::id()));
+        fs::create_dir(&runtime).unwrap();
+        // The relay only connects through an owner-only directory.
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = runtime.join("splinterd.sock");
+        // Without development access nothing grants automation access
+        // except an answered prompt, and the daemon has no display.
+        let child = Daemon::spawn_configured(&runtime, &socket, None, false);
+        Daemon::wait_until_ready(&socket).await;
+        let daemon = Daemon {
+            child,
+            runtime,
+            socket,
+            policy: None,
+            development_terminal_access: false,
+        };
+
+        let mut relay = Command::new(&relay_binary)
+            .arg("--graphical-stdio")
+            .env("SPLINTERM_SOCKET", &daemon.socket)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(
+                fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(daemon.runtime.join("relay.stderr"))
+                    .unwrap(),
+            )
+            .spawn()
+            .unwrap();
+        let to_relay = tokio::net::unix::pipe::Sender::from_file(fs::File::from(
+            std::os::fd::OwnedFd::from(relay.stdin.take().unwrap()),
+        ))
+        .unwrap();
+        let from_relay = tokio::net::unix::pipe::Receiver::from_file(fs::File::from(
+            std::os::fd::OwnedFd::from(relay.stdout.take().unwrap()),
+        ))
+        .unwrap();
+        let relay = ReapOnDrop(relay);
+        let multiplexer =
+            splinterm_graphical_relay::ClientMultiplexer::negotiate(from_relay, to_relay)
+                .await
+                .unwrap();
+        let mut window = RelayedConnection::open(&multiplexer).await;
+
+        // The Window opens a workspace, then subscribes to consent offers.
+        let mut automation = daemon.connect().await;
+        let Ok(Response::Topology { snapshot }) = window.request(Request::InspectTopology).await
+        else {
+            panic!("the remote Window cannot read the topology");
+        };
+        let revision = snapshot.revision;
+        let Ok(Response::LairCreated { lair, .. }) = window
+            .request(Request::CreateLair {
+                expected_topology_revision: revision,
+                name: "remote-consent".to_owned(),
+                launch: LaunchParameters {
+                    cwd: daemon.runtime.clone(),
+                    command: vec!["/bin/sh".into(), "-c".into(), "sleep 3600".into()],
+                    shell: None,
+                    login_shell: false,
+                    scrollback_lines: 100,
+                },
+                generated_name: false,
+            })
+            .await
+        else {
+            panic!("the remote Window could not open a workspace");
+        };
+        let Ok(Response::ConsentOffersSubscribed { subscription_id }) = window
+            .request(Request::SubscribeConsentOffers {
+                kind: splinterm_protocol::ConsentResponderKind::Window,
+            })
+            .await
+        else {
+            panic!("the relayed Window is not a consent responder");
+        };
+        // Automation itself cannot answer.
+        assert_eq!(
+            automation
+                .request_result(Request::SubscribeConsentOffers {
+                    kind: splinterm_protocol::ConsentResponderKind::Window,
+                })
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::Unauthorized
+        );
+
+        // The agent asks, and waits.
+        let result = daemon.runtime.join("requester.result");
+        let requester = ReapOnDrop(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "remote_consent_requester_probe",
+                    "--test-threads=1",
+                    "-q",
+                ])
+                .env(REMOTE_CONSENT_PROBE_SOCKET, &daemon.socket)
+                .env(REMOTE_CONSENT_PROBE_LAIR, lair.id.to_string())
+                .env(REMOTE_CONSENT_PROBE_RESULT, &result)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let (event_subscription, event) = window.next_event().await;
+        assert_eq!(event_subscription, subscription_id);
+        let SubscriptionEvent::ConsentOffered { offer } = event else {
+            panic!("expected a consent offer, got {event:?}");
+        };
+        assert_eq!(offer.validate(), Ok(()));
+        assert!(matches!(
+            &offer.prompt.target,
+            splinterm_protocol::ConsentTarget::Lair { lair_id, .. } if *lair_id == lair.id
+        ));
+        assert!((1..=118).contains(&offer.respond_within_seconds));
+        // A wrong nonce answers nothing.
+        let mut forged = [0_u8; splinterm_protocol::CONSENT_OFFER_NONCE_BYTES];
+        forged[0] = 1;
+        let answer = |nonce| Request::AnswerConsentOffer {
+            daemon_generation: offer.daemon_generation,
+            offer_id: offer.offer_id,
+            nonce,
+            decision: splinterm_protocol::ConsentDecision::Grant {
+                duration: splinterm_protocol::GrantDuration::Once,
+            },
+        };
+        let forged = splinterm_protocol::ConsentOfferNonce::new(forged);
+        if forged != offer.nonce {
+            assert_eq!(
+                window.request(answer(forged)).await.unwrap_err().code,
+                ErrorCode::NotFound
+            );
+        }
+        assert_eq!(
+            window.request(answer(offer.nonce)).await,
+            Ok(Response::ConsentOfferAnswered)
+        );
+        assert_eq!(wait_for_probe_result(&result).await, "granted:Ephemeral");
+        // The answered offer is gone.
+        assert_eq!(
+            window.request(answer(offer.nonce)).await.unwrap_err().code,
+            ErrorCode::NotFound
+        );
+        drop(requester);
+        drop(window);
+        drop(multiplexer);
+        drop(relay);
+        drop(automation);
+        daemon.shutdown();
+    })
+    .await
+    .expect("the remote consent scenario timed out");
 }

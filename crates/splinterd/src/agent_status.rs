@@ -535,11 +535,11 @@ pub(crate) enum SelfReportPath {
 
 /// The `/proc/<pid>/stat` fields that peer location reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ProcStat {
-    parent: u32,
-    session: u32,
+pub(crate) struct ProcStat {
+    pub(crate) parent: u32,
+    pub(crate) session: u32,
     /// Clock ticks since boot; tells a process from a later one reusing its PID.
-    start_time: u64,
+    pub(crate) start_time: u64,
 }
 
 /// Parses `/proc/<pid>/stat`. The command name may hold any bytes, including
@@ -563,7 +563,7 @@ fn parse_proc_stat(contents: &[u8]) -> Option<ProcStat> {
     })
 }
 
-fn read_proc_stat(pid: u32) -> Option<ProcStat> {
+pub(crate) fn read_proc_stat(pid: u32) -> Option<ProcStat> {
     parse_proc_stat(&fs::read(format!("/proc/{pid}/stat")).ok()?)
 }
 
@@ -597,32 +597,84 @@ fn locate_peer_with(
     if peer_pid <= 1 || child_pid <= 1 {
         return None;
     }
-    let peer = read(peer_pid)?;
-    // The PID must still name the process that opened the connection.
-    if peer.start_time != peer_start_time {
-        return None;
-    }
-    if peer.session == child_pid {
+    let ancestry = walk_ancestry_with(peer_pid, peer_start_time, read)?;
+    if ancestry.session == child_pid {
         return Some(SelfReportPath::Session);
     }
-    let (mut parent, mut child_start) = (peer.parent, peer.start_time);
+    ancestry
+        .descends_from(child_pid)
+        .then_some(SelfReportPath::Ancestry)
+}
+
+/// One process's place in the process tree, from one bounded `/proc` walk
+/// ([`walk_ancestry_with`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Ancestry {
+    /// The process's session ID.
+    pub(crate) session: u32,
+    /// Every parent the walk reached, nearest first, at most
+    /// [`MAX_ANCESTRY_STEPS`]; the process itself is not among them. When the
+    /// walk stopped early, the last one is the parent it could not prove.
+    pub(crate) ancestors: Vec<u32>,
+    /// Whether the walk reached init (a parent of PID 0 or 1) with every
+    /// ancestor read and started no later than its child. Only a complete
+    /// walk proves that a process is outside a tree; an incomplete one
+    /// proves only what it reached.
+    pub(crate) complete: bool,
+}
+
+impl Ancestry {
+    /// Whether the walk reached `pid` as a parent.
+    pub(crate) fn descends_from(&self, pid: u32) -> bool {
+        self.ancestors.contains(&pid)
+    }
+}
+
+/// Walks from `pid`, which must still be the process that started at
+/// `start_time`, towards init through at most [`MAX_ANCESTRY_STEPS`]
+/// parents. A parent that cannot be read, or that started after its child
+/// (it exited during the walk and its PID now names another process), ends
+/// the walk incomplete. `None` when `pid` is not that process.
+///
+/// Agent status self-reports ([`locate_peer`]) and consent responder
+/// eligibility (`remote_consent`) share this one walk.
+pub(crate) fn walk_ancestry_with(
+    pid: u32,
+    start_time: u64,
+    read: impl Fn(u32) -> Option<ProcStat>,
+) -> Option<Ancestry> {
+    if pid <= 1 {
+        return None;
+    }
+    let process = read(pid)?;
+    // The PID must still name the process that opened the connection.
+    if process.start_time != start_time {
+        return None;
+    }
+    let mut ancestry = Ancestry {
+        session: process.session,
+        ancestors: Vec::new(),
+        complete: false,
+    };
+    let (mut parent, mut child_start) = (process.parent, process.start_time);
     for _ in 0..MAX_ANCESTRY_STEPS {
-        if parent == child_pid {
-            return Some(SelfReportPath::Ancestry);
-        }
         if parent <= 1 {
-            return None;
+            ancestry.complete = true;
+            break;
         }
-        let ancestor = read(parent)?;
+        ancestry.ancestors.push(parent);
+        let Some(ancestor) = read(parent) else {
+            break;
+        };
         // A parent starts no later than its child. A later start means the
         // parent exited during the walk and its PID now names another process.
         if ancestor.start_time > child_start {
-            return None;
+            break;
         }
         parent = ancestor.parent;
         child_start = ancestor.start_time;
     }
-    None
+    Some(ancestry)
 }
 
 struct LiveTarget {
@@ -1333,6 +1385,46 @@ mod tests {
             locate_peer_with(220, 40, 200, &processes),
             Some(SelfReportPath::Ancestry)
         );
+    }
+
+    #[test]
+    fn the_ancestry_walk_is_bounded_and_completes_only_at_init() {
+        // A chain 1000 -> 999 -> ... -> 900 -> init: 100 parents, more than
+        // the walk may take.
+        let mut entries: Vec<(u32, u32, u32, u64)> = (900..=1000)
+            .map(|pid| {
+                (
+                    pid,
+                    if pid == 900 { 1 } else { pid - 1 },
+                    900,
+                    u64::from(pid),
+                )
+            })
+            .collect();
+        let processes = table(&entries);
+        let deep = walk_ancestry_with(1000, 1000, &processes).unwrap();
+        assert!(!deep.complete, "a walk cut off by the bound proves nothing");
+        assert_eq!(deep.ancestors.len(), MAX_ANCESTRY_STEPS);
+        assert_eq!(deep.ancestors[0], 999);
+        // Near the top, the same chain reaches init.
+        let shallow = walk_ancestry_with(910, 910, &processes).unwrap();
+        assert!(shallow.complete);
+        assert_eq!(shallow.ancestors, (900..910).rev().collect::<Vec<_>>());
+        assert_eq!(shallow.session, 900);
+        // The process itself must be the one that started then.
+        assert_eq!(walk_ancestry_with(910, 911, &processes), None);
+        assert_eq!(walk_ancestry_with(1, 1, &processes), None);
+        // An unreadable parent ends the walk incomplete, naming it.
+        let missing = table(&[(20, 10, 20, 5)]);
+        let cut = walk_ancestry_with(20, 5, &missing).unwrap();
+        assert!(!cut.complete);
+        assert_eq!(cut.ancestors, vec![10]);
+        drop(processes);
+        // A parent younger than its child is a reused PID: incomplete.
+        entries.push((2000, 905, 2000, 1));
+        let reused = walk_ancestry_with(2000, 1, table(&entries)).unwrap();
+        assert!(!reused.complete);
+        assert_eq!(reused.ancestors, vec![905]);
     }
 
     #[test]

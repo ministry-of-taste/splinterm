@@ -1470,6 +1470,7 @@ dependencies = [
  "splinterm-automation-client",
  "splinterm-core",
  "splinterm-filemap",
+ "splinterm-graphical-relay",
  "splinterm-inherited-fd",
  "splinterm-mcp",
  "splinterm-policy",

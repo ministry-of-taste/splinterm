@@ -236,6 +236,9 @@ a hostile program running as your account.
   two minutes, and the agent collects your answer by asking again; the MCP tool
   `splinterm.request_lair_access` returns `status: "pending"` meanwhile instead
   of failing.
+- When nothing can show the prompt, for example on a headless computer, the
+  request fails with `consent_unavailable` at once: "no Splinterm Window or
+  approver connected to this computer can show the prompt".
 - While a request waits, the Explorer marks its workspace **Agent asking for
   access**, the Window title ends with **AGENT ACCESS REQUEST WAITING**, and
   **Agent access** in the palette shows how many wait.

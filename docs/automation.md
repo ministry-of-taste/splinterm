@@ -463,6 +463,10 @@ grants; the prompt then closes and the request ends unanswered, without
 access. After you deny a request, the same agent cannot ask again for that
 workspace for a few seconds. Closing the prompt denies.
 
+If nothing can show the prompt, the request fails with `consent_unavailable`
+at once: "no Splinterm Window or approver connected to this computer can show
+the prompt".
+
 ### Seeing and revoking access
 
 `splinterm access list` shows every grant of every duration, with the agent's

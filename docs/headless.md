@@ -173,6 +173,24 @@ their connection-owned subscriptions, controller leases, and pending transfers;
 automation clients must reconnect explicitly. Local and SSH-remote human
 graphical clients do not use persistent policy and remain connected.
 
+## Agent access prompts
+
+A headless computer cannot show an [easy agent access](automation.md#easy-agent-access)
+prompt itself, so a request that needs one fails at once with
+`consent_unavailable`: "no Splinterm Window or approver connected to this
+computer can show the prompt". Policy rules keep working without one. The
+daemon can already pass such prompts to connected approvers; the Window and
+terminal approvers that answer them are not available yet.
+
+The daemon refuses an approver that runs inside a Splint's or the requesting
+agent's process tree or session, or, when workloads run in systemd units,
+inside a Splint scope or Dojo slice. A same-user process that leaves all of
+these on purpose, or anyone holding your SSH key for this computer, can still
+see and answer prompts. A bogus approver can also deny a request or leave it
+waiting until it expires, and one process may hold at most 2 of the daemon's
+16 approver places. See
+[ADR 0015](adr/0015-remote-consent.md#consequences) for the details.
+
 ## Runtime, state, restart, and recovery
 
 The default socket is `$XDG_RUNTIME_DIR/splinterm/splinterd.sock` and is removed

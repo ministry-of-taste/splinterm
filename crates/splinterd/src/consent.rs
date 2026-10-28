@@ -1626,6 +1626,27 @@ impl PromptDetails {
     }
 }
 
+/// The content of one workspace prompt as a consent responder is offered it
+/// (ADR 0015): exactly what [`prompt_lair`] shows in the local dialog, built
+/// by the same [`consent_prompt`], without the dialog capability, the
+/// origin, or the countdown.
+pub fn offered_lair_prompt(
+    peer: &PeerIdentity,
+    lair_id: LairId,
+    lair_name: String,
+    scopes: Vec<AccessScope>,
+    details: PromptDetails,
+) -> splinterm_protocol::OfferedConsentPrompt {
+    consent_prompt(
+        peer,
+        ConsentTarget::Lair { lair_id, lair_name },
+        scopes,
+        details,
+        Duration::ZERO,
+    )
+    .offered()
+}
+
 /// Closes an open consent prompt from another task: the pending request was
 /// cancelled, expired, or ended while the person had not answered.
 ///
@@ -1779,7 +1800,7 @@ fn consent_prompt(
 /// count down. Never zero, which would show no countdown and leave Allow
 /// live: with no whole second left, the dialog starts with its time
 /// already up (it counts a second short), so it grants nothing.
-fn respond_within_seconds(deadline: Duration) -> u64 {
+pub fn respond_within_seconds(deadline: Duration) -> u64 {
     deadline
         .as_secs()
         .clamp(1, splinterm_protocol::MAX_CONSENT_RESPOND_WITHIN_SECONDS)

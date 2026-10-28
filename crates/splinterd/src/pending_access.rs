@@ -29,13 +29,14 @@ use std::{
     collections::VecDeque,
     os::fd::OwnedFd,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use splinterm_core::LairId;
 use splinterm_protocol::{
-    AccessScope, ErrorCode, PENDING_ACCESS_LIFETIME_SECONDS, ProtocolError, Response,
+    AccessScope, ConsentOfferEnd, ErrorCode, PENDING_ACCESS_LIFETIME_SECONDS, ProtocolError,
+    Response,
 };
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -158,6 +159,9 @@ pub struct PromptJob {
     pub agent_name: Option<String>,
     pub expires: Instant,
     pub cancel: Arc<PromptCancel>,
+    /// Why the request ended without an answer, set before [`Self::cancel`]
+    /// fires, so the prompter withdraws its consent offers with that reason.
+    pub ended: Arc<OnceLock<ConsentOfferEnd>>,
 }
 
 /// A pinned requester: its pidfd, and the file it executed when pinned
@@ -214,6 +218,7 @@ struct Entry {
     expires_at_unix_seconds: u64,
     outcome: watch::Sender<Option<Outcome>>,
     cancel: Arc<PromptCancel>,
+    ended: Arc<OnceLock<ConsentOfferEnd>>,
     done: CancellationToken,
     pidfd: Arc<OwnedFd>,
     executing: (u64, u64),
@@ -268,7 +273,14 @@ impl Inner {
     /// Ends every matching request without a grant: queued and prompting
     /// ones leave at once, committing ones are marked for the committer.
     /// A published grant is already out, so its request is not ended.
-    fn end_where(&mut self, error: &ProtocolError, selected: impl Fn(&Entry) -> bool) -> usize {
+    /// `reason` is what a consent offer for a shown request is withdrawn
+    /// with (ADR 0015).
+    fn end_where(
+        &mut self,
+        error: &ProtocolError,
+        reason: ConsentOfferEnd,
+        selected: impl Fn(&Entry) -> bool,
+    ) -> usize {
         let mut count = 0;
         let mut index = 0;
         while index < self.entries.len() {
@@ -285,6 +297,7 @@ impl Inner {
                 continue;
             }
             let entry = self.entries.remove(index);
+            let _ = entry.ended.set(reason);
             entry.deliver(Outcome::Failed(error.clone()));
         }
         count
@@ -480,6 +493,7 @@ impl PendingAccess {
             expires_at_unix_seconds: unix_seconds_at(expires, now),
             outcome,
             cancel: Arc::new(PromptCancel::default()),
+            ended: Arc::default(),
             done: done.clone(),
             pidfd: Arc::clone(&pidfd),
             executing: pinned.executing,
@@ -530,6 +544,7 @@ impl PendingAccess {
             agent_name: entry.agent_name.clone(),
             expires: entry.expires,
             cancel: Arc::clone(&entry.cancel),
+            ended: Arc::clone(&entry.ended),
         })
     }
 
@@ -569,11 +584,15 @@ impl PendingAccess {
         })
     }
 
-    /// Ends one request with `error`, whatever its phase.
+    /// Ends one request with `error`, whatever its phase: its process exited,
+    /// or its prompt failed. A consent offer still open for it is withdrawn as
+    /// cancelled.
     pub fn end_request(&self, request_id: u64, error: &ProtocolError) -> bool {
         let count = self
             .inner()
-            .end_where(error, |entry| entry.id == request_id);
+            .end_where(error, ConsentOfferEnd::Cancelled, |entry| {
+                entry.id == request_id
+            });
         self.ended(count) == 1
     }
 
@@ -581,6 +600,7 @@ impl PendingAccess {
     pub fn expire(&self, request_id: u64, now: Instant) -> bool {
         let count = self.inner().end_where(
             &cancelled("the access request expired without an answer"),
+            ConsentOfferEnd::Expired,
             |entry| entry.id == request_id && entry.expires <= now,
         );
         self.ended(count) == 1
@@ -589,19 +609,21 @@ impl PendingAccess {
     /// The requester cancels its own request for this workspace; another
     /// process's request, or one for another workspace, is never found.
     pub fn cancel(&self, process: &ProcessKey, lair_id: LairId, request_id: u64) -> bool {
-        let count = self
-            .inner()
-            .end_where(&cancelled("the access request was cancelled"), |entry| {
-                entry.id == request_id && entry.process == *process && entry.lair_id == lair_id
-            });
+        let count = self.inner().end_where(
+            &cancelled("the access request was cancelled"),
+            ConsentOfferEnd::Cancelled,
+            |entry| entry.id == request_id && entry.process == *process && entry.lair_id == lair_id,
+        );
         self.ended(count) == 1
     }
 
     /// **Revoke all access**: every pending request ends.
     pub fn cancel_all(&self) -> usize {
-        let count = self
-            .inner()
-            .end_where(&cancelled("access was revoked"), |_| true);
+        let count = self.inner().end_where(
+            &cancelled("access was revoked"),
+            ConsentOfferEnd::Cancelled,
+            |_| true,
+        );
         self.ended(count)
     }
 
@@ -610,7 +632,11 @@ impl PendingAccess {
     pub fn close(&self) -> usize {
         let mut inner = self.inner();
         inner.closed = true;
-        let count = inner.end_where(&cancelled("the daemon is shutting down"), |_| true);
+        let count = inner.end_where(
+            &cancelled("the daemon is shutting down"),
+            ConsentOfferEnd::RequestEnded,
+            |_| true,
+        );
         drop(inner);
         self.ended(count)
     }
@@ -637,6 +663,7 @@ impl PendingAccess {
     pub fn end_lair(&self, lair_id: LairId) -> usize {
         let count = self.inner().end_where(
             &ProtocolError::new(ErrorCode::NotFound, "the workspace no longer exists"),
+            ConsentOfferEnd::RequestEnded,
             |entry| entry.lair_id == lair_id,
         );
         self.ended(count)
@@ -649,6 +676,7 @@ impl PendingAccess {
                 ErrorCode::HandoffInProgress,
                 "the daemon is upgrading; ask again after it restarts",
             ),
+            ConsentOfferEnd::Fenced,
             |_| true,
         );
         self.ended(count)

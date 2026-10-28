@@ -1,8 +1,9 @@
 # ADR 0015: agent access prompts in remote Windows and the terminal approver
 
-- **Status:** Proposed (Plan 0066). The protocol contract is on `main`; the
-  daemon still answers every consent responder request with
-  `UnsupportedOperation`, and prompts are routed as before.
+- **Status:** Proposed (Plan 0066). The protocol contract and the daemon's
+  routing are on `main`: the daemon offers workspace prompts to subscribed
+  responders and commits their answers. No Window or `splinterm approvals`
+  subscribes yet.
 - **Date:** 2026-10-27
 - **Amends:** [ADR 0005](0005-trusted-consent-broker.md) (where the trusted
   prompt is shown), [ADR 0010](0010-one-authentication-graphical-relay.md)
@@ -40,7 +41,7 @@ at the same time:
   `SubscribeConsentOffers { kind: terminal }`.
 
 Every eligible responder gets the prompt. A daemon holds at most 16
-responders.
+responders, one per connection and at most 2 per process.
 
 Each responder connection gets its own offer, with its own offer ID and nonce.
 The first valid answer from any route consumes the request. The daemon then
@@ -84,25 +85,41 @@ the origin, or the countdown. An answer (`AnswerConsentOffer`) is accepted
 only on the connection that offer was sent to, only while that offer is
 outstanding, and only when the generation and nonce match; a grant must name a
 duration the offered prompt offers. Everything else fails with `NotFound` and
-grants nothing. A valid answer commits through the same re-checks as a local
+grants nothing, with two exceptions that grant nothing either: a grant naming
+a duration the prompt does not offer fails with `InvalidArgument` and leaves
+the offer open for another answer, and an answer on a connection whose process
+no longer has the identity it subscribed with fails with `Unauthorized`. Once
+the request has ended (answered, cancelled, expired, or fenced), its offers
+answer `NotFound` even before their withdrawal arrives. A valid answer commits through the same re-checks as a local
 answer: the request is still pending, the requester is alive with the same
 identity, the workspace exists, and no handoff fence is up. The audit records
 the subscription and the answer, and which route answered.
 
 Offers and responders live in memory only. Subscribing and answering are
 fenced during a daemon handoff (`HandoffInProgress`). The fence ends the
-request, withdraws its offers (`fenced`), and ends the responders, which
-subscribe again on the new daemon.
+request and withdraws its offers (`fenced`); an answer then commits nothing.
+The fence leaves responders subscribed: a handoff that completes ends their
+connections, and they subscribe again after reconnecting to the new daemon,
+while a cancelled handoff leaves them in place.
 
 ### Eligibility
 
 - **Window responders:** a `RemoteInteractive` connection from the installed
   `splinterm-relay --graphical-stdio`, whose relay process is outside every
-  live Splint's session and process ancestry and outside the requester's.
+  live Splint's session and process ancestry and outside the requester's,
+  and is still the process that subscribed (same start time) when it answers.
 - **Terminal approvers:** a trusted-UI connection from the installed
   `splinterm` binary (the device and inode rule of the trusted-UI identity),
   with a real controlling terminal on standard input and output, outside every
   live Splint's session and ancestry and outside the requester's.
+- "Outside the requester's" covers the requester's session too: a responder
+  that descends from the requester's session leader is refused even after
+  leaving that session with `setsid`.
+- When the daemon places workloads in systemd units, a responder whose
+  `/proc/<pid>/cgroup` path lies inside any live Splint scope or Dojo slice is
+  refused, however it left the process tree. An unreadable or unparsable
+  cgroup file refuses the responder. Without workload units the check is
+  skipped.
 - Automation connections are never responders. Responder status belongs to
   one connection and is never inherited by another channel or process.
 
@@ -151,10 +168,18 @@ opt-in by subscribing. MCP gains no tools or error codes.
 - No relay connection gains trusted-UI identity, and no public surface (MCP or
   the machine CLI) answers a prompt.
 - **Residual risk.**
-  - A same-user process that deliberately escapes the Splint and requester
-    process trees (for example with `systemd-run --user`, or through
-    `ssh localhost`) can register as a responder, see every workspace prompt,
-    and answer it, Always included.
+  - Stock tools leave a process tree without any special privilege: a
+    `tmux` or `screen` server, `setsid -f`, or a double fork reparents a
+    process to init or a subreaper and gives it a new session. The
+    requester-session rule catches these for descendants of the requester's
+    session, and the cgroup check catches them for any process still in a
+    Splint scope or Dojo slice, which is where such tools leave it when
+    workload units are active.
+  - What remains is a same-user process that leaves both: an agent that starts
+    the adapter itself under `setsid` outside its Splint's cgroup (with
+    `systemd-run --user`, through `ssh localhost`, or on a daemon without
+    workload units). It can register as a responder, see every workspace
+    prompt, and answer it, Always included.
   - Any holder of the user's SSH credentials for the daemon host, including an
     agent on another host using the user's key, gets an sshd-spawned relay
     that passes the process-tree check, and can likewise see and answer every
@@ -166,4 +191,12 @@ opt-in by subscribing. MCP gains no tools or error codes.
   - A compromised relay or remote account can forge answers and show
     remote-labelled dialogs, but it already controls that account and
     everything its Windows show.
+  - Some residuals cost availability only, never a grant. A forged responder
+    can answer Deny, which ends the request and starts the deny cooldown. A
+    responder that holds an offer unread keeps a headless prompt open until it
+    expires. The caps of 2 responders per process and 16 per daemon can be
+    filled, refusing later responders until one disconnects.
+  - The requester-session rule refuses a legitimate responder whose own
+    ancestry passes through the requester's session leader, for example when
+    the agent runs as a session leader high in the person's own login tree.
 - Every host connected by a remote Window must run protocol 45 together.
