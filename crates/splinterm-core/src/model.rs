@@ -808,6 +808,14 @@ impl Topology {
         self.lairs.values()
     }
 
+    /// A read-only view holding only the Lairs `keep` selects, at the same
+    /// revision, for a reader allowed to see some Lairs. It commits nothing.
+    #[must_use]
+    pub fn retaining_lairs(mut self, mut keep: impl FnMut(LairId) -> bool) -> Self {
+        self.lairs.retain(|id, _| keep(*id));
+        self
+    }
+
     fn validate_new_dojos(&self, dojos: &[Dojo]) -> Result<(), TopologyError> {
         let mut dojo_ids = HashSet::new();
         let mut splint_ids = HashSet::new();
@@ -1126,6 +1134,23 @@ mod tests {
             topology.terminate_lair_at(revision, lair_id),
             Err(TopologyError::StaleTopology { .. })
         ));
+    }
+
+    #[test]
+    fn a_lair_view_keeps_the_revision_and_only_the_selected_lairs() {
+        let mut topology = Topology::new();
+        let kept = topology
+            .create_lair("kept", PathBuf::from("/tmp"))
+            .unwrap()
+            .id;
+        topology
+            .create_lair("hidden", PathBuf::from("/tmp"))
+            .unwrap();
+        let revision = topology.revision();
+        let view = topology.retaining_lairs(|id| id == kept);
+        assert_eq!(view.revision(), revision);
+        let ids: Vec<_> = view.lairs().map(|lair| lair.id).collect();
+        assert_eq!(ids, [kept]);
     }
 
     #[test]

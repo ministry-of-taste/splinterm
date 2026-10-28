@@ -1105,6 +1105,11 @@ pub const CONSENT_RESPONDER_IDENTITY_CHANGED: &str =
 /// prompt expires unanswered. The MCP adapter tells it apart by it.
 pub const ACCESS_REQUEST_EXPIRED: &str = "the access request expired without an answer";
 
+/// The `Unauthorized` reason a Lair list or topology read gets when no
+/// policy rule and no workspace grant covers any Lair. The MCP adapter
+/// passes it on, so the agent knows what to ask for.
+pub const NO_WORKSPACE_GRANT: &str = "no grant or policy covers any workspace; request access to one (MCP: request_lair_access with the Lair in SPLINTERM_LAIR_ID)";
+
 /// The `Unauthorized` reason a terminal approver gets without its session's
 /// controlling terminal on standard input and output.
 pub const CONSENT_APPROVER_NEEDS_TERMINAL: &str =

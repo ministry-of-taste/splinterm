@@ -375,6 +375,15 @@ once, without a prompt; the result's `source` names the grant
 
 - Every level includes `agent_status_report`, so `splinterm.report_agent_status`
   works for any Splint in the granted workspace without a second request.
+- Every level includes `topology_observe`, so `list_lairs`, `inspect_topology`,
+  and a read of the topology resource work too. Without a daemon policy rule
+  they show only the workspaces the agent's grants or per-Lair policy rules
+  with `topology_metadata_read` cover; such a rule's `max_returned_bytes`
+  applies to the whole reply. When nothing covers any workspace, `list_lairs`
+  and `inspect_topology` fail with `unauthorized` and the message "no grant or
+  policy covers any workspace; request access to one (MCP: request_lair_access
+  with the Lair in SPLINTERM_LAIR_ID)". Subscribing to the topology resource
+  still needs a daemon policy rule.
 - Look and type and Manage include `control_takeover`, so `acquire_control`
   with `takeover: true` works when the person's Window controls the pane.
 - A request for any other set of consent scopes is shown as Custom and is
@@ -486,7 +495,9 @@ publish `resync_required`; read fresh state and explicitly subscribe again.
 
 `SPLINTERM_LAIR_ID`, `SPLINTERM_DOJO_ID`, `SPLINTERM_SPLINT_ID`, and
 `SPLINTERM_SPLINT_INCARNATION` are non-authoritative discovery hints. A host must
-validate them through an authorized topology read before selecting a resource.
+validate them through an authorized topology read before selecting a resource:
+ask for the Lair in `SPLINTERM_LAIR_ID` with `request_lair_access`, then
+`inspect_topology` shows that workspace's Dojos and Splints.
 MCP Dojo operations edit daemon topology; they do not map, focus, move, resize,
 or assign a native Wayland Window, and Splinterm does not provide
 semantic agent supervision, readiness, messaging, or completion.
