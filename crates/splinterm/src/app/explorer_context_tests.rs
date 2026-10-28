@@ -1109,6 +1109,43 @@ fn explorer_observation_ignores_agent_status_age_and_sequence_but_not_state() {
     assert!(observer.observe(&snapshot));
 }
 
+// Plan 0069: the foreground app name changes with no topology revision, so
+// the Explorer must still see it.
+#[test]
+fn explorer_observation_sees_a_foreground_app_change_at_the_same_revision() {
+    use splinterm_protocol::{SplintLifecycle, SplintRuntimeSummary, TopologySnapshot};
+    let mut snapshot = TopologySnapshot {
+        topology: splinterm_core::Topology::new(),
+        revision: TopologyRevision::new(1),
+        runtimes: vec![SplintRuntimeSummary {
+            splint_id: SplintId::new(),
+            live_incarnation: Some(3),
+            last_incarnation: Some(3),
+            restorable: false,
+            lifecycle: SplintLifecycle::Running,
+            exit_status: None,
+            agent_status: None,
+            foreground_app: None,
+        }],
+    };
+    let mut observer = ExplorerObservation::default();
+    assert!(observer.observe(&snapshot));
+    assert!(!observer.observe(&snapshot));
+    snapshot.runtimes[0].foreground_app = Some("nvim".to_owned());
+    assert!(
+        observer.observe(&snapshot),
+        "an app name appearing is presented"
+    );
+    assert!(!observer.observe(&snapshot));
+    snapshot.runtimes[0].foreground_app = Some("htop".to_owned());
+    assert!(observer.observe(&snapshot), "a new app name is presented");
+    snapshot.runtimes[0].foreground_app = None;
+    assert!(
+        observer.observe(&snapshot),
+        "the shell's return is presented"
+    );
+}
+
 /// Routes `command` against a read-only peer that answers `ListLairs` and
 /// `InspectTopology` from `snapshot` and refuses every other request, until
 /// the manager drops its connection. Returns every request it was sent.

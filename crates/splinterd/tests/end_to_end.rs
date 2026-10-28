@@ -7180,6 +7180,27 @@ async fn dojos_count_as_used_after_input_or_rename() {
             })
             .await;
         assert_dojo_used(&mut admin, pane_renamed.dojo_id, DojoUse::Renamed).await;
+
+        // Going back to the app name of a Splint that never left it changes
+        // nothing, so its Dojo stays unused (Plan 0069).
+        let untouched = create_lair_with(&mut admin, plain_shell_launch(&shell)).await;
+        let expected_topology_revision = admin.topology_revision().await;
+        assert_eq!(
+            admin
+                .request(Request::ResetSplintTitle {
+                    expected_topology_revision,
+                    splint_id: untouched.splint_id,
+                })
+                .await,
+            Response::TopologyCommitted {
+                topology_revision: expected_topology_revision
+            }
+        );
+        assert_eq!(admin.topology_revision().await, expected_topology_revision);
+        assert!(matches!(
+            close_unused(&mut admin, untouched.dojo_id).await,
+            UnusedDojoCloseOutcome::Closed { .. }
+        ));
         daemon.shutdown();
     })
     .await

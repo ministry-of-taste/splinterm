@@ -799,6 +799,38 @@ mod tests {
     }
 
     #[test]
+    fn rename_splint_takes_a_title_or_use_app_name_but_not_both() {
+        let id = "018f4d8c-2a18-4b31-8c2f-9e7c5de77103";
+        let splint_id: SplintId = id.parse().unwrap();
+        let parsed = Cli::try_parse_from(["splinterm", "rename-splint", id, "notes"]).unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(Command::RenameSplint {
+                splint_id: parsed_id,
+                title: Some(title),
+                use_app_name: false,
+            }) if parsed_id == splint_id && title == "notes"
+        ));
+        let parsed =
+            Cli::try_parse_from(["splinterm", "rename-splint", id, "--use-app-name"]).unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(Command::RenameSplint {
+                splint_id: parsed_id,
+                title: None,
+                use_app_name: true,
+            }) if parsed_id == splint_id
+        ));
+        for rejected in [
+            &["splinterm", "rename-splint", id, "notes", "--use-app-name"][..],
+            &["splinterm", "rename-splint", id, "--use-app-name", "notes"][..],
+            &["splinterm", "rename-splint", id][..],
+        ] {
+            assert!(Cli::try_parse_from(rejected).is_err(), "{rejected:?}");
+        }
+    }
+
+    #[test]
     fn upgrade_defaults_to_the_report_and_executes_only_with_now() {
         let parsed = Cli::try_parse_from(["splinterm", "upgrade"]).unwrap();
         assert!(matches!(

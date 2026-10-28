@@ -252,8 +252,8 @@ its name, even one renamed to `shell`. To go back to the app name, choose
 **Use app name** from the Splint's menu in the Explorer, run
 `splinterm rename-splint SPLINT_ID --use-app-name`, or call MCP
 `splinterm.rename_splint` with `use_app_name: true`. The name is only a label:
-any program can choose its own command line, so nothing finds, targets, or
-trusts a Splint by it, and it is not saved. The agents section and Explorer
+any program can choose its own command line, so no command or agent targets
+or trusts a Splint by it, and it is not saved. The agents section and Explorer
 search use the same label; pane frames, tabs, and `splinterm list` keep the
 title.
 

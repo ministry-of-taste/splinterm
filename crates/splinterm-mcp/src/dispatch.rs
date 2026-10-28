@@ -2388,7 +2388,8 @@ async fn dispatch_mutation_to(
                 exact_splint_preparation(&preparation, splint_id)?;
             let expected_topology_revision = preparation.topology_revision;
             // The input schema admits exactly one of a title and `use_app_name`.
-            let request = if arguments.get("use_app_name") == Some(&Value::Bool(true)) {
+            let reset = arguments.get("use_app_name") == Some(&Value::Bool(true));
+            let request = if reset {
                 Request::ResetSplintTitle {
                     expected_topology_revision,
                     splint_id,
@@ -2405,7 +2406,12 @@ async fn dispatch_mutation_to(
             };
             match session.request(request).await? {
                 Response::TopologyCommitted { topology_revision } => {
-                    let revision = next_topology_revision(&preparation, topology_revision)?;
+                    // A reset of a Splint already on its app name changes nothing.
+                    let revision = if reset && topology_revision == preparation.topology_revision {
+                        unchanged_topology_revision(&preparation, topology_revision)?
+                    } else {
+                        next_topology_revision(&preparation, topology_revision)?
+                    };
                     Ok(success(
                         tool,
                         splint_resource(lair_id, dojo_id, splint_id, incarnation, revision)?,

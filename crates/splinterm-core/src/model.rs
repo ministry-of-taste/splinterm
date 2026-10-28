@@ -714,20 +714,25 @@ impl Topology {
     }
 
     /// Restores a Splint's default title and clears its rename, so windows
-    /// may show its foreground app's name again.
+    /// may show its foreground app's name again. Returns `None`, changing
+    /// nothing and keeping the revision, when the Splint already uses the
+    /// default title.
     pub fn reset_splint_title_at(
         &mut self,
         expected: TopologyRevision,
         splint_id: SplintId,
-    ) -> Result<TopologyRevision, TopologyError> {
+    ) -> Result<Option<TopologyRevision>, TopologyError> {
         self.check_revision(expected)?;
         let splint = self
             .find_splint_mut(splint_id)
             .ok_or(TopologyError::SplintNotFound(splint_id))?;
+        if splint.uses_default_title() {
+            return Ok(None);
+        }
         crate::DEFAULT_SPLINT_TITLE.clone_into(&mut splint.title);
         splint.title_set = false;
         self.advance_revision();
-        Ok(self.revision)
+        Ok(Some(self.revision))
     }
 
     /// Replaces launch metadata and marks an exited Splint running without changing topology.
@@ -1333,11 +1338,17 @@ mod tests {
 
         let reset = topology
             .reset_splint_title_at(topology.revision(), id)
+            .unwrap()
             .unwrap();
         assert!(reset > renamed);
         let splint = topology.find_splint(id).unwrap();
         assert_eq!(splint.title, crate::DEFAULT_SPLINT_TITLE);
         assert!(splint.uses_default_title());
+
+        // A second reset has nothing to do and keeps the revision.
+        let before = topology.clone();
+        assert_eq!(topology.reset_splint_title_at(reset, id), Ok(None));
+        assert_eq!(topology, before);
         let missing = SplintId::new();
         assert_eq!(
             topology.reset_splint_title_at(topology.revision(), missing),

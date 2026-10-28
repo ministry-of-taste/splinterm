@@ -228,6 +228,9 @@ async fn run_sampler(
 ) {
     let mut ticks = time::interval(SAMPLE_INTERVAL);
     ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    // The last name derived per Splint, kept only for Splints the latest
+    // round read; a failed round starts the cache again.
+    let mut names = HashMap::<SplintId, CachedName>::new();
     loop {
         ticks.tick().await;
         let Some(state) = state.upgrade() else {
@@ -249,62 +252,108 @@ async fn run_sampler(
             .collect::<Vec<_>>();
         drop(state);
         let default_shell = Arc::clone(&default_shell);
+        let previous = std::mem::take(&mut names);
         // One blocking task reads every Splint's `/proc` entries.
-        let Ok(samples) = tokio::task::spawn_blocking(move || {
-            probes
+        let Ok((samples, next)) = tokio::task::spawn_blocking(move || {
+            let mut next = HashMap::new();
+            let samples = probes
                 .into_iter()
                 .map(|(splint_id, incarnation, probe)| {
-                    let sample = probe.map_or(Foreground::Unknown, |probe| {
-                        sample_foreground(&probe, &default_shell)
+                    let sampled = probe.and_then(|probe| {
+                        sample_foreground(&probe, &default_shell, previous.get(&splint_id))
                     });
+                    let sample = match sampled {
+                        Some(name) => {
+                            let sample = Foreground::Holder {
+                                key: name.key,
+                                name: name.name.clone(),
+                            };
+                            next.insert(splint_id, name);
+                            sample
+                        }
+                        None => Foreground::Unknown,
+                    };
                     (splint_id, incarnation, sample)
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            (samples, next)
         })
         .await
         else {
             continue;
         };
+        names = next;
         service.apply(samples, Instant::now());
     }
 }
 
-/// Names what holds the root's terminal. The root leads its session, so a
-/// job in it has the root's PID as its session ID; a group leader that does
-/// not, or that is not its own group's leader, is a reused PID.
-fn sample_foreground(probe: &RootProcessProbe, default_shell: &str) -> Foreground {
-    probe
-        .observe(|root| {
-            let root_stat = read_proc_stat(root)?;
-            let leader = u32::try_from(root_stat.terminal_process_group)
-                .ok()
-                .filter(|leader| *leader > 0)?;
-            let start_time = if leader == root {
-                root_stat.start_time
-            } else {
-                let stat = read_proc_stat(leader)?;
-                if stat.process_group != leader || stat.session != root {
-                    return None;
-                }
-                stat.start_time
-            };
-            let cmdline = read_bounded(&format!("/proc/{leader}/cmdline"))?;
-            let name = derive_app_name(
-                &cmdline,
-                || fs::read(format!("/proc/{leader}/comm")).ok(),
-                default_shell,
-            );
-            // The leader must still be the process the names were read from.
-            if read_proc_stat(leader)?.start_time != start_time {
+/// The name last derived for a Splint's foreground group leader, kept while
+/// that leader and its command name stay the same.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CachedName {
+    key: HolderKey,
+    comm: Vec<u8>,
+    name: Option<String>,
+}
+
+/// Reuses `cached` while the same leader keeps the same command name, which
+/// an exec or `PR_SET_NAME` changes; otherwise derives the name again from
+/// the command line `read_cmdline` returns. Reading `/proc/<pid>/cmdline`
+/// takes the process's memory map lock, so a process stuck in the kernel
+/// could stall the sampler; `comm` and `stat` never take it.
+fn cached_or_derived(
+    cached: Option<&CachedName>,
+    key: HolderKey,
+    comm: Vec<u8>,
+    read_cmdline: impl FnOnce() -> Option<Vec<u8>>,
+    default_shell: &str,
+) -> Option<CachedName> {
+    if let Some(cached) = cached.filter(|cached| cached.key == key && cached.comm == comm) {
+        return Some(cached.clone());
+    }
+    let cmdline = read_cmdline()?;
+    let name = derive_app_name(&cmdline, || Some(comm.clone()), default_shell);
+    Some(CachedName { key, comm, name })
+}
+
+/// Names what holds the root's terminal, or `None` when nothing reliable was
+/// read. The root leads its session, so a job in it has the root's PID as its
+/// session ID; a group leader that does not, or that is not its own group's
+/// leader, is a reused PID.
+fn sample_foreground(
+    probe: &RootProcessProbe,
+    default_shell: &str,
+    cached: Option<&CachedName>,
+) -> Option<CachedName> {
+    probe.observe(|root| {
+        let root_stat = read_proc_stat(root)?;
+        let leader = u32::try_from(root_stat.terminal_process_group)
+            .ok()
+            .filter(|leader| *leader > 0)?;
+        let start_time = if leader == root {
+            root_stat.start_time
+        } else {
+            let stat = read_proc_stat(leader)?;
+            if stat.process_group != leader || stat.session != root {
                 return None;
             }
-            let key = HolderKey {
-                pid: leader,
-                start_time,
-            };
-            Some(Foreground::Holder { key, name })
-        })
-        .unwrap_or(Foreground::Unknown)
+            stat.start_time
+        };
+        let key = HolderKey {
+            pid: leader,
+            start_time,
+        };
+        let comm = read_bounded(&format!("/proc/{leader}/comm"))?;
+        let name = cached_or_derived(
+            cached,
+            key,
+            comm,
+            || read_bounded(&format!("/proc/{leader}/cmdline")),
+            default_shell,
+        )?;
+        // The leader must still be the process the names were read from.
+        (read_proc_stat(leader)?.start_time == start_time).then_some(name)
+    })
 }
 
 fn read_bounded(path: &str) -> Option<Vec<u8>> {
@@ -406,6 +455,77 @@ mod tests {
 
     fn name(cmdline: &[u8]) -> Option<String> {
         derive_app_name(cmdline, || None, "")
+    }
+
+    #[test]
+    fn a_command_line_is_read_again_only_when_the_leader_or_its_comm_changes() {
+        let key = HolderKey {
+            pid: 40,
+            start_time: 7,
+        };
+        let reads = std::cell::Cell::new(0);
+        let cmdline = |bytes: &'static [u8]| {
+            let reads = &reads;
+            move || {
+                reads.set(reads.get() + 1);
+                Some(bytes.to_vec())
+            }
+        };
+        let first = cached_or_derived(
+            None,
+            key,
+            b"bash\n".to_vec(),
+            cmdline(b"bash\0build.sh\0"),
+            "",
+        )
+        .unwrap();
+        assert_eq!(first.name.as_deref(), Some("build.sh"));
+        assert_eq!(reads.get(), 1);
+
+        // Same leader, same comm: the cached name, no read.
+        let again = cached_or_derived(
+            Some(&first),
+            key,
+            b"bash\n".to_vec(),
+            || panic!("the command line must not be read again"),
+            "",
+        )
+        .unwrap();
+        assert_eq!(again, first);
+
+        // An exec changes comm, so the new program is named.
+        let execed = cached_or_derived(
+            Some(&first),
+            key,
+            b"nvim\n".to_vec(),
+            cmdline(b"nvim\0notes\0"),
+            "",
+        )
+        .unwrap();
+        assert_eq!(execed.name.as_deref(), Some("nvim"));
+        assert_eq!(reads.get(), 2);
+
+        // A different leader is never named from another's cache.
+        let other = HolderKey {
+            pid: 41,
+            start_time: 9,
+        };
+        let job = cached_or_derived(
+            Some(&execed),
+            other,
+            b"nvim\n".to_vec(),
+            cmdline(b"/usr/bin/htop\0"),
+            "",
+        )
+        .unwrap();
+        assert_eq!((job.key, job.name.as_deref()), (other, Some("htop")));
+        assert_eq!(reads.get(), 3);
+
+        // An unreadable command line names nothing; the caller keeps no cache.
+        assert_eq!(
+            cached_or_derived(None, key, b"x\n".to_vec(), || None, ""),
+            None
+        );
     }
 
     #[test]

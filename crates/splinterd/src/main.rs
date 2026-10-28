@@ -11151,16 +11151,25 @@ async fn handle_authorized_request(
                 .acquire()
                 .await
                 .map_err(|_| internal())?;
-            let (candidate, topology_revision) = durable_topology_candidate(state, |lair| {
-                lair.reset_splint_title_at(expected_topology_revision, splint_id)
-            })
-            .await?;
-            install_topology(state, candidate).await;
-            if let Some(context) = splint_launch_context(&*state.topology.read().await, splint_id) {
-                record_dojo_organized(state, context.dojo, DojoUse::Renamed);
+            let mut candidate = state.topology.read().await.clone();
+            let reset = candidate
+                .reset_splint_title_at(expected_topology_revision, splint_id)
+                .map_err(model_error)?;
+            // A Splint already on its default title has nothing to undo: no
+            // save, no new revision, and its Dojo still counts as unused.
+            if let Some(topology_revision) = reset {
+                persist_topology(state, &candidate).await?;
+                install_topology(state, candidate).await;
+                if let Some(context) =
+                    splint_launch_context(&*state.topology.read().await, splint_id)
+                {
+                    record_dojo_organized(state, context.dojo, DojoUse::Renamed);
+                }
+                publish_topology(state, topology_revision, TopologyChangeKind::SplintRenamed).await;
             }
-            publish_topology(state, topology_revision, TopologyChangeKind::SplintRenamed).await;
-            Response::TopologyCommitted { topology_revision }
+            Response::TopologyCommitted {
+                topology_revision: reset.unwrap_or(expected_topology_revision),
+            }
         }
         Request::Attach {
             splint_id,
