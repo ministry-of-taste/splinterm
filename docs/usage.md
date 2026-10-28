@@ -651,12 +651,13 @@ green yes button on the right that names exactly what it does, such as
 label are the keys that give that answer. Only a click inside the green
 button says yes; a click anywhere else, even beside it, does not. The frame's
 bottom edge says how to engage the keyboard until you do, then which keys
-answer. The box casts a hard shadow, as the popups inside a Window do. The
-upgrade and restart questions show the time left to answer at the right end
-of the top edge, such as `cancels in 0:42` or `not now in 1:58`; when it runs
-out, the question ends as it always has. The access prompt shows no
-countdown. Trusted dialogs always use the default, even padding, whatever
-`[main] padding-*` says.
+answer. The box casts a hard shadow, as the popups inside a Window do. Each
+dialog shows the time left to answer at the right end of the top edge, such
+as `denies in 0:19`, `cancels in 0:42`, or `not now in 1:58`. When the
+access prompt's time runs out, its Allow button is disabled and nothing
+grants, then it closes and the request ends without access. The upgrade and
+restart questions end as they always have. Trusted dialogs always use the
+default, even padding, whatever `[main] padding-*` says.
 
 Each dialog asks for one fixed size: the size at which all of its text fits
 above the buttons, but never larger than the screen space the compositor

@@ -311,10 +311,13 @@ a hostile program running as your account.
   says that the agent names itself and Splinterm cannot verify that name. A
   button label too long for its half counts as hidden text, so the dialog
   can then only be declined. The box casts the same hard shadow as the
-  in-Window popups. The upgrade and restart questions count their time to
-  answer down at the right of the top edge, such as `cancels in 0:42`; the
-  access prompt shows no countdown. Trusted dialogs always use the default,
-  even padding, whatever `[main] padding-*` says.
+  in-Window popups. Each dialog counts its time to answer down at the right
+  of the top edge, such as `denies in 0:19` or `cancels in 0:42`. The access
+  prompt's time is 20 seconds for a Splint request or a forced takeover, and
+  what is left of the two-minute pending request for a workspace; once it
+  runs out, nothing grants, and the prompt closes without access. Trusted
+  dialogs always use the default, even padding, whatever `[main] padding-*`
+  says.
 - Names in the access prompt and the **Agent access** list show every quote
   and quote look-alike (such as `ʼ`, `′`, `“`, or a backtick) as an escape
   such as `\u{02bc}`, and a run of spaces as one space, so a name cannot

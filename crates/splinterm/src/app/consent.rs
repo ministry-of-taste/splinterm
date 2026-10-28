@@ -1,6 +1,7 @@
 use std::{
     io::{self, Read, Write},
     sync::mpsc as std_mpsc,
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
@@ -454,7 +455,8 @@ fn dialog_theme(theme: ResolvedTheme) -> ResolvedTheme {
 }
 
 /// The consent dialog's Window at the natural size of its text, answering on
-/// `decision`.
+/// `decision`. It counts down the time its asker waits, when the prompt
+/// says, and denies when that runs out; zero shows no countdown.
 fn consent_window_options(
     prompt: ConsentPrompt,
     decision: std_mpsc::Sender<ConsentDecision>,
@@ -466,8 +468,10 @@ fn consent_window_options(
         .map(|offer| (offer.duration, offer.withheld.is_none()))
         .collect();
     let identity = consent_identity(&prompt.target);
+    let respond_within = Duration::from_secs(prompt.respond_within_seconds);
     TrustedConsentUi::access_consent(decision, durations, consent_renderer(prompt))
         .with_shortcut(shortcut)
+        .with_respond_within(respond_within)
         .with_identity(identity)
         .into_window_options()
 }
@@ -824,6 +828,38 @@ mod tests {
                 splinterm::check_window_options(options).unwrap();
             }
         }
+    }
+
+    /// The top edge of the dialog's first snapshot, as text.
+    fn top_edge(prompt: &ConsentPrompt) -> String {
+        let (decision, _receiver) = std::sync::mpsc::channel();
+        let options = consent_window_options(prompt.clone(), decision, shortcut());
+        options.snapshot.as_ref().unwrap().visible_rows[0]
+            .cells
+            .iter()
+            .map(|cell| cell.content.as_str())
+            .collect::<String>()
+            .trim_end()
+            .to_owned()
+    }
+
+    /// The dialog counts down the time its asker waits, which the prompt
+    /// carries, as the time it denies in; a prompt without one shows no
+    /// countdown. Running out denies (the trusted dialog's own test).
+    #[test]
+    fn the_prompt_counts_down_its_askers_wait_and_none_without_one() {
+        let mut prompt = manage_prompt();
+        assert!(!top_edge(&prompt).contains("denies in"));
+        for (seconds, shown) in [(20, "0:19"), (120, "1:59")] {
+            prompt.respond_within_seconds = seconds;
+            assert_eq!(prompt.validate(), Ok(()));
+            let top = top_edge(&prompt);
+            assert!(top.ends_with(&format!(" denies in {shown}")), "{top:?}");
+            assert!(top.contains("agent access request"), "{top:?}");
+        }
+        let mut splint = splint_prompt();
+        splint.respond_within_seconds = 20;
+        assert!(top_edge(&splint).ends_with(" denies in 0:19"));
     }
 
     /// The longest inputs a valid prompt can carry still show every fixed
