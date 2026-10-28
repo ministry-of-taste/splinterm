@@ -65,32 +65,6 @@ pub(super) fn opaque(color: u32) -> [u8; 4] {
     [red, green, blue, u8::MAX]
 }
 
-/// `source` truncated to its last `maximum_cells` cells behind a leading `…`.
-pub(super) fn truncate_text_start(source: &str, maximum_cells: usize) -> String {
-    let width = |character: char| character.width().unwrap_or(0).min(2);
-    if cells(source) <= maximum_cells {
-        return source.to_owned();
-    }
-    if maximum_cells == 0 {
-        return String::new();
-    }
-    let mut used = 0_usize;
-    let mut reversed = Vec::new();
-    for character in source.chars().rev() {
-        if used.saturating_add(width(character)) > maximum_cells - 1 {
-            break;
-        }
-        used = used.saturating_add(width(character));
-        reversed.push(character);
-    }
-    let tail = reversed
-        .into_iter()
-        .rev()
-        .skip_while(|character| width(*character) == 0)
-        .collect::<String>();
-    format!("…{tail}")
-}
-
 /// One frame of chrome painting on a canvas: the text cache, the canvas and
 /// its scale. Text goes through the picker's painter; [`Self::finish`]
 /// tells the cache which entries the frame used.
@@ -204,21 +178,6 @@ impl<'a> ChromePainter<'a> {
             alignment,
             color,
         )
-    }
-
-    /// Paints `source` right-aligned in `clip`; when it does not fit it
-    /// starts with `…` and keeps its end, so a shortcut keeps its key.
-    pub(super) fn text_keep_end(
-        &mut self,
-        source: &str,
-        style: ChromeTextStyle,
-        clip: Rect,
-        color: u32,
-    ) -> Result<()> {
-        let (cell_width, _) = self.cell(style)?;
-        let maximum_cells = usize::try_from(clip.width / cell_width).unwrap_or(usize::MAX);
-        let fitted = truncate_text_start(source, maximum_cells);
-        self.text(&fitted, style, clip, PickerTextAlignment::Right, color)
     }
 
     /// Ends the frame: the cache keeps what this and the last frames drew.
@@ -899,14 +858,6 @@ mod tests {
             assert_eq!(palette.shadow, [0, 0, 0, 89]);
         }
         assert_eq!(super::super::picker::MODAL_SCRIM_ALPHA, 128);
-    }
-
-    #[test]
-    fn truncating_from_the_start_keeps_the_end() {
-        assert_eq!(truncate_text_start("Ctrl+Shift+P", 12), "Ctrl+Shift+P");
-        assert_eq!(truncate_text_start("Ctrl+Shift+P", 7), "…hift+P");
-        assert_eq!(truncate_text_start("Ctrl+界", 3), "…界");
-        assert_eq!(truncate_text_start("abc", 0), "");
     }
 
     #[test]

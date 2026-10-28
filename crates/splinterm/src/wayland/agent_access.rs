@@ -12,8 +12,8 @@ use super::{
     Result, WindowTopologyCommand, binding_help_repeat_consumed,
 };
 use crate::frontend::{
-    AGENT_ACCESS_PAGE_ITEMS, AccessActivation, AccessMarks, AccessSnapshot, AgentAccessUi,
-    PromptReconcile, RevokeAccessUi, WindowAccessCommand, WindowAccessUpdate, counts_are_empty,
+    AccessActivation, AccessMarks, AccessSnapshot, AgentAccessUi, PromptReconcile, RevokeAccessUi,
+    WindowAccessCommand, WindowAccessUpdate, counts_are_empty,
 };
 use crate::renderer::command_palette_row_hit_test;
 use splinterm_protocol::AccessEntryKey;
@@ -244,7 +244,7 @@ impl App {
 
     /// Keys for the access list. Text goes to its search field before this.
     pub(super) fn handle_agent_access_key(&mut self, keysym: Keysym) {
-        let page = isize::try_from(AGENT_ACCESS_PAGE_ITEMS).unwrap_or(isize::MAX);
+        let page = self.command_palette_page();
         let Some(list) = self.modal.agent_access.as_mut() else {
             return;
         };

@@ -466,11 +466,13 @@ connections it authorizes and the control it holds. Pending requests are
 listed too, and so are policy rules that match a connected agent, marked as
 coming from the policy file and read-only here.
 
-**Agent access** in the command palette shows the same list in a Window. Each
-row starts with a word for its kind (ALWAYS, OPEN, ONCE, WAITING, or POLICY),
-names the agent, the access, and the workspace, and says whether the agent is
-connected now; the footer shows the selected entry's executable, how it is
-identified, its times, and what Enter does. Type to search. A click only
+**Agent access** in the command palette shows the same list in a Window,
+grouped by kind under the headers `always`, `while open`, `once`, `waiting`
+and `policy` while nothing is typed. Each row names the agent, the access
+(with its kind in words, such as "always for" or "while"), and the
+workspace, and says whether the agent is connected now; the line under the
+list shows the selected entry's executable, how it is identified, its
+times, and what Enter does. Type to search; the results are one list. A click only
 selects a row and never revokes it; Enter revokes. Enter on a just-this-once or
 while-open grant revokes it at once; on an "Always" grant it first asks, with
 Cancel selected. A pending request or a policy rule
