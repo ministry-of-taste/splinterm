@@ -6661,19 +6661,28 @@ async fn wait_for_signal_file(path: &Path, label: &str) {
     }
 }
 
-async fn create_lair_with(admin: &mut Connection, launch: LaunchParameters) -> MutationTarget {
+async fn create_lair_with(
+    daemon: &Daemon,
+    admin: &mut Connection,
+    launch: LaunchParameters,
+) -> MutationTarget {
     let name = format!("unused {}", admin.topology().await.lairs().count());
-    create_named_lair(admin, name, false, launch).await
+    create_named_lair(daemon, admin, name, false, launch).await
 }
 
+/// Creates a Lair as a person does, from a remote Window through the real
+/// relay: an agent's Lair is never closable as unused (Plan 0067 M3).
 async fn create_named_lair(
+    daemon: &Daemon,
     admin: &mut Connection,
     name: String,
     generated_name: bool,
     launch: LaunchParameters,
 ) -> MutationTarget {
     let expected_topology_revision = admin.topology_revision().await;
-    let Response::LairCreated { lair, .. } = admin
+    let (relay, multiplexer) = start_graphical_relay(daemon).await;
+    let mut window = RelayedConnection::open(&multiplexer).await;
+    let Ok(Response::LairCreated { lair, .. }) = window
         .request(Request::CreateLair {
             expected_topology_revision,
             name,
@@ -6684,6 +6693,9 @@ async fn create_named_lair(
     else {
         panic!("daemon did not create the Lair");
     };
+    drop(window);
+    drop(multiplexer);
+    drop(relay);
     let LayoutNode::Leaf(splint) = &lair.dojos[0].root else {
         panic!("new Dojo was not a leaf");
     };
@@ -7003,7 +7015,7 @@ async fn unused_dojo_closes_and_its_shell_is_reaped() {
             &format!("echo $$ > '{}'\nexec /bin/sh\n", pid_file.display()),
         );
         let mut admin = daemon.connect().await;
-        let target = create_lair_with(&mut admin, plain_shell_launch(&shell)).await;
+        let target = create_lair_with(&daemon, &mut admin, plain_shell_launch(&shell)).await;
         let pid = wait_for_pid_file(&pid_file).await;
         // Focus reports the client generates leave it unused.
         admin
@@ -7047,7 +7059,7 @@ async fn a_split_dojo_counts_as_used() {
         let shell = PathBuf::from("/bin/sh");
         let mut admin = daemon.connect().await;
 
-        let split = create_lair_with(&mut admin, plain_shell_launch(&shell)).await;
+        let split = create_lair_with(&daemon, &mut admin, plain_shell_launch(&shell)).await;
         let expected_topology_revision = admin.topology_revision().await;
         let Response::SplintStarted {
             splint_id: added, ..
@@ -7084,7 +7096,7 @@ async fn a_split_dojo_counts_as_used() {
         assert_dojo_used(&mut admin, split.dojo_id, DojoUse::Split).await;
 
         // A split stays a user action after its extra pane closes again.
-        let reverted = create_lair_with(&mut admin, plain_shell_launch(&shell)).await;
+        let reverted = create_lair_with(&daemon, &mut admin, plain_shell_launch(&shell)).await;
         let expected_topology_revision = admin.topology_revision().await;
         let Response::SplintStarted {
             splint_id: extra,
@@ -7132,21 +7144,21 @@ async fn dojos_count_as_used_after_input_or_rename() {
         let daemon = Daemon::start().await;
         let shell = PathBuf::from("/bin/sh");
         let mut admin = daemon.connect().await;
-        let typed = create_lair_with(&mut admin, plain_shell_launch(&shell)).await;
+        let typed = create_lair_with(&daemon, &mut admin, plain_shell_launch(&shell)).await;
         admin.input(typed.splint_id, typed.incarnation, b"x").await;
         admin.release_control().await;
         assert_dojo_used(&mut admin, typed.dojo_id, DojoUse::Input).await;
 
         // Focus-shaped bytes the client did not flag, from automation or an
         // unbracketed paste, reached the shell and count as input.
-        let pasted = create_lair_with(&mut admin, plain_shell_launch(&shell)).await;
+        let pasted = create_lair_with(&daemon, &mut admin, plain_shell_launch(&shell)).await;
         admin
             .input(pasted.splint_id, pasted.incarnation, b"\x1b[I\x1b[O")
             .await;
         admin.release_control().await;
         assert_dojo_used(&mut admin, pasted.dojo_id, DojoUse::Input).await;
 
-        let renamed = create_lair_with(&mut admin, plain_shell_launch(&shell)).await;
+        let renamed = create_lair_with(&daemon, &mut admin, plain_shell_launch(&shell)).await;
         let expected_topology_revision = admin.topology_revision().await;
         admin
             .request(Request::RenameDojo {
@@ -7158,7 +7170,7 @@ async fn dojos_count_as_used_after_input_or_rename() {
             .await;
         assert_dojo_used(&mut admin, renamed.dojo_id, DojoUse::Renamed).await;
 
-        let pane_renamed = create_lair_with(&mut admin, plain_shell_launch(&shell)).await;
+        let pane_renamed = create_lair_with(&daemon, &mut admin, plain_shell_launch(&shell)).await;
         let expected_topology_revision = admin.topology_revision().await;
         admin
             .request(Request::RenameSplint {
@@ -7183,13 +7195,13 @@ async fn only_plain_default_shell_dojos_can_be_unused() {
 
         let mut command_bearing = plain_shell_launch(&shell);
         command_bearing.command = vec!["/bin/sh".into()];
-        let command = create_lair_with(&mut admin, command_bearing).await;
+        let command = create_lair_with(&daemon, &mut admin, command_bearing).await;
         assert_dojo_used(&mut admin, command.dojo_id, DojoUse::Launch).await;
 
         // A Window's new Dojo whose name Splinterm generated qualifies; a name
         // the user chose is use, even one equal to the default label. An
         // agent's new Dojo never qualifies (Plan 0067 M3).
-        let host = create_lair_with(&mut admin, plain_shell_launch(&shell)).await;
+        let host = create_lair_with(&daemon, &mut admin, plain_shell_launch(&shell)).await;
         let (relay, multiplexer) = start_graphical_relay(&daemon).await;
         let mut window = RelayedConnection::open(&multiplexer).await;
         for (name, generated_name, from_window, used) in [
@@ -7225,7 +7237,7 @@ async fn only_plain_default_shell_dojos_can_be_unused() {
         }
 
         // A relaunched Splint is no longer the original incarnation.
-        let relaunched = create_lair_with(&mut admin, plain_shell_launch(&shell)).await;
+        let relaunched = create_lair_with(&daemon, &mut admin, plain_shell_launch(&shell)).await;
         admin
             .request(Request::KillSplint {
                 splint_id: relaunched.splint_id,
@@ -7256,7 +7268,12 @@ async fn an_attached_window_keeps_the_dojo_until_it_detaches() {
     time::timeout(TEST_TIMEOUT, async {
         let daemon = Daemon::start().await;
         let mut admin = daemon.connect().await;
-        let target = create_lair_with(&mut admin, plain_shell_launch(Path::new("/bin/sh"))).await;
+        let target = create_lair_with(
+            &daemon,
+            &mut admin,
+            plain_shell_launch(Path::new("/bin/sh")),
+        )
+        .await;
         let mut window = daemon.connect().await;
         let (subscription_id, _) = window.attach(target.splint_id, target.incarnation).await;
         assert_dojo_used(&mut admin, target.dojo_id, DojoUse::Attached).await;
@@ -7291,7 +7308,7 @@ async fn a_program_in_the_foreground_counts_as_use() {
             ),
         );
         let mut admin = daemon.connect().await;
-        let target = create_lair_with(&mut admin, plain_shell_launch(&shell)).await;
+        let target = create_lair_with(&daemon, &mut admin, plain_shell_launch(&shell)).await;
         let pid = wait_for_pid_file(&pid_file).await;
         let deadline = Instant::now() + Duration::from_secs(5);
         while foreground_group(pid).is_none_or(|group| group == pid) {
@@ -7379,7 +7396,7 @@ async fn input_racing_an_unused_close_never_reaches_a_closed_shell() {
         let mut admin = daemon.connect().await;
         let (mut kept, mut closed) = (0, 0);
         for round in 0..12_u64 {
-            let target = create_lair_with(&mut admin, plain_shell_launch(&shell)).await;
+            let target = create_lair_with(&daemon, &mut admin, plain_shell_launch(&shell)).await;
             let mut typist = daemon.connect().await;
             let controller_id = typist
                 .acquire_control(target.splint_id, target.incarnation)
@@ -7433,7 +7450,7 @@ async fn unused_close_does_not_wait_for_the_shell_under_the_transaction() {
             ),
         );
         let mut admin = daemon.connect().await;
-        let target = create_lair_with(&mut admin, plain_shell_launch(&shell)).await;
+        let target = create_lair_with(&daemon, &mut admin, plain_shell_launch(&shell)).await;
         let pid = wait_for_pid_file(&pid_file).await;
         let group = ProcessGroupGuard::new(pid);
         time::sleep(Duration::from_millis(200)).await;
@@ -7472,6 +7489,10 @@ async fn unused_close_does_not_wait_for_the_shell_under_the_transaction() {
 // A Lair the user never named goes with its last unused Dojo. A Lair that
 // still holds another Dojo, or that was renamed, stays.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one scenario follows an unnamed Lair through each way it is kept or removed"
+)]
 async fn an_unused_close_removes_an_empty_unnamed_lair() {
     time::timeout(TEST_TIMEOUT, async {
         let daemon = Daemon::start().await;
@@ -7480,8 +7501,14 @@ async fn an_unused_close_removes_an_empty_unnamed_lair() {
         let generated =
             |index: u128| splinterm_core::generated_lair_name(1_787_899_189_000 + index, 42);
 
-        let unnamed =
-            create_named_lair(&mut admin, generated(1), true, plain_shell_launch(&shell)).await;
+        let unnamed = create_named_lair(
+            &daemon,
+            &mut admin,
+            generated(1),
+            true,
+            plain_shell_launch(&shell),
+        )
+        .await;
         // A Window opens the second Dojo: an agent's is never unused.
         let (relay, multiplexer) = start_graphical_relay(&daemon).await;
         let mut window = RelayedConnection::open(&multiplexer).await;
@@ -7528,8 +7555,14 @@ async fn an_unused_close_removes_an_empty_unnamed_lair() {
         assert!(topology_revision > before);
 
         // Renaming names it.
-        let renamed =
-            create_named_lair(&mut admin, generated(2), true, plain_shell_launch(&shell)).await;
+        let renamed = create_named_lair(
+            &daemon,
+            &mut admin,
+            generated(2),
+            true,
+            plain_shell_launch(&shell),
+        )
+        .await;
         let expected_topology_revision = admin.topology_revision().await;
         admin
             .request(Request::RenameLair {
@@ -7549,8 +7582,14 @@ async fn an_unused_close_removes_an_empty_unnamed_lair() {
         assert!(kept.find_lair(renamed.lair_id).unwrap().dojos.is_empty());
 
         // A name the user chose stays, even one shaped like a generated name.
-        let lookalike =
-            create_named_lair(&mut admin, generated(3), false, plain_shell_launch(&shell)).await;
+        let lookalike = create_named_lair(
+            &daemon,
+            &mut admin,
+            generated(3),
+            false,
+            plain_shell_launch(&shell),
+        )
+        .await;
         assert!(matches!(
             close_unused(&mut admin, lookalike.dojo_id).await,
             UnusedDojoCloseOutcome::Closed {

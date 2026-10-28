@@ -4128,7 +4128,8 @@
             "claim_handoff_control",
             "acknowledge_handoff_prepare",
             "subscribe_consent_offers",
-            "answer_consent_offer"
+            "answer_consent_offer",
+            "claim_dojo_presentation"
           ]
         },
         "resource": {

@@ -82,6 +82,13 @@ running daemon by themselves.
   form (see "MCP").
 - New Dojos and Lairs start in your home directory, not the focused Splint's
   directory.
+- A launch with no command from an agent or a JSON-mode command
+  (`create_lair`, `split_splint`, `relaunch_splint`, `new_dojo`, and the CLI
+  `--output json` forms) now starts your login shell. So a remote Window's new
+  panes and Dojos start login shells, whatever that host's
+  `login-shell = false` says, and a remote `splinterm new-dojo` without `--cwd`
+  starts in the remote owner's home, not in the directory of the Lair's first
+  Dojo.
 - On Omarchy 4 with no font size in `config.ini`, the terminal follows
   Omarchy's text size (9 pt on a stock desktop) instead of Splinterm's 14 px.
   Set a size in `config.ini` to keep your own.

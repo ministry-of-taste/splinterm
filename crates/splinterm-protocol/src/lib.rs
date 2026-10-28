@@ -474,7 +474,8 @@ impl ServerLimits {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AutomationLaunch {
     pub cwd: Option<PathBuf>,
-    /// Direct executable plus argv. Empty selects the daemon-owned default shell.
+    /// Direct executable plus argv. Empty runs the daemon-owned default shell
+    /// as a login shell (Plan 0067 M3).
     pub argv: Vec<String>,
 }
 
@@ -2489,6 +2490,8 @@ pub enum AuditOperation {
     AcknowledgeHandoffPrepare,
     SubscribeConsentOffers,
     AnswerConsentOffer,
+    /// Plan 0067 M3: a Window claims an agent's new Dojo as a background tab.
+    ClaimDojoPresentation,
 }
 
 impl AuditOperation {
@@ -2546,6 +2549,7 @@ impl AuditOperation {
             Self::AcknowledgeHandoffPrepare => "acknowledge_handoff_prepare",
             Self::SubscribeConsentOffers => "subscribe_consent_offers",
             Self::AnswerConsentOffer => "answer_consent_offer",
+            Self::ClaimDojoPresentation => "claim_dojo_presentation",
         }
     }
 }
@@ -5599,6 +5603,7 @@ mod tests {
             AuditOperation::AcknowledgeHandoffPrepare,
             AuditOperation::SubscribeConsentOffers,
             AuditOperation::AnswerConsentOffer,
+            AuditOperation::ClaimDojoPresentation,
         ] {
             assert_eq!(
                 serde_json::to_string(&operation).unwrap(),

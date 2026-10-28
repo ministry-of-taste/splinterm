@@ -26,8 +26,8 @@ use splinterm_protocol::{DojoPresentationOffer, Request, Response, TopologySnaps
 use tokio::sync::mpsc;
 
 use super::{
-    ManagedDojo, TopologyManagerState, cancel_pane_tasks, prepare_managed_dojo,
-    window_dojo_identity, window_has_tab_capacity,
+    ManagedDojo, PreparedManagedDojo, TopologyManagerState, cancel_pane_tasks,
+    prepare_managed_dojo, window_dojo_identity, window_has_tab_capacity,
 };
 
 /// How long a Window that shows an offer's Lair, but not as its active tab,
@@ -157,6 +157,23 @@ async fn open_background_tab(
     dojo: splinterm_core::Dojo,
 ) -> Result<()> {
     let prepared = prepare_managed_dojo(factory, config, image_cache, identity, dojo, None).await?;
+    show_background_tab(updates, state, prepared).await
+}
+
+/// Hands a prepared Dojo to the frontend as a background tab and records it
+/// once the frontend has it. A tab that is not shown stops its panes.
+async fn show_background_tab(
+    updates: &mpsc::Sender<WindowTopologyUpdate>,
+    state: &mut TopologyManagerState,
+    prepared: PreparedManagedDojo,
+) -> Result<()> {
+    let lair_id = prepared.identity.lair_id;
+    let dojo_id = prepared.dojo.id;
+    // Nothing else changes this Window's tabs meanwhile, so this only guards.
+    if state.tabs.get(dojo_id).is_some() || !window_has_tab_capacity(state.tabs.len()) {
+        cancel_pane_tasks(prepared.pane_tasks).await;
+        bail!("the Window already shows the offered Dojo or is full");
+    }
     let (acknowledged, acknowledgement) = tokio::sync::oneshot::channel();
     if updates
         .send(WindowTopologyUpdate::OpenTab {
@@ -185,8 +202,6 @@ async fn open_background_tab(
             bail!("Wayland dropped the background Dojo tab acknowledgement");
         }
     }
-    let lair_id = prepared.identity.lair_id;
-    let dojo_id = prepared.dojo.id;
     state.tabs.open_background(DojoTab::new(
         lair_id,
         dojo_id,
@@ -202,7 +217,13 @@ async fn open_background_tab(
 
 #[cfg(test)]
 mod tests {
-    use splinterm_core::LairId;
+    use std::{collections::VecDeque, path::PathBuf};
+
+    use splinterm_core::{Dojo, LairId, Topology};
+    use splinterm_protocol::{
+        ClientFrame, PROTOCOL_VERSION, ServerFrame, ServerLimits, encode_frame,
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
 
@@ -250,5 +271,185 @@ mod tests {
         tabs.activate(other_dojo);
         let mut tracker = PresentationOfferTracker::default();
         assert_eq!(tracker.due(&offers, &tabs, start), [in_other]);
+    }
+
+    /// A Lair holding the Window's Dojo and an agent's new one, which the
+    /// daemon offers.
+    fn offered_snapshot() -> (TopologySnapshot, DojoId) {
+        let mut topology = Topology::new();
+        let lair_id = topology
+            .create_lair("agent", PathBuf::from("/tmp"))
+            .unwrap()
+            .id;
+        topology
+            .new_dojo_at(
+                topology.revision(),
+                lair_id,
+                Dojo::with_shell("Dojo 2", PathBuf::from("/tmp")),
+            )
+            .unwrap();
+        let dojo_id = topology.find_lair(lair_id).unwrap().dojos[1].id;
+        let snapshot = TopologySnapshot {
+            revision: topology.revision(),
+            topology,
+            runtimes: Vec::new(),
+            presentation_offers: vec![DojoPresentationOffer { lair_id, dojo_id }],
+        };
+        (snapshot, dojo_id)
+    }
+
+    /// A Window whose one, active tab is the Lair's first Dojo.
+    fn window_state(snapshot: &TopologySnapshot) -> TopologyManagerState {
+        let lair = snapshot.topology.lairs().next().unwrap();
+        let dojo = &lair.dojos[0];
+        let managed = ManagedDojo {
+            identity: window_dojo_identity(snapshot.revision, lair, dojo),
+            root: dojo.root.clone(),
+            pending_focus: None,
+            pane_tasks: HashMap::new(),
+        };
+        TopologyManagerState {
+            tabs: WindowTabSet::new(DojoTab::new(lair.id, dojo.id, managed)),
+            transient_owners: HashMap::new(),
+            agent_status_republish: false,
+        }
+    }
+
+    /// A daemon end that answers each request with the next reply and,
+    /// once the client closes, returns the requests it saw.
+    async fn scripted_daemon(
+        replies: Vec<Response>,
+    ) -> (Connection, tokio::task::JoinHandle<Vec<Request>>) {
+        let (client, server) = tokio::io::duplex(1 << 16);
+        let daemon = tokio::spawn(async move {
+            let (mut reader, mut writer) = tokio::io::split(server);
+            let mut replies = VecDeque::from(replies);
+            let mut requests = Vec::new();
+            while let Ok(size) = reader.read_u32().await {
+                let mut bytes = vec![0; size as usize];
+                reader.read_exact(&mut bytes).await.unwrap();
+                let frame = match serde_json::from_slice(&bytes).unwrap() {
+                    ClientFrame::Hello { .. } => ServerFrame::Hello {
+                        version: PROTOCOL_VERSION,
+                        limits: ServerLimits::default(),
+                        development_terminal_access: false,
+                        daemon_hostname: None,
+                        daemon_generation: 1,
+                    },
+                    ClientFrame::Request {
+                        request_id,
+                        request,
+                        ..
+                    } => {
+                        requests.push(request);
+                        let result = replies.pop_front().expect("an unscripted request");
+                        ServerFrame::Response { request_id, result }
+                    }
+                    frame => panic!("unexpected client frame: {frame:?}"),
+                };
+                writer
+                    .write_all(&encode_frame(&frame).unwrap())
+                    .await
+                    .unwrap();
+            }
+            requests
+        });
+        let (reader, writer) = tokio::io::split(client);
+        let connection = Connection::connect_remote_interactive_transport(reader, writer)
+            .await
+            .unwrap();
+        (connection, daemon)
+    }
+
+    #[tokio::test]
+    async fn only_an_offer_is_claimed_and_a_refused_claim_opens_nothing() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (offered, dojo_id) = offered_snapshot();
+            let mut quiet = offered.clone();
+            quiet.presentation_offers.clear();
+            let (mut connection, daemon) =
+                scripted_daemon(vec![Response::DojoPresentationClaimed { granted: false }]).await;
+            let mut state = window_state(&offered);
+            let (updates, mut frontend) = mpsc::channel(4);
+            let mut tracker = PresentationOfferTracker::default();
+            let factory = ConnectionFactory::local();
+            let config = AppConfig::default();
+            let image_cache = SharedImageContentCache::default();
+            // Without offers nothing is sent, so an older daemon never sees
+            // the claim; the one offer, due at once in the active tab's
+            // Lair, is claimed once.
+            for snapshot in [&quiet, &offered] {
+                assert!(
+                    claim_presentation_offers(
+                        &factory,
+                        &mut connection,
+                        &config,
+                        &image_cache,
+                        &updates,
+                        &mut state,
+                        snapshot,
+                        &mut tracker,
+                    )
+                    .await
+                );
+            }
+            drop(connection);
+            assert_eq!(
+                daemon.await.unwrap(),
+                [Request::ClaimDojoPresentation { dojo_id }]
+            );
+            assert!(frontend.try_recv().is_err());
+            assert_eq!(state.tabs.len(), 1);
+        })
+        .await
+        .expect("the claim scenario timed out");
+    }
+
+    #[tokio::test]
+    async fn a_granted_dojo_opens_behind_the_active_tab() {
+        let (snapshot, dojo_id) = offered_snapshot();
+        let mut state = window_state(&snapshot);
+        let active = state.tabs.active().map(|tab| tab.dojo_id);
+        let lair = snapshot.topology.lairs().next().unwrap();
+        let prepared = || PreparedManagedDojo {
+            identity: window_dojo_identity(snapshot.revision, lair, &lair.dojos[1]),
+            dojo: lair.dojos[1].clone(),
+            panes: Vec::new(),
+            pane_tasks: HashMap::new(),
+        };
+        let (updates, mut frontend) = mpsc::channel(4);
+        let (shown, opened) = tokio::join!(
+            show_background_tab(&updates, &mut state, prepared()),
+            async {
+                let Some(WindowTopologyUpdate::OpenTab {
+                    identity,
+                    acknowledged,
+                    explorer_target,
+                    activate,
+                    ..
+                }) = frontend.recv().await
+                else {
+                    panic!("the frontend was not asked to open a tab");
+                };
+                assert!(!activate, "the agent's Dojo must not take the active tab");
+                assert!(explorer_target.is_none());
+                acknowledged.send(Ok(())).unwrap();
+                identity.dojo_id
+            }
+        );
+        shown.unwrap();
+        assert_eq!(opened, dojo_id);
+        assert_eq!(state.tabs.len(), 2);
+        assert_eq!(state.tabs.active().map(|tab| tab.dojo_id), active);
+        assert!(state.tabs.get(dojo_id).is_some());
+
+        // A Dojo the Window already shows is neither sent nor recorded again.
+        assert!(
+            show_background_tab(&updates, &mut state, prepared())
+                .await
+                .is_err()
+        );
+        assert!(frontend.try_recv().is_err());
+        assert_eq!(state.tabs.len(), 2);
     }
 }

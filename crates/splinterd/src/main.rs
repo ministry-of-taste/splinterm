@@ -10132,7 +10132,9 @@ async fn handle_authorized_request(
                 dojo_id,
                 splint_id,
                 incarnation,
-                launch.command.is_empty(),
+                // Plan 0067 M3: an agent's first Dojo is never plain.
+                launch.command.is_empty()
+                    && !agent_connection(trusted_ui_client, remote_interactive_client),
                 false,
             )
             .await;
@@ -10233,7 +10235,9 @@ async fn handle_authorized_request(
                 dojo_id,
                 splint_id,
                 incarnation,
-                launch.command.is_empty(),
+                // Plan 0067 M3: an agent's first Dojo is never plain.
+                launch.command.is_empty()
+                    && !agent_connection(trusted_ui_client, remote_interactive_client),
                 false,
             )
             .await;
@@ -10621,7 +10625,7 @@ async fn handle_authorized_request(
             // Plan 0067 M3: an agent's Dojo, told apart by the connection's
             // role, is never plain, so closing a Window never ends it as
             // unused; and it is offered to the Windows showing its Lair.
-            let agent_origin = !trusted_ui_client && !remote_interactive_client;
+            let agent_origin = agent_connection(trusted_ui_client, remote_interactive_client);
             record_plain_dojo(
                 state,
                 dojo_id,
@@ -14649,8 +14653,13 @@ fn topology_snapshot_from(
     }
 }
 
-/// Plan 0067: the part of a snapshot a topology read may show, at the same
-/// revision: the Lairs it may show and their Splints' runtimes.
+/// Plan 0067 M3: whether a connection is an agent's rather than a Window's:
+/// neither the installed client nor a remote Window. Its Dojos are never
+/// plain, and a Dojo it opens is offered to the Windows as a background tab.
+const fn agent_connection(trusted_ui_client: bool, remote_interactive_client: bool) -> bool {
+    !trusted_ui_client && !remote_interactive_client
+}
+
 /// Plan 0067 M3: whether this connection is a Window, which alone sees and
 /// claims Dojo presentation offers: the installed client still running the
 /// executable it said `Hello` with, or a remote Window through its relay.
@@ -14671,6 +14680,8 @@ fn presentation_window(
         )
 }
 
+/// Plan 0067: the part of a snapshot a topology read may show, at the same
+/// revision: the Lairs it may show and their Splints' runtimes.
 fn shown_topology_snapshot(
     snapshot: TopologySnapshot,
     authorization: &RequestAuthorizationContext,
@@ -19065,6 +19076,25 @@ mod tests {
             panic!("the agent's plain Dojo was not created");
         };
         assert!(!state.plain_dojos.lock().unwrap().contains_key(&plain));
+        // So is the first Dojo of an agent's Lair.
+        let revision = state.topology.read().await.revision();
+        let Response::LairCreated { lair: agents, .. } = request_as(
+            &state,
+            64,
+            None,
+            Request::CreateLair {
+                expected_topology_revision: revision,
+                name: "agent's".into(),
+                launch: plain_shell_launch(),
+                generated_name: false,
+            },
+        )
+        .await
+        .unwrap() else {
+            panic!("the agent's Lair was not created");
+        };
+        let first = agents.dojos[0].id;
+        assert!(!state.plain_dojos.lock().unwrap().contains_key(&first));
 
         let revision = state.topology.read().await.revision();
         let Response::DojoStarted { dojo_id, .. } = request_as(
