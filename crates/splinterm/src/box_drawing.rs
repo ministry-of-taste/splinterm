@@ -551,9 +551,9 @@ mod tests {
         let terminal = generate('\u{28ff}', width, height, 1).expect("Braille supported");
         assert!(inked(&full) > inked(&terminal) * 2);
 
-        // Each spinner frame keeps its dot pattern: one dot is one ninth.
+        // Each spinner frame keeps its dot pattern: '⠋' is dots 1, 2 and 4.
         let frame = chrome_braille('⠋', width, height).expect("Braille supported");
-        assert_eq!(inked(&frame), 4 * 9);
+        assert_eq!(inked(&frame), 3 * 9);
         assert_eq!(
             inked(&chrome_braille('\u{2800}', width, height).expect("Braille supported")),
             0
@@ -569,7 +569,11 @@ mod tests {
         let (width, height) = (8_u32, 17_u32);
         let first = |character| {
             let mask = chrome_braille(character, width, height).expect("Braille supported");
-            let index = mask.data.iter().position(|alpha| *alpha != 0).expect("a dot");
+            let index = mask
+                .data
+                .iter()
+                .position(|alpha| *alpha != 0)
+                .expect("a dot");
             let index = u32::try_from(index).unwrap();
             (index % width, index / width)
         };
