@@ -573,6 +573,9 @@ async fn run_configured_command(
             }
         }
         Command::Consent => {
+            // Dies with whoever asked: the daemon, or a remote Window
+            // (`remote_consent`), so a dialog never outlives its asker.
+            tie_dialog_to_parent()?;
             let theme = configure_dialog_renderer(&config)?;
             let shortcut = config.dialog_shortcut;
             tokio::task::spawn_blocking(move || run_consent_client(shortcut, theme))

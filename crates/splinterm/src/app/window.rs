@@ -41,6 +41,7 @@ use super::{
         resolve_image_contents, resolve_update_images, resynchronize, terminal_grid_limits,
         update_advances_from, validate_attached_snapshot,
     },
+    remote_consent::spawn_remote_consent_responder,
     theme_watch::{ThemeOverrides, ThemeUpdateSink, load_startup_theme_for_watch, watch_theme},
     topology_manager::{
         TopologyRestore, initial_window_dojo_identity, run_topology_manager, spawn_topology_smoke,
@@ -776,6 +777,15 @@ async fn run_live_multipane_window_inner(
         watch::channel(TopologyReloadSettings::from_config(&config));
     let (topology_update_sender, topology_updates) = mpsc::channel(4);
     let (graphical_focus, _graphical_focus_reporter) = endpoint_graphical_focus(&factory);
+    // Beside the focus reporter, a remote Window answers its daemon's agent
+    // access prompts (ADR 0015) for as long as it lasts, following Reload
+    // configuration; a local Window never starts one.
+    let _remote_consent = spawn_remote_consent_responder(
+        &factory,
+        remote_display_identity.as_ref(),
+        topology_settings_receiver.clone(),
+    )
+    .map(AbortOnDropTask::new);
     let local_endpoint = factory.is_local();
     let handoff_status = factory.handoff_status().clone();
     let (layout_ledger, _window_anchor) = spawn_window_anchor(&factory, app_id.clone());
@@ -991,6 +1001,16 @@ pub(super) async fn run_live_window(
     let initial_snapshot = attachment.snapshot;
     let window_config = config.clone();
     let (graphical_focus, _graphical_focus_reporter) = endpoint_graphical_focus(&factory);
+    // A single-Splint Window has no Reload configuration to publish, so it
+    // keeps the opt-out it opened with, for as long as the Window lasts.
+    let (_remote_consent_settings, remote_consent_settings) =
+        watch::channel(TopologyReloadSettings::from_config(&config));
+    let _remote_consent = spawn_remote_consent_responder(
+        &factory,
+        remote_display_identity.as_ref(),
+        remote_consent_settings,
+    )
+    .map(AbortOnDropTask::new);
     let local_endpoint = factory.is_local();
     let handoff_status = factory.handoff_status().clone();
     let forced_control_transfer =

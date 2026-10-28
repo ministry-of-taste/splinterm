@@ -372,6 +372,10 @@ while True:
                     }
                 elif request['type'] in ('release_control', 'detach'):
                     result = {'type': 'acknowledged'}
+                elif request['type'] == 'subscribe_consent_offers':
+                    result = {'type': 'consent_offers_subscribed', 'subscription_id': 5}
+                elif request['type'] == 'answer_consent_offer':
+                    result = {'type': 'consent_offer_answered'}
                 else:
                     raise SystemExit(7)
                 private_write(channel, {
@@ -379,6 +383,10 @@ while True:
                     'request_id': request_id,
                     'result': result
                 })
+                # A consent responder's first offer, as the test wrote it.
+                if request['type'] == 'subscribe_consent_offers':
+                    with open(os.path.join(base, 'consent-offer.json'), encoding='utf-8') as handle:
+                        private_write(channel, json.load(handle))
     elif kind == 7:
         pass
     elif kind == 8:

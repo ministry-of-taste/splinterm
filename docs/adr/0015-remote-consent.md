@@ -2,8 +2,8 @@
 
 - **Status:** Proposed (Plan 0066). The protocol contract and the daemon's
   routing are on `main`: the daemon offers workspace prompts to subscribed
-  responders and commits their answers, and `splinterm approvals` subscribes and
-  answers in a terminal. No Window subscribes yet.
+  responders and commits their answers, and a remote Window and `splinterm
+  approvals` subscribe and answer.
 - **Date:** 2026-10-27
 - **Amends:** [ADR 0005](0005-trusted-consent-broker.md) (where the trusted
   prompt is shown), [ADR 0010](0010-one-authentication-graphical-relay.md)
