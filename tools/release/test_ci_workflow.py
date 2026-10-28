@@ -310,9 +310,11 @@ class CiWorkflowTests(unittest.TestCase):
             encoding="utf-8"
         )
         fetch = "run: cargo fetch --locked"
-        helper = "run: cargo build --frozen -p splinterm-pty --bin splinterm-pty-child"
+        helper = "cargo build --frozen -p splinterm-pty --bin splinterm-pty-child"
+        relay = "-p splinterm-relay --bin splinterm-relay"
         self.assertEqual(workflow.count(fetch), 1)
         self.assertEqual(workflow.count(helper), 1)
+        self.assertEqual(workflow.count(relay), 1)
         self.assertLess(workflow.index(fetch), workflow.index("--frozen"))
         loop = workflow.index("for ((iteration = 1;")
         self.assertLess(workflow.index(helper), loop)
