@@ -298,8 +298,9 @@ verification, and lifecycle guidance.
 Easy agent access lets you give an agent access to one workspace (a Lair) in a
 single deliberate answer, choose how long that lasts, and see and revoke it
 later. It is for agents helping you while you are there to answer: the prompt
-shows in your graphical session, in a Splinterm Window connected to that
-computer over SSH, or in `splinterm approvals` in your own terminal there.
+shows on the display of the computer the agent runs on, in a Splinterm Window
+connected to that computer over SSH, or in `splinterm approvals` in your own
+terminal on that computer.
 Unattended and administrative access keeps using the
 [policy file](#persistent-policy-v2), which does not change.
 
@@ -459,8 +460,8 @@ A prompt shown in a remote Window, for an agent on the computer that Window
 is connected to, says so. Its title is **remote agent access request**, its
 sentence names that computer, the `host` row reads
 `neuromancer · remote, SSH profile 'work'` (the hostname that computer
-reports, then the SSH profile you connected with), and a last line says that
-answering there allows it on that computer only. A remote computer whose
+reports, then the SSH profile you connected with), and a note under the
+sentence says that answering there allows it on that computer only. A remote computer whose
 hostname matches this one is also named by its SSH profile, so it never reads
 as this computer ([remote Windows](remote.md#agent-access-prompts)).
 
@@ -480,8 +481,9 @@ the prompt".
 
 A Splinterm Window connected over SSH to the computer the agent runs on shows
 the prompt too, as a dialog marked remote
-([remote Windows](remote.md#agent-access-prompts)). On a computer without a Window, such as a headless host, you can also run
-`splinterm approvals` in your own terminal there to answer prompts as text
+([remote Windows](remote.md#agent-access-prompts)). On a computer without a
+Window, such as a headless host, you can also run `splinterm approvals` in
+your own terminal on that computer to answer prompts as text
 ([Usage](usage.md#answering-access-prompts-in-a-terminal)). It shows the same
 request and starts on Deny. splinterd refuses it inside a Splint, inside the
 requesting agent's process tree or session, and, when workloads run in systemd

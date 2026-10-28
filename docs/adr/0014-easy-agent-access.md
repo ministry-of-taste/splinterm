@@ -650,6 +650,6 @@ terminal approver as well as to the local dialog, so a request fails with
 `consent_unavailable` only when none of them can show it. Every duration,
 Always included, may be answered remotely, and the answer passes the same
 re-checks before it commits. The prompt also counts down and names the
-computer the agent runs on. The relay's own eligibility for While this
-workspace is open and Always, the remembered-grant store, and the policy file
-are unchanged.
+computer the agent runs on. The rule that a request through `splinterm-relay`
+is never offered While this workspace is open or Always, the remembered-grant
+store, and the policy file are unchanged.

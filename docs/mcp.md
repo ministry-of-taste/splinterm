@@ -333,11 +333,12 @@ cursors expire with the adapter process and are not portable.
 
 Persistent policy remains the unattended/headless authorization path. For an
 agent assisting a person who is there to answer, `request_lair_access` instead
-asks them through the installed trusted Splinterm consent window: on that
-computer's own display, in a Splinterm Window connected to it over SSH, or in
-`splinterm approvals` in their terminal there. The prompt identifies the exact
-requester process and named Lair, shows the level or every requested scope, and
-grants nothing unless the person explicitly accepts it. Give exactly one of
+asks them through a trusted Splinterm prompt: the consent dialog on the daemon
+computer's own display, in a Splinterm Window connected to that computer over
+SSH, or in `splinterm approvals` in their own terminal on it. The prompt
+identifies the exact requester process and named Lair, shows the level or every
+requested scope, and grants nothing unless the person explicitly accepts it.
+Give exactly one of
 `level` (`look`, `look_and_type`, or `manage`), `scopes`, or `cancel_request_id`.
 
 A "just this once" grant is held only in daemon memory for five minutes. It is

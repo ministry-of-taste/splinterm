@@ -1,6 +1,6 @@
 # ADR 0010: Multiplex native remote channels over one authenticated SSH process
 
-- **Status:** Accepted and validated — transport, native human-interactive routing, and reviewed real-host graphical closure are complete; a relay connection may answer workspace access prompts, amended by [ADR 0015](0015-remote-consent.md)
+- **Status:** Accepted and validated — transport, native human-interactive routing, and reviewed real-host graphical closure are complete; which workspace access prompts a relay connection may answer amended by [ADR 0015](0015-remote-consent.md)
 - **Date:** 2026-08-07
 
 ## Context
