@@ -32,6 +32,14 @@ impl RemoteDisplayIdentity {
             .as_ref()
             .map_or_else(|| "Remote".to_owned(), |host| format!("Remote: {host}"))
     }
+
+    /// The remote daemon's self-reported hostname, as
+    /// [`splinterm_protocol::usable_daemon_hostname`] accepts it: display
+    /// only, never an identity.
+    #[must_use]
+    pub fn hostname(&self) -> Option<&str> {
+        self.hostname.as_deref()
+    }
 }
 
 /// Whether terminal image bodies may be retrieved for an endpoint.
@@ -62,6 +70,18 @@ pub enum ForcedControlTransfer {
     Disabled,
 }
 
+/// Whether a Window of this endpoint answers the daemon's agent access
+/// prompts (ADR 0015).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RemoteConsent {
+    /// A remote Window shows the prompts its daemon offers, labelled with
+    /// this SSH profile name as their origin; the viewer's
+    /// `[integration] remote-agent-prompts` can still turn it off.
+    Enabled { profile: String },
+    /// The local daemon shows its own prompts; nothing subscribes.
+    Disabled,
+}
+
 /// Stable behavior carried with every connection factory clone.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EndpointCapabilities {
@@ -70,6 +90,7 @@ pub struct EndpointCapabilities {
     pub launch_semantics: LaunchSemantics,
     pub forced_control_transfer: ForcedControlTransfer,
     pub recency_namespace: String,
+    pub remote_consent: RemoteConsent,
 }
 
 #[derive(Debug)]
@@ -105,6 +126,7 @@ impl ConnectionFactory {
                 launch_semantics: LaunchSemantics::LocalTrusted,
                 forced_control_transfer: ForcedControlTransfer::Enabled,
                 recency_namespace: "local".to_owned(),
+                remote_consent: RemoteConsent::Disabled,
             }),
             handoff_status: HandoffStatusHub::default(),
             handoff_control: HandoffControlRestore::default(),
@@ -146,6 +168,9 @@ impl ConnectionFactory {
                 launch_semantics: LaunchSemantics::RemoteInteractive,
                 forced_control_transfer: ForcedControlTransfer::Disabled,
                 recency_namespace: format!("remote-{profile_name}"),
+                remote_consent: RemoteConsent::Enabled {
+                    profile: profile_name.to_owned(),
+                },
             }),
             handoff_status: HandoffStatusHub::default(),
             handoff_control: HandoffControlRestore::default(),
@@ -240,6 +265,12 @@ mod tests {
                 .label(),
             "Remote: actual-daemon"
         );
+        assert_eq!(
+            remote_display_identity(false, Some("actual-daemon"))
+                .unwrap()
+                .hostname(),
+            Some("actual-daemon")
+        );
         for value in [
             None,
             Some(""),
@@ -250,6 +281,10 @@ mod tests {
             assert_eq!(
                 remote_display_identity(false, value).unwrap().label(),
                 "Remote"
+            );
+            assert_eq!(
+                remote_display_identity(false, value).unwrap().hostname(),
+                None
             );
         }
         assert!(
@@ -271,6 +306,7 @@ mod tests {
                 launch_semantics: LaunchSemantics::LocalTrusted,
                 forced_control_transfer: ForcedControlTransfer::Enabled,
                 recency_namespace: "local".to_owned(),
+                remote_consent: RemoteConsent::Disabled,
             }
         );
         assert_ne!(

@@ -1,10 +1,12 @@
 use std::{
     io::{self, Read, Write},
+    os::fd::{AsFd as _, BorrowedFd},
     sync::mpsc as std_mpsc,
     time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
+use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use splinterd::dialog_shortcut::{BackgroundRegistration, DialogShortcut};
 use splinterm::{
     DialogIdentity, DialogLine, DialogStyle, DialogText, TrustedConsentUi, WindowOptions,
@@ -629,12 +631,19 @@ fn consent_window_options(
 }
 
 pub(in crate::app) fn run_consent_client(
+    asker: Option<rustix::process::Pid>,
     shortcut: Option<DialogShortcut>,
     theme: ResolvedTheme,
 ) -> Result<()> {
     let prompt: ConsentPrompt = read_private_frame(&mut io::stdin().lock())?;
     if let Err(reason) = prompt.validate() {
         bail!("invalid trusted consent prompt: {reason}");
+    }
+    // An asker that went before the death signal was tied, or before this
+    // child even started, is gone now: it is no longer the parent, or its
+    // end of the private socket is closed. Nobody would read the answer.
+    if rustix::process::getppid() != asker || peer_hung_up(io::stdin().as_fd()) {
+        bail!("the process that asked has exited");
     }
     let capability = prompt.capability.clone();
     let (decision, receiver) = std_mpsc::channel();
@@ -652,6 +661,30 @@ pub(in crate::app) fn run_consent_client(
     // The answer goes first; the shortcut registration ends after it.
     registration.finish();
     written
+}
+
+/// Whether the other end of the socket `descriptor` is closed, as it is once
+/// the process that asked has exited. Neither asker shuts down its writing
+/// half before it reaps the dialog, so a half-close means the same.
+fn peer_hung_up(descriptor: BorrowedFd<'_>) -> bool {
+    let mut descriptors = [PollFd::new(&descriptor, PollFlags::RDHUP)];
+    loop {
+        match poll(
+            &mut descriptors,
+            Some(&Timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            }),
+        ) {
+            Err(rustix::io::Errno::INTR) => {}
+            Err(_) => return true,
+            Ok(_) => {
+                return descriptors[0].revents().intersects(
+                    PollFlags::HUP | PollFlags::RDHUP | PollFlags::ERR | PollFlags::NVAL,
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -726,6 +759,24 @@ mod tests {
             respond_within_seconds: 0,
             origin: splinterm_protocol::ConsentOrigin::Local,
         }
+    }
+
+    /// The dialog sees its asker go: a closed socket end is a hang-up, an
+    /// open one is not, even after the request was read.
+    #[test]
+    fn a_closed_asker_socket_is_a_hang_up() {
+        use std::{
+            io::{Read as _, Write as _},
+            os::{fd::AsFd as _, unix::net::UnixStream},
+        };
+
+        let (mut asker, dialog) = UnixStream::pair().unwrap();
+        asker.write_all(b"request").unwrap();
+        let mut request = [0_u8; 7];
+        (&dialog).read_exact(&mut request).unwrap();
+        assert!(!super::peer_hung_up(dialog.as_fd()));
+        drop(asker);
+        assert!(super::peer_hung_up(dialog.as_fd()));
     }
 
     #[test]

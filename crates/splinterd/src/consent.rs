@@ -1843,6 +1843,11 @@ fn prompt_blocking(
     // passes it on). No daemon thread that can reach here holds a blocked
     // mask: a handoff candidate releases the signals its exec carried before
     // it builds its runtime (`handoff_exec`, "Signals across exec").
+    // The client ties itself to this parent with PR_SET_PDEATHSIG, which
+    // follows the spawning THREAD: it fires when the thread that forked
+    // exits. This runs on a `spawn_blocking` thread only because this same
+    // call reaps the client before it returns; the spawn must stay on a
+    // thread that lives until then.
     let mut process = Command::new(executable)
         .arg("consent")
         .stdin(Stdio::from(OwnedFd::from(child_read)))

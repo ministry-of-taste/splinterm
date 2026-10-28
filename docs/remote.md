@@ -436,6 +436,25 @@ itself: when the outer SSH transport or the relay is gone, reconnection fails
 and the Window keeps its last screen with "Lost connection to splinterd —
 reopen from the launcher".
 
+### Agent access prompts
+
+A remote Window shows the agent access prompts of the computer it is connected
+to, so an agent working there can ask for a workspace while you work in the
+Window (ADR 0015). The prompt is the same trusted dialog as a local one, started
+by the Window itself, and it says that the request is remote: its title, and a
+host row naming the SSH profile and the hostname that computer reports. Every
+connected Window shows the prompt at once, beside that computer's own dialog
+when it has one; the first answer counts and the other dialogs close. This
+holds per Window: with three Windows open to the same computer, each prompt
+shows three identical dialogs, and answering any one of them closes the others.
+A prompt nobody answers closes when the request's time runs out, without
+answering.
+
+The Window keeps one relay channel for this, and subscribes again by itself
+after the remote daemon is upgraded live. Set
+`[integration] remote-agent-prompts = no` in this computer's configuration to
+leave the prompts to the remote computer ([configuration](configuration.md)).
+
 ## Remote window hostname tag
 
 Available in the 0.1.1 source; publication is pending.

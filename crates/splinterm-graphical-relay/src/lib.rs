@@ -28,8 +28,13 @@ pub const MAX_DIAGNOSTIC_BYTES: usize = 1024;
 pub const MAX_NATIVE_WINDOW_SPLINTS: usize = 256;
 /// Observation plus controller channels retained for each mapped Splint.
 pub const RETAINED_CHANNELS_PER_SPLINT: usize = 2;
-/// Topology, focus/identity, and bounded transient Window service allowance.
-pub const FIXED_WINDOW_SERVICE_CHANNELS: usize = 8;
+/// Topology, focus/identity, and bounded transient Window service allowance,
+/// plus the [`CONSENT_RESPONDER_CHANNELS`] a remote Window's agent access
+/// prompt responder holds for its lifetime (ADR 0015), so it never takes a
+/// slot the other services count on.
+pub const FIXED_WINDOW_SERVICE_CHANNELS: usize = 8 + CONSENT_RESPONDER_CHANNELS;
+/// The long-lived channels a remote Window's consent responder holds: one.
+pub const CONSENT_RESPONDER_CHANNELS: usize = 1;
 /// Hard maximum channels for the largest supported native Window topology.
 pub const MAX_LOGICAL_CHANNELS: usize =
     MAX_NATIVE_WINDOW_SPLINTS * RETAINED_CHANNELS_PER_SPLINT + FIXED_WINDOW_SERVICE_CHANNELS;

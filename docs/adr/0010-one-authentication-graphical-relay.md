@@ -32,7 +32,8 @@ remote command is:
 
 That mode negotiates a separate bounded outer protocol and multiplexes a hard
 maximum derived from 256 supported Splints, two retained channels per Splint,
-and eight fixed/transient Window service channels. Channel IDs are nonzero,
+and nine fixed/transient Window service channels (eight before a remote
+Window's consent responder took one, ADR 0015). Channel IDs are nonzero,
 monotonically allocated, and never reused. Every accepted channel opens
 and repeats the existing owner, mode, UID, pidfd, and exact adjacent
 `splinterd` executable validation before carrying opaque private-protocol bytes.

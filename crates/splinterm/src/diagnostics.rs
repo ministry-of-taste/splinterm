@@ -315,6 +315,10 @@ pub struct ClientDiagnostics {
 static GLOBAL: OnceLock<ClientDiagnostics> = OnceLock::new();
 static PANIC_HOOK_INSTALLED: AtomicBool = AtomicBool::new(false);
 static SIGNAL_TASK_INSTALLED: AtomicBool = AtomicBool::new(false);
+/// Whether the termination signal task is running, so its hooks run.
+static SIGNAL_TASK_RUNNING: AtomicBool = AtomicBool::new(false);
+/// What the termination signal task runs before it exits.
+static SIGNAL_EXIT_HOOKS: Mutex<Vec<fn()>> = Mutex::new(Vec::new());
 
 impl ClientDiagnostics {
     /// Creates an isolated diagnostic owner. Production callers normally use
@@ -714,17 +718,40 @@ pub fn install_termination_signal_task() {
     let Ok(mut interrupt) = signal(SignalKind::interrupt()) else {
         return;
     };
+    SIGNAL_TASK_RUNNING.store(true, Ordering::Release);
     tokio::spawn(async move {
         let signal_number = tokio::select! {
             _ = terminate.recv() => libc::SIGTERM,
             _ = interrupt.recv() => libc::SIGINT,
         };
+        let hooks = SIGNAL_EXIT_HOOKS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        for hook in hooks {
+            hook();
+        }
         finish_global(
             ExitClass::SignalTermination,
             Some(DiagnosticErrorCode::TerminationSignal),
         );
         std::process::exit(128 + signal_number);
     });
+}
+
+/// Runs `hook` before this process exits on `SIGTERM` or `SIGINT` through
+/// its termination signal task ([`install_termination_signal_task`]), and
+/// returns whether that task is running. Without it, the caller handles the
+/// signals itself: a second exiting handler beside the task would race it.
+pub fn run_before_signal_exit(hook: fn()) -> bool {
+    if !SIGNAL_TASK_RUNNING.load(Ordering::Acquire) {
+        return false;
+    }
+    SIGNAL_EXIT_HOOKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(hook);
+    true
 }
 
 /// Prunes finalized retained logs to the configured count and size budgets.

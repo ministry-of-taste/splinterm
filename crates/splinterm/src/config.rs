@@ -154,6 +154,9 @@ pub struct AppConfig {
     /// Splinterm also binds in Hyprland while a dialog waits; `None` turns
     /// it off (`[integration] dialog-shortcut`, default `ctrl+alt+g`).
     pub dialog_shortcut: Option<DialogShortcut>,
+    /// Whether a remote Window shows and answers its daemon's agent access
+    /// prompts (`[integration] remote-agent-prompts`, default on).
+    pub remote_agent_prompts: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -236,8 +239,9 @@ impl Default for MultiplexerLifetimeConfig {
     }
 }
 
-/// The settings a Window's topology manager reads from its configuration that
-/// Reload configuration changes. The Window publishes them on reload and the
+/// The settings a Window's topology manager, and a remote Window's agent
+/// access prompt responder, read from its configuration that Reload
+/// configuration changes. The Window publishes them on reload and the
 /// manager picks up the latest before each decision.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TopologyReloadSettings {
@@ -245,6 +249,9 @@ pub struct TopologyReloadSettings {
     pub persist_on_tab_organization: bool,
     pub new_dojo_directory: LaunchDirectory,
     pub new_splint_directory: LaunchDirectory,
+    /// `[integration] remote-agent-prompts`: whether a remote Window answers
+    /// its daemon's agent access prompts.
+    pub remote_agent_prompts: bool,
 }
 
 impl TopologyReloadSettings {
@@ -255,6 +262,7 @@ impl TopologyReloadSettings {
             persist_on_tab_organization: config.multiplexer_lifetime.persist_on_tab_organization,
             new_dojo_directory: config.new_dojo_directory.clone(),
             new_splint_directory: config.new_splint_directory.clone(),
+            remote_agent_prompts: config.remote_agent_prompts,
         }
     }
 
@@ -264,6 +272,7 @@ impl TopologyReloadSettings {
         config.multiplexer_lifetime.persist_on_tab_organization = self.persist_on_tab_organization;
         config.new_dojo_directory = self.new_dojo_directory.clone();
         config.new_splint_directory = self.new_splint_directory.clone();
+        config.remote_agent_prompts = self.remote_agent_prompts;
     }
 }
 
@@ -316,6 +325,7 @@ impl Default for AppConfig {
             explorer_two_line_rows: false,
             omarchy_integration_hint: true,
             dialog_shortcut: Some(DialogShortcut::default()),
+            remote_agent_prompts: true,
         }
     }
 }
@@ -1438,6 +1448,10 @@ fn parse_with_base(text: &str, config_dir: &Path) -> Result<ConfigLoad> {
                     DialogShortcut::parse_setting(value).map_err(|reason| {
                         anyhow::anyhow!("line {}: dialog-shortcut {value:?}: {reason}", index + 1)
                     })?;
+                false
+            }
+            "integration.remote-agent-prompts" => {
+                config.remote_agent_prompts = parse_bool(value, index)?;
                 false
             }
             "multiplexer.frame-title" => {
@@ -3665,6 +3679,38 @@ pub(crate) mod tests {
         let shipped = parse(include_str!("../../../config/splinterm/config.ini")).unwrap();
         assert!(shipped.diagnostics.is_empty(), "{:?}", shipped.diagnostics);
         assert_eq!(shipped.config.dialog_shortcut, default);
+    }
+
+    /// The viewer's opt-out for agent access prompts in remote Windows
+    /// (ADR 0015): on unless set to no, a strict boolean, and carried by
+    /// the settings a reload publishes.
+    #[test]
+    fn remote_agent_prompts_default_on_and_turn_off_with_a_strict_boolean() {
+        assert!(AppConfig::default().remote_agent_prompts);
+        for off in ["no", "false", "off", "0", "NO"] {
+            let loaded = parse(&format!("[integration]\nremote-agent-prompts={off}\n")).unwrap();
+            assert!(!loaded.config.remote_agent_prompts, "{off:?}");
+            assert_eq!(loaded.diagnostics, Vec::<String>::new());
+            assert!(!TopologyReloadSettings::from_config(&loaded.config).remote_agent_prompts);
+        }
+        let on = parse("[integration]\nremote-agent-prompts=yes\n").unwrap();
+        assert!(on.config.remote_agent_prompts);
+        for invalid in ["", "maybe", "ask"] {
+            let error = parse(&format!("[integration]\nremote-agent-prompts={invalid}\n"))
+                .expect_err(invalid)
+                .to_string();
+            assert!(error.contains("line 2"), "{error}");
+        }
+        let mut reloaded = AppConfig::default();
+        TopologyReloadSettings {
+            remote_agent_prompts: false,
+            ..TopologyReloadSettings::from_config(&reloaded)
+        }
+        .apply_to(&mut reloaded);
+        assert!(!reloaded.remote_agent_prompts);
+        let shipped = parse(include_str!("../../../config/splinterm/config.ini")).unwrap();
+        assert!(shipped.diagnostics.is_empty(), "{:?}", shipped.diagnostics);
+        assert!(shipped.config.remote_agent_prompts);
     }
 
     #[test]

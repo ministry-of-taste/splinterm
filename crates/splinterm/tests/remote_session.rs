@@ -56,6 +56,14 @@ async fn remote_window_identity_is_refreshed_per_connection_without_retargeting_
             .await
             .unwrap();
     let factory = ConnectionFactory::from_remote_session("test", session);
+    // A remote Window answers its daemon's agent access prompts, labelled
+    // with its own profile (ADR 0015).
+    assert_eq!(
+        factory.capabilities().remote_consent,
+        splinterm::endpoint::RemoteConsent::Enabled {
+            profile: "test".to_owned()
+        }
+    );
     let first = factory.connect().await.unwrap();
     let initial = factory.remote_display_identity(&first).unwrap();
     let cloned_factory = factory.clone();
