@@ -14,13 +14,18 @@ use splinterm_automation_client::{
 };
 use splinterm_core::{Axis, DojoId, LairId, LayoutNode, SplintId, SplitRatio, SplitSide};
 use splinterm_protocol::{
-    AccessGrant, AccessGrantSource, AccessScope, AgentState, AgentStatusReport, AuditDecision,
-    AuditOutcome, AutomationLaunch, ErrorCode, MAX_SCROLLBACK_PAGE_ROWS, MAX_SEARCH_QUERY_BYTES,
-    MAX_SEARCH_RESULTS, MutationPreflight, MutationPreparation, Request, Response,
-    RestoreLeafResult, ScrollbackPage, SearchPage, SplintLifecycle, SplintRuntimeSummary,
-    TerminalProvenance, TerminalSnapshot, TopologySnapshot,
+    AccessGrant, AccessGrantSource, AccessScope, ActiveScreen, AgentState, AgentStatusReport,
+    AuditDecision, AuditOutcome, AutomationLaunch, ErrorCode, MAX_SCROLLBACK_PAGE_ROWS,
+    MAX_SEARCH_QUERY_BYTES, MAX_SEARCH_RESULTS, MutationPreflight, MutationPreparation, Request,
+    Response, RestoreLeafResult, ScrollbackPage, SearchPage, SplintLifecycle, SplintRuntimeSummary,
+    TerminalProvenance, TerminalRow, TerminalSnapshot, TopologySnapshot,
 };
 use tokio_util::sync::CancellationToken;
+
+use crate::{
+    limits::MAXIMUM_TOOL_RESPONSE_BYTES,
+    terminal_text::{TerminalFormat, TextLayout, terminal_text},
+};
 
 const SCHEMA: &str = "splinterm.mcp.v2";
 const DEFAULT_DEADLINE: Duration = Duration::from_secs(5);
@@ -1019,6 +1024,7 @@ fn take_terminal_cursor(
 
 fn terminal_snapshot_output(
     tool: &str,
+    format: TerminalFormat,
     requested_splint: SplintId,
     provenance: &TerminalProvenance,
     snapshot: &TerminalSnapshot,
@@ -1041,27 +1047,65 @@ fn terminal_snapshot_output(
         snapshot.revision,
         snapshot.history_generation,
     )?;
-    let rows = serde_json::to_value(
-        project_terminal_rows(&snapshot.visible_rows).map_err(|_| DispatchFailure::internal())?,
-    )
-    .map_err(|_| DispatchFailure::internal())?;
     Ok(success(
         tool,
         resource,
-        json!({
-            "content_encoding": "unicode_scalars",
-            "title": provenance.title,
-            "rows": rows,
-            "continuation_cursor": null,
-            "resync_required": false,
-        }),
+        terminal_rows_data(
+            format,
+            screen_layout(snapshot.active_screen),
+            &provenance.title,
+            &snapshot.visible_rows,
+            None,
+        )?,
         false,
         "untrusted_terminal_data",
     ))
 }
 
+/// Foot reflows only the main screen, so only its wrapped rows are joined.
+const fn screen_layout(screen: ActiveScreen) -> TextLayout {
+    match screen {
+        ActiveScreen::Normal => TextLayout::Screen,
+        ActiveScreen::Alternate => TextLayout::AlternateScreen,
+    }
+}
+
+/// The `data` of a terminal read in the requested format.
+fn terminal_rows_data(
+    format: TerminalFormat,
+    layout: TextLayout,
+    title: &str,
+    rows: &[TerminalRow],
+    continuation_cursor: Option<&str>,
+) -> Result<Value, DispatchFailure> {
+    let rows = project_terminal_rows(rows).map_err(|_| DispatchFailure::internal())?;
+    Ok(match format {
+        TerminalFormat::Text => {
+            let text = terminal_text(&rows, layout);
+            if text.len() > MAXIMUM_TOOL_RESPONSE_BYTES {
+                return Err(DispatchFailure::resource_limit());
+            }
+            json!({
+                "content_encoding": "text",
+                "title": title,
+                "text": text,
+                "continuation_cursor": continuation_cursor,
+                "resync_required": false,
+            })
+        }
+        TerminalFormat::Cells => json!({
+            "content_encoding": "unicode_scalars",
+            "title": title,
+            "rows": serde_json::to_value(rows).map_err(|_| DispatchFailure::internal())?,
+            "continuation_cursor": continuation_cursor,
+            "resync_required": false,
+        }),
+    })
+}
+
 fn scrollback_output(
     cursor_registry: &Mutex<CursorRegistry>,
+    format: TerminalFormat,
     requested_splint: SplintId,
     provenance: &TerminalProvenance,
     page: &ScrollbackPage,
@@ -1094,20 +1138,16 @@ fn scrollback_output(
     } else {
         None
     };
-    let rows = serde_json::to_value(
-        project_terminal_rows(&page.rows).map_err(|_| DispatchFailure::internal())?,
-    )
-    .map_err(|_| DispatchFailure::internal())?;
     Ok(success(
         "splinterm.read_scrollback",
         resource,
-        json!({
-            "content_encoding": "unicode_scalars",
-            "title": provenance.title,
-            "rows": rows,
-            "continuation_cursor": continuation_cursor,
-            "resync_required": false,
-        }),
+        terminal_rows_data(
+            format,
+            TextLayout::ScrollbackPage,
+            &provenance.title,
+            &page.rows,
+            continuation_cursor.as_deref(),
+        )?,
         continuation_cursor.is_some(),
         "untrusted_terminal_data",
     ))
@@ -1166,8 +1206,10 @@ fn search_output(
     ))
 }
 
+/// A resync reply; `format` is `None` for search results.
 fn terminal_resync_output(
     tool: &str,
+    format: Option<TerminalFormat>,
     requested_splint: SplintId,
     provenance: &TerminalProvenance,
     current_revision: u64,
@@ -1180,20 +1222,26 @@ fn terminal_resync_output(
         current_revision,
         history_generation,
     )?;
-    let data = if tool == "splinterm.search_scrollback" {
-        json!({
+    let data = match format {
+        None => json!({
             "matches": [],
             "continuation_cursor": null,
             "resync_required": true,
-        })
-    } else {
-        json!({
+        }),
+        Some(TerminalFormat::Text) => json!({
+            "content_encoding": "text",
+            "title": provenance.title,
+            "text": "",
+            "continuation_cursor": null,
+            "resync_required": true,
+        }),
+        Some(TerminalFormat::Cells) => json!({
             "content_encoding": "unicode_scalars",
             "title": provenance.title,
             "rows": [],
             "continuation_cursor": null,
             "resync_required": true,
-        })
+        }),
     };
     Ok(success(
         tool,
@@ -1204,11 +1252,17 @@ fn terminal_resync_output(
     ))
 }
 
+fn parse_terminal_format(arguments: &Value) -> Result<TerminalFormat, DispatchFailure> {
+    TerminalFormat::from_arguments(arguments)
+        .ok_or_else(|| invalid_terminal_argument("the format must be text or cells"))
+}
+
 async fn read_terminal(
     arguments: &Value,
     cancellation: &CancellationToken,
 ) -> Result<Value, DispatchFailure> {
     let splint_id = parse_splint(arguments)?;
+    let format = parse_terminal_format(arguments)?;
     let mut session = DaemonSession::connect(cancellation).await?;
     let response = session
         .request(Request::Attach {
@@ -1229,9 +1283,13 @@ async fn read_terminal(
         return Err(DispatchFailure::internal());
     }
     match session.request(Request::Detach { subscription_id }).await? {
-        Response::Acknowledged => {
-            terminal_snapshot_output("splinterm.read_terminal", splint_id, &provenance, &snapshot)
-        }
+        Response::Acknowledged => terminal_snapshot_output(
+            "splinterm.read_terminal",
+            format,
+            splint_id,
+            &provenance,
+            &snapshot,
+        ),
         _ => Err(DispatchFailure::internal()),
     }
 }
@@ -1242,6 +1300,7 @@ async fn read_scrollback(
     cursor_registry: &Mutex<CursorRegistry>,
 ) -> Result<Value, DispatchFailure> {
     let splint_id = parse_splint(arguments)?;
+    let format = parse_terminal_format(arguments)?;
     let cursor = arguments
         .get("cursor")
         .and_then(Value::as_str)
@@ -1281,7 +1340,7 @@ async fn read_scrollback(
     };
     match session.request(request).await? {
         Response::ScrollbackPage { provenance, page } => {
-            scrollback_output(cursor_registry, splint_id, &provenance, &page)
+            scrollback_output(cursor_registry, format, splint_id, &provenance, &page)
         }
         Response::ScrollbackResyncRequired {
             provenance,
@@ -1289,6 +1348,7 @@ async fn read_scrollback(
             history_generation,
         } => terminal_resync_output(
             "splinterm.read_scrollback",
+            Some(format),
             splint_id,
             &provenance,
             current_revision,
@@ -1377,6 +1437,7 @@ async fn search_scrollback(
             history_generation,
         } => terminal_resync_output(
             "splinterm.search_scrollback",
+            None,
             splint_id,
             &provenance,
             current_revision,
@@ -2916,7 +2977,16 @@ mod tests {
             timed_out: false,
         };
         let registry = Mutex::new(CursorRegistry::default());
-        assert!(scrollback_output(&registry, requested, &provenance, &page).is_err());
+        assert!(
+            scrollback_output(
+                &registry,
+                TerminalFormat::Text,
+                requested,
+                &provenance,
+                &page,
+            )
+            .is_err()
+        );
         assert!(
             search_output(&registry, requested, "needle", false, &provenance, &search).is_err()
         );

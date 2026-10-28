@@ -77,6 +77,9 @@ running daemon by themselves.
   ID`), which has no command palette.
 - The desktop launcher no longer restarts a daemon that may still run shells
   without asking.
+- MCP `splinterm.read_terminal` and `splinterm.read_scrollback` return
+  `data.text` by default. Pass `"format": "cells"` for the 0.1 `data.rows`
+  form (see "MCP").
 - New Dojos and Lairs start in your home directory, not the focused Splint's
   directory.
 - On Omarchy 4 with no font size in `config.ini`, the terminal follows
@@ -694,6 +697,10 @@ a hostile program running as your account.
 - `splinterm.request_lair_access` asks for one of the easy agent access levels
   and can return a pending result while you have not answered yet; see "Easy
   agent access".
+- `splinterm.read_terminal` and `splinterm.read_scrollback` now return plain
+  text by default (`content_encoding: "text"`, one `text` string), which is
+  about 50 times smaller than one object per cell. Pass `"format": "cells"` for
+  the per-cell form.
 
 ## Security and robustness
 

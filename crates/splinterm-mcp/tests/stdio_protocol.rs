@@ -1289,7 +1289,7 @@ fn terminal_tools_use_exact_scoped_requests_cursors_and_cleanup() {
     let fake = thread::spawn(move || {
         let splint_id: SplintId = "018f4d8c-2a18-4b31-8c2f-9e7c5de77103".parse().unwrap();
         let other_splint_id: SplintId = "018f4d8c-2a18-4b31-8c2f-9e7c5de77104".parse().unwrap();
-        for index in 0..8 {
+        for index in 0..10 {
             let (mut stream, _) = listener.accept().unwrap();
             assert!(matches!(
                 read_private_frame::<ClientFrame>(&mut stream),
@@ -1318,7 +1318,7 @@ fn terminal_tools_use_exact_scoped_requests_cursors_and_cleanup() {
             };
             match (index, request) {
                 (
-                    0,
+                    0 | 8,
                     Request::Attach {
                         splint_id: requested,
                         incarnation: None,
@@ -1548,6 +1548,59 @@ fn terminal_tools_use_exact_scoped_requests_cursors_and_cleanup() {
                         },
                     },
                 ),
+                (
+                    9,
+                    Request::Attach {
+                        splint_id: requested,
+                        incarnation: None,
+                        scrollback_rows: 0,
+                    },
+                ) if requested == splint_id => {
+                    // A full-screen program on the alternate screen: a row
+                    // without a linebreak still reads as its own line.
+                    let mut snapshot = reviewed_terminal_snapshot();
+                    snapshot.rows = 2;
+                    snapshot.active_screen = ActiveScreen::Alternate;
+                    let row = |row_id, text: &str, linebreak| TerminalRow {
+                        row_id: Some(row_id),
+                        linebreak,
+                        cells: text
+                            .chars()
+                            .map(|character| TerminalCell {
+                                content: character.to_string(),
+                                spacer_remaining: None,
+                                attributes: terminal_attributes(),
+                            })
+                            .collect(),
+                    };
+                    snapshot.visible_rows = vec![row(2, "abcd", false), row(3, "ef", true)];
+                    write_private_frame(
+                        &mut stream,
+                        &ServerFrame::Response {
+                            request_id,
+                            result: Response::Attached {
+                                subscription_id: 9,
+                                provenance: reviewed_terminal_provenance(9, 3),
+                                snapshot,
+                            },
+                        },
+                    );
+                    let ClientFrame::Request {
+                        diagnostic_correlation: _,
+                        request_id,
+                        request: Request::Detach { subscription_id: 9 },
+                    } = read_private_frame(&mut stream)
+                    else {
+                        panic!("alternate-screen terminal read did not detach");
+                    };
+                    write_private_frame(
+                        &mut stream,
+                        &ServerFrame::Response {
+                            request_id,
+                            result: Response::Acknowledged,
+                        },
+                    );
+                }
                 (_, request) => panic!("unexpected terminal-tool request {index}: {request:?}"),
             }
         }
@@ -1562,9 +1615,13 @@ fn terminal_tools_use_exact_scoped_requests_cursors_and_cleanup() {
         &mut server,
         30,
         "splinterm.read_terminal",
-        json!({"splint_id": splint_id}),
+        json!({"splint_id": splint_id, "format": "cells"}),
     );
     assert_eq!(terminal["isError"], false);
+    assert_eq!(
+        terminal["structuredContent"]["data"]["content_encoding"],
+        "unicode_scalars"
+    );
     assert_eq!(terminal["structuredContent"]["resource"]["incarnation"], 2);
     assert_eq!(
         terminal["structuredContent"]["data"]["rows"][0]["cells"],
@@ -1592,6 +1649,14 @@ fn terminal_tools_use_exact_scoped_requests_cursors_and_cleanup() {
         .to_owned();
     assert!(cursor.starts_with("cur_"));
     assert_eq!(first["structuredContent"]["truncated"], true);
+    assert_eq!(
+        first["structuredContent"]["data"]["content_encoding"],
+        "text"
+    );
+    // A scrollback page ends each hard line, so older pages join by
+    // plain concatenation.
+    assert_eq!(first["structuredContent"]["data"]["text"], "history\n");
+    assert!(first["structuredContent"]["data"].get("rows").is_none());
 
     let resync = call_tool(
         &mut server,
@@ -1600,7 +1665,8 @@ fn terminal_tools_use_exact_scoped_requests_cursors_and_cleanup() {
         json!({"splint_id": splint_id, "cursor": cursor, "max_rows": 64}),
     );
     assert_eq!(resync["structuredContent"]["data"]["resync_required"], true);
-    assert_eq!(resync["structuredContent"]["data"]["rows"], json!([]));
+    assert_eq!(resync["structuredContent"]["data"]["text"], "");
+    assert!(resync["structuredContent"]["data"].get("rows").is_none());
     assert_eq!(
         resync["structuredContent"]["resource"]["terminal_revision"],
         10
@@ -1701,6 +1767,46 @@ fn terminal_tools_use_exact_scoped_requests_cursors_and_cleanup() {
         "invalid_argument"
     );
     assert!(!oversized_query.to_string().contains('é'));
+
+    // Plan 0067 M2: the default is one plain-text string, a wide character
+    // appears once, and an unknown format never reaches the daemon.
+    let text = call_tool(
+        &mut server,
+        42,
+        "splinterm.read_terminal",
+        json!({"splint_id": splint_id}),
+    );
+    assert_eq!(text["isError"], false);
+    assert_eq!(
+        text["structuredContent"]["data"]["content_encoding"],
+        "text"
+    );
+    assert_eq!(
+        text["structuredContent"]["data"]["text"],
+        "e\u{301}界\u{fffd}"
+    );
+    assert!(text["structuredContent"]["data"].get("rows").is_none());
+    assert_eq!(
+        text["structuredContent"]["content_trust"],
+        "untrusted_terminal_data"
+    );
+    let unknown_format = call_tool(
+        &mut server,
+        43,
+        "splinterm.read_terminal",
+        json!({"splint_id": splint_id, "format": "rows"}),
+    );
+    assert_eq!(
+        unknown_format["structuredContent"]["error"]["code"],
+        "invalid_argument"
+    );
+    let alternate = call_tool(
+        &mut server,
+        44,
+        "splinterm.read_terminal",
+        json!({"splint_id": splint_id}),
+    );
+    assert_eq!(alternate["structuredContent"]["data"]["text"], "abcd\nef");
 
     server.close_input();
     assert!(server.wait().success());
@@ -1900,16 +2006,13 @@ fn prompt_injection_values_remain_inert_untrusted_data() {
         "untrusted_terminal_data"
     );
     assert_eq!(terminal["structuredContent"]["data"]["title"], PAYLOADS[3]);
-    assert_eq!(
-        terminal["structuredContent"]["data"]["rows"][0]["cells"][0]["text"],
-        PAYLOADS[2]
-    );
+    assert_eq!(terminal["structuredContent"]["data"]["text"], PAYLOADS[2]);
 
     let scrollback = call_tool(
         &mut server,
         202,
         "splinterm.read_scrollback",
-        json!({"splint_id": splint_id}),
+        json!({"splint_id": splint_id, "format": "cells"}),
     );
     assert_eq!(
         scrollback["structuredContent"]["content_trust"],

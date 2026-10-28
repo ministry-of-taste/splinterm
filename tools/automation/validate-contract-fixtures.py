@@ -244,10 +244,10 @@ EXPECTED_MCP_SCHEMA_SHA256 = {
     'tools/new_dojo.output.schema.json': 'cb7ffc4f64cccbd790c720d3d44329217c660aec417a6e77e6e9ee35352e0b3b',
     'tools/ping.input.schema.json': '5a7b4c41ee38f501c742ae046bbf3ab28324153c405660014658ec793bb27f9c',
     'tools/ping.output.schema.json': '4635778ab43ce5e096c61606986af3380b56c88f8edcec0f414e596100e84d71',
-    'tools/read_scrollback.input.schema.json': 'da57e8713e47bb86e4d0592594e6c70a5bcad222764dc045740378c6e2aecea9',
-    'tools/read_scrollback.output.schema.json': 'ebabbf07f40a3463699312b0d2542b90e31718ad2a5a0d51c82305780d24dbbb',
-    'tools/read_terminal.input.schema.json': 'b2dcadd667421447d0203ec3149decc30c68ed4333c6fb619ff9b03d9f79d5a5',
-    'tools/read_terminal.output.schema.json': 'a63d0de1e471095278d638956e8d29ecc97f17ac80911839cb2791082e1c604e',
+    'tools/read_scrollback.input.schema.json': '59e71f0b8a8f01d82f4bf57dd79b2a7414b9d5bee385214162f88a5130e84391',
+    'tools/read_scrollback.output.schema.json': '4e4e81777014dd236200ae2fe31c5213e7cdb1e2444fb58e9ac206d428fae511',
+    'tools/read_terminal.input.schema.json': 'fa676197877e461f65af235d9950eda15838ae9259751daaa5a2323f06adc06b',
+    'tools/read_terminal.output.schema.json': 'e279db0a0dcbf0f8e957d69bd9959080a8c431014641422d6591276c8b1c5544',
     'tools/relaunch_splint.input.schema.json': '017535302da3a14cbf143436b5480343fec67d7212ff1ed93e52485eba091430',
     'tools/relaunch_splint.output.schema.json': '7de79ba51a5f95bf018a215fb747d7c098d9cf0e798ca3c288abdd3af89b173d',
     'tools/release_control.input.schema.json': '60d9ce35f58e068a4de6a0a3631e319bfffb84296645735208bdc5877502a432',
@@ -303,6 +303,10 @@ EXPECTED_MCP_VALID_FIXTURES = {
     "request_lair_access-pending.output.json",
     "request_lair_access-cancelled.output.json",
     "request_lair_access-remembered.output.json",
+    # Plan 0067 M2: terminal reads default to plain text; the reviewed
+    # per-tool fixtures keep the per-cell form.
+    "read_terminal-text.output.json",
+    "read_scrollback-text.output.json",
 }
 EXPECTED_MCP_INVALID_FIXTURES = {
     "argv-echo.json",

@@ -20,17 +20,23 @@
           "required": [
             "content_encoding",
             "title",
-            "rows",
             "continuation_cursor",
             "resync_required"
           ],
           "properties": {
             "content_encoding": {
-              "const": "unicode_scalars"
+              "enum": [
+                "text",
+                "unicode_scalars"
+              ]
             },
             "title": {
               "type": "string",
               "maxLength": 1024
+            },
+            "text": {
+              "type": "string",
+              "maxLength": 1048576
             },
             "rows": {
               "$ref": "https://splinterm.oldjobobo.com/schemas/mcp/v2/common.schema.json#/$defs/terminal_rows"
@@ -51,6 +57,32 @@
           },
           "allOf": [
             {
+              "oneOf": [
+                {
+                  "properties": {
+                    "content_encoding": {
+                      "const": "text"
+                    },
+                    "rows": false
+                  },
+                  "required": [
+                    "text"
+                  ]
+                },
+                {
+                  "properties": {
+                    "content_encoding": {
+                      "const": "unicode_scalars"
+                    },
+                    "text": false
+                  },
+                  "required": [
+                    "rows"
+                  ]
+                }
+              ]
+            },
+            {
               "if": {
                 "properties": {
                   "resync_required": {
@@ -68,6 +100,9 @@
                   },
                   "rows": {
                     "maxItems": 0
+                  },
+                  "text": {
+                    "maxLength": 0
                   }
                 }
               }

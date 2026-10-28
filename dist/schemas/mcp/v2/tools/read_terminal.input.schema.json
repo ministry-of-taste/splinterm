@@ -12,6 +12,14 @@
       "properties": {
         "splint_id": {
           "$ref": "https://splinterm.oldjobobo.com/schemas/mcp/v2/common.schema.json#/$defs/uuid"
+        },
+        "format": {
+          "enum": [
+            "text",
+            "cells"
+          ],
+          "default": "text",
+          "description": "text: the screen as one plain-text string; wrapped rows are joined (not on the alternate screen) and trailing spaces dropped. cells: one object per cell with its display width."
         }
       }
     }
