@@ -104,8 +104,8 @@ pub struct TrustedConsentUi {
     /// is drawn again once a click or the shortcut engages the keyboard.
     legend_live: bool,
     /// When the asker stops waiting for an answer, if the dialog knows; the
-    /// frame then shows the time left. Display only: what happens then is
-    /// the asker's.
+    /// frame then shows the time left. What happens then is the asker's;
+    /// an access consent grants nothing from then on.
     deadline: Option<Instant>,
     /// The time left the current snapshot shows.
     countdown_shown: Option<String>,
@@ -203,9 +203,10 @@ impl TrustedConsentUi {
     }
 
     /// How long the asker waits for an answer, from now: the frame's top
-    /// edge then counts it down. It only shows the time; the asker ends the
-    /// dialog when it runs out, as before. A zero wait, from an asker that
-    /// sent none, shows no countdown.
+    /// edge then counts it down. The asker ends the dialog when it runs
+    /// out, as before; an access consent that has run out grants nothing
+    /// meanwhile, so only a deny still answers it. A zero wait, from an
+    /// asker that sent none, shows no countdown.
     ///
     /// The asker started its clock before this dialog started, so the time
     /// shown is [`COUNTDOWN_MARGIN`] short of `within`: it reaches "0:00"
@@ -291,9 +292,11 @@ impl TrustedConsentUi {
     /// ([`dialog_text::ChromeRows::body_room`]). A layout that hides part of
     /// the text, a body row or a button label, shows
     /// [`TrustedDialogKind::clipped_notice`] in place of the answer hints
-    /// and makes every yes answer inert. When the whole text shows again,
-    /// an engaged dialog arms again from `now`, so a yes counts only once
-    /// the whole text has been in view for the arming delay.
+    /// and makes every yes answer inert; so does an access consent's
+    /// countdown that the top edge has no room for, since the person must
+    /// see how long is left. When the whole text shows again, an engaged
+    /// dialog arms again from `now`, so a yes counts only once the whole
+    /// text has been in view for the arming delay.
     pub(crate) fn lay_out(&mut self, frame: DialogFrame, now: Instant) -> Option<TerminalSnapshot> {
         let variants = self.variants();
         let selected = self.selected_variant();
@@ -301,13 +304,17 @@ impl TrustedConsentUi {
         let max_rows = frame
             .max_text_rows
             .min(dialog_text::chrome_rows(frame.grid_rows).body_room);
+        let countdown_hidden = self.access.is_some()
+            && self.countdown(now).is_some_and(|countdown| {
+                !dialog_text::countdown_fits(text.title(), &countdown, frame.grid_columns)
+            });
         let layout = dialog_text::layout_hiding(
             &variants,
             selected,
             frame.wrap_columns,
             max_rows,
             Some(self.kind.clipped_notice()),
-            !text.buttons_fit(frame.grid_columns),
+            !text.buttons_fit(frame.grid_columns) || countdown_hidden,
         );
         if let Some(access) = self.access.as_mut() {
             // A click lands on a snapshot row; the body starts below the
@@ -325,7 +332,7 @@ impl TrustedConsentUi {
         self.frame = Some(frame);
         self.legend_live = self.keyboard_engaged();
         self.countdown_shown = self.countdown(now);
-        let chrome = self.chrome();
+        let chrome = self.chrome(now);
         Some(dialog_text::dialog_snapshot(
             dialog_text::compose(text, &layout, &chrome, frame.grid_columns, frame.grid_rows),
             frame.grid_columns,
@@ -343,8 +350,8 @@ impl TrustedConsentUi {
     }
 
     /// The box around the current layout: the keys under each button, the
-    /// Allow button's state, and the legend.
-    fn chrome(&self) -> dialog_text::DialogChrome {
+    /// Allow button's state at `now`, and the legend.
+    fn chrome(&self, now: Instant) -> dialog_text::DialogChrome {
         let choices = self
             .access
             .as_ref()
@@ -352,7 +359,7 @@ impl TrustedConsentUi {
         dialog_text::DialogChrome {
             deny_keys: self.kind.deny_keys().to_owned(),
             allow_keys: self.kind.allow_keys().to_owned(),
-            allow_enabled: !self.clipped,
+            allow_enabled: !self.clipped && !self.consent_expired(now),
             legend: self
                 .kind
                 .legend(self.legend_live, choices > 1, self.shortcut),
@@ -400,6 +407,16 @@ impl TrustedConsentUi {
     /// Whether the countdown the frame shows is out of date at `now`.
     pub(crate) fn countdown_stale(&self, now: Instant) -> bool {
         self.frame.is_some() && self.countdown_shown != self.countdown(now)
+    }
+
+    /// Whether the access consent dialog's time to answer has run out at
+    /// `now`: from then on it grants nothing, its Allow button is drawn
+    /// disabled, and only a deny answers it, until its asker, which has
+    /// stopped waiting, ends it. The request then ends unanswered, as the
+    /// countdown's "denies in" says. The upgrade and restart questions
+    /// leave all of that to their asker.
+    fn consent_expired(&self, now: Instant) -> bool {
+        self.access.is_some() && self.deadline.is_some_and(|deadline| now >= deadline)
     }
 
     /// A redraw when a click that answers nothing, outside any row, just
@@ -476,12 +493,13 @@ impl TrustedConsentUi {
         action: Option<ConsentAction>,
         now: Instant,
     ) -> Option<TrustedInput> {
-        let clipped = self.clipped;
+        // Nothing grants while part of the request is hidden, or once the
+        // time to answer is up.
+        let grants = !self.clipped && !self.consent_expired(now);
         let access = self.access.as_mut()?;
         match action? {
             ConsentAction::Deny => Some(TrustedInput::Answer(false)),
-            // Nothing grants while part of the request is hidden.
-            ConsentAction::Grant => (!clipped).then_some(TrustedInput::Answer(true)),
+            ConsentAction::Grant => grants.then_some(TrustedInput::Answer(true)),
             ConsentAction::Select(index) => access
                 .choice
                 .select(index, now)
@@ -1460,8 +1478,8 @@ mod tests {
     }
 
     /// A dialog that does not know its deadline shows no countdown and
-    /// never wakes for one: the access consent (its deadline is the
-    /// daemon's) and a question whose asker sent a zero wait.
+    /// never wakes for one: an access consent and a question whose askers
+    /// sent a zero wait.
     #[test]
     fn without_a_known_deadline_nothing_counts_down() {
         let (decision, _answers) = std::sync::mpsc::channel();
@@ -1508,5 +1526,151 @@ mod tests {
             .with_text(consent_text(0));
         let top = top_row(&dialog.lay_out(narrow_frame(), Instant::now()).unwrap());
         assert!(top.ends_with(" not now in 1:59"), "{top:?}");
+    }
+
+    /// The access consent counts its asker's wait down as "denies in". Once
+    /// that has run out it grants nothing: `G` and the green button are
+    /// inert and the Allow button is drawn disabled, while a deny still
+    /// answers, until the asker, which has stopped waiting, ends it and the
+    /// request ends unanswered. The upgrade and restart questions are
+    /// unchanged.
+    #[test]
+    fn the_access_consent_grants_nothing_once_its_time_runs_out() {
+        let (decision, answers) = std::sync::mpsc::channel();
+        let mut dialog = TrustedConsentUi::access_consent(
+            decision,
+            vec![
+                (GrantDuration::Once, true),
+                (GrantDuration::WorkspaceSession, true),
+            ],
+            Box::new(consent_text),
+        )
+        .with_respond_within(Duration::from_secs(20));
+        let start = Instant::now();
+        dialog.deadline = Some(start + Duration::from_secs(20));
+        let top = top_row(&dialog.lay_out(narrow_frame(), start).unwrap());
+        assert!(top.ends_with(" denies in 0:20"), "{top:?}");
+        // Before the time is up a grant counts.
+        click_inside(&mut dialog, start);
+        let armed = start + UPGRADE_ARMING_DELAY;
+        assert!(dialog.chrome(armed).allow_enabled);
+        assert_eq!(
+            dialog.key_input(TrustedDialogKey::G, false, armed),
+            Some(TrustedInput::Answer(true))
+        );
+        assert_eq!(
+            dialog.action_area_input(true, armed),
+            Some(TrustedInput::Answer(true))
+        );
+        // Once it is up, nothing grants, and the redraw at "0:00" shows
+        // Allow disabled; every deny still answers.
+        let deadline = start + Duration::from_secs(20);
+        assert!(dialog.countdown_stale(deadline));
+        let redrawn = top_row(&dialog.render(deadline).unwrap());
+        assert!(redrawn.ends_with(" denies in 0:00"), "{redrawn:?}");
+        for at in [deadline, deadline + Duration::from_secs(5)] {
+            assert!(!dialog.chrome(at).allow_enabled);
+            assert_eq!(dialog.key_input(TrustedDialogKey::G, false, at), None);
+            assert_eq!(dialog.action_area_input(true, at), None);
+            for key in [
+                TrustedDialogKey::D,
+                TrustedDialogKey::Escape,
+                TrustedDialogKey::Enter,
+            ] {
+                assert_eq!(
+                    dialog.key_input(key, false, at),
+                    Some(TrustedInput::Answer(false)),
+                    "{key:?}"
+                );
+            }
+            assert_eq!(
+                dialog.action_area_input(false, at),
+                Some(TrustedInput::Answer(false))
+            );
+        }
+        dialog.answer(false);
+        assert_eq!(answers.try_recv().unwrap(), ConsentDecision::Deny);
+        // A question's time running out changes none of its answers.
+        let (decision, _answers) = std::sync::mpsc::channel();
+        let mut question = TrustedConsentUi::upgrade(decision)
+            .with_respond_within(Duration::from_secs(20))
+            .with_text(consent_text(0));
+        let start = Instant::now();
+        question.deadline = Some(start + Duration::from_secs(20));
+        question.lay_out(narrow_frame(), start).unwrap();
+        question.engage(start);
+        let after = start + Duration::from_secs(25);
+        assert!(question.chrome(after).allow_enabled);
+        assert_eq!(
+            question.key_input(TrustedDialogKey::G, false, after),
+            Some(TrustedInput::Answer(true))
+        );
+    }
+
+    /// An access consent whose countdown the top edge has no room for
+    /// counts as hidden text: nothing grants until the time left shows
+    /// again. A question's countdown just goes, as before.
+    #[test]
+    fn an_access_consent_grants_nothing_while_its_countdown_is_hidden() {
+        let titled = |selected: usize| {
+            let mut text = consent_text(selected);
+            text.lines
+                .insert(0, DialogLine::title("remote agent access request"));
+            text
+        };
+        let (decision, _answers) = std::sync::mpsc::channel();
+        let mut dialog = TrustedConsentUi::access_consent(
+            decision,
+            vec![
+                (GrantDuration::Once, true),
+                (GrantDuration::WorkspaceSession, true),
+            ],
+            Box::new(titled),
+        )
+        .with_respond_within(Duration::from_secs(20));
+        let start = Instant::now();
+        dialog.deadline = Some(start + Duration::from_secs(20));
+        // 40 columns: the buttons fit their halves, but the title and
+        // "denies in 0:20" need 46 inside the frame.
+        let narrow = DialogFrame {
+            wrap_columns: 36,
+            grid_columns: 40,
+            grid_rows: 20,
+            max_text_rows: 20,
+        };
+        assert!(titled(0).buttons_fit(40));
+        let snapshot = dialog.lay_out(narrow, start).unwrap();
+        assert!(dialog.clipped());
+        assert!(!top_row(&snapshot).contains("denies in"));
+        click_inside(&mut dialog, start);
+        let armed = start + UPGRADE_ARMING_DELAY;
+        assert_eq!(dialog.key_input(TrustedDialogKey::G, false, armed), None);
+        assert_eq!(dialog.action_area_input(true, armed), None);
+        assert_eq!(
+            dialog.key_input(TrustedDialogKey::D, false, armed),
+            Some(TrustedInput::Answer(false))
+        );
+        // With room for both, it grants once armed again.
+        let wide = DialogFrame {
+            wrap_columns: 60,
+            grid_columns: 64,
+            grid_rows: 20,
+            max_text_rows: 20,
+        };
+        let top = top_row(&dialog.lay_out(wide, armed).unwrap());
+        assert!(top.ends_with(" denies in 0:20"), "{top:?}");
+        assert!(!dialog.clipped());
+        assert_eq!(dialog.key_input(TrustedDialogKey::G, false, armed), None);
+        assert_eq!(
+            dialog.key_input(TrustedDialogKey::G, false, armed + UPGRADE_ARMING_DELAY),
+            Some(TrustedInput::Answer(true))
+        );
+        // The upgrade question at the same width only drops its countdown.
+        let mut question = TrustedConsentUi::upgrade(std::sync::mpsc::channel().0)
+            .with_respond_within(Duration::from_secs(20))
+            .with_text(titled(0));
+        let snapshot = question.lay_out(narrow, Instant::now()).unwrap();
+        assert!(!question.clipped());
+        assert!(!top_row(&snapshot).contains("cancels in"));
     }
 }

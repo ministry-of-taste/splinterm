@@ -1742,7 +1742,23 @@ async fn prompt_target(
     if scopes.is_empty() || scopes.len() > MAX_ACCESS_SCOPES {
         bail!("invalid consent scope count");
     }
-    let prompt = ConsentPrompt {
+    let prompt = consent_prompt(peer, target, scopes, details, deadline);
+    tokio::task::spawn_blocking(move || prompt_blocking(&client, prompt, deadline, &cancel))
+        .await
+        .context("consent broker task failed")?
+}
+
+/// The prompt the trusted consent client shows, before its capability is
+/// minted: this daemon's own, so its origin is local, counting down the
+/// `deadline` the daemon waits for its answer.
+fn consent_prompt(
+    peer: &PeerIdentity,
+    target: ConsentTarget,
+    scopes: Vec<AccessScope>,
+    details: PromptDetails,
+    deadline: Duration,
+) -> ConsentPrompt {
+    ConsentPrompt {
         capability: Vec::new(),
         requester: peer.requester_label(),
         requester_pid: peer.pid,
@@ -1752,12 +1768,21 @@ async fn prompt_target(
         scopes,
         level: details.level,
         durations: details.durations,
-        respond_within_seconds: 0,
+        respond_within_seconds: respond_within_seconds(deadline),
         origin: splinterm_protocol::ConsentOrigin::Local,
-    };
-    tokio::task::spawn_blocking(move || prompt_blocking(&client, prompt, deadline, &cancel))
-        .await
-        .context("consent broker task failed")?
+    }
+}
+
+/// The whole seconds the countdown of a prompt the daemon is about to show
+/// counts for `deadline`: rounded down, so it never shows more time than
+/// the daemon waits, and at most the pending request lifetime a prompt may
+/// count down. Never zero, which would show no countdown and leave Allow
+/// live: with no whole second left, the dialog starts with its time
+/// already up (it counts a second short), so it grants nothing.
+fn respond_within_seconds(deadline: Duration) -> u64 {
+    deadline
+        .as_secs()
+        .clamp(1, splinterm_protocol::MAX_CONSENT_RESPOND_WITHIN_SECONDS)
 }
 
 /// Launches the trusted consent client, `<prefix>/splinterm`, from the
@@ -2722,5 +2747,66 @@ mod tests {
             .unwrap()
             .to_be_bytes();
         assert!(read_bounded::<ConsentReply>(&mut &oversized[..]).is_err());
+    }
+
+    /// Every prompt the daemon shows counts down the time it waits for the
+    /// answer, in whole seconds rounded down: a Splint request or a forced
+    /// takeover the fixed consent deadline, a workspace request what is
+    /// left of its pending lifetime. Its origin is always local.
+    #[test]
+    fn every_daemon_prompt_counts_down_the_time_the_daemon_waits() {
+        let peer = PeerIdentity::for_test();
+        let splint = |deadline| {
+            consent_prompt(
+                &peer,
+                ConsentTarget::Splint {
+                    splint_id: SplintId::new(),
+                    incarnation: 1,
+                },
+                vec![AccessScope::ControlTakeover],
+                PromptDetails::once_only(),
+                deadline,
+            )
+        };
+        let lair = |deadline| {
+            consent_prompt(
+                &peer,
+                ConsentTarget::Lair {
+                    lair_id: LairId::new(),
+                    lair_name: "Workspace".to_owned(),
+                },
+                AccessLevel::Look.scopes().to_vec(),
+                PromptDetails {
+                    agent_name: Some("agent".to_owned()),
+                    level: Some(AccessLevel::Look),
+                    ..PromptDetails::once_only()
+                },
+                deadline,
+            )
+        };
+        // `prompt`, for Splint requests and forced takeover, waits the
+        // consent deadline.
+        let shown = splint(CONSENT_DEADLINE);
+        assert_eq!(shown.respond_within_seconds, 20);
+        assert_eq!(shown.origin, splinterm_protocol::ConsentOrigin::Local);
+        // `prompt_lair` waits until the pending request expires. With no
+        // whole second left it still counts one, so its dialog starts with
+        // its time up and never shows a live Allow without a countdown.
+        for (left, seconds) in [
+            (Duration::from_millis(119_900), 119),
+            (Duration::from_secs(45), 45),
+            (Duration::from_millis(400), 1),
+            (Duration::from_secs(600), 120),
+            (Duration::ZERO, 1),
+        ] {
+            let shown = lair(left);
+            assert_eq!(shown.respond_within_seconds, seconds, "{left:?}");
+            assert_eq!(shown.origin, splinterm_protocol::ConsentOrigin::Local);
+        }
+        // What the daemon builds is a prompt the dialog accepts.
+        for mut shown in [splint(CONSENT_DEADLINE), lair(Duration::from_secs(600))] {
+            shown.capability = vec![7; CONSENT_CAPABILITY_BYTES];
+            assert_eq!(shown.validate(), Ok(()));
+        }
     }
 }

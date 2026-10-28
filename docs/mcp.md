@@ -387,7 +387,10 @@ Escape, and `D` deny, and only `G` or a click on the green Allow button
 grants, after a
 short arming delay. Earlier releases granted on Enter. A person who has not
 got to the prompt yet simply leaves the request pending. The prompt shows the
-host's reported MCP client name as a label only.
+host's reported MCP client name as a label only. Its `host` row names the
+computer (`this computer (wintermute)`), and it counts down the time left to
+answer. Once that runs out, Allow is disabled and nothing grants, and the
+request ends unanswered.
 
 **Pending requests.** A person may take longer to answer than one MCP call
 lasts.

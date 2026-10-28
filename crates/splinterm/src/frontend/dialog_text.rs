@@ -774,6 +774,15 @@ fn title_text(title: &str) -> String {
     }
 }
 
+/// Whether `countdown` shows on the top edge of a dialog `columns` wide
+/// beside `title`: it keeps a stretch of frame between them, and goes
+/// before the title would be cut.
+#[must_use]
+pub fn countdown_fits(title: &str, countdown: &str, columns: usize) -> bool {
+    title_text(title).chars().count() + COUNTDOWN_GAP_COLUMNS + countdown.chars().count()
+        <= text_columns(columns)
+}
+
 /// What a dialog cell is drawn in. Each ink but [`DialogInk::Text`] is one
 /// slot of the snapshot's palette, which the Window fills from the dialog's
 /// floored colors (`wayland::chrome::trusted_dialog_theme`).
@@ -962,12 +971,10 @@ pub fn compose(
     let inside_end = columns.saturating_sub(FRAME_INSET_COLUMNS);
     let places = chrome_rows(grid_rows);
     let title = title_text(text.title());
-    // The countdown keeps a stretch of frame between it and the title, and
-    // goes before the title would be cut.
-    let countdown = chrome.countdown.as_deref().filter(|countdown| {
-        title.chars().count() + COUNTDOWN_GAP_COLUMNS + countdown.chars().count()
-            <= text_columns(columns)
-    });
+    let countdown = chrome
+        .countdown
+        .as_deref()
+        .filter(|countdown| countdown_fits(text.title(), countdown, columns));
     put(
         &mut rows[0],
         FRAME_INSET_COLUMNS,

@@ -440,20 +440,28 @@ The prompt is deliberate by default:
 
 The prompt shows the request as one sentence with the agent's reported name.
 When the agent reported a name, a note follows that the agent names itself and
-Splinterm cannot verify that name. Then come its exact executable path, the
-workspace name with its short ID, the level with one line of what it allows,
-and the exact scopes. Names and paths are shown escaped, as data, in the same
-form as the **Agent access** list: a control or bidirectional character, and
-every quote or quote look-alike, appears as an escape such as `\u{202e}`, and
-a run of spaces as one space, so the name you approve reads the same in the
-list and cannot imitate the prompt's own wording.
+Splinterm cannot verify that name. Then come the computer the agent runs on,
+its exact executable path, the workspace name with its short ID, the level
+with one line of what it allows, and the exact scopes. Names and paths are
+shown escaped, as data, in the same form as the **Agent access** list: a
+control or bidirectional character, and every quote or quote look-alike,
+appears as an escape such as `\u{202e}`, and a run of spaces as one space, so
+the name you approve reads the same in the list and cannot imitate the
+prompt's own wording.
+
+The computer comes first in the table, on the `host` row, for example
+`this computer (wintermute)`, or just `this computer` when its hostname is not
+usable.
 
 A request that a grant already covers is answered at once, without a prompt.
 Prompts appear one at a time; further requests wait their turn. If you do not
 answer right away, the request stays pending for up to two minutes, and the
-agent collects your answer by asking again, without a new prompt. After you
-deny a request, the same agent cannot ask again for that workspace for a few
-seconds. Closing the prompt denies.
+agent collects your answer by asking again, without a new prompt. The prompt
+counts the time left down at the right of its top edge, such as
+`denies in 1:42`. Once it runs out, the Allow button is disabled and nothing
+grants; the prompt then closes and the request ends unanswered, without
+access. After you deny a request, the same agent cannot ask again for that
+workspace for a few seconds. Closing the prompt denies.
 
 ### Seeing and revoking access
 

@@ -229,6 +229,8 @@ a hostile program running as your account.
   exact scopes. Names and paths appear as data: a control or bidirectional
   character shows as an escape such as `\u{202e}`, the same in the prompt, the
   **Agent access** list, and `splinterm access list`.
+- Every prompt names the computer first in its table:
+  `host  this computer (wintermute)`.
 - A request a grant already covers is answered at once, without a prompt.
   Prompts appear one at a time. An unanswered request stays pending for up to
   two minutes, and the agent collects your answer by asking again; the MCP tool
@@ -311,10 +313,15 @@ a hostile program running as your account.
   says that the agent names itself and Splinterm cannot verify that name. A
   button label too long for its half counts as hidden text, so the dialog
   can then only be declined. The box casts the same hard shadow as the
-  in-Window popups. The upgrade and restart questions count their time to
-  answer down at the right of the top edge, such as `cancels in 0:42`; the
-  access prompt shows no countdown. Trusted dialogs always use the default,
-  even padding, whatever `[main] padding-*` says.
+  in-Window popups. Each dialog counts its time to answer down at the right
+  of the top edge, such as `denies in 0:19` or `cancels in 0:42`. The access
+  prompt's time is 20 seconds for a Splint request or a forced takeover, and
+  what is left of the two-minute pending request for a workspace. Once it
+  runs out, Allow is disabled and nothing grants, and the request ends
+  unanswered. An access prompt too narrow to show its countdown beside the
+  title counts that as hidden text, so it can then only be declined. Trusted
+  dialogs always use the default, even padding, whatever `[main] padding-*`
+  says.
 - Names in the access prompt and the **Agent access** list show every quote
   and quote look-alike (such as `ʼ`, `′`, `“`, or a backtick) as an escape
   such as `\u{02bc}`, and a run of spaces as one space, so a name cannot
