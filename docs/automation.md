@@ -273,6 +273,11 @@ stable Splint ID using `current`; directly configured numeric incarnations remai
 exact. The singleton `{ "kind": "daemon" }` selector authorizes daemon-level
 operations such as creating a Lair and never selects the resulting descendants.
 
+`ListLairs` and `InspectTopology` are daemon-level reads. Without a matching
+daemon rule they show only the Lairs that `lair` rules with
+`topology_metadata_read` or the agent's consent grants cover, and the smallest
+`max_returned_bytes` of those rules limits the reply.
+
 Schema validation is necessary but not sufficient. The daemon must additionally
 reject duplicate rule IDs, expired rules, unsafe ownership or mode, symlinks,
 hard links, non-canonical paths, unknown resources, invalid scope/selector
@@ -337,8 +342,8 @@ one corresponds to.
 
 Every level covers the whole workspace, including Dojos and Splints created
 later, and nothing outside it. An agent's list of Lairs and topology read show
-only the workspaces its grants cover; watching the whole topology for changes
-still needs the policy file.
+only the workspaces its grants or per-Lair policy rules cover; watching the
+whole topology for changes still needs a daemon policy rule.
 
 - No level includes clipboard access. A request that asks for a clipboard scope
   is rejected as invalid.

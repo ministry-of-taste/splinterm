@@ -6555,11 +6555,24 @@ struct RequestAuthorizationContext {
     ephemeral_grant_id: Option<u64>,
     /// The ADR 0014 source behind `ephemeral_grant_id`, when it is a
     /// workspace-session or remembered grant rather than a once grant.
+    /// A filtered topology read leaves both unset.
     agent_grant: Option<agent_access::GrantDuration>,
-    /// Plan 0067: a Lair list or topology read that Lair grants authorized
-    /// sees only these Lairs. `None` sees every Lair.
+    /// Plan 0067: a Lair list or topology read that per-Lair grants or
+    /// Lair-scoped policy rules authorized sees only these Lairs. `None`
+    /// sees every Lair.
     granted_lairs: Option<HashSet<LairId>>,
+    /// The smallest byte limit among the Lair-scoped policy rules that put a
+    /// Lair in `granted_lairs`; it never makes the request policy-authorized.
+    lair_policy_byte_limit: Option<usize>,
     interactive_bypass: bool,
+}
+
+/// The tighter of two optional byte limits.
+fn tighter_byte_limit(first: Option<usize>, second: Option<usize>) -> Option<usize> {
+    match (first, second) {
+        (Some(first), Some(second)) => Some(first.min(second)),
+        (first, second) => first.or(second),
+    }
 }
 
 impl RequestAuthorizationContext {
@@ -6601,9 +6614,12 @@ impl RequestAuthorizationContext {
     }
 
     fn maximum_returned_bytes(&self) -> Option<usize> {
-        self.policy_match
-            .as_ref()
-            .and_then(|matched| matched.max_returned_bytes)
+        tighter_byte_limit(
+            self.policy_match
+                .as_ref()
+                .and_then(|matched| matched.max_returned_bytes),
+            self.lair_policy_byte_limit,
+        )
     }
 }
 
@@ -8602,12 +8618,14 @@ fn common_lair_resource(resources: &[policy::PolicyResource]) -> Option<LairId> 
 
 /// Plan 0067: authorizes a Lair list or topology read that no daemon-wide
 /// policy rule covers. A live Lair counts when one of this peer's grants for
-/// it (just this once, while open, or remembered) alone covers `scopes`,
+/// it (just this once, while open, or remembered) alone covers `scopes`, or
+/// else a persistent policy rule authorizes `policy_request` on that Lair,
 /// matched exactly as for a request naming that Lair. `None` when none does.
-async fn lair_grant_topology_authorization(
+async fn lair_scoped_topology_authorization(
     state: &DaemonState,
     peer: &PeerIdentity,
     scopes: &[AccessScope],
+    policy_request: &policy::PolicyRequest<'_>,
 ) -> Option<RequestAuthorizationContext> {
     let live: Vec<LairId> = state
         .topology
@@ -8629,21 +8647,40 @@ async fn lair_grant_topology_authorization(
         }
     }
     let now = unix_seconds_now();
-    let mut agent_grant = None;
     let mut flush_due = false;
-    for lair_id in remaining {
-        if let Some(authorized) = state.agent_access.authorize(peer, lair_id, scopes, now) {
-            flush_due |= authorized.flush_due;
-            agent_grant = agent_grant.or(Some(authorized.duration));
-            granted.insert(lair_id);
-        }
-    }
+    remaining.retain(|lair_id| {
+        let Some(authorized) = state.agent_access.authorize(peer, *lair_id, scopes, now) else {
+            return true;
+        };
+        flush_due |= authorized.flush_due;
+        granted.insert(*lair_id);
+        false
+    });
     if flush_due {
         schedule_agent_access_flush(state);
     }
+    // A Lair-scoped rule shows its Lair, and the reply keeps its byte limit.
+    let mut lair_policy_byte_limit = None;
+    if let Some(executable) = peer.persistent_executable()
+        && !remaining.is_empty()
+    {
+        let mut rules = state.policy.lock().await;
+        for lair_id in remaining {
+            let resources = [policy::PolicyResource::Lair { lair_id }];
+            let request = policy::PolicyRequest {
+                resources: &resources,
+                ..*policy_request
+            };
+            if let Some(matched) = rules.authorize(executable, &request, now) {
+                lair_policy_byte_limit =
+                    tighter_byte_limit(lair_policy_byte_limit, matched.max_returned_bytes);
+                granted.insert(lair_id);
+            }
+        }
+    }
     (!granted.is_empty()).then(|| RequestAuthorizationContext {
-        agent_grant,
         granted_lairs: Some(granted),
+        lair_policy_byte_limit,
         ..RequestAuthorizationContext::default()
     })
 }
@@ -8805,11 +8842,12 @@ async fn authorize_request(
         }
     }
     // Plan 0067: without a daemon-wide policy rule, a Lair list or topology
-    // read shows exactly the live Lairs this peer's grants cover.
+    // read shows exactly the live Lairs this peer's grants or Lair-scoped
+    // policy rules cover.
     if matches!(request, Request::ListLairs | Request::InspectTopology) {
         let authorized = match ephemeral_access_scopes(&required_scopes) {
             Some(scopes) if !scopes.is_empty() => {
-                lair_grant_topology_authorization(state, peer, &scopes).await
+                lair_scoped_topology_authorization(state, peer, &scopes, &policy_request).await
             }
             _ => None,
         };
@@ -9008,6 +9046,8 @@ async fn append_request_result_audit(
         route.audit_reason()
     } else if authorization.policy_authorized() {
         "policy_match"
+    } else if authorization.granted_lairs.is_some() {
+        "workspace_grants_filtered"
     } else if authorization.agent_grant == Some(agent_access::GrantDuration::WorkspaceSession) {
         "workspace_session_grant"
     } else if authorization.agent_grant == Some(agent_access::GrantDuration::Remembered) {
@@ -27729,7 +27769,20 @@ mod tests {
         let read = authorize_request(&Request::InspectTopology, state, peer, 0, false, false)
             .await
             .unwrap();
-        assert_eq!(read.agent_grant, Some(GrantDuration::WorkspaceSession));
+        // A filtered read claims no single grant or policy rule.
+        assert!(!read.policy_authorized());
+        assert_eq!(read.authorized_grant_id(), None);
+        assert_eq!(read.agent_grant, None);
+        assert_eq!(read.maximum_returned_bytes(), None);
+        for operation in [
+            splinterm_protocol::AuditOperation::ListLairs,
+            splinterm_protocol::AuditOperation::InspectTopology,
+        ] {
+            let record = newest_audit(state, operation).await;
+            assert_eq!(record.decision, splinterm_protocol::AuditDecision::Allowed);
+            assert_eq!(record.reason, "workspace_grants_filtered");
+            assert_eq!(record.policy_rule_id, None);
+        }
 
         // Another build is another identity, and a grant without
         // topology_observe does not count.
@@ -27757,13 +27810,156 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(shown_lairs(state, peer).await.unwrap(), [fixture.lair_id]);
-        let read = authorize_request(&Request::ListLairs, state, peer, 0, false, false)
-            .await
-            .unwrap();
-        assert_eq!(read.agent_grant, Some(GrantDuration::Remembered));
         let entry_id = remembered.entry_id.unwrap();
         assert!(state.agent_access.revoke_remembered(&entry_id).is_some());
         assert!(shown_lairs(state, peer).await.is_err());
+        let refused = newest_audit(state, splinterm_protocol::AuditOperation::ListLairs).await;
+        assert_eq!(refused.decision, splinterm_protocol::AuditDecision::Denied);
+    }
+
+    /// The newest audit record of `operation`.
+    async fn newest_audit(
+        state: &DaemonState,
+        operation: splinterm_protocol::AuditOperation,
+    ) -> splinterm_protocol::AuditRecord {
+        let page = state
+            .audit
+            .lock()
+            .await
+            .page(None, splinterm_protocol::MAX_AUDIT_PAGE_RECORDS);
+        page.records
+            .into_iter()
+            .rev()
+            .find(|record| record.operation == operation)
+            .expect("the request is audited")
+    }
+
+    /// Replaces the fixture's persistent policy with `rules`.
+    async fn install_policy(fixture: &AgentFixture, rules: serde_json::Value) {
+        let path = fixture.root.join("policy.json");
+        let policy = serde_json::json!({"schema": "splinterm.policy.v2", "rules": rules});
+        std::fs::write(&path, serde_json::to_vec(&policy).unwrap()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let topology = fixture.state.topology.read().await.clone();
+        let generation = fixture
+            .state
+            .policy
+            .lock()
+            .await
+            .reload(Some(path.as_path()), &topology);
+        assert_eq!(generation.diagnostic, None);
+    }
+
+    #[tokio::test]
+    async fn lair_scoped_policy_rules_show_topology_reads_only_their_lair() {
+        let fixture = agent_fixture().await;
+        let peer = &fixture.peer;
+        let state = &fixture.state;
+        let executable = peer.persistent_executable().unwrap().clone();
+        let identity = serde_json::json!({"path": executable.path, "sha256": executable.sha256});
+        let hidden = Lair::new("hidden", PathBuf::from("/tmp"));
+        let hidden_id = hidden.id;
+        {
+            let mut topology = state.topology.write().await;
+            let revision = topology.revision();
+            topology.insert_lair_at(revision, hidden).unwrap();
+        }
+        let lair_rule = |id: &str, lair_id: LairId, scope: &str, limits: serde_json::Value| {
+            serde_json::json!({
+                "id": id,
+                "executable": identity,
+                "scopes": [scope],
+                "resources": [{"kind": "lair", "lair_id": lair_id}],
+                "limits": limits,
+            })
+        };
+        let unlimited = serde_json::json!({"deadline_ms": 1000});
+
+        // A rule on the Lair with topology_metadata_read shows exactly that
+        // Lair; a rule on another Lair without it shows nothing more.
+        install_policy(
+            &fixture,
+            serde_json::json!([
+                lair_rule(
+                    "reader",
+                    fixture.lair_id,
+                    "topology_metadata_read",
+                    unlimited.clone(),
+                ),
+                lair_rule(
+                    "renamer",
+                    hidden_id,
+                    "topology_name_mutate",
+                    unlimited.clone(),
+                ),
+            ]),
+        )
+        .await;
+        assert_eq!(shown_lairs(state, peer).await.unwrap(), [fixture.lair_id]);
+        let read = authorize_request(&Request::ListLairs, state, peer, 0, false, false)
+            .await
+            .unwrap();
+        assert!(!read.policy_authorized());
+        assert_eq!(read.maximum_returned_bytes(), None);
+        let record = newest_audit(state, splinterm_protocol::AuditOperation::ListLairs).await;
+        assert_eq!(record.reason, "workspace_grants_filtered");
+
+        // With a once grant for the other Lair, both show.
+        state
+            .grants
+            .lock()
+            .await
+            .grant_lair(peer, hidden_id, vec![AccessScope::TopologyObserve]);
+        let both: HashSet<LairId> = shown_lairs(state, peer)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(both, HashSet::from([fixture.lair_id, hidden_id]));
+
+        // A limited rule's limit applies to the whole reply.
+        install_policy(
+            &fixture,
+            serde_json::json!([lair_rule(
+                "reader",
+                fixture.lair_id,
+                "topology_metadata_read",
+                serde_json::json!({"deadline_ms": 1000, "max_returned_bytes": 1}),
+            )]),
+        )
+        .await;
+        let read = authorize_request(&Request::InspectTopology, state, peer, 0, false, false)
+            .await
+            .unwrap();
+        assert_eq!(read.maximum_returned_bytes(), Some(1));
+        assert_eq!(
+            shown_lairs(state, peer).await.unwrap_err().code,
+            ErrorCode::ResourceLimit
+        );
+
+        // A daemon rule still wins first and shows every Lair.
+        install_policy(
+            &fixture,
+            serde_json::json!([{
+                "id": "daemon-reader",
+                "executable": identity,
+                "scopes": ["topology_metadata_read"],
+                "resources": [{"kind": "daemon"}],
+                "limits": unlimited,
+            }]),
+        )
+        .await;
+        let read = authorize_request(&Request::ListLairs, state, peer, 0, false, false)
+            .await
+            .unwrap();
+        assert!(read.policy_authorized());
+        assert_eq!(read.granted_lairs, None);
+        let every: HashSet<LairId> = shown_lairs(state, peer)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(every, HashSet::from([fixture.lair_id, hidden_id]));
     }
 
     #[tokio::test]

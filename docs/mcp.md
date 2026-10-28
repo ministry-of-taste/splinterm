@@ -377,10 +377,13 @@ once, without a prompt; the result's `source` names the grant
   works for any Splint in the granted workspace without a second request.
 - Every level includes `topology_observe`, so `list_lairs`, `inspect_topology`,
   and a read of the topology resource work too. Without a daemon policy rule
-  they show only the workspaces the agent's grants cover. With no such grant
-  they fail with `unauthorized` and the message "no grant covers any
-  workspace; ask with request_lair_access for the Lair in SPLINTERM_LAIR_ID".
-  Subscribing to the topology resource still needs a policy rule.
+  they show only the workspaces the agent's grants or per-Lair policy rules
+  with `topology_metadata_read` cover; such a rule's `max_returned_bytes`
+  applies to the whole reply. When nothing covers any workspace, `list_lairs`
+  and `inspect_topology` fail with `unauthorized` and the message "no grant or
+  policy covers any workspace; request access to one (MCP: request_lair_access
+  with the Lair in SPLINTERM_LAIR_ID)". Subscribing to the topology resource
+  still needs a daemon policy rule.
 - Look and type and Manage include `control_takeover`, so `acquire_control`
   with `takeover: true` works when the person's Window controls the pane.
 - A request for any other set of consent scopes is shown as Custom and is
