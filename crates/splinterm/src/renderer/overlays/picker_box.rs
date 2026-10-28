@@ -176,6 +176,55 @@ pub(crate) fn paint_session_picker(
     Ok(())
 }
 
+/// The status line's row, logical px: the list's first row, where a
+/// status picker says why it lists nothing. The Window damages only it
+/// when the loading spinner steps.
+#[must_use]
+pub(crate) fn picker_status_line(layout: &CommandPaletteLayout) -> Option<Rect> {
+    (layout.list.height > 0).then(|| Rect {
+        height: super::chrome_rows::ROW_HEIGHT.min(layout.list.height),
+        ..layout.list
+    })
+}
+
+/// While the picker waits on the daemon: nothing for its first 150 ms,
+/// then the shared spinner's frame in the accent and `loading` in
+/// secondary text.
+fn paint_loading_line(
+    painter: &mut ChromePainter<'_>,
+    palette: &SessionPickerPalette,
+    clip: Rect,
+    glyph: Option<char>,
+) -> Result<()> {
+    let Some(glyph) = glyph else {
+        return Ok(());
+    };
+    let cell_width = painter.cell(ChromeTextStyle::Regular)?.0;
+    let end = clip.x.saturating_add(clip.width);
+    painter.text(
+        glyph.encode_utf8(&mut [0; 4]),
+        ChromeTextStyle::Regular,
+        Rect {
+            width: cell_width.min(clip.width),
+            ..clip
+        },
+        PickerTextAlignment::Left,
+        palette.accent_text,
+    )?;
+    let word = clip.x.saturating_add(cell_width.saturating_mul(2)).min(end);
+    painter.text(
+        "loading",
+        ChromeTextStyle::Regular,
+        Rect {
+            x: word,
+            width: end.saturating_sub(word),
+            ..clip
+        },
+        PickerTextAlignment::Left,
+        palette.secondary,
+    )
+}
+
 /// The listed rows with their group headers, or the one line that says
 /// why there are none: the status (loading, could not load), or no match.
 fn paint_picker_rows(
@@ -194,23 +243,21 @@ fn paint_picker_rows(
         None
     };
     if let Some(line) = line
-        && layout.list.height > 0
+        && let Some(status) = picker_status_line(layout)
     {
-        let list = painter.buffer_rect(layout.list);
-        let row = Rect {
-            height: painter
-                .scaled(super::chrome_rows::ROW_HEIGHT)
-                .min(list.height),
-            ..list
-        };
+        let row = painter.buffer_rect(status);
         let clip = title_column(painter, row)?;
-        painter.text(
-            line,
-            ChromeTextStyle::Regular,
-            clip,
-            PickerTextAlignment::Left,
-            palette.secondary,
-        )?;
+        if picker.shows_status() && picker.is_loading() {
+            paint_loading_line(painter, palette, clip, picker.loading_shown())?;
+        } else {
+            painter.text(
+                line,
+                ChromeTextStyle::Regular,
+                clip,
+                PickerTextAlignment::Left,
+                palette.secondary,
+            )?;
+        }
     }
     let chips = CREATE_CHIPS.map(str::to_owned);
     let query = picker.query();
@@ -563,5 +610,59 @@ mod tests {
             }
             assert_eq!(cache.contains_source("retry"), retryable, "{query:?}");
         }
+    }
+
+    /// A picker waiting on the daemon draws nothing in its body for its
+    /// first 150 ms, then the shared spinner's frame in the accent and
+    /// `loading`, never "Loading…".
+    #[test]
+    fn a_loading_picker_shows_the_spinner_once_the_wait_shows() {
+        let palette = chrome_panel_palette(ResolvedTheme::default(), ChromeSurface::Menu);
+        let (width, height) = (960, 640);
+        let start = std::time::Instant::now();
+        let paint = |picker: &SessionPickerUi| {
+            let layout = session_picker_layout(CONTENT, picker).unwrap();
+            let mut canvas = vec![0_u8; usize::try_from(width * height * 4).unwrap()];
+            let mut cache = SessionPickerTextCache::default();
+            paint_session_picker(
+                &mut cache,
+                &RenderContext::new(u16::MAX),
+                &mut canvas,
+                width,
+                height,
+                CONTENT,
+                120,
+                1,
+                &layout,
+                palette,
+                picker,
+                SessionPickerPurpose::Dojos,
+                None,
+                true,
+            )
+            .unwrap();
+            cache
+        };
+        let mut picker =
+            SessionPickerUi::inline(Vec::new(), false, Some("Loading navigation…"), None)
+                .with_purpose(SessionPickerPurpose::Dojos);
+        picker.set_loading(start);
+        let early = paint(&picker);
+        for absent in ["Loading navigation…", "loading", "⠋"] {
+            assert!(
+                !early.contains_source(absent),
+                "drew {absent} before 150 ms"
+            );
+        }
+        let spinner = crate::frontend::AgentSpinner::STATIC.next();
+        assert!(picker.tick_loading(start + std::time::Duration::from_millis(150), spinner));
+        let shown = paint(&picker);
+        assert!(shown.contains_source(&spinner.glyph().to_string()));
+        assert!(shown.contains_source("loading"));
+        assert!(!shown.contains_source("Loading navigation…"));
+        let layout = session_picker_layout(CONTENT, &picker).unwrap();
+        let line = picker_status_line(&layout).unwrap();
+        assert_eq!((line.x, line.y), (layout.list.x, layout.list.y));
+        assert!(line.height <= layout.list.height);
     }
 }

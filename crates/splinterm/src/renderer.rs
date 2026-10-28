@@ -116,7 +116,9 @@ pub(crate) use overlays::picker::{
     ChromeSurface, SessionPickerPurpose, SessionPickerTextCache, chrome_panel_fill,
     chrome_panel_palette, paint_search_overlay, search_overlay_panel,
 };
-pub(crate) use overlays::picker_box::{paint_session_picker, session_picker_layout};
+pub(crate) use overlays::picker_box::{
+    paint_session_picker, picker_status_line, session_picker_layout,
+};
 #[cfg(test)]
 use raster::pixel_index;
 use raster::{alpha_u8, blend_glyph, blend_rect, premultiplied_rgba};

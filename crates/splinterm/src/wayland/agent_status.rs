@@ -238,18 +238,45 @@ impl App {
                         .iter()
                         .any(|tab| agent.shows_working(tab.dojo_id))
                 });
-        let Some(next) =
+        // A picker's shown loading line moves the same spinner.
+        let picker_loading = moves_here
+            && self
+                .modal
+                .session_picker
+                .as_ref()
+                .is_some_and(|picker| picker.loading_shown().is_some());
+        let now = Instant::now();
+        let next =
             self.tab_state
                 .agent
-                .tick_spinner(Instant::now(), moves_here, tabs_working)
-        else {
-            return Ok(());
-        };
-        self.explorer.set_agent_spinner(next);
-        if self.surface.configured {
+                .tick_spinner(now, moves_here, tabs_working || picker_loading);
+        if let Some(next) = next {
+            self.explorer.set_agent_spinner(next);
+        }
+        // The waiting picker's line appears after 150 ms and then follows
+        // the spinner; only that line is damaged.
+        let spinner = self.tab_state.agent.spinner;
+        let loading_changed = self
+            .modal
+            .session_picker
+            .as_mut()
+            .is_some_and(|picker| picker.tick_loading(now, spinner));
+        if loading_changed {
+            self.modal.session_picker_status_damage = true;
+        }
+        if (next.is_some() || loading_changed) && self.surface.configured {
             self.schedule_draw(queue_handle)?;
         }
         Ok(())
+    }
+
+    /// How long the event loop may sleep before a waiting picker's loading
+    /// line appears; `None` once it shows or while no picker waits.
+    pub(super) fn picker_loading_timeout(&self) -> Option<Duration> {
+        self.modal
+            .session_picker
+            .as_ref()
+            .and_then(|picker| picker.loading_reveal_in(Instant::now()))
     }
 
     /// How long the event loop may sleep before the spinner's next frame;

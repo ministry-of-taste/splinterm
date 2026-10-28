@@ -1,6 +1,9 @@
 //! Platform-independent Dojo-picker interaction and standalone presentation state.
 
-use std::sync::mpsc::Sender as StdSender;
+use std::{
+    sync::mpsc::Sender as StdSender,
+    time::{Duration, Instant},
+};
 
 use splinterm_core::SplintId;
 use splinterm_protocol::{
@@ -9,7 +12,10 @@ use splinterm_protocol::{
 };
 use unicode_width::UnicodeWidthChar;
 
-use crate::{frontend::agent_status::state_text, renderer::SessionPickerPurpose};
+use crate::{
+    frontend::agent_status::{AgentSpinner, state_text},
+    renderer::SessionPickerPurpose,
+};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum PickerHitTarget {
@@ -126,6 +132,28 @@ pub struct SessionPickerUi {
     /// the requesting selector.
     purpose: Option<SessionPickerPurpose>,
     host: SessionPickerHost,
+    /// Waiting on the daemon for its rows, on first open or a Tab scope
+    /// switch; a picker with rows replaces this one.
+    loading: Option<PickerLoading>,
+}
+
+/// How long a picker waits on the daemon before its status line says it is
+/// loading, so a fast local load never flashes it.
+pub(crate) const LOADING_REVEAL: Duration = Duration::from_millis(150);
+
+/// A picker waiting on the daemon: since when, and the spinner frame its
+/// status line shows, `None` until [`LOADING_REVEAL`] has passed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PickerLoading {
+    since: Instant,
+    shown: Option<char>,
+}
+
+/// The loading line's spinner frame after waiting `elapsed`: none before
+/// [`LOADING_REVEAL`], then `spinner`'s, the frame the Explorer and the
+/// tabs show, which stays on its first frame where it does not move.
+pub(crate) fn loading_glyph(elapsed: Duration, spinner: AgentSpinner) -> Option<char> {
+    (elapsed >= LOADING_REVEAL).then(|| spinner.glyph())
 }
 
 /// Rows the standalone picker lists at once, as the inline list does.
@@ -187,6 +215,7 @@ impl SessionPickerUi {
                 synthetic_id: SplintId::new(),
                 decision,
             },
+            loading: None,
         };
         picker.apply_search();
         picker.selected = usize::from(!picker.filtered_indices.is_empty());
@@ -278,6 +307,7 @@ impl SessionPickerUi {
             retryable: false,
             purpose: None,
             host: SessionPickerHost::Inline,
+            loading: None,
         };
         picker.apply_search();
         picker.selected = initial_row
@@ -484,6 +514,51 @@ impl SessionPickerUi {
     /// only the line that says why (loading, or could not load).
     pub(crate) fn shows_status(&self) -> bool {
         self.items.is_empty() && !self.new_enabled
+    }
+
+    /// Marks a status picker as waiting on the daemon since `now`: its
+    /// status line stays empty for [`LOADING_REVEAL`], then shows the
+    /// spinner and "loading".
+    pub(crate) fn set_loading(&mut self, now: Instant) {
+        self.loading = Some(PickerLoading {
+            since: now,
+            shown: None,
+        });
+    }
+
+    /// Whether the picker waits on the daemon for its rows.
+    pub(crate) const fn is_loading(&self) -> bool {
+        self.loading.is_some()
+    }
+
+    /// The spinner frame the loading line shows, `None` while it is still
+    /// hidden or the picker is not loading.
+    pub(crate) fn loading_shown(&self) -> Option<char> {
+        self.loading.and_then(|loading| loading.shown)
+    }
+
+    /// Updates the loading line at `now` with the shared `spinner`;
+    /// returns whether it changed, so the status line needs a redraw. A
+    /// picker that is not loading never changes.
+    pub(crate) fn tick_loading(&mut self, now: Instant, spinner: AgentSpinner) -> bool {
+        let Some(loading) = self.loading.as_mut() else {
+            return false;
+        };
+        let shown = loading_glyph(now.saturating_duration_since(loading.since), spinner);
+        if shown == loading.shown {
+            return false;
+        }
+        loading.shown = shown;
+        true
+    }
+
+    /// How long until the loading line appears, while it is still hidden.
+    pub(crate) fn loading_reveal_in(&self, now: Instant) -> Option<Duration> {
+        self.loading
+            .filter(|loading| loading.shown.is_none())
+            .map(|loading| {
+                LOADING_REVEAL.saturating_sub(now.saturating_duration_since(loading.since))
+            })
     }
 
     /// Whether R asks again: a status picker whose request failed, not one
@@ -1092,6 +1167,54 @@ mod tests {
         assert_eq!(standalone.item(0).unwrap().display_title, "old");
         // A stopped Dojo says nothing at its end: its header says it.
         assert_eq!(standalone.item(0).unwrap().status(), None);
+    }
+
+    #[test]
+    fn loading_shows_the_shared_spinner_only_after_150_ms_and_stops_with_rows() {
+        let start = Instant::now();
+        let moving = AgentSpinner::STATIC.next().next();
+        // Nothing before 150 ms, so a fast load never flashes the line.
+        assert_eq!(loading_glyph(Duration::from_millis(149), moving), None);
+        assert_eq!(loading_glyph(LOADING_REVEAL, moving), Some(moving.glyph()));
+        // A spinner that does not move (reduced motion, an unfocused
+        // Window) shows its first frame, fixed.
+        assert_eq!(
+            loading_glyph(Duration::from_secs(5), AgentSpinner::STATIC),
+            Some('⠋')
+        );
+
+        let mut picker =
+            SessionPickerUi::inline(Vec::new(), false, Some("Loading navigation…"), None);
+        assert!(!picker.is_loading());
+        assert!(!picker.tick_loading(start, moving));
+        picker.set_loading(start);
+        assert!(picker.is_loading());
+        assert_eq!(picker.loading_reveal_in(start), Some(LOADING_REVEAL));
+        assert!(!picker.tick_loading(start + Duration::from_millis(100), moving));
+        assert_eq!(picker.loading_shown(), None);
+        assert_eq!(
+            picker.loading_reveal_in(start + Duration::from_millis(100)),
+            Some(Duration::from_millis(50))
+        );
+        let later = start + Duration::from_millis(200);
+        assert!(picker.tick_loading(later, moving));
+        assert_eq!(picker.loading_shown(), Some(moving.glyph()));
+        assert_eq!(picker.loading_reveal_in(later), None);
+        assert!(!picker.tick_loading(later, moving), "the same frame");
+        assert!(picker.tick_loading(later, moving.next()));
+        // A static spinner stays on one frame.
+        let mut fixed = SessionPickerUi::inline(Vec::new(), false, None, None);
+        fixed.set_loading(start);
+        assert!(fixed.tick_loading(later, AgentSpinner::STATIC));
+        assert!(!fixed.tick_loading(later + Duration::from_secs(1), AgentSpinner::STATIC));
+        assert_eq!(fixed.loading_shown(), Some('⠋'));
+
+        // The rows arrive as a new picker, which is not loading: no frame,
+        // nothing to tick, nothing to wake for.
+        let loaded = SessionPickerUi::inline(vec![item("work", "Lair 1", 1, 1)], true, None, None);
+        assert!(!loaded.is_loading());
+        assert_eq!(loaded.loading_shown(), None);
+        assert_eq!(loaded.loading_reveal_in(later), None);
     }
 
     #[test]

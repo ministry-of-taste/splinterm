@@ -169,9 +169,9 @@ use crate::renderer::{
     paint_handoff_banner, paint_history_overlay, paint_lair_explorer, paint_search_overlay,
     paint_session_picker, paint_snapshot_overlays, paint_snapshot_presented,
     paint_snapshot_region_presented, paint_snapshot_rows_presented, paint_tab_context_menu,
-    premultiplied_theme_rgba, scroll_snapshot_pixels, search_overlay_panel, session_picker_layout,
-    snapshot_row_rect, tab_context_menu_hit_test, tab_context_menu_layout, tab_menu_label_width,
-    write_ppm,
+    picker_status_line, premultiplied_theme_rgba, scroll_snapshot_pixels, search_overlay_panel,
+    session_picker_layout, snapshot_row_rect, tab_context_menu_hit_test, tab_context_menu_layout,
+    tab_menu_label_width, write_ppm,
 };
 #[cfg(test)]
 use crate::renderer::{lair_explorer_layout, paint_box_drawing_cell};
@@ -1275,6 +1275,7 @@ fn assemble_app(
             session_picker_wheel: WheelAccumulator::default(),
             session_picker_consumed_keys: HashSet::new(),
             session_picker_redraw: false,
+            session_picker_status_damage: false,
             session_picker_reconcile_pending: false,
             session_picker_open_focus: None,
             session_picker_requested: false,
@@ -2561,6 +2562,8 @@ struct ModalState {
     session_picker_wheel: WheelAccumulator,
     session_picker_consumed_keys: HashSet<u32>,
     session_picker_redraw: bool,
+    /// The loading line's spinner changed: the next draw damages that line.
+    session_picker_status_damage: bool,
     session_picker_reconcile_pending: bool,
     session_picker_open_focus: Option<bool>,
     session_picker_requested: bool,
@@ -7100,10 +7103,7 @@ impl App {
                     let WindowTopologyCommand::RequestSelector { kind, .. } = request else {
                         unreachable!("picker request classification changed");
                     };
-                    self.show_embedded_session_picker(
-                        session_picker_status_catalog("Loading navigation…"),
-                        Some(*kind),
-                    )?;
+                    self.show_loading_session_picker(Some(*kind))?;
                     self.modal.session_picker_requested = true;
                     self.modal.session_picker_retry_command = picker_request;
                 } else if requests_picker {
@@ -7292,10 +7292,7 @@ impl App {
             }
             BuiltInCommandDispatch::OpenRemoteChooser => self.show_remote_profiles(),
             BuiltInCommandDispatch::RecentSessions => (|| -> Result<()> {
-                self.show_embedded_session_picker(
-                    session_picker_status_catalog("Loading navigation…"),
-                    None,
-                )?;
+                self.show_loading_session_picker(None)?;
                 self.modal.session_picker_requested = true;
                 self.modal.session_picker_retry_command =
                     Some(WindowTopologyCommand::RequestSessionPicker);
@@ -7748,6 +7745,19 @@ impl App {
         // press, and release before another frame is painted. Opening, closing,
         // retargeting, and resizing invalidate the layout separately.
         self.presentation.full_redraw = true;
+    }
+
+    /// Shows a picker waiting on the daemon for its rows: its body stays
+    /// empty for 150 ms, then shows the shared spinner and "loading".
+    fn show_loading_session_picker(&mut self, selector_kind: Option<SelectorKind>) -> Result<()> {
+        self.show_embedded_session_picker(
+            session_picker_status_catalog("Loading navigation…"),
+            selector_kind,
+        )?;
+        if let Some(picker) = self.modal.session_picker.as_mut() {
+            picker.set_loading(Instant::now());
+        }
+        Ok(())
     }
 
     fn show_embedded_session_picker(
@@ -9460,10 +9470,7 @@ impl App {
         let command = self.modal.session_picker_retry_command.clone();
         let selector_kind = self.modal.selector_kind;
         self.close_inline_session_picker();
-        if let Err(error) = self.show_embedded_session_picker(
-            session_picker_status_catalog("Loading navigation…"),
-            selector_kind,
-        ) {
+        if let Err(error) = self.show_loading_session_picker(selector_kind) {
             self.scheduling.fail(error);
             return;
         }
@@ -9493,10 +9500,7 @@ impl App {
         };
         let query = self.inline_picker_query();
         self.close_inline_session_picker();
-        if let Err(error) = self.show_embedded_session_picker(
-            session_picker_status_catalog("Loading navigation…"),
-            selector_kind,
-        ) {
+        if let Err(error) = self.show_loading_session_picker(selector_kind) {
             self.scheduling.fail(error);
             return;
         }
@@ -12310,6 +12314,11 @@ impl App {
             (Some(timeout), Some(spinner)) => Some(timeout.min(spinner)),
             (timeout, _) => timeout,
         };
+        // Wake to show a waiting picker's loading line.
+        let timeout = match (timeout, self.picker_loading_timeout()) {
+            (Some(timeout), Some(loading)) => Some(timeout.min(loading)),
+            (timeout, _) => timeout,
+        };
         // Wake to clear an expired upgrade outcome notice.
         let timeout = match (timeout, self.handoff.timeout(Instant::now())) {
             (Some(timeout), Some(notice)) => Some(timeout.min(notice)),
@@ -13280,6 +13289,8 @@ impl App {
         // A spinner frame changes only chrome, which partial damage misses.
         let spinner_damage = self.tab_state.agent.take_chrome_damage();
         let picker_damage_full_surface = std::mem::take(&mut self.modal.session_picker_redraw);
+        // The loading spinner changes only the picker's status line.
+        let picker_status_damage = std::mem::take(&mut self.modal.session_picker_status_damage);
         let damage_full_surface = picker_damage_full_surface
             || take_full_surface_damage(
                 &mut self.presentation.full_redraw,
@@ -13317,6 +13328,17 @@ impl App {
                     i32::try_from(region.y).unwrap_or(i32::MAX),
                     i32::try_from(region.width).unwrap_or(i32::MAX),
                     i32::try_from(region.height).unwrap_or(i32::MAX),
+                );
+            }
+            if picker_status_damage
+                && let Some(line) = picker_layout.as_ref().and_then(picker_status_line)
+            {
+                let line = Self::buffer_rect(line, self.surface.scale_120)?;
+                self.surface.window.wl_surface().damage_buffer(
+                    i32::try_from(line.x).unwrap_or(i32::MAX),
+                    i32::try_from(line.y).unwrap_or(i32::MAX),
+                    i32::try_from(line.width).unwrap_or(i32::MAX),
+                    i32::try_from(line.height).unwrap_or(i32::MAX),
                 );
             }
             let spinner_regions = [

@@ -561,8 +561,10 @@ a hostile program running as your account.
   `↑↓ move  ↵ open  esc close`.
 - **Typing filters at once in every picker**: there is no `/` first, so `j`
   and `k` type rather than move. `Ctrl+U` clears the query, and Escape
-  clears it, then closes. While a picker loads it says so alone; `R`
-  retries from a picker that failed to load.
+  clears it, then closes. A picker still waiting on the daemon after
+  150 ms shows the shared Braille spinner in the accent and `loading`
+  alone, instead of "Loading…"; `R` retries from a picker that failed to
+  load.
 - Trusted dialogs (access consent, upgrade, restart) take your theme and its
   `[colors]` keys as they open, always opaque: the frame in `warning`, the
   left "no" button's edge and label in `danger` and the right "yes" button's

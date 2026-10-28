@@ -132,8 +132,9 @@ no `/` first, so `j` and `k` are letters, not moves. Arrows, Page Up and Page
 Down, Home and End move; Enter opens; `Ctrl+N` chooses the `+` row; `Ctrl+U`
 clears what you typed; Escape clears it, then closes. While you type, the `+`
 row and the headers give way to the matches, and the top match is selected.
-A picker that is loading says so alone; one that failed to load says so and
-`R` asks again. `splinterm dojos` lists Dojos most recent first, ungrouped.
+A picker still waiting on the daemon after 150 ms shows the spinner and
+*loading* alone; one that failed to load says so and `R` asks again.
+`splinterm dojos` lists Dojos most recent first, ungrouped.
 
 The trusted tab strip provides activation, a close target, and a `+` picker
 action. It is visible by default; hiding it is local to the current Window,
