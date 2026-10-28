@@ -140,6 +140,7 @@ substitution, but do not sandbox hostile processes running as your own user.
 | `explorer.full-height` | a docked Lair Explorer runs the Window's full height and the tab strip begins at its right edge, above the terminal only; `no` puts the Explorer below a full-width tab strip. An Explorer too wide to dock opens over the terminal below the tab strip either way; configuration reload applies it | strict boolean; yes |
 | `explorer.collapsed` | a new Window's Lair Explorer shows as its collapsed rail, one row per Lair, instead of the full tree; `«`, `»` and **Toggle Lair explorer rail** still switch it while the Window is open ([Lair Explorer](usage.md#lair-explorer)). A reload that changes the value collapses or expands the Explorer at once; one that keeps it leaves the Window's own choice alone | strict boolean; no |
 | `explorer.row-lines` | `2` makes each row of the expanded Lair Explorer and its agents section two lines tall: a Splint row shows, muted under its name, the agent's detail while the Splint reports one and agent status is shown, else its working directory with the home directory as `~` (a remote Window's directories are written in full), its middle elided to keep the root and the last components (`~/…/crates/splinterm`). Lair and Dojo rows centre their one line, the rail keeps one line, and a list too short for a two-line row shows one-line rows ([Lair Explorer](usage.md#lair-explorer)). The directory is where the Splint was started or last relaunched, not followed as its shell changes directory. Configuration reload applies it | `1` or `2`; 1 |
+| `explorer.current-marker` | the built-in [Tabler](https://tabler.io/icons) icon before the current Lair, Dojo, and Splint in the Lair Explorer, two cells wide: `eye`, `current-location`, `focus-2`, `crosshair`, `arrow-narrow-right`, `corner-down-right`, `caret-right-filled`, `arrow-badge-right-filled`, `player-play-filled`, `map-pin-filled`, or `circle-dot-filled`. Other rows leave those cells blank, so names stay lined up. Any other value warns and uses `eye`; if the built-in icons cannot load, the Explorer draws `●` instead. Configuration reload applies it | eye |
 | `explorer.agent-status` | show explicitly reported agent status in the Explorer, on Dojo tabs, and in navigation accessibility; `no` hides it all; configuration reload applies it | yes |
 | `explorer.status-colors` | colour agent status glyphs in the Explorer and on Dojo tabs by state, and the access "Asking" marker; see [Status colours](#status-colours). `no` draws them in the colour of the text around them; the remote host tag is not a status and keeps its colour. Configuration reload applies it | strict boolean; yes |
 | `explorer.status-glyphs` | `icons` draws two-cell icons; `dots` draws one-cell shapes: ◆ needs input, ▲ error, ■ done, □ idle, the Braille spinner for working, and `~` after a stale status. Every state keeps its own shape in both, so colour is never the only signal; configuration reload applies it | icons |
@@ -169,6 +170,16 @@ and at the edges alike, and grows back when there is room again. When the
 Splints cannot fit even without a gap, the Window shows only the focused Splint
 until there is room again ([Panes and layouts](usage.md#panes-and-layouts)).
 
+`explorer.current-marker` picks the icon that marks where you are in the Lair
+Explorer: the current Lair and Dojo show it before their chevron, and the
+current Splint shows it where a chevron would be. For a filled triangle
+instead of the default eye:
+
+```ini
+[explorer]
+current-marker=caret-right-filled
+```
+
 The protocol grid is bounded at 480×128. The shipped 14 px output-scale profile
 uses the complete natural grid on validated 2560×1440 and 3840×2160 surfaces.
 A smaller font or larger surface can exceed that envelope; Splinterm then keeps
@@ -187,11 +198,12 @@ is cancelled), `main.ui-font-pixelsize` and `multiplexer.tab-strip-border`
 `[colors-light]` (the theme is resolved again at once, and a key the file no
 longer sets gives the theme's own value back),
 `explorer.agent-status`, `explorer.status-colors`, `explorer.status-glyphs`,
-`explorer.full-height`, `explorer.collapsed`, `explorer.row-lines` (the
-Explorer's rows are laid out again at once), `multiplexer.divider-style`,
-`multiplexer.frame-title`, `multiplexer.pane-gap`, `multiplexer.close-unused`,
-`multiplexer.persist-on-tab-organization`, `multiplexer.new-dojo-directory`,
-and `multiplexer.new-splint-directory`. A changed `explorer.full-height`,
+`explorer.current-marker`, `explorer.full-height`, `explorer.collapsed`,
+`explorer.row-lines` (the Explorer's rows are laid out again at once),
+`multiplexer.divider-style`, `multiplexer.frame-title`, `multiplexer.pane-gap`,
+`multiplexer.close-unused`, `multiplexer.persist-on-tab-organization`,
+`multiplexer.new-dojo-directory`, and `multiplexer.new-splint-directory`. A
+changed `explorer.full-height`,
 `explorer.collapsed`, `multiplexer.divider-style`, `multiplexer.frame-title`,
 or `multiplexer.pane-gap` lays the Splints out again at once and resizes each
 one's PTY; a gap they cannot fit shrinks for that layout, as described above,

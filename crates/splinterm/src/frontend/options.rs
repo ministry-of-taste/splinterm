@@ -719,6 +719,8 @@ pub struct WindowOptions {
     pub explorer_collapsed: bool,
     /// `[explorer] row-lines=2`: Splint rows take a second, muted line.
     pub explorer_two_line_rows: bool,
+    /// `[explorer] current-marker`: the icon before the current row.
+    pub explorer_current_marker: crate::config::ExplorerCurrentMarker,
     /// Whether the Window binds the text-input (IME) protocol. The remote
     /// connection status Window turns it off so an input method never sees or
     /// draws a typed password as composing text.
@@ -796,6 +798,7 @@ impl Default for WindowOptions {
             explorer_full_height: true,
             explorer_collapsed: false,
             explorer_two_line_rows: false,
+            explorer_current_marker: crate::config::ExplorerCurrentMarker::Eye,
             input_method: true,
             mapped: None,
             handoff_status: None,

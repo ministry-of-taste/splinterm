@@ -130,6 +130,9 @@ pub struct AppConfig {
     pub explorer_agent_status: bool,
     /// `[explorer] status-colors` and `status-glyphs`.
     pub explorer_status_style: AgentStatusStyle,
+    /// The icon that marks the current Lair, Dojo, and Splint in the
+    /// Explorer (`[explorer] current-marker`, default `eye`).
+    pub explorer_current_marker: ExplorerCurrentMarker,
     /// Whether a shown tab strip draws a full-width bottom border in the
     /// light `line` Splint divider stroke and colour, under the active tab's
     /// thicker underline (`[multiplexer] tab-strip-border`, default on).
@@ -202,6 +205,67 @@ pub enum StatusGlyphs {
     Icons,
     /// One-cell geometric shapes from the chrome font.
     Dots,
+}
+
+/// `[explorer] current-marker`: the built-in Tabler icon drawn before the
+/// current Lair, Dojo, and Splint. Each is named after its Tabler icon.
+/// Without the built-in icons the Explorer draws `●` whatever this says.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ExplorerCurrentMarker {
+    #[default]
+    Eye,
+    CurrentLocation,
+    Focus2,
+    Crosshair,
+    ArrowNarrowRight,
+    CornerDownRight,
+    CaretRightFilled,
+    ArrowBadgeRightFilled,
+    PlayerPlayFilled,
+    MapPinFilled,
+    CircleDotFilled,
+}
+
+impl ExplorerCurrentMarker {
+    pub const ALL: [Self; 11] = [
+        Self::Eye,
+        Self::CurrentLocation,
+        Self::Focus2,
+        Self::Crosshair,
+        Self::ArrowNarrowRight,
+        Self::CornerDownRight,
+        Self::CaretRightFilled,
+        Self::ArrowBadgeRightFilled,
+        Self::PlayerPlayFilled,
+        Self::MapPinFilled,
+        Self::CircleDotFilled,
+    ];
+
+    /// The Tabler icon name, which is also the configuration value.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Eye => "eye",
+            Self::CurrentLocation => "current-location",
+            Self::Focus2 => "focus-2",
+            Self::Crosshair => "crosshair",
+            Self::ArrowNarrowRight => "arrow-narrow-right",
+            Self::CornerDownRight => "corner-down-right",
+            Self::CaretRightFilled => "caret-right-filled",
+            Self::ArrowBadgeRightFilled => "arrow-badge-right-filled",
+            Self::PlayerPlayFilled => "player-play-filled",
+            Self::MapPinFilled => "map-pin-filled",
+            Self::CircleDotFilled => "circle-dot-filled",
+        }
+    }
+
+    /// The marker named `name`, ignoring ASCII case.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|marker| marker.name().eq_ignore_ascii_case(name))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -319,6 +383,7 @@ impl Default for AppConfig {
             allow_unrestricted_commands: false,
             explorer_agent_status: true,
             explorer_status_style: AgentStatusStyle::default(),
+            explorer_current_marker: ExplorerCurrentMarker::Eye,
             tab_strip_border: true,
             explorer_full_height: true,
             explorer_collapsed: false,
@@ -1413,6 +1478,22 @@ fn parse_with_base(text: &str, config_dir: &Path) -> Result<ConfigLoad> {
                     "dots" => StatusGlyphs::Dots,
                     _ => bail!("line {}: status-glyphs must be icons or dots", index + 1),
                 };
+                false
+            }
+            "explorer.current-marker" => {
+                config.explorer_current_marker = ExplorerCurrentMarker::from_name(value)
+                    .unwrap_or_else(|| {
+                        let default = ExplorerCurrentMarker::default();
+                        diagnostics.push(format!(
+                            "line {}: current-marker {value:?} is not one of {}; using {}",
+                            index + 1,
+                            ExplorerCurrentMarker::ALL
+                                .map(ExplorerCurrentMarker::name)
+                                .join(", "),
+                            default.name()
+                        ));
+                        default
+                    });
                 false
             }
             "explorer.agent-status" => {
@@ -3531,6 +3612,80 @@ pub(crate) mod tests {
         assert_eq!(
             shipped.config.explorer_status_style,
             AgentStatusStyle::default()
+        );
+    }
+
+    #[test]
+    fn explorer_current_marker_defaults_to_eye_and_warns_on_other_names() {
+        assert_eq!(
+            AppConfig::default().explorer_current_marker,
+            ExplorerCurrentMarker::Eye
+        );
+        assert_eq!(
+            parse("[explorer]\n")
+                .unwrap()
+                .config
+                .explorer_current_marker,
+            ExplorerCurrentMarker::Eye
+        );
+        let names = [
+            "eye",
+            "current-location",
+            "focus-2",
+            "crosshair",
+            "arrow-narrow-right",
+            "corner-down-right",
+            "caret-right-filled",
+            "arrow-badge-right-filled",
+            "player-play-filled",
+            "map-pin-filled",
+            "circle-dot-filled",
+        ];
+        assert_eq!(
+            ExplorerCurrentMarker::ALL.map(ExplorerCurrentMarker::name),
+            names
+        );
+        for marker in ExplorerCurrentMarker::ALL {
+            let upper = marker.name().to_ascii_uppercase();
+            for value in [marker.name(), upper.as_str()] {
+                let loaded = parse(&format!("[explorer]\ncurrent-marker={value}\n")).unwrap();
+                assert_eq!(loaded.config.explorer_current_marker, marker, "{value}");
+                assert!(loaded.diagnostics.is_empty(), "{:?}", loaded.diagnostics);
+            }
+        }
+        // Stars and bookmarks are kept for other uses, and nothing outside
+        // the list is accepted: each warns and keeps the eye.
+        for value in ["star-filled", "bookmark-filled", "star", "dot", "●", ""] {
+            let loaded = parse(&format!(
+                "[explorer]\ncurrent-marker=caret-right-filled\ncurrent-marker={value}\n"
+            ))
+            .unwrap();
+            assert_eq!(
+                loaded.config.explorer_current_marker,
+                ExplorerCurrentMarker::Eye,
+                "{value}"
+            );
+            assert_eq!(loaded.diagnostics.len(), 1, "{value}");
+            assert_eq!(
+                loaded.diagnostics[0],
+                format!(
+                    "line 3: current-marker {value:?} is not one of {}; using eye",
+                    names.join(", ")
+                )
+            );
+        }
+        // The key belongs to [explorer]; elsewhere it is an unknown key.
+        let misplaced = parse("[main]\ncurrent-marker=crosshair\n").unwrap();
+        assert_eq!(
+            misplaced.config.explorer_current_marker,
+            ExplorerCurrentMarker::Eye
+        );
+        assert!(!misplaced.diagnostics.is_empty());
+        let shipped = parse(include_str!("../../../config/splinterm/config.ini")).unwrap();
+        assert!(shipped.diagnostics.is_empty(), "{:?}", shipped.diagnostics);
+        assert_eq!(
+            shipped.config.explorer_current_marker,
+            ExplorerCurrentMarker::Eye
         );
     }
 

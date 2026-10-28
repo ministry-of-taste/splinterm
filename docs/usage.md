@@ -238,9 +238,10 @@ when siblings are added or removed. Search, the navigation pickers, and the
 standalone Recent Dojos picker (`splinterm dojos`) use the same labels.
 
 Each Explorer row is one line, or two with `row-lines=2` (below). On the left
-are a dot marking the current row, a chevron icon before each Lair and Dojo
-(pointing right when collapsed and down when expanded), and the name. On the
-right, fixed icon columns line up on every row:
+are an icon marking the current row (an eye unless `[explorer] current-marker`
+picks another icon), a chevron icon before each Lair and Dojo (pointing right
+when collapsed and down when expanded), and the name. On the right, fixed icon
+columns line up on every row:
 
 | Column | Shows |
 | --- | --- |
@@ -305,7 +306,8 @@ included, for example *Agent connected · Running · Saved · 1 working*.
 
 Parent rows summarize runtime state independently of retention and window
 attachment. A saved Lair can still be running, and a Dojo not open in this
-Window can be running too. The current-row dot marks the active Dojo, the
+Window can be running too. The current-row marker (an eye unless
+`[explorer] current-marker` picks another icon) marks the active Dojo, the
 footer says *open here* for another Dojo attached to this Window as a tab,
 and it says nothing about attachment otherwise. Assistive technology reads
 **Current**, **Open here**, or **Not open here** for every Dojo. A stopped

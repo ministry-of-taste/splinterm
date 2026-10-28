@@ -1170,7 +1170,7 @@ impl LairExplorerUi {
                 blocker,
             ),
         );
-        // The current-row dot already marks the current Dojo, and most Dojos
+        // The current-row marker already marks the current Dojo, and most Dojos
         // in the list are not open here; only a background tab is worth words.
         let attachment_brief = (dojo.attachment == WindowAttachment::Here && !dojo.active_here)
             .then(|| "open here".to_owned());
