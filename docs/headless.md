@@ -176,10 +176,11 @@ graphical clients do not use persistent policy and remain connected.
 ## Agent access prompts
 
 A headless computer cannot show an [easy agent access](automation.md#easy-agent-access)
-prompt itself. A remote Splinterm Window connected to it over SSH shows the
-prompt instead, and its answer counts as one given here. With no Window
-connected, a request that needs a prompt fails at once with
-`consent_unavailable`; policy rules keep working without one.
+prompt itself, so a request that needs one fails at once with
+`consent_unavailable`: "no Splinterm Window or approver connected to this
+computer can show the prompt". Policy rules keep working without one. The
+daemon can already pass such prompts to connected approvers; the Window and
+terminal approvers that answer them are not available yet.
 
 ## Runtime, state, restart, and recovery
 

@@ -36,10 +36,10 @@ use std::{
 
 use splinterm_protocol::{
     CONSENT_OFFER_NONCE_BYTES, ConsentDecision, ConsentOffer, ConsentOfferEnd, ConsentOfferNonce,
-    ConsentResponderKind, ErrorCode, MAX_CONSENT_RESPOND_WITHIN_SECONDS, OfferedConsentPrompt,
-    ProtocolError, SubscriptionEvent,
+    ConsentResponderKind, ErrorCode, OfferedConsentPrompt, ProtocolError, SubscriptionEvent,
 };
 use tokio::sync::{mpsc, oneshot, watch};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::{
@@ -62,6 +62,10 @@ pub const NO_ROUTE: &str =
     "no Splinterm Window or approver connected to this computer can show the prompt";
 /// Why it ends so when every route showing its prompt went away.
 pub const ROUTES_CLOSED: &str = "the Window or approver showing the prompt closed";
+/// Why the daemon closes a responder connection that stopped reading its
+/// offers.
+pub const RESPONDER_LAGGED: &str =
+    "this connection did not read its consent offers in time; reconnect to subscribe again";
 
 /// A prompt no route could show, or whose every route closed: its request
 /// ends `consent_unavailable` with this message.
@@ -324,15 +328,15 @@ fn random_nonce() -> std::io::Result<ConsentOfferNonce> {
 }
 
 /// The whole seconds an offer says are left: the prompt's remaining time
-/// less the transport margin, at most the pending-request lifetime. `None`
-/// when under a second would be left: no offer is made then, since an offer
-/// gives its responder at least a second.
+/// less the transport margin, counted as the local dialog counts
+/// ([`consent::respond_within_seconds`]). `None` when under a second would
+/// be left: no offer is made then, since an offer gives its responder at
+/// least a second.
 fn respond_within(expires: Instant, now: Instant) -> Option<u64> {
-    let seconds = expires
+    let remaining = expires
         .saturating_duration_since(now)
-        .saturating_sub(TRANSPORT_MARGIN)
-        .as_secs();
-    (seconds >= 1).then(|| seconds.min(MAX_CONSENT_RESPOND_WITHIN_SECONDS))
+        .saturating_sub(TRANSPORT_MARGIN);
+    (remaining >= Duration::from_secs(1)).then(|| consent::respond_within_seconds(remaining))
 }
 
 /// The answer a responder gave to the shown prompt.
@@ -347,6 +351,9 @@ struct Responder {
     kind: ConsentResponderKind,
     peer: PeerIdentity,
     events: mpsc::Sender<SubscriptionEvent>,
+    /// Cancelled when the daemon drops this responder because it stopped
+    /// reading; its connection is then closed.
+    lagged: CancellationToken,
 }
 
 /// An offer outstanding on one responder connection.
@@ -384,8 +391,8 @@ struct Inner {
 
 impl Inner {
     /// Queues `event` for the responder on `connection_id`. One that stopped
-    /// reading (a full queue) or is gone is dropped with its offer; `false`
-    /// then.
+    /// reading (a full queue) or is gone is dropped with its offer, as a lost
+    /// responder is, and its connection is closed; `false` then.
     fn send(&mut self, connection_id: u64, event: SubscriptionEvent) -> bool {
         let Some(responder) = self.responders.get(&connection_id) else {
             return false;
@@ -397,21 +404,22 @@ impl Inner {
             connection_id,
             "a consent responder that stopped reading was dropped"
         );
-        self.drop_responder(connection_id);
+        if let Some(dropped) = self.drop_responder(connection_id) {
+            dropped.lagged.cancel();
+        }
         false
     }
 
     /// Removes a responder; only its own offer goes with it.
-    fn drop_responder(&mut self, connection_id: u64) {
-        if self.responders.remove(&connection_id).is_none() {
-            return;
-        }
+    fn drop_responder(&mut self, connection_id: u64) -> Option<Responder> {
+        let removed = self.responders.remove(&connection_id)?;
         if let Some(round) = &mut self.round {
             round
                 .offers
                 .retain(|_, offer| offer.connection_id != connection_id);
             round.publish_outstanding();
         }
+        Some(removed)
     }
 
     /// Withdraws every outstanding offer of the shown prompt.
@@ -534,6 +542,7 @@ impl ConsentResponders {
             return Err(ProtocolError::new(ErrorCode::Unauthorized, why.message()));
         }
         let (events, receiver) = mpsc::channel(RESPONDER_QUEUE);
+        let lagged = CancellationToken::new();
         let mut inner = self.inner();
         if inner.responders.contains_key(&connection_id) {
             return Err(ProtocolError::new(
@@ -554,12 +563,14 @@ impl ConsentResponders {
                 kind,
                 peer: peer.clone(),
                 events,
+                lagged: lagged.clone(),
             },
         );
         drop(inner);
         Ok(ResponderStream {
             subscription_id,
             events: receiver,
+            lagged,
             guard: ResponderGuard {
                 registry: Arc::clone(self),
                 connection_id,
@@ -902,6 +913,7 @@ impl Drop for OpenRound {
 pub struct ResponderStream {
     subscription_id: u64,
     events: mpsc::Receiver<SubscriptionEvent>,
+    lagged: CancellationToken,
     guard: ResponderGuard,
 }
 
@@ -918,6 +930,12 @@ impl std::fmt::Debug for ResponderStream {
 impl ResponderStream {
     pub const fn subscription_id(&self) -> u64 {
         self.subscription_id
+    }
+
+    /// Cancelled if the daemon drops this responder for not reading its
+    /// offers: its connection must then close, so the client sees the end.
+    pub fn lagged(&self) -> CancellationToken {
+        self.lagged.clone()
     }
 
     pub fn into_parts(self) -> (mpsc::Receiver<SubscriptionEvent>, ResponderGuard) {
@@ -1559,6 +1577,82 @@ mod tests {
             ErrorCode::NotFound
         );
         assert!(!round.claim_local());
+    }
+
+    #[tokio::test]
+    async fn a_responder_that_stops_reading_is_dropped_as_a_lost_route() {
+        let registry = Arc::new(ConsentResponders::new(7));
+        permissive(&registry);
+        let lagging = responder(&registry, 1).await;
+        let mut reading = responder(&registry, 2).await;
+        let lagged = lagging.lagged();
+        let expires = Instant::now() + Duration::from_secs(60);
+        // Each prompt queues an offer and its withdrawal: the eighth event
+        // fills the queue of a responder that never reads.
+        let prompts_to_fill = u64::try_from(RESPONDER_QUEUE / 2).unwrap();
+        for request_id in 1..=prompts_to_fill {
+            let round = registry
+                .open_round(request_id, prompt(), expires, offer_context())
+                .await;
+            assert_eq!(round.offered(), 2);
+            drop(round);
+            offered(&mut reading);
+            withdrawn(&mut reading);
+        }
+        assert!(!lagged.is_cancelled());
+        // The next offer cannot be queued: that responder is dropped, so it
+        // holds no offer and counts as no route, while the other keeps its
+        // offer.
+        let mut round = registry
+            .open_round(9, prompt(), expires, offer_context())
+            .await;
+        assert_eq!(round.offered(), 1);
+        assert!(lagged.is_cancelled(), "its connection is closed");
+        assert_eq!(registry.responder_count(), 1);
+        let offer = offered(&mut reading);
+        assert_eq!(
+            registry
+                .answer(
+                    1,
+                    &PeerIdentity::for_test(),
+                    7,
+                    offer.offer_id,
+                    &offer.nonce,
+                    ONCE
+                )
+                .unwrap_err()
+                .code,
+            ErrorCode::NotFound,
+            "the dropped responder answers nothing"
+        );
+        // When the last route goes, the prompt sees every route closed.
+        let mut outstanding = round.outstanding();
+        registry.remove(2, None);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            OpenRound::every_route_closed(&mut outstanding),
+        )
+        .await
+        .expect("every route closed");
+        assert!(!round.settled());
+        round.end_with(ConsentOfferEnd::Cancelled);
+        // A lone responder that stopped reading leaves a prompt no route.
+        drop(round);
+        drop(lagging);
+        let lone = responder(&registry, 3).await;
+        for request_id in 10..10 + prompts_to_fill {
+            drop(
+                registry
+                    .open_round(request_id, prompt(), expires, offer_context())
+                    .await,
+            );
+        }
+        let round = registry
+            .open_round(20, prompt(), expires, offer_context())
+            .await;
+        assert_eq!(round.offered(), 0);
+        assert!(!round.too_late());
+        assert!(lone.lagged().is_cancelled());
     }
 
     #[tokio::test]

@@ -414,11 +414,9 @@ lasts.
   access, or the daemon upgrades.
 - After a deny, a new request for that workspace fails with the retryable
   `resource_limit` for a few seconds.
-- The prompt opens in this computer's own graphical session and, at the same
-  time, in every remote Splinterm Window connected to it. The first answer
-  counts and closes the prompt everywhere else. With no graphical session here
-  and no remote Window connected, the request fails with `consent_unavailable`
-  at once; it fails the same way if every Window showing the prompt closes.
+- If nothing can show the prompt, the request fails with `consent_unavailable`
+  at once, with the message "no Splinterm Window or approver can show the
+  access prompt".
 
 **Who shares a grant.** A "while this workspace is open" or "always" grant
 belongs to the adapter executable, not to one process, connection, or MCP host.

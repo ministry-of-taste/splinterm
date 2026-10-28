@@ -92,8 +92,10 @@ the subscription and the answer, and which route answered.
 
 Offers and responders live in memory only. Subscribing and answering are
 fenced during a daemon handoff (`HandoffInProgress`). The fence ends the
-request, withdraws its offers (`fenced`), and ends the responders, which
-subscribe again on the new daemon.
+request and withdraws its offers (`fenced`); an answer then commits nothing.
+The fence leaves responders subscribed: a handoff that completes ends their
+connections, and they subscribe again after reconnecting to the new daemon,
+while a cancelled handoff leaves them in place.
 
 ### Eligibility
 

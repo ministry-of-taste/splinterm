@@ -4601,6 +4601,9 @@ async fn serve_authenticated(
         connection_id,
     };
     let mut subscriptions = HashMap::<u64, ConnectionSubscription>::new();
+    // Cancelled when the daemon drops this connection's consent responder
+    // for not reading its offers.
+    let mut consent_lagged: Option<tokio_util::sync::CancellationToken> = None;
     let mut policy_reloads = state.policy_reloads.subscribe();
     let mut connection_revocations = state.connection_revocations.subscribe();
     let mut last_request_id = 0_u64;
@@ -4620,6 +4623,25 @@ async fn serve_authenticated(
                     )
                     .await?;
                 }
+                break;
+            }
+            // A responder that stopped reading was dropped with its offer;
+            // closing the connection tells it, so it can subscribe again.
+            () = async {
+                match &consent_lagged {
+                    Some(lagged) => lagged.cancelled().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                send_control(
+                    control,
+                    protocol_error(
+                        None,
+                        ErrorCode::ResourceLimit,
+                        remote_consent::RESPONDER_LAGGED,
+                    ),
+                )
+                .await?;
                 break;
             }
             // Filtering inside this future keeps read_exact's partial header/body alive
@@ -4954,10 +4976,13 @@ async fn serve_authenticated(
                                         },
                                     ),
                                 ),
-                                PendingSubscription::ConsentOffers { stream } => (
-                                    stream.subscription_id(),
-                                    spawn_consent_offer_subscription(stream, outbound.clone()),
-                                ),
+                                PendingSubscription::ConsentOffers { stream } => {
+                                    consent_lagged = Some(stream.lagged());
+                                    (
+                                        stream.subscription_id(),
+                                        spawn_consent_offer_subscription(stream, outbound.clone()),
+                                    )
+                                }
                             };
                             subscriptions.insert(
                                 id,
@@ -23239,6 +23264,124 @@ mod tests {
             wait_until_no_request_is_pending(&state).await;
         }
         drop(fixture);
+    }
+
+    /// A responder whose connection stops reading its offers is dropped and
+    /// its connection closed, so the client sees the end and can subscribe
+    /// again instead of staying silently subscribed.
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one connection from Hello through its lagging subscription to its close"
+    )]
+    async fn a_responder_connection_that_stops_reading_is_closed() {
+        time::timeout(Duration::from_secs(10), async {
+            let state = headless(test_state(false));
+            state.consent_responders.set_probe(Arc::new(|_, _| Ok(())));
+            let pinned = Arc::new(consent::PinnedClientSnapshot::own_executable_for_test());
+            let peer = pinned_window_peer(&pinned);
+            let (mut client, server) = UnixStream::pair().unwrap();
+            let (reader, _writer) = server.into_split();
+            // One queued frame: past it the connection's writer is full.
+            let (outbound, mut responses) = mpsc::channel(1);
+            let (control, mut controls) = mpsc::channel(4);
+            let (_closed, writer_closed) = watch::channel(false);
+            let task_state = Arc::clone(&state);
+            let task = tokio::spawn(async move {
+                Box::pin(serve_authenticated(
+                    reader,
+                    &task_state,
+                    &peer,
+                    None,
+                    41,
+                    &outbound,
+                    &control,
+                    writer_closed,
+                ))
+                .await
+            });
+            for frame in [
+                ClientFrame::Hello {
+                    minimum_version: PROTOCOL_VERSION,
+                    maximum_version: PROTOCOL_VERSION,
+                    role: ClientRole::TrustedUi,
+                    handoff_window: false,
+                },
+                ClientFrame::Request {
+                    request_id: 1,
+                    diagnostic_correlation: None,
+                    request: Request::SubscribeConsentOffers {
+                        kind: splinterm_protocol::ConsentResponderKind::Terminal,
+                    },
+                },
+            ] {
+                client
+                    .write_all(&splinterm_protocol::encode_frame(&frame).unwrap())
+                    .await
+                    .unwrap();
+            }
+            assert!(matches!(
+                controls.recv().await,
+                Some(ControlFrame::Frame(ServerFrame::Hello { .. }))
+            ));
+            assert!(matches!(
+                responses.recv().await.unwrap().frame,
+                ServerFrame::Response {
+                    request_id: 1,
+                    result: Response::ConsentOffersSubscribed { .. },
+                }
+            ));
+            assert_eq!(state.consent_responders.responder_count(), 1);
+            // Prompts come and go while nothing reads the connection.
+            let offered = consent::offered_lair_prompt(
+                &with_start_time(PeerIdentity::for_test()),
+                LairId::new(),
+                "agents".into(),
+                vec![AccessScope::Observe],
+                consent::PromptDetails::once_only(),
+            );
+            let context = remote_consent::TreeContext {
+                splint_leaders: Vec::new(),
+                requester: Some(remote_consent::Requester {
+                    pid: 300,
+                    start_time: 40,
+                }),
+            };
+            for request_id in 1..=32 {
+                if state.consent_responders.responder_count() == 0 {
+                    break;
+                }
+                drop(
+                    state
+                        .consent_responders
+                        .open_round(
+                            request_id,
+                            offered.clone(),
+                            Instant::now() + Duration::from_secs(60),
+                            context.clone(),
+                        )
+                        .await,
+                );
+                time::sleep(Duration::from_millis(5)).await;
+            }
+            assert_eq!(state.consent_responders.responder_count(), 0);
+            // Whatever else the trusted UI is sent comes first.
+            loop {
+                if let ControlFrame::Frame(ServerFrame::Error {
+                    request_id: None,
+                    error,
+                }) = controls.recv().await.expect("the connection says why")
+                {
+                    assert_eq!(error.code, ErrorCode::ResourceLimit);
+                    assert_eq!(error.message, remote_consent::RESPONDER_LAGGED);
+                    break;
+                }
+            }
+            // And then closes.
+            let _ = task.await.unwrap();
+        })
+        .await
+        .expect("the lagging responder's connection closes");
     }
 
     #[tokio::test]

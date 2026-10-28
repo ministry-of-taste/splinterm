@@ -297,9 +297,9 @@ verification, and lifecycle guidance.
 
 Easy agent access lets you give an agent access to one workspace (a Lair) in a
 single deliberate answer, choose how long that lasts, and see and revoke it
-later. It is for agents helping you, answered in your own graphical session or
-in a remote Splinterm Window. Unattended and administrative access keeps using
-the [policy file](#persistent-policy-v2), which does not change.
+later. It is for agents helping you in your own graphical session. Headless,
+remote, and administrative access keeps using the [policy file](#persistent-policy-v2),
+which does not change.
 
 What it protects: it keeps cooperating agents inside what you agreed to and
 shows you which agent can reach what. It is not a sandbox. A program running as
@@ -463,12 +463,9 @@ grants; the prompt then closes and the request ends unanswered, without
 access. After you deny a request, the same agent cannot ask again for that
 workspace for a few seconds. Closing the prompt denies.
 
-The prompt also opens in every remote Splinterm Window connected to this
-computer over SSH, at the same time as the local one, so you can answer from
-your workstation when the agent runs on a computer with no display. The first
-answer counts, wherever it comes from, and the prompt closes everywhere else.
-Every duration is offered there too. With no local graphical session and no
-remote Window connected, the request fails with `consent_unavailable` at once.
+If nothing can show the prompt, the request fails with `consent_unavailable`
+at once: "no Splinterm Window or approver connected to this computer can show
+the prompt".
 
 ### Seeing and revoking access
 
