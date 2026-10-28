@@ -366,6 +366,9 @@ pub struct NavigationPickerRow {
     pub working_directory: String,
     pub pane_count: usize,
     pub running_pane_count: usize,
+    /// The most urgent agent state its Splints report, and whether it is
+    /// stale; display data only.
+    pub agent: Option<(AgentState, bool)>,
 }
 
 /// Complete policy view for one picker opening.
@@ -819,6 +822,13 @@ impl NavigationProjection {
                 .iter()
                 .filter(|splint| splint.node.lifecycle == NavigationLifecycle::Running)
                 .count(),
+            agent: crate::frontend::AgentAggregate::from_statuses(
+                dojo.splints
+                    .iter()
+                    .filter_map(|splint| splint.agent_status.as_ref()),
+            )
+            .top()
+            .map(|(state, stale, _)| (state, stale)),
         })
     }
 
@@ -2834,6 +2844,16 @@ mod tests {
         assert_eq!(
             view.lairs[0].dojos[0].splints[0].agent_status,
             Some(expected)
+        );
+
+        // A picker row carries its Dojo's most urgent state and whether it
+        // is stale, through the same aggregate as the Explorer's marks.
+        let detached = NavigationProjection::build(&snapshot, context(&[])).unwrap();
+        let lair_id = detached.lairs[0].lair_id;
+        let picker = detached.picker_view(NavigationPickerKind::ChooseDojo { lair_id }, &[], &[]);
+        assert_eq!(
+            picker.rows.first().map(|row| row.agent),
+            Some(Some((AgentState::Working, true)))
         );
 
         // A fresh status keeps no report age, so heartbeats compare equal.

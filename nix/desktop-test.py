@@ -345,7 +345,7 @@ if not SMOKE_ONLY:
 
     with subtest("Dojos desktop action opens the native picker"):
         launch("Dojos")
-        desktop.wait_for_text("(?i)RECENT DOJOS", timeout=3)
+        desktop.wait_for_text("(?i)filter dojos|New terminal", timeout=3)
         capture("dojos-action")
         cleanup("dojos-action")
 

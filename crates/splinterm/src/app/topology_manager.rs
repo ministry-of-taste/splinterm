@@ -742,6 +742,7 @@ fn picker_catalog(view: NavigationPickerView) -> SessionPickerCatalog {
             working_directory: row.working_directory,
             pane_count: row.pane_count,
             running_pane_count: row.running_pane_count,
+            agent: row.agent,
         });
         targets.push(SessionPickerTarget {
             topology_revision: row.target.topology_revision,
@@ -4781,6 +4782,7 @@ mod tests {
                 working_directory: "/work".to_owned(),
                 pane_count: 2,
                 running_pane_count: 2,
+                agent: None,
                 target,
             }],
             kind: NavigationPickerKind::RecentDojos,

@@ -95,6 +95,19 @@ pub(in crate::wayland) fn binding_help_repeat_consumed(
     binding_help_open && keysym == Keysym::Escape
 }
 
+/// Whether a held key must not repeat into an inline picker: Tab would
+/// switch the `dojos` scope back and forth, and R ask again while the
+/// retry is still loading.
+pub(in crate::wayland) fn picker_repeat_consumed(
+    inline_open: bool,
+    retryable: bool,
+    keysym: Keysym,
+) -> bool {
+    inline_open
+        && (matches!(keysym, Keysym::Tab | Keysym::ISO_Left_Tab)
+            || (retryable && matches!(keysym, Keysym::r | Keysym::R)))
+}
+
 pub(in crate::wayland) fn owned_field_clipboard_action(
     keymap: &ResolvedKeymap,
     keysym: Keysym,
@@ -695,6 +708,21 @@ mod tests {
             assert!(!binding_help_repeat_consumed(true, keysym));
         }
         assert!(!binding_help_repeat_consumed(false, Keysym::Escape));
+    }
+
+    #[test]
+    fn inline_pickers_consume_tab_and_retry_repeats_but_not_typing() {
+        for keysym in [Keysym::Tab, Keysym::ISO_Left_Tab] {
+            assert!(picker_repeat_consumed(true, false, keysym));
+            assert!(!picker_repeat_consumed(false, false, keysym));
+        }
+        assert!(picker_repeat_consumed(true, true, Keysym::r));
+        assert!(picker_repeat_consumed(true, true, Keysym::R));
+        // Typed into a list, a held R types r after r.
+        assert!(!picker_repeat_consumed(true, false, Keysym::r));
+        for keysym in [Keysym::BackSpace, Keysym::Down, Keysym::a] {
+            assert!(!picker_repeat_consumed(true, true, keysym));
+        }
     }
 
     #[test]

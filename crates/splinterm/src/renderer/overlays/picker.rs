@@ -1,9 +1,6 @@
 //! Trusted inline session-picker layout and CPU composition.
 
-use std::{
-    collections::{HashMap, HashSet, VecDeque},
-    ops::Range,
-};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use anyhow::Result;
 use unicode_width::UnicodeWidthChar;
@@ -14,22 +11,13 @@ use crate::{
         contrast_ratio, mix_linear, packed_channels, relative_luminance, rgb_channels,
     },
     config::{OmarchyShellSettings, ResolvedTheme},
-    frontend::PickerHitTarget,
     geometry::Rect,
     theme::{ChromeTints, Role},
 };
 
 use super::super::{
-    ChromeSource, ChromeText, ChromeTextStyle, RenderContext, blend_rect, fill_rect,
-    raster::premultiplied_rgba,
+    ChromeSource, ChromeText, ChromeTextStyle, RenderContext, fill_rect, raster::premultiplied_rgba,
 };
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SessionPickerPresentationMode {
-    Normal,
-    Compact,
-    Minimal,
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SessionPickerPurpose {
@@ -40,39 +28,50 @@ pub(crate) enum SessionPickerPurpose {
 }
 
 impl SessionPickerPurpose {
-    pub(crate) const fn heading(self, minimal: bool) -> &'static str {
-        match (self, minimal) {
-            (Self::RecentDojos, _) => "RECENT DOJOS",
-            (Self::Dojos, _) => "DOJOS",
-            (Self::Lairs, _) => "LAIRS",
-            (Self::Remotes, _) => "REMOTES",
+    /// The title set into the frame.
+    pub(crate) const fn title(self) -> &'static str {
+        match self {
+            Self::RecentDojos | Self::Dojos => "dojos",
+            Self::Lairs => "lairs",
+            Self::Remotes => "remotes",
         }
     }
 
-    pub(crate) const fn guidance(self) -> &'static str {
+    /// The input line's text while nothing is typed.
+    pub(crate) const fn placeholder(self) -> &'static str {
         match self {
-            Self::RecentDojos => "Open a recent running Dojo.",
-            Self::Dojos => "Switch to a Dojo in this Lair.",
-            Self::Lairs => "Switch to a Lair.",
-            Self::Remotes => "Connect to a remote profile.",
+            Self::RecentDojos | Self::Dojos => "filter dojos",
+            Self::Lairs => "filter lairs",
+            Self::Remotes => "filter remotes",
         }
     }
 
-    pub(crate) const fn new_title(self) -> &'static str {
+    /// The creation row's label, after its `+`.
+    pub(crate) const fn create_title(self) -> &'static str {
         match self {
-            Self::RecentDojos => "+ New terminal",
-            Self::Dojos => "+ New Dojo",
-            Self::Lairs => "+ New Lair",
-            Self::Remotes => "+ Add a profile",
+            Self::RecentDojos => "New terminal",
+            Self::Dojos => "New Dojo",
+            Self::Lairs => "New Lair",
+            Self::Remotes => "Add a profile",
         }
     }
 
-    pub(crate) const fn new_description(self) -> &'static str {
+    /// The line under the creation row when there is nothing to list.
+    pub(crate) const fn empty_label(self) -> &'static str {
         match self {
-            Self::RecentDojos => "Start a fresh shell",
-            Self::Dojos => "Add a Dojo to this Lair",
-            Self::Lairs => "Start a fresh workspace",
-            Self::Remotes => "Edit remotes.toml",
+            Self::RecentDojos => "No recent Dojos",
+            Self::Dojos => "No Dojos",
+            Self::Lairs => "No Lairs",
+            Self::Remotes => "No remote profiles",
+        }
+    }
+
+    /// The line when nothing matches what is typed.
+    pub(crate) const fn no_match(self) -> &'static str {
+        match self {
+            Self::RecentDojos | Self::Dojos => "No matching Dojos",
+            Self::Lairs => "No matching Lairs",
+            Self::Remotes => "No matching remotes",
         }
     }
 
@@ -84,302 +83,15 @@ impl SessionPickerPurpose {
         }
     }
 
-    /// Remote profiles are created by editing `remotes.toml`, not from the picker.
-    pub(crate) const fn offers_creation(self) -> bool {
-        !matches!(self, Self::Remotes)
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct SessionPickerRowLayout {
-    pub(crate) target: PickerHitTarget,
-    pub(crate) rect: Rect,
-    pub(crate) surface: Rect,
-    pub(crate) title_clip: Rect,
-    pub(crate) metadata_clip: Rect,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct SessionPickerOverlayLayout {
-    pub(crate) panel: Rect,
-    pub(crate) header: Rect,
-    pub(crate) action: Rect,
-    pub(crate) list: Rect,
-    pub(crate) footer: Rect,
-    pub(crate) rows: Vec<SessionPickerRowLayout>,
-    pub(crate) visible_range: Range<usize>,
-    pub(crate) visible_capacity: usize,
-    pub(crate) mode: SessionPickerPresentationMode,
-    pub(crate) cache_key: (u32, u32, u32),
-}
-
-fn picker_item_rect(slot: Rect, mode: SessionPickerPresentationMode) -> Rect {
-    let (horizontal_margin, vertical_margin) = match mode {
-        SessionPickerPresentationMode::Normal => (8_u32, 3_u32),
-        SessionPickerPresentationMode::Compact => (6_u32, 3_u32),
-        SessionPickerPresentationMode::Minimal => (0_u32, 0_u32),
-    };
-    Rect {
-        x: slot.x.saturating_add(horizontal_margin.min(slot.width / 2)),
-        y: slot.y.saturating_add(vertical_margin.min(slot.height / 2)),
-        width: slot
-            .width
-            .saturating_sub(horizontal_margin.saturating_mul(2)),
-        height: slot
-            .height
-            .saturating_sub(vertical_margin.saturating_mul(2)),
-    }
-}
-
-fn picker_row_layout(
-    target: PickerHitTarget,
-    slot: Rect,
-    two_lines: bool,
-    mode: SessionPickerPresentationMode,
-) -> SessionPickerRowLayout {
-    let surface = picker_item_rect(slot, mode);
-    let horizontal_inset = 12_u32.min(surface.width / 4);
-    let content_x = surface.x.saturating_add(horizontal_inset);
-    let content_width = surface
-        .width
-        .saturating_sub(horizontal_inset.saturating_mul(2));
-    let title_height = if two_lines {
-        surface.height / 2
-    } else {
-        surface.height
-    };
-    SessionPickerRowLayout {
-        target,
-        rect: slot,
-        surface,
-        title_clip: Rect {
-            x: content_x,
-            y: surface.y,
-            width: content_width,
-            height: title_height,
-        },
-        metadata_clip: Rect {
-            x: content_x,
-            y: surface.y.saturating_add(title_height),
-            width: content_width,
-            height: surface.height.saturating_sub(title_height),
-        },
-    }
-}
-
-fn picker_visible_start(
-    item_count: usize,
-    selected_action: usize,
-    requested_start: usize,
-    capacity: usize,
-) -> usize {
-    if item_count == 0 || capacity == 0 {
-        return 0;
-    }
-    let mut start = requested_start.min(item_count.saturating_sub(capacity));
-    if selected_action > 0 {
-        let selected_item = selected_action - 1;
-        if selected_item < start {
-            start = selected_item;
-        } else if selected_item >= start.saturating_add(capacity) {
-            start = selected_item.saturating_add(1).saturating_sub(capacity);
+    /// The `dojos` picker's scope, `recent · this lair`, that Tab
+    /// switches: which of the two this is. `None` for the others.
+    pub(crate) const fn scope(self) -> Option<usize> {
+        match self {
+            Self::RecentDojos => Some(0),
+            Self::Dojos => Some(1),
+            Self::Lairs | Self::Remotes => None,
         }
     }
-    start.min(item_count.saturating_sub(capacity))
-}
-
-#[must_use]
-#[allow(
-    clippy::too_many_lines,
-    reason = "the specialized responsive layout keeps all mode invariants in one pure seam"
-)]
-pub(crate) fn session_picker_overlay_layout(
-    logical_width: u32,
-    logical_height: u32,
-    scale_120: u32,
-    item_count: usize,
-    selected_action: usize,
-    requested_start: usize,
-) -> Option<SessionPickerOverlayLayout> {
-    if logical_width == 0 || logical_height == 0 || scale_120 == 0 {
-        return None;
-    }
-    let preferred_mode = if logical_width >= 480 && logical_height >= 320 {
-        SessionPickerPresentationMode::Normal
-    } else if logical_width >= 280 && logical_height >= 180 {
-        SessionPickerPresentationMode::Compact
-    } else {
-        SessionPickerPresentationMode::Minimal
-    };
-    let (margin, header_height, row_height, footer_height): (u32, u32, u32, u32) =
-        match preferred_mode {
-            SessionPickerPresentationMode::Normal => (16, 64, 56, 40),
-            SessionPickerPresentationMode::Compact => (8, 44, 44, 36),
-            SessionPickerPresentationMode::Minimal => (0, 32, 44, 28),
-        };
-    let available_width = logical_width.saturating_sub(margin.saturating_mul(2));
-    let available_height = logical_height.saturating_sub(margin.saturating_mul(2));
-    if available_width == 0 || available_height == 0 {
-        return None;
-    }
-    let panel_width = available_width.min(680);
-    let normal_fixed = header_height
-        .saturating_add(row_height)
-        .saturating_add(footer_height);
-    let computed_capacity =
-        usize::try_from(available_height.saturating_sub(normal_fixed) / row_height.max(1))
-            .unwrap_or(0);
-    let mode = if preferred_mode != SessionPickerPresentationMode::Minimal
-        && item_count > 0
-        && computed_capacity == 0
-    {
-        SessionPickerPresentationMode::Minimal
-    } else {
-        preferred_mode
-    };
-    if mode == SessionPickerPresentationMode::Minimal {
-        let action_height = if available_height >= 104 {
-            available_height.saturating_sub(60)
-        } else {
-            available_height.min(44)
-        }
-        .max(1);
-        let chrome_height = available_height.saturating_sub(action_height);
-        let header_height = 32.min(chrome_height.div_ceil(2));
-        let footer_height = chrome_height.saturating_sub(header_height);
-        let panel_height = header_height
-            .saturating_add(action_height)
-            .saturating_add(footer_height)
-            .min(available_height);
-        let panel = Rect {
-            x: (logical_width.saturating_sub(panel_width)) / 2,
-            y: (logical_height.saturating_sub(panel_height)) / 2,
-            width: panel_width,
-            height: panel_height,
-        };
-        let header = Rect {
-            x: panel.x,
-            y: panel.y,
-            width: panel.width,
-            height: header_height,
-        };
-        let action = Rect {
-            x: panel.x,
-            y: header.y.saturating_add(header.height),
-            width: panel.width,
-            height: action_height,
-        };
-        let footer = Rect {
-            x: panel.x,
-            y: action.y.saturating_add(action.height),
-            width: panel.width,
-            height: footer_height,
-        };
-        let target = if selected_action == 0 || item_count == 0 {
-            PickerHitTarget::New
-        } else {
-            PickerHitTarget::Open((selected_action - 1).min(item_count - 1))
-        };
-        let visible_range = match target {
-            PickerHitTarget::New => 0..0,
-            PickerHitTarget::Open(index) => index..index.saturating_add(1),
-        };
-        return Some(SessionPickerOverlayLayout {
-            panel,
-            header,
-            action,
-            list: action,
-            footer,
-            rows: vec![picker_row_layout(target, action, false, mode)],
-            visible_range,
-            visible_capacity: usize::from(item_count > 0),
-            mode,
-            cache_key: (logical_width, logical_height, scale_120),
-        });
-    }
-
-    let capacity = computed_capacity.max(usize::from(item_count > 0));
-    let visible_count = item_count.min(capacity);
-    let panel_height = normal_fixed
-        .saturating_add(row_height.saturating_mul(u32::try_from(visible_count).unwrap_or(u32::MAX)))
-        .min(available_height);
-    let panel = Rect {
-        x: (logical_width.saturating_sub(panel_width)) / 2,
-        y: (logical_height.saturating_sub(panel_height)) / 2,
-        width: panel_width,
-        height: panel_height,
-    };
-    let header = Rect {
-        x: panel.x,
-        y: panel.y,
-        width: panel.width,
-        height: header_height,
-    };
-    let action = Rect {
-        x: panel.x,
-        y: header.y.saturating_add(header.height),
-        width: panel.width,
-        height: row_height,
-    };
-    let list = Rect {
-        x: panel.x,
-        y: action.y.saturating_add(action.height),
-        width: panel.width,
-        height: row_height.saturating_mul(u32::try_from(visible_count).unwrap_or(u32::MAX)),
-    };
-    let footer = Rect {
-        x: panel.x,
-        y: list.y.saturating_add(list.height),
-        width: panel.width,
-        height: footer_height,
-    };
-    let start = picker_visible_start(item_count, selected_action, requested_start, visible_count);
-    let visible_range = start..start.saturating_add(visible_count);
-    let mut rows = Vec::with_capacity(visible_count.saturating_add(1));
-    rows.push(picker_row_layout(PickerHitTarget::New, action, false, mode));
-    for (slot, index) in visible_range.clone().enumerate() {
-        rows.push(picker_row_layout(
-            PickerHitTarget::Open(index),
-            Rect {
-                x: list.x,
-                y: list.y.saturating_add(
-                    row_height.saturating_mul(u32::try_from(slot).unwrap_or(u32::MAX)),
-                ),
-                width: list.width,
-                height: row_height,
-            },
-            mode == SessionPickerPresentationMode::Normal,
-            mode,
-        ));
-    }
-    Some(SessionPickerOverlayLayout {
-        panel,
-        header,
-        action,
-        list,
-        footer,
-        rows,
-        visible_range,
-        visible_capacity: visible_count,
-        mode,
-        cache_key: (logical_width, logical_height, scale_120),
-    })
-}
-
-#[must_use]
-pub(crate) fn session_picker_hit_test(
-    layout: &SessionPickerOverlayLayout,
-    position: (f64, f64),
-) -> Option<PickerHitTarget> {
-    layout.rows.iter().find_map(|row| {
-        let right = f64::from(row.rect.x.saturating_add(row.rect.width));
-        let bottom = f64::from(row.rect.y.saturating_add(row.rect.height));
-        (position.0 >= f64::from(row.rect.x)
-            && position.0 < right
-            && position.1 >= f64::from(row.rect.y)
-            && position.1 < bottom)
-            .then_some(row.target)
-    })
 }
 
 /// Corrects `foreground` toward the strongest endpoint until it keeps the floor
@@ -953,15 +665,6 @@ fn highlight_overlays(palette: &SessionPickerPalette) -> [Vec<(u32, u8)>; 3] {
     let hover = (palette.selected_fill, ROW_HOVER_ALPHA);
     let press = (palette.selected_rail, ROW_PRESS_ALPHA);
     [vec![hover], vec![press], vec![hover, press]]
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct SessionPickerTextItem<'a> {
-    pub(crate) display_title: &'a str,
-    pub(crate) breadcrumb: &'a str,
-    pub(crate) working_directory: &'a str,
-    pub(crate) pane_count: usize,
-    pub(crate) running_pane_count: usize,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -1597,502 +1300,6 @@ pub(crate) fn paint_search_overlay(
     cache.finish_frame(used);
     Ok(true)
 }
-
-#[allow(
-    clippy::similar_names,
-    clippy::too_many_arguments,
-    clippy::too_many_lines,
-    reason = "the specialized picker painter keeps ordered chrome composition in one bounded seam"
-)]
-pub(crate) fn paint_session_picker_overlay(
-    cache: &mut SessionPickerTextCache,
-    context: &RenderContext,
-    canvas: &mut [u8],
-    canvas_width: u32,
-    canvas_height: u32,
-    scrim_rect: Rect,
-    scale_120: u32,
-    renderer_generation: u64,
-    layout: &SessionPickerOverlayLayout,
-    palette: SessionPickerPalette,
-    purpose: SessionPickerPurpose,
-    items: &[SessionPickerTextItem<'_>],
-    new_enabled: bool,
-    new_blocker: Option<&str>,
-    search_active: bool,
-    search_query: &str,
-    selected: PickerHitTarget,
-    hovered: Option<PickerHitTarget>,
-    pressed: Option<PickerHitTarget>,
-    keyboard_focused: bool,
-) -> Result<()> {
-    blend_rect(
-        canvas,
-        canvas_width,
-        canvas_height,
-        rect_tuple(scrim_rect),
-        palette.scrim,
-    );
-    let panel = picker_buffer_rect(layout.panel, scale_120);
-    let shadow_offset = 6_u32.saturating_mul(scale_120).div_ceil(120);
-    blend_rect(
-        canvas,
-        canvas_width,
-        canvas_height,
-        (
-            i32::try_from(panel.x.saturating_add(shadow_offset)).unwrap_or(i32::MAX),
-            i32::try_from(panel.y.saturating_add(shadow_offset)).unwrap_or(i32::MAX),
-            panel.width,
-            panel.height,
-        ),
-        palette.shadow,
-    );
-    fill_rect(
-        canvas,
-        canvas_width,
-        canvas_height,
-        rect_tuple(panel),
-        palette.panel_fill,
-    );
-    let frame_color = if keyboard_focused {
-        palette.focused_frame
-    } else {
-        palette.frame
-    };
-    let border = scale_120.div_ceil(120).max(1);
-    for rect in [
-        (panel.x, panel.y, panel.width, border),
-        (
-            panel.x,
-            panel.y.saturating_add(panel.height.saturating_sub(border)),
-            panel.width,
-            border,
-        ),
-        (panel.x, panel.y, border, panel.height),
-        (
-            panel.x.saturating_add(panel.width.saturating_sub(border)),
-            panel.y,
-            border,
-            panel.height,
-        ),
-    ] {
-        fill_rect(
-            canvas,
-            canvas_width,
-            canvas_height,
-            (
-                i32::try_from(rect.0).unwrap_or(i32::MAX),
-                i32::try_from(rect.1).unwrap_or(i32::MAX),
-                rect.2,
-                rect.3,
-            ),
-            opaque_rgba(frame_color),
-        );
-    }
-    for separator_y in [
-        layout.header.y.saturating_add(layout.header.height),
-        layout.footer.y,
-    ] {
-        let separator = picker_buffer_rect(
-            Rect {
-                x: layout.panel.x,
-                y: separator_y,
-                width: layout.panel.width,
-                height: 1,
-            },
-            scale_120,
-        );
-        fill_rect(
-            canvas,
-            canvas_width,
-            canvas_height,
-            rect_tuple(separator),
-            opaque_rgba(palette.frame),
-        );
-    }
-
-    let mut used = HashSet::new();
-    let header = picker_buffer_rect(layout.header, scale_120);
-    let header_inset = 14_u32.saturating_mul(scale_120).div_ceil(120);
-    let header_content = Rect {
-        x: header.x.saturating_add(header_inset),
-        y: header.y,
-        width: header.width.saturating_sub(header_inset.saturating_mul(2)),
-        height: if layout.mode == SessionPickerPresentationMode::Normal {
-            header.height / 2
-        } else {
-            header.height
-        },
-    };
-    let header_title = Rect {
-        width: if layout.mode == SessionPickerPresentationMode::Minimal {
-            header_content.width
-        } else {
-            header_content.width.saturating_mul(2) / 3
-        },
-        ..header_content
-    };
-    paint_picker_text(
-        cache,
-        context,
-        &mut used,
-        canvas,
-        canvas_width,
-        canvas_height,
-        purpose.heading(layout.mode == SessionPickerPresentationMode::Minimal),
-        ChromeTextStyle::Bold,
-        scale_120,
-        renderer_generation,
-        header_title,
-        PickerTextAlignment::Left,
-        palette.primary,
-    )?;
-    if layout.mode != SessionPickerPresentationMode::Minimal {
-        let count = format!("{} available", items.len());
-        paint_picker_text(
-            cache,
-            context,
-            &mut used,
-            canvas,
-            canvas_width,
-            canvas_height,
-            &count,
-            ChromeTextStyle::Regular,
-            scale_120,
-            renderer_generation,
-            Rect {
-                x: header_title.x.saturating_add(header_title.width),
-                width: header_content.width.saturating_sub(header_title.width),
-                ..header_content
-            },
-            PickerTextAlignment::Right,
-            palette.secondary,
-        )?;
-    }
-    if layout.mode == SessionPickerPresentationMode::Normal {
-        paint_picker_text(
-            cache,
-            context,
-            &mut used,
-            canvas,
-            canvas_width,
-            canvas_height,
-            &if !search_active {
-                purpose.guidance().to_owned()
-            } else if items.is_empty() && !search_query.is_empty() {
-                format!("Search: {search_query} · No matches")
-            } else {
-                format!("Search: {search_query}")
-            },
-            ChromeTextStyle::Regular,
-            scale_120,
-            renderer_generation,
-            Rect {
-                x: header_content.x,
-                y: header.y.saturating_add(header.height / 2),
-                width: header_content.width,
-                height: header.height.saturating_sub(header.height / 2),
-            },
-            PickerTextAlignment::Left,
-            palette.secondary,
-        )?;
-    }
-
-    for row in &layout.rows {
-        let row_buffer = picker_buffer_rect(row.surface, scale_120);
-        let is_selected = row.target == selected;
-        if is_selected {
-            fill_rect(
-                canvas,
-                canvas_width,
-                canvas_height,
-                rect_tuple(row_buffer),
-                opaque_rgba(palette.selected_fill),
-            );
-            let rail_width = 3_u32.saturating_mul(scale_120).div_ceil(120).max(1);
-            fill_rect(
-                canvas,
-                canvas_width,
-                canvas_height,
-                (
-                    i32::try_from(row_buffer.x).unwrap_or(i32::MAX),
-                    i32::try_from(row_buffer.y).unwrap_or(i32::MAX),
-                    rail_width,
-                    row_buffer.height,
-                ),
-                opaque_rgba(palette.selected_rail),
-            );
-        } else if hovered == Some(row.target) {
-            blend_rect(
-                canvas,
-                canvas_width,
-                canvas_height,
-                rect_tuple(row_buffer),
-                [
-                    rgb_channels(palette.selected_fill)[0],
-                    rgb_channels(palette.selected_fill)[1],
-                    rgb_channels(palette.selected_fill)[2],
-                    ROW_HOVER_ALPHA,
-                ],
-            );
-        }
-        if pressed == Some(row.target) {
-            blend_rect(
-                canvas,
-                canvas_width,
-                canvas_height,
-                rect_tuple(row_buffer),
-                [
-                    rgb_channels(palette.selected_rail)[0],
-                    rgb_channels(palette.selected_rail)[1],
-                    rgb_channels(palette.selected_rail)[2],
-                    ROW_PRESS_ALPHA,
-                ],
-            );
-        }
-        let highlighted =
-            !is_selected && (hovered == Some(row.target) || pressed == Some(row.target));
-        let (primary, secondary) = palette.row_text(is_selected, highlighted);
-        let marker_width = 22_u32.saturating_mul(scale_120).div_ceil(120);
-        if is_selected {
-            paint_picker_text(
-                cache,
-                context,
-                &mut used,
-                canvas,
-                canvas_width,
-                canvas_height,
-                "›",
-                ChromeTextStyle::Bold,
-                scale_120,
-                renderer_generation,
-                Rect {
-                    x: row_buffer.x.saturating_add(border),
-                    y: row_buffer.y,
-                    width: marker_width,
-                    height: row_buffer.height,
-                },
-                PickerTextAlignment::Center,
-                primary,
-            )?;
-        }
-        let content = Rect {
-            x: row_buffer.x.saturating_add(marker_width),
-            y: row_buffer.y,
-            width: row_buffer
-                .width
-                .saturating_sub(marker_width.saturating_add(header_inset)),
-            height: row_buffer.height,
-        };
-        let (title, detail, status) = match row.target {
-            PickerHitTarget::New => (
-                purpose.new_title(),
-                String::new(),
-                if new_enabled {
-                    purpose.new_description().to_owned()
-                } else {
-                    new_blocker.unwrap_or("Unavailable").to_owned()
-                },
-            ),
-            PickerHitTarget::Open(index) => {
-                let Some(item) = items.get(index) else {
-                    continue;
-                };
-                // Rows without panes are navigation rows (remote profiles or the
-                // Recent Dojos remote entry), so they carry no running status.
-                let status = if item.pane_count == 0 {
-                    String::new()
-                } else if layout.mode == SessionPickerPresentationMode::Normal {
-                    format!("{}/{} running", item.running_pane_count, item.pane_count)
-                } else {
-                    format!("{}/{}", item.running_pane_count, item.pane_count)
-                };
-                let detail = if is_selected
-                    && layout.mode == SessionPickerPresentationMode::Normal
-                    && !item.working_directory.is_empty()
-                {
-                    format!("{} · {}", item.breadcrumb, item.working_directory)
-                } else {
-                    item.breadcrumb.to_owned()
-                };
-                (item.display_title, detail, status)
-            }
-        };
-        if layout.mode == SessionPickerPresentationMode::Normal
-            && matches!(row.target, PickerHitTarget::Open(_))
-        {
-            let top = Rect {
-                x: content.x,
-                y: content.y,
-                width: content.width,
-                height: content.height / 2,
-            };
-            let title_width = top.width.saturating_mul(2) / 3;
-            let title_rect = Rect {
-                width: title_width,
-                ..top
-            };
-            let status_rect = Rect {
-                x: top.x.saturating_add(title_width),
-                width: top.width.saturating_sub(title_width),
-                ..top
-            };
-            paint_picker_text(
-                cache,
-                context,
-                &mut used,
-                canvas,
-                canvas_width,
-                canvas_height,
-                title,
-                ChromeTextStyle::Bold,
-                scale_120,
-                renderer_generation,
-                title_rect,
-                PickerTextAlignment::Left,
-                primary,
-            )?;
-            paint_picker_text(
-                cache,
-                context,
-                &mut used,
-                canvas,
-                canvas_width,
-                canvas_height,
-                &status,
-                ChromeTextStyle::Regular,
-                scale_120,
-                renderer_generation,
-                status_rect,
-                PickerTextAlignment::Right,
-                secondary,
-            )?;
-            paint_picker_text(
-                cache,
-                context,
-                &mut used,
-                canvas,
-                canvas_width,
-                canvas_height,
-                &detail,
-                ChromeTextStyle::Regular,
-                scale_120,
-                renderer_generation,
-                Rect {
-                    x: content.x,
-                    y: content.y.saturating_add(content.height / 2),
-                    width: content.width,
-                    height: content.height.saturating_sub(content.height / 2),
-                },
-                PickerTextAlignment::Left,
-                secondary,
-            )?;
-        } else {
-            let title_width = if layout.mode == SessionPickerPresentationMode::Minimal {
-                content.width
-            } else {
-                content.width.saturating_mul(2) / 3
-            };
-            let title_rect = Rect {
-                width: title_width,
-                ..content
-            };
-            paint_picker_text(
-                cache,
-                context,
-                &mut used,
-                canvas,
-                canvas_width,
-                canvas_height,
-                title,
-                ChromeTextStyle::Bold,
-                scale_120,
-                renderer_generation,
-                title_rect,
-                PickerTextAlignment::Left,
-                primary,
-            )?;
-            if layout.mode != SessionPickerPresentationMode::Minimal {
-                paint_picker_text(
-                    cache,
-                    context,
-                    &mut used,
-                    canvas,
-                    canvas_width,
-                    canvas_height,
-                    &status,
-                    ChromeTextStyle::Regular,
-                    scale_120,
-                    renderer_generation,
-                    Rect {
-                        x: content.x.saturating_add(title_width),
-                        width: content.width.saturating_sub(title_width),
-                        ..content
-                    },
-                    PickerTextAlignment::Right,
-                    secondary,
-                )?;
-            }
-        }
-    }
-
-    let footer = picker_buffer_rect(layout.footer, scale_120);
-    let footer_text = if items.is_empty() {
-        if search_active && !search_query.is_empty() {
-            "No matches   Esc clear".to_owned()
-        } else if let Some(blocker) = new_blocker {
-            blocker.to_owned()
-        } else {
-            let empty = match purpose {
-                SessionPickerPurpose::RecentDojos => "No recent Dojos",
-                SessionPickerPurpose::Dojos => "No Dojos",
-                SessionPickerPurpose::Lairs => "No Lairs",
-                SessionPickerPurpose::Remotes => "No remote profiles",
-            };
-            if new_enabled {
-                format!("{empty}   Ctrl+N new")
-            } else {
-                empty.to_owned()
-            }
-        }
-    } else {
-        match layout.mode {
-            SessionPickerPresentationMode::Normal if purpose.offers_creation() => format!(
-                "/ search   ↑↓ / J K navigate   Enter {}   Ctrl+N new   Esc cancel",
-                purpose.selection_verb()
-            ),
-            SessionPickerPresentationMode::Normal => format!(
-                "/ search   ↑↓ / J K navigate   Enter {}   Esc cancel",
-                purpose.selection_verb()
-            ),
-            SessionPickerPresentationMode::Compact => format!(
-                "/ search   ↑↓ navigate   Enter {}   Esc cancel",
-                purpose.selection_verb()
-            ),
-            SessionPickerPresentationMode::Minimal => {
-                format!("Enter {}   Esc cancel", purpose.selection_verb())
-            }
-        }
-    };
-    paint_picker_text(
-        cache,
-        context,
-        &mut used,
-        canvas,
-        canvas_width,
-        canvas_height,
-        &footer_text,
-        ChromeTextStyle::Regular,
-        scale_120,
-        renderer_generation,
-        footer,
-        PickerTextAlignment::Center,
-        palette.secondary,
-    )?;
-    cache.finish_frame(used);
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::super::pixel_index;
@@ -2386,177 +1593,38 @@ mod tests {
     }
 
     #[test]
-    fn picker_purpose_keeps_hierarchy_copy_distinct() {
+    fn picker_purpose_keeps_its_copy_distinct() {
         let cases = [
             (
                 SessionPickerPurpose::RecentDojos,
-                "RECENT DOJOS",
-                "RECENT DOJOS",
-                "Open a recent running Dojo.",
-                "+ New terminal",
-                "Start a fresh shell",
-                "open",
+                ["dojos", "filter dojos", "New terminal", "open"],
+                Some(0),
             ),
             (
                 SessionPickerPurpose::Dojos,
-                "DOJOS",
-                "DOJOS",
-                "Switch to a Dojo in this Lair.",
-                "+ New Dojo",
-                "Add a Dojo to this Lair",
-                "switch",
+                ["dojos", "filter dojos", "New Dojo", "switch"],
+                Some(1),
             ),
             (
                 SessionPickerPurpose::Lairs,
-                "LAIRS",
-                "LAIRS",
-                "Switch to a Lair.",
-                "+ New Lair",
-                "Start a fresh workspace",
-                "switch",
+                ["lairs", "filter lairs", "New Lair", "switch"],
+                None,
             ),
             (
                 SessionPickerPurpose::Remotes,
-                "REMOTES",
-                "REMOTES",
-                "Connect to a remote profile.",
-                "+ Add a profile",
-                "Edit remotes.toml",
-                "connect",
+                ["remotes", "filter remotes", "Add a profile", "connect"],
+                None,
             ),
         ];
-        for (purpose, normal, minimal, guidance, new_title, new_description, verb) in cases {
-            assert_eq!(purpose.heading(false), normal);
-            assert_eq!(purpose.heading(true), minimal);
-            assert_eq!(purpose.guidance(), guidance);
-            assert_eq!(purpose.new_title(), new_title);
-            assert_eq!(purpose.new_description(), new_description);
+        for (purpose, [title, placeholder, create, verb], scope) in cases {
+            assert_eq!(purpose.title(), title);
+            assert_eq!(purpose.placeholder(), placeholder);
+            assert_eq!(purpose.create_title(), create);
             assert_eq!(purpose.selection_verb(), verb);
+            assert_eq!(purpose.scope(), scope);
+            assert!(purpose.no_match().starts_with("No matching "));
+            assert!(purpose.empty_label().starts_with("No "));
         }
-        for purpose in [
-            SessionPickerPurpose::RecentDojos,
-            SessionPickerPurpose::Dojos,
-            SessionPickerPurpose::Lairs,
-        ] {
-            assert!(purpose.offers_creation());
-        }
-        assert!(!SessionPickerPurpose::Remotes.offers_creation());
-    }
-
-    #[test]
-    fn session_picker_layout_is_responsive_bounded_and_scale_deterministic() {
-        for (width, height, expected_mode) in [
-            (960, 600, SessionPickerPresentationMode::Normal),
-            (400, 240, SessionPickerPresentationMode::Compact),
-            (240, 140, SessionPickerPresentationMode::Minimal),
-        ] {
-            let mut previous = None;
-            for scale in [120, 150, 240] {
-                let layout = session_picker_overlay_layout(width, height, scale, 256, 256, 0)
-                    .expect("picker layout");
-                assert_eq!(layout.mode, expected_mode);
-                assert!(layout.panel.x + layout.panel.width <= width);
-                assert!(layout.panel.y + layout.panel.height <= height);
-                assert!(layout.rows.iter().all(|row| {
-                    row.rect.x >= layout.panel.x
-                        && row.rect.y >= layout.panel.y
-                        && row.rect.x + row.rect.width <= layout.panel.x + layout.panel.width
-                        && row.rect.y + row.rect.height <= layout.panel.y + layout.panel.height
-                        && row.surface.x >= row.rect.x
-                        && row.surface.y >= row.rect.y
-                        && row.surface.x + row.surface.width <= row.rect.x + row.rect.width
-                        && row.surface.y + row.surface.height <= row.rect.y + row.rect.height
-                }));
-                for pair in layout.rows.windows(2) {
-                    assert_eq!(pair[0].rect.y + pair[0].rect.height, pair[1].rect.y);
-                    let first = picker_buffer_rect(pair[0].surface, scale);
-                    let second = picker_buffer_rect(pair[1].surface, scale);
-                    assert!(first.y + first.height < second.y);
-                }
-                let first = &layout.rows[0].surface;
-                match expected_mode {
-                    SessionPickerPresentationMode::Normal => {
-                        assert_eq!(first.x, layout.action.x + 8);
-                        assert_eq!(first.y, layout.action.y + 3);
-                        assert_eq!(first.width, layout.action.width - 16);
-                        assert_eq!(first.height, layout.action.height - 6);
-                    }
-                    SessionPickerPresentationMode::Compact => {
-                        assert_eq!(first.x, layout.action.x + 6);
-                        assert_eq!(first.y, layout.action.y + 3);
-                        assert_eq!(first.width, layout.action.width - 12);
-                        assert_eq!(first.height, layout.action.height - 6);
-                    }
-                    SessionPickerPresentationMode::Minimal => {
-                        assert_eq!(*first, layout.action);
-                    }
-                }
-                let header = picker_buffer_rect(layout.header, scale);
-                let action = picker_buffer_rect(layout.action, scale);
-                let footer = picker_buffer_rect(layout.footer, scale);
-                assert_eq!(header.y + header.height, action.y);
-                assert!(action.y + action.height <= footer.y);
-                assert!(layout.rows.iter().any(|row| {
-                    row.target == PickerHitTarget::Open(255)
-                        || expected_mode != SessionPickerPresentationMode::Minimal
-                            && layout.visible_range.contains(&255)
-                }));
-                let geometry = (
-                    layout.panel,
-                    layout.header,
-                    layout.action,
-                    layout.list,
-                    layout.footer,
-                    layout.rows.clone(),
-                    layout.visible_range.clone(),
-                    layout.mode,
-                );
-                if let Some(previous) = &previous {
-                    assert_eq!(previous, &geometry);
-                }
-                previous = Some(geometry);
-            }
-        }
-    }
-
-    #[test]
-    fn minimal_picker_prioritizes_pointer_target_height() {
-        let constrained = session_picker_overlay_layout(240, 50, 150, 8, 2, 0).unwrap();
-        assert_eq!(constrained.mode, SessionPickerPresentationMode::Minimal);
-        assert_eq!(constrained.action.height, 44);
-        let impossible = session_picker_overlay_layout(240, 40, 150, 8, 2, 0).unwrap();
-        assert_eq!(impossible.action.height, 40);
-    }
-
-    #[test]
-    fn session_picker_hit_rectangles_are_half_open_and_stable() {
-        let layout = session_picker_overlay_layout(960, 600, 120, 8, 1, 0).unwrap();
-        let first = &layout.rows[0];
-        assert_eq!(
-            session_picker_hit_test(&layout, (f64::from(first.rect.x), f64::from(first.rect.y))),
-            Some(PickerHitTarget::New)
-        );
-        assert_ne!(
-            session_picker_hit_test(
-                &layout,
-                (
-                    f64::from(first.rect.x + first.rect.width),
-                    f64::from(first.rect.y)
-                )
-            ),
-            Some(PickerHitTarget::New)
-        );
-        assert_eq!(
-            session_picker_hit_test(
-                &layout,
-                (
-                    f64::from(layout.action.x + 1),
-                    f64::from(layout.action.y + 1)
-                )
-            ),
-            Some(PickerHitTarget::New),
-            "visual menu padding must preserve the full pointer target"
-        );
     }
 
     #[test]
@@ -2630,241 +1698,6 @@ mod tests {
         assert!(contrast_ratio(blue_palette.secondary, blue_palette.panel) >= 4.5);
         assert_ne!(blue_palette.secondary, 0);
         assert_ne!(blue_palette.secondary, 0x00ff_ffff);
-    }
-
-    #[test]
-    #[allow(clippy::too_many_lines)]
-    fn session_picker_painter_reuses_text_except_selected_cwd_detail() {
-        let theme = ResolvedTheme::default();
-        let palette = session_picker_palette(theme);
-        let layout = session_picker_overlay_layout(960, 600, 120, 2, 0, 0).unwrap();
-        let items = [
-            SessionPickerTextItem {
-                display_title: "editor",
-                breadcrumb: "work / editor",
-                working_directory: "/work",
-                pane_count: 2,
-                running_pane_count: 2,
-            },
-            SessionPickerTextItem {
-                display_title: "notes",
-                breadcrumb: "notes / Dojo 1",
-                working_directory: "/notes",
-                pane_count: 1,
-                running_pane_count: 1,
-            },
-        ];
-        let [_, red, green, blue] = theme.background.to_be_bytes();
-        let mut canvas = vec![0_u8; 960 * 600 * 4];
-        for pixel in canvas.as_chunks_mut::<4>().0 {
-            pixel.copy_from_slice(&[blue, green, red, 0xff]);
-        }
-        let mut cache = SessionPickerTextCache::default();
-        paint_session_picker_overlay(
-            &mut cache,
-            &RenderContext::new(u16::MAX),
-            &mut canvas,
-            960,
-            600,
-            Rect {
-                x: 0,
-                y: 0,
-                width: 960,
-                height: 600,
-            },
-            120,
-            1,
-            &layout,
-            palette,
-            SessionPickerPurpose::RecentDojos,
-            &items,
-            true,
-            None,
-            false,
-            "",
-            PickerHitTarget::New,
-            None,
-            None,
-            true,
-        )
-        .unwrap();
-        let shaped = cache.len();
-        assert!(shaped > 0);
-        assert!(
-            cache
-                .entries
-                .iter()
-                .all(|(key, text)| text.pixel_width() <= key.constrained_width)
-        );
-        let outside = pixel_index(960, 600, 0, 0).unwrap();
-        assert_ne!(&canvas[outside..outside + 4], &[blue, green, red, 0xff]);
-        let frame = pixel_index(
-            960,
-            600,
-            i32::try_from(layout.panel.x).unwrap(),
-            i32::try_from(layout.panel.y).unwrap(),
-        )
-        .unwrap();
-        let [_, frame_red, frame_green, frame_blue] = palette.focused_frame.to_be_bytes();
-        assert_eq!(
-            &canvas[frame..frame + 4],
-            &[frame_blue, frame_green, frame_red, 0xff]
-        );
-        let rail = pixel_index(
-            960,
-            600,
-            i32::try_from(layout.rows[0].surface.x).unwrap(),
-            i32::try_from(layout.rows[0].surface.y + layout.rows[0].surface.height / 2).unwrap(),
-        )
-        .unwrap();
-        let [_, accent_red, accent_green, accent_blue] = theme.roles.accent.to_be_bytes();
-        assert_eq!(
-            &canvas[rail..rail + 4],
-            &[accent_blue, accent_green, accent_red, 0xff]
-        );
-        paint_session_picker_overlay(
-            &mut cache,
-            &RenderContext::new(u16::MAX),
-            &mut canvas,
-            960,
-            600,
-            Rect {
-                x: 0,
-                y: 0,
-                width: 960,
-                height: 600,
-            },
-            120,
-            1,
-            &layout,
-            palette,
-            SessionPickerPurpose::RecentDojos,
-            &items,
-            true,
-            None,
-            false,
-            "",
-            PickerHitTarget::Open(0),
-            None,
-            None,
-            true,
-        )
-        .unwrap();
-        assert_eq!(cache.len(), shaped + 1);
-    }
-
-    #[test]
-    fn compact_and_minimal_pickers_render_no_match_status() {
-        let theme = ResolvedTheme::default();
-        for (width, height, expected_mode) in [
-            (400, 240, SessionPickerPresentationMode::Compact),
-            (240, 140, SessionPickerPresentationMode::Minimal),
-        ] {
-            let layout = session_picker_overlay_layout(width, height, 120, 0, 0, 0).unwrap();
-            assert_eq!(layout.mode, expected_mode);
-            let mut cache = SessionPickerTextCache::default();
-            let mut canvas = vec![0_u8; usize::try_from(width * height * 4).unwrap()];
-            paint_session_picker_overlay(
-                &mut cache,
-                &RenderContext::new(u16::MAX),
-                &mut canvas,
-                width,
-                height,
-                Rect {
-                    x: 0,
-                    y: 0,
-                    width,
-                    height,
-                },
-                120,
-                1,
-                &layout,
-                session_picker_palette(theme),
-                SessionPickerPurpose::RecentDojos,
-                &[],
-                true,
-                None,
-                true,
-                "missing",
-                PickerHitTarget::New,
-                None,
-                None,
-                true,
-            )
-            .unwrap();
-            assert!(
-                cache
-                    .entries
-                    .keys()
-                    .any(|key| key.source.text() == "No matches   Esc clear")
-            );
-        }
-    }
-
-    #[test]
-    fn session_picker_text_cache_stays_bounded_for_large_catalogs() {
-        let owned = (0..256)
-            .map(|index| (format!("session {index}"), format!("/work/{index}")))
-            .collect::<Vec<_>>();
-        let items = owned
-            .iter()
-            .map(|(title, cwd)| SessionPickerTextItem {
-                display_title: title,
-                breadcrumb: title,
-                working_directory: cwd,
-                pane_count: 2,
-                running_pane_count: 2,
-            })
-            .collect::<Vec<_>>();
-        let theme = ResolvedTheme::default();
-        let mut cache = SessionPickerTextCache::default();
-        let mut canvas = vec![0_u8; 960 * 600 * 4];
-        let mut visible_start = 0;
-        for selected in [0, 32, 96, 255] {
-            let layout = session_picker_overlay_layout(
-                960,
-                600,
-                120,
-                items.len(),
-                selected + 1,
-                visible_start,
-            )
-            .unwrap();
-            visible_start = layout.visible_range.start;
-            paint_session_picker_overlay(
-                &mut cache,
-                &RenderContext::new(u16::MAX),
-                &mut canvas,
-                960,
-                600,
-                Rect {
-                    x: 0,
-                    y: 0,
-                    width: 960,
-                    height: 600,
-                },
-                120,
-                1,
-                &layout,
-                session_picker_palette(theme),
-                SessionPickerPurpose::RecentDojos,
-                &items,
-                true,
-                None,
-                false,
-                "",
-                PickerHitTarget::Open(selected),
-                None,
-                None,
-                true,
-            )
-            .unwrap();
-        }
-        assert!(
-            cache.len() < 128,
-            "cache held {} shaped strings",
-            cache.len()
-        );
     }
 
     /// tokyo-night's background and foreground with Omarchy's Glassy Windows

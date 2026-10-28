@@ -156,22 +156,22 @@ use crate::renderer::{
     ChromeSource, ChromeSurface, ChromeText, ChromeTextStyle, CommandPaletteLayout,
     CursorPresentation, DojoPromptLayout, HistoryOverlayStatus, LairExplorerAction,
     LairExplorerLayout, LairExplorerMetrics, LairExplorerPresentationMode, PaletteBody,
-    PaletteShape, PickerHitTarget, RenderContext, SessionPickerOverlayLayout, SessionPickerPurpose,
-    SessionPickerTextCache, SessionPickerTextItem, SnapshotFrame, SnapshotOverlays,
-    TabContextMenuLayout, TextRow, background_bgra, chrome_panel_fill, chrome_panel_palette,
-    clear_snapshot_caches, command_palette_hit_test, command_palette_layout, dojo_prompt_hit_test,
-    dojo_prompt_layout, explorer_minimum_docked_terminal_width, fill_rect, history_overlay_layout,
+    PaletteShape, PickerHitTarget, RenderContext, SessionPickerPurpose, SessionPickerTextCache,
+    SnapshotFrame, SnapshotOverlays, TabContextMenuLayout, TextRow, background_bgra,
+    chrome_panel_fill, chrome_panel_palette, clear_snapshot_caches, command_palette_hit_test,
+    command_palette_layout, command_palette_row_hit_test, dojo_prompt_hit_test, dojo_prompt_layout,
+    explorer_minimum_docked_terminal_width, fill_rect, history_overlay_layout,
     lair_explorer_action_hit_test, lair_explorer_agent_hit_test,
     lair_explorer_agents_label_hit_test, lair_explorer_chrome_cell_width,
     lair_explorer_disclosure_hit_test, lair_explorer_filter_hit_test,
     lair_explorer_footer_hit_test, lair_explorer_hit_test, lair_explorer_shown_layout,
     lair_explorer_with_agents, paint, paint_command_palette, paint_dojo_prompt,
     paint_handoff_banner, paint_history_overlay, paint_lair_explorer, paint_search_overlay,
-    paint_session_picker_overlay, paint_snapshot_overlays, paint_snapshot_presented,
+    paint_session_picker, paint_snapshot_overlays, paint_snapshot_presented,
     paint_snapshot_region_presented, paint_snapshot_rows_presented, paint_tab_context_menu,
-    premultiplied_theme_rgba, scroll_snapshot_pixels, search_overlay_panel,
-    session_picker_hit_test, session_picker_overlay_layout, snapshot_row_rect,
-    tab_context_menu_hit_test, tab_context_menu_layout, tab_menu_label_width, write_ppm,
+    picker_status_line, premultiplied_theme_rgba, scroll_snapshot_pixels, search_overlay_panel,
+    session_picker_layout, snapshot_row_rect, tab_context_menu_hit_test, tab_context_menu_layout,
+    tab_menu_label_width, write_ppm,
 };
 #[cfg(test)]
 use crate::renderer::{lair_explorer_layout, paint_box_drawing_cell};
@@ -226,9 +226,9 @@ use input::{
     keymap_press_consumes_key, keymap_press_for, local_selection_owner, mouse_report,
     owned_field_clipboard_action, pane_focus_action, pane_topology_action,
     pending_selection_drag_anchor, picker_ime_reconcile, picker_release_activation,
-    pointer_axis_focus_target, reconciled_focus_report, session_picker_shortcut_action,
-    shortcut_action_for, shortcut_paused_during_handoff, tab_action_dispatch_allowed,
-    tab_shortcut_action, take_press_owner,
+    picker_repeat_consumed, pointer_axis_focus_target, reconciled_focus_report,
+    session_picker_shortcut_action, shortcut_action_for, shortcut_paused_during_handoff,
+    tab_action_dispatch_allowed, tab_shortcut_action, take_press_owner,
 };
 use selection::{
     CellPosition, CopyModeState, CopyMotion, CopyMoveOutcome, Selection, SelectionEndpoint,
@@ -277,30 +277,6 @@ const IDLE_EVENT_LOOP_TIMEOUT: Duration = Duration::from_secs(60);
 const RECEIVER_DRAIN_BUDGET: usize = 8;
 const MAX_SHM_BUFFERS: usize = 2;
 const MAX_WINDOW_PRESENTATION_BYTES: usize = 512 * 1024 * 1024;
-
-fn translated_rect(mut rect: Rect, origin: Rect) -> Rect {
-    rect.x = rect.x.saturating_add(origin.x);
-    rect.y = rect.y.saturating_add(origin.y);
-    rect
-}
-
-fn translate_picker_layout(
-    mut layout: SessionPickerOverlayLayout,
-    origin: Rect,
-) -> SessionPickerOverlayLayout {
-    layout.panel = translated_rect(layout.panel, origin);
-    layout.header = translated_rect(layout.header, origin);
-    layout.action = translated_rect(layout.action, origin);
-    layout.list = translated_rect(layout.list, origin);
-    layout.footer = translated_rect(layout.footer, origin);
-    for row in &mut layout.rows {
-        row.rect = translated_rect(row.rect, origin);
-        row.surface = translated_rect(row.surface, origin);
-        row.title_clip = translated_rect(row.title_clip, origin);
-        row.metadata_clip = translated_rect(row.metadata_clip, origin);
-    }
-    layout
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FinalTabRemovalAction {
@@ -1293,11 +1269,13 @@ fn assemble_app(
             session_picker_targets: Vec::new(),
             session_picker_creation_target: None,
             session_picker_layout: None,
+            session_picker_page_rows: 0,
             session_picker_pressed: None,
             session_picker_text_cache: SessionPickerTextCache::default(),
             session_picker_wheel: WheelAccumulator::default(),
             session_picker_consumed_keys: HashSet::new(),
             session_picker_redraw: false,
+            session_picker_status_damage: false,
             session_picker_reconcile_pending: false,
             session_picker_open_focus: None,
             session_picker_requested: false,
@@ -2575,12 +2553,17 @@ struct ModalState {
     selector_kind: Option<SelectorKind>,
     session_picker_targets: Vec<SessionPickerTarget>,
     session_picker_creation_target: Option<SessionPickerCreationTarget>,
-    session_picker_layout: Option<SessionPickerOverlayLayout>,
+    session_picker_layout: Option<CommandPaletteLayout>,
+    /// The rows the inline picker's list showed when last painted, for
+    /// paging before its next layout.
+    session_picker_page_rows: usize,
     session_picker_pressed: Option<PickerHitTarget>,
     session_picker_text_cache: SessionPickerTextCache,
     session_picker_wheel: WheelAccumulator,
     session_picker_consumed_keys: HashSet<u32>,
     session_picker_redraw: bool,
+    /// The loading line's spinner changed: the next draw damages that line.
+    session_picker_status_damage: bool,
     session_picker_reconcile_pending: bool,
     session_picker_open_focus: Option<bool>,
     session_picker_requested: bool,
@@ -4092,6 +4075,25 @@ const fn session_picker_purpose(selector_kind: Option<SelectorKind>) -> SessionP
     }
 }
 
+/// Tab in the `dojos` picker: the request for the other scope, and the
+/// selector it opens; `None` for a picker with no scope.
+fn session_picker_scope_request(
+    selector_kind: Option<SelectorKind>,
+    lair_id: LairId,
+) -> Option<(WindowTopologyCommand, Option<SelectorKind>)> {
+    match selector_kind {
+        None => Some((
+            WindowTopologyCommand::RequestSelector {
+                kind: SelectorKind::Dojo,
+                lair_id,
+            },
+            Some(SelectorKind::Dojo),
+        )),
+        Some(SelectorKind::Dojo) => Some((WindowTopologyCommand::RequestSessionPicker, None)),
+        Some(SelectorKind::Lair) => None,
+    }
+}
+
 fn session_picker_status_catalog(message: &'static str) -> SessionPickerCatalog {
     SessionPickerCatalog {
         items: Vec::new(),
@@ -4101,6 +4103,18 @@ fn session_picker_status_catalog(message: &'static str) -> SessionPickerCatalog 
         creation_target: None,
         initial_row: None,
     }
+}
+
+/// Whether a picker reply of `reply`'s kind is for the picker showing:
+/// once a navigation picker is open, a reply for the other scope, from a
+/// Tab since superseded, is stale and dropped, while the request the
+/// picker waits for stays pending.
+fn picker_reply_matches(
+    navigation_picker_open: bool,
+    showing: Option<SelectorKind>,
+    reply: Option<SelectorKind>,
+) -> bool {
+    !navigation_picker_open || showing == reply
 }
 
 const fn session_picker_title(selector_kind: Option<SelectorKind>) -> &'static str {
@@ -7089,10 +7103,7 @@ impl App {
                     let WindowTopologyCommand::RequestSelector { kind, .. } = request else {
                         unreachable!("picker request classification changed");
                     };
-                    self.show_embedded_session_picker(
-                        session_picker_status_catalog("Loading navigation…"),
-                        Some(*kind),
-                    )?;
+                    self.show_loading_session_picker(Some(*kind))?;
                     self.modal.session_picker_requested = true;
                     self.modal.session_picker_retry_command = picker_request;
                 } else if requests_picker {
@@ -7281,10 +7292,7 @@ impl App {
             }
             BuiltInCommandDispatch::OpenRemoteChooser => self.show_remote_profiles(),
             BuiltInCommandDispatch::RecentSessions => (|| -> Result<()> {
-                self.show_embedded_session_picker(
-                    session_picker_status_catalog("Loading navigation…"),
-                    None,
-                )?;
+                self.show_loading_session_picker(None)?;
                 self.modal.session_picker_requested = true;
                 self.modal.session_picker_retry_command =
                     Some(WindowTopologyCommand::RequestSessionPicker);
@@ -7739,6 +7747,19 @@ impl App {
         self.presentation.full_redraw = true;
     }
 
+    /// Shows a picker waiting on the daemon for its rows: its body stays
+    /// empty for 150 ms, then shows the shared spinner and "loading".
+    fn show_loading_session_picker(&mut self, selector_kind: Option<SelectorKind>) -> Result<()> {
+        self.show_embedded_session_picker(
+            session_picker_status_catalog("Loading navigation…"),
+            selector_kind,
+        )?;
+        if let Some(picker) = self.modal.session_picker.as_mut() {
+            picker.set_loading(Instant::now());
+        }
+        Ok(())
+    }
+
     fn show_embedded_session_picker(
         &mut self,
         catalog: SessionPickerCatalog,
@@ -7754,7 +7775,8 @@ impl App {
         } = catalog;
         anyhow::ensure!(items.len() == targets.len(), "Dojo picker targets differ");
         self.install_inline_picker(
-            SessionPickerUi::inline(items, creation_enabled, creation_blocker, initial_row),
+            SessionPickerUi::inline(items, creation_enabled, creation_blocker, initial_row)
+                .with_purpose(session_picker_purpose(selector_kind)),
             selector_kind,
             targets,
             creation_target,
@@ -9220,7 +9242,13 @@ impl App {
             .modal
             .session_picker_layout
             .as_ref()
-            .and_then(|layout| session_picker_hit_test(layout, event.position));
+            .and_then(|layout| command_palette_row_hit_test(layout, event.position))
+            .and_then(|index| {
+                self.modal
+                    .session_picker
+                    .as_ref()
+                    .and_then(|picker| picker.list_target(index))
+            });
         let mut changed = false;
         let mut activate = None;
         match event.kind {
@@ -9261,7 +9289,7 @@ impl App {
                         vertical.absolute,
                         vertical.discrete,
                         vertical.value120,
-                        44,
+                        28,
                     )
                 {
                     let count = isize::try_from(count).unwrap_or(isize::MAX);
@@ -9292,6 +9320,214 @@ impl App {
             self.modal.session_picker_redraw = true;
         }
         changed
+    }
+
+    /// A key while a picker is open. Typing filters at once; arrows, Page
+    /// Up and Down, Home and End move; Enter chooses; Ctrl+N creates; Tab
+    /// switches the `dojos` picker's scope; Escape clears what is typed,
+    /// then closes.
+    fn handle_session_picker_key(&mut self, event: &KeyEvent) {
+        let page = self.session_picker_page();
+        let modifiers = self.input.modifiers;
+        let plain = !modifiers.ctrl && !modifiers.alt && !modifiers.logo;
+        let mut changed = false;
+        match event.keysym {
+            Keysym::Up => self.move_session_picker(-1),
+            Keysym::Down => self.move_session_picker(1),
+            Keysym::Page_Up => self.move_session_picker(-page),
+            Keysym::Page_Down => self.move_session_picker(page),
+            Keysym::Home | Keysym::End => {
+                if let Some(picker) = self.modal.session_picker.as_mut() {
+                    if event.keysym == Keysym::Home {
+                        picker.select_first();
+                    } else {
+                        picker.select_last();
+                    }
+                }
+                if let Err(error) = self.refresh_session_picker() {
+                    self.scheduling.fail(error);
+                }
+            }
+            Keysym::Return | Keysym::KP_Enter => {
+                if let Some(decision) = self
+                    .modal
+                    .session_picker
+                    .as_ref()
+                    .and_then(SessionPickerUi::selected_decision)
+                {
+                    self.decide_session_picker(decision);
+                }
+            }
+            Keysym::n | Keysym::N
+                if modifiers.ctrl
+                    && self
+                        .modal
+                        .session_picker
+                        .as_ref()
+                        .is_some_and(SessionPickerUi::new_enabled) =>
+            {
+                self.decide_session_picker(SessionPickerDecision::New);
+            }
+            Keysym::u | Keysym::U if modifiers.ctrl && !modifiers.alt && !modifiers.logo => {
+                changed = self
+                    .modal
+                    .session_picker
+                    .as_mut()
+                    .is_some_and(SessionPickerUi::clear_query);
+            }
+            Keysym::Tab | Keysym::ISO_Left_Tab if plain => {
+                self.toggle_session_picker_scope();
+            }
+            Keysym::r | Keysym::R
+                if plain
+                    && self.modal.session_picker_retry_command.is_some()
+                    && self.modal.remote_profiles.is_none()
+                    && self
+                        .modal
+                        .session_picker
+                        .as_ref()
+                        .is_some_and(SessionPickerUi::retryable) =>
+            {
+                self.retry_session_picker();
+            }
+            Keysym::BackSpace => {
+                changed = self
+                    .modal
+                    .session_picker
+                    .as_mut()
+                    .is_some_and(SessionPickerUi::backspace);
+            }
+            Keysym::Escape => {
+                let cleared = self
+                    .modal
+                    .session_picker
+                    .as_mut()
+                    .is_some_and(SessionPickerUi::clear_query);
+                if cleared {
+                    changed = true;
+                } else {
+                    self.cancel_session_picker();
+                }
+            }
+            _ if plain => {
+                if let Some(text) = Self::editable_field_text(event.utf8.as_deref()) {
+                    changed = self
+                        .modal
+                        .session_picker
+                        .as_mut()
+                        .is_some_and(|picker| picker.append_text(text));
+                }
+            }
+            _ => {}
+        }
+        if changed && let Err(error) = self.refresh_session_picker() {
+            self.scheduling.fail(error);
+        }
+    }
+
+    /// Page Up and Page Down in a picker move by the rows its list last
+    /// showed, even before the next paint lays it out again; the
+    /// standalone picker, which has no list layout, by its ten rows.
+    fn session_picker_page(&self) -> isize {
+        let rows = self
+            .modal
+            .session_picker_layout
+            .as_ref()
+            .map_or(self.modal.session_picker_page_rows, |layout| {
+                layout.rows.len()
+            });
+        isize::try_from(if rows == 0 { 10 } else { rows }).unwrap_or(1)
+    }
+
+    /// Whether a picker reply is for the picker showing.
+    fn picker_reply_expected(&self, kind: Option<SelectorKind>) -> bool {
+        picker_reply_matches(
+            self.modal
+                .session_picker
+                .as_ref()
+                .is_some_and(SessionPickerUi::is_inline)
+                && self.modal.remote_profiles.is_none(),
+            self.modal.selector_kind,
+            kind,
+        )
+    }
+
+    /// The status picker that says a request failed: R asks again.
+    fn show_session_picker_failure(
+        &mut self,
+        message: &'static str,
+        selector_kind: Option<SelectorKind>,
+    ) -> Result<()> {
+        self.show_embedded_session_picker(session_picker_status_catalog(message), selector_kind)?;
+        if let Some(picker) = self.modal.session_picker.as_mut() {
+            picker.set_retryable();
+        }
+        Ok(())
+    }
+
+    /// R on a status picker: the same request again, behind "Loading".
+    fn retry_session_picker(&mut self) {
+        let command = self.modal.session_picker_retry_command.clone();
+        let selector_kind = self.modal.selector_kind;
+        self.close_inline_session_picker();
+        if let Err(error) = self.show_loading_session_picker(selector_kind) {
+            self.scheduling.fail(error);
+            return;
+        }
+        self.modal.session_picker_requested = true;
+        if command.is_none_or(|command| self.send_topology_command(command).is_err()) {
+            self.modal.session_picker_requested = false;
+        }
+    }
+
+    /// Tab in the `dojos` picker: `recent` and `this lair` swap, keeping
+    /// what is typed. The other pickers have no scope.
+    fn toggle_session_picker_scope(&mut self) {
+        if self.modal.remote_profiles.is_some()
+            || !self
+                .modal
+                .session_picker
+                .as_ref()
+                .is_some_and(SessionPickerUi::is_inline)
+        {
+            return;
+        }
+        let Some((command, selector_kind)) = session_picker_scope_request(
+            self.modal.selector_kind,
+            self.tab_state.active_identity.lair_id,
+        ) else {
+            return;
+        };
+        let query = self.inline_picker_query();
+        self.close_inline_session_picker();
+        if let Err(error) = self.show_loading_session_picker(selector_kind) {
+            self.scheduling.fail(error);
+            return;
+        }
+        self.restore_inline_picker_query(&query);
+        self.modal.session_picker_requested = true;
+        self.modal.session_picker_retry_command = Some(command.clone());
+        if self.send_topology_command(command).is_err() {
+            self.modal.session_picker_requested = false;
+        }
+    }
+
+    /// What is typed in the inline picker, to carry into the one replacing it.
+    fn inline_picker_query(&self) -> String {
+        self.modal
+            .session_picker
+            .as_ref()
+            .filter(|picker| picker.is_inline())
+            .map(|picker| picker.query().to_owned())
+            .unwrap_or_default()
+    }
+
+    fn restore_inline_picker_query(&mut self, query: &str) {
+        if !query.is_empty()
+            && let Some(picker) = self.modal.session_picker.as_mut()
+        {
+            picker.append_text(query);
+        }
     }
 
     fn cancel_session_picker(&mut self) {
@@ -9784,144 +10020,7 @@ impl App {
             return;
         }
         if self.modal.session_picker.is_some() {
-            match event.keysym {
-                Keysym::Up => self.move_session_picker(-1),
-                Keysym::Down => self.move_session_picker(1),
-                Keysym::k | Keysym::K
-                    if self
-                        .modal
-                        .session_picker
-                        .as_ref()
-                        .is_some_and(|picker| !picker.search_active()) =>
-                {
-                    self.move_session_picker(-1);
-                }
-                Keysym::j | Keysym::J
-                    if self
-                        .modal
-                        .session_picker
-                        .as_ref()
-                        .is_some_and(|picker| !picker.search_active()) =>
-                {
-                    self.move_session_picker(1);
-                }
-                Keysym::Page_Up => self.move_session_picker(-7),
-                Keysym::Page_Down => self.move_session_picker(7),
-                Keysym::Home => {
-                    if let Some(picker) = self.modal.session_picker.as_mut() {
-                        picker.select_first();
-                    }
-                    if let Err(error) = self.refresh_session_picker() {
-                        self.scheduling.fail(error);
-                    }
-                }
-                Keysym::End => {
-                    if let Some(picker) = self.modal.session_picker.as_mut() {
-                        picker.select_last();
-                    }
-                    if let Err(error) = self.refresh_session_picker() {
-                        self.scheduling.fail(error);
-                    }
-                }
-                Keysym::Return | Keysym::KP_Enter => {
-                    if let Some(decision) = self
-                        .modal
-                        .session_picker
-                        .as_ref()
-                        .and_then(SessionPickerUi::selected_decision)
-                    {
-                        self.decide_session_picker(decision);
-                    }
-                }
-                Keysym::n | Keysym::N
-                    if self.input.modifiers.ctrl
-                        && self
-                            .modal
-                            .session_picker
-                            .as_ref()
-                            .is_some_and(SessionPickerUi::new_enabled) =>
-                {
-                    self.decide_session_picker(SessionPickerDecision::New);
-                }
-                Keysym::r | Keysym::R
-                    if self.modal.session_picker_retry_command.is_some()
-                        && self.modal.remote_profiles.is_none()
-                        && self
-                            .modal
-                            .session_picker
-                            .as_ref()
-                            .is_some_and(|picker| !picker.search_active()) =>
-                {
-                    let command = self.modal.session_picker_retry_command.clone();
-                    let selector_kind = self.modal.selector_kind;
-                    self.close_inline_session_picker();
-                    if let Err(error) = self.show_embedded_session_picker(
-                        session_picker_status_catalog("Loading navigation…"),
-                        selector_kind,
-                    ) {
-                        self.scheduling.fail(error);
-                        return;
-                    }
-                    self.modal.session_picker_requested = true;
-                    if command.is_none_or(|command| self.send_topology_command(command).is_err()) {
-                        self.modal.session_picker_requested = false;
-                    }
-                }
-                Keysym::slash | Keysym::f | Keysym::F
-                    if matches!(event.keysym, Keysym::slash) || self.input.modifiers.ctrl =>
-                {
-                    let changed = self
-                        .modal
-                        .session_picker
-                        .as_mut()
-                        .is_some_and(SessionPickerUi::begin_search);
-                    if changed {
-                        let _ = self.refresh_session_picker();
-                    }
-                }
-                Keysym::BackSpace => {
-                    let changed = self
-                        .modal
-                        .session_picker
-                        .as_mut()
-                        .is_some_and(SessionPickerUi::backspace_search);
-                    if changed {
-                        let _ = self.refresh_session_picker();
-                    }
-                }
-                Keysym::Escape => {
-                    let cleared = self
-                        .modal
-                        .session_picker
-                        .as_mut()
-                        .is_some_and(SessionPickerUi::clear_search);
-                    if cleared {
-                        let _ = self.refresh_session_picker();
-                    } else {
-                        self.cancel_session_picker();
-                    }
-                }
-                _ if !self.input.modifiers.ctrl
-                    && !self.input.modifiers.alt
-                    && self
-                        .modal
-                        .session_picker
-                        .as_ref()
-                        .is_some_and(SessionPickerUi::search_active) =>
-                {
-                    if let Some(text) = Self::editable_field_text(event.utf8.as_deref()) {
-                        let changed = self
-                            .modal
-                            .session_picker
-                            .as_mut()
-                            .is_some_and(|picker| picker.append_search(text));
-                        if changed {
-                            let _ = self.refresh_session_picker();
-                        }
-                    }
-                }
-                _ => {}
-            }
+            self.handle_session_picker_key(event);
             return;
         }
         if let Some(consent) = self.modal.trusted_consent.as_mut() {
@@ -10840,10 +10939,8 @@ impl App {
                             }
                             _ => None,
                         };
-                        self.show_embedded_session_picker(
-                            session_picker_status_catalog(
-                                "Target changed or is unavailable · R to refresh",
-                            ),
+                        self.show_session_picker_failure(
+                            "Target changed or is unavailable",
                             selector_kind,
                         )?;
                         changed = true;
@@ -10861,12 +10958,15 @@ impl App {
                 }
                 WindowTopologyUpdate::ShowSessionPicker { catalog } => {
                     if self.modal.session_picker_requested
+                        && self.picker_reply_expected(None)
                         && !self.tab_state.session_switch_pending
                         && !self.modal.session_picker_reconcile_pending
                         && !self.modal.command_palette_reconcile_pending
                     {
+                        let query = self.inline_picker_query();
                         self.close_inline_session_picker();
                         self.show_embedded_session_picker(catalog, None)?;
+                        self.restore_inline_picker_query(&query);
                         changed = true;
                     }
                 }
@@ -10906,12 +11006,15 @@ impl App {
                 }
                 WindowTopologyUpdate::ShowSelector { kind, catalog } => {
                     if self.modal.session_picker_requested
+                        && self.picker_reply_expected(Some(kind))
                         && !self.tab_state.session_switch_pending
                         && !self.modal.session_picker_reconcile_pending
                         && !self.modal.command_palette_reconcile_pending
                     {
+                        let query = self.inline_picker_query();
                         self.close_inline_session_picker();
                         self.show_embedded_session_picker(catalog, Some(kind))?;
+                        self.restore_inline_picker_query(&query);
                         changed = true;
                     }
                 }
@@ -10973,10 +11076,7 @@ impl App {
                         Some(WindowTopologyCommand::RequestSelector { kind, .. }) => Some(*kind),
                         _ => None,
                     };
-                    self.show_embedded_session_picker(
-                        session_picker_status_catalog("Could not load navigation · R to retry"),
-                        selector_kind,
-                    )?;
+                    self.show_session_picker_failure("Could not load navigation", selector_kind)?;
                     eprintln!("splinterm Dojo picker failed");
                     changed = true;
                 }
@@ -12214,6 +12314,11 @@ impl App {
             (Some(timeout), Some(spinner)) => Some(timeout.min(spinner)),
             (timeout, _) => timeout,
         };
+        // Wake to show a waiting picker's loading line.
+        let timeout = match (timeout, self.picker_loading_timeout()) {
+            (Some(timeout), Some(loading)) => Some(timeout.min(loading)),
+            (timeout, _) => timeout,
+        };
         // Wake to clear an expired upgrade outcome notice.
         let timeout = match (timeout, self.handoff.timeout(Instant::now())) {
             (Some(timeout), Some(notice)) => Some(timeout.min(notice)),
@@ -12486,18 +12591,9 @@ impl App {
                 .session_picker
                 .as_mut()
                 .context("inline picker exists")?;
-            let (item_count, selected, visible_start) = picker.layout_state();
-            let layout = session_picker_overlay_layout(
-                content.width,
-                content.height,
-                self.surface.scale_120,
-                item_count,
-                selected,
-                visible_start,
-            )
-            .map(|layout| translate_picker_layout(layout, content));
+            let layout = session_picker_layout(content, picker);
             if let Some(layout) = &layout {
-                picker.set_visible_start(layout.visible_range.start);
+                picker.set_visible_start(layout.visible_start);
             }
             layout
         } else {
@@ -13071,37 +13167,21 @@ impl App {
         if let (Some(layout), Some(picker)) =
             (picker_layout.as_ref(), self.modal.session_picker.as_ref())
         {
-            let items = picker
-                .items()
-                .map(|item| SessionPickerTextItem {
-                    display_title: &item.display_title,
-                    breadcrumb: &item.breadcrumb,
-                    working_directory: &item.working_directory,
-                    pane_count: item.pane_count,
-                    running_pane_count: item.running_pane_count,
-                })
-                .collect::<Vec<_>>();
-            paint_session_picker_overlay(
+            paint_session_picker(
                 &mut self.modal.session_picker_text_cache,
                 &self.presentation.render_context,
                 canvas,
                 width,
                 height,
-                content_buffer_rect,
+                content_rect,
                 self.surface.scale_120,
                 self.presentation.renderer_generation,
                 layout,
                 chrome_panel_palette(self.presentation.theme, ChromeSurface::Menu),
+                picker,
                 picker
                     .purpose()
                     .unwrap_or(session_picker_purpose(self.modal.selector_kind)),
-                &items,
-                picker.new_enabled(),
-                picker.new_blocker(),
-                picker.search_active(),
-                picker.query(),
-                picker.selected_target(),
-                picker.hovered(),
                 self.modal.session_picker_pressed,
                 self.input.keyboard_focused,
             )?;
@@ -13209,6 +13289,8 @@ impl App {
         // A spinner frame changes only chrome, which partial damage misses.
         let spinner_damage = self.tab_state.agent.take_chrome_damage();
         let picker_damage_full_surface = std::mem::take(&mut self.modal.session_picker_redraw);
+        // The loading spinner changes only the picker's status line.
+        let picker_status_damage = std::mem::take(&mut self.modal.session_picker_status_damage);
         let damage_full_surface = picker_damage_full_surface
             || take_full_surface_damage(
                 &mut self.presentation.full_redraw,
@@ -13246,6 +13328,17 @@ impl App {
                     i32::try_from(region.y).unwrap_or(i32::MAX),
                     i32::try_from(region.width).unwrap_or(i32::MAX),
                     i32::try_from(region.height).unwrap_or(i32::MAX),
+                );
+            }
+            if picker_status_damage
+                && let Some(line) = picker_layout.as_ref().and_then(picker_status_line)
+            {
+                let line = Self::buffer_rect(line, self.surface.scale_120)?;
+                self.surface.window.wl_surface().damage_buffer(
+                    i32::try_from(line.x).unwrap_or(i32::MAX),
+                    i32::try_from(line.y).unwrap_or(i32::MAX),
+                    i32::try_from(line.width).unwrap_or(i32::MAX),
+                    i32::try_from(line.height).unwrap_or(i32::MAX),
                 );
             }
             let spinner_regions = [
@@ -13396,6 +13489,9 @@ impl App {
             }
         }
         self.panes.dirty_inactive_panes.clear();
+        if let Some(layout) = &picker_layout {
+            self.modal.session_picker_page_rows = layout.rows.len();
+        }
         self.modal.session_picker_layout = picker_layout;
         self.complete_background_effect_draw_commit()?;
         let inject_graphical_input = self
@@ -14552,25 +14648,51 @@ mod tests {
         );
     }
 
+    /// Tab swaps the `dojos` picker's `recent` and `this lair` scopes, in
+    /// this Window's Lair; the Lairs picker has no scope.
     #[test]
-    fn picker_translation_moves_visual_surfaces_with_hit_slots_and_text() {
-        let layout = session_picker_overlay_layout(960, 600, 120, 3, 1, 0).unwrap();
-        let origin = Rect {
-            x: 7,
-            y: DEFAULT_TAB_STRIP_LOGICAL_HEIGHT,
-            width: 960,
-            height: 600,
-        };
-        let translated = translate_picker_layout(layout.clone(), origin);
-        for (source, moved) in layout.rows.iter().zip(&translated.rows) {
-            assert_eq!(moved.rect, translated_rect(source.rect, origin));
-            assert_eq!(moved.surface, translated_rect(source.surface, origin));
-            assert_eq!(moved.title_clip, translated_rect(source.title_clip, origin));
-            assert_eq!(
-                moved.metadata_clip,
-                translated_rect(source.metadata_clip, origin)
-            );
-        }
+    fn tab_swaps_the_dojos_picker_scope() {
+        let lair_id = LairId::new();
+        let (this_lair, kind) = session_picker_scope_request(None, lair_id).unwrap();
+        assert_eq!(
+            this_lair,
+            WindowTopologyCommand::RequestSelector {
+                kind: SelectorKind::Dojo,
+                lair_id,
+            }
+        );
+        assert_eq!(kind, Some(SelectorKind::Dojo));
+        assert_eq!(session_picker_purpose(kind), SessionPickerPurpose::Dojos);
+        let (recent, kind) = session_picker_scope_request(kind, lair_id).unwrap();
+        assert_eq!(recent, WindowTopologyCommand::RequestSessionPicker);
+        assert_eq!(kind, None);
+        assert_eq!(
+            session_picker_purpose(kind),
+            SessionPickerPurpose::RecentDojos
+        );
+        // Each scope is a retryable request, so R and a failed load return
+        // to the scope that was shown.
+        assert_eq!(session_picker_retry_request(&recent), Some(recent.clone()));
+        assert_eq!(
+            session_picker_retry_request(&this_lair),
+            Some(this_lair.clone())
+        );
+        assert_eq!(
+            session_picker_scope_request(Some(SelectorKind::Lair), lair_id),
+            None
+        );
+        // A fast double Tab: the reply for the scope left behind is dropped
+        // while the other scope loads.
+        assert!(!picker_reply_matches(true, None, Some(SelectorKind::Dojo)));
+        assert!(!picker_reply_matches(true, Some(SelectorKind::Dojo), None));
+        assert!(picker_reply_matches(true, None, None));
+        assert!(picker_reply_matches(
+            true,
+            Some(SelectorKind::Dojo),
+            Some(SelectorKind::Dojo)
+        ));
+        // No navigation picker showing: the first reply opens one.
+        assert!(picker_reply_matches(false, None, Some(SelectorKind::Lair)));
     }
 
     #[test]

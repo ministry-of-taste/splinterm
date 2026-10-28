@@ -42,6 +42,7 @@ fn remote_dojos_row_for(catalog: &Result<RemoteCatalog>) -> Option<SessionPicker
         working_directory: String::new(),
         pane_count: 0,
         running_pane_count: 0,
+        agent: None,
     })
 }
 

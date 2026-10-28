@@ -42,7 +42,6 @@ pub(crate) fn agent_access_test_entry(
         lair_id,
     )
 }
-#[cfg(test)]
 pub(crate) use agent_status::state_tint;
 pub(crate) use agent_status::{AgentAggregate, AgentGlyphs, AgentSpinner, badged_tab_label};
 pub(crate) use binding_help::{BindingHelpUi, shortcut_chips};
@@ -65,7 +64,7 @@ pub(crate) use options::TrustedInput;
 pub use options::{
     AccessConsentRenderer, TerminalGridLimits, TrustedConsentUi, WindowOptions, WindowPaneOptions,
 };
-pub(crate) use picker::{PickerHitTarget, synthetic_text_snapshot};
+pub(crate) use picker::{PICKER_NAME_CELLS, PickerHitTarget, synthetic_text_snapshot};
 pub use picker::{SessionPickerDecision, SessionPickerItem, SessionPickerUi};
 pub(crate) use text_edit::BoundedTextEditor;
 pub use topology::{

@@ -9,7 +9,8 @@
 
 use super::{
     App, BTN_LEFT, DojoPromptUi, Keysym, MouseAction, PointerEvent, PointerEventKind, QueueHandle,
-    Result, WindowTopologyCommand, binding_help_repeat_consumed,
+    Result, SessionPickerUi, WindowTopologyCommand, binding_help_repeat_consumed,
+    picker_repeat_consumed,
 };
 use crate::frontend::{
     AccessActivation, AccessMarks, AccessSnapshot, AgentAccessUi, PromptReconcile, RevokeAccessUi,
@@ -72,10 +73,20 @@ impl App {
     }
 
     /// Whether a held key must not repeat into binding help, the access
-    /// list, or a revoke prompt.
+    /// list, a revoke prompt, or an inline picker's Tab and retry.
     pub(super) fn modal_repeat_consumed(&self, keysym: Keysym) -> bool {
+        let picker = self
+            .modal
+            .session_picker
+            .as_ref()
+            .filter(|picker| picker.is_inline());
         binding_help_repeat_consumed(self.modal.binding_help.is_some(), keysym)
             || access_repeat_consumed(self.access_surface_open(), keysym)
+            || picker_repeat_consumed(
+                picker.is_some(),
+                picker.is_some_and(SessionPickerUi::retryable),
+                keysym,
+            )
     }
 
     pub(super) fn show_agent_access(&mut self, queue_handle: &QueueHandle<Self>) -> Result<()> {
