@@ -1101,6 +1101,10 @@ pub const TRUSTED_UI_REQUIRES_INSTALLED_CLIENT: &str =
 pub const CONSENT_RESPONDER_IDENTITY_CHANGED: &str =
     "this connection no longer runs the installed relay or client";
 
+/// The `Cancelled` reason a workspace access request ends with when its
+/// prompt expires unanswered. The MCP adapter tells it apart by it.
+pub const ACCESS_REQUEST_EXPIRED: &str = "the access request expired without an answer";
+
 /// The `Unauthorized` reason a terminal approver gets without its session's
 /// controlling terminal on standard input and output.
 pub const CONSENT_APPROVER_NEEDS_TERMINAL: &str =

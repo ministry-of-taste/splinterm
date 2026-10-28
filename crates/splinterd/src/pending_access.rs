@@ -16,9 +16,10 @@
 //! still here, and a request ended while its grant is being committed has
 //! that grant revoked again by the committer.
 //!
-//! After a deny, the same executable identity is refused with `rate_limited`
-//! for that workspace for [`DENY_COOLDOWN`], so a retrying agent cannot
-//! reopen the prompt. The requesting process collects the deny itself by
+//! After a deny, or a prompt that expired unanswered, the same executable
+//! identity is refused with `rate_limited` for that workspace for
+//! [`DENY_COOLDOWN`], so a retrying agent cannot reopen the prompt. The
+//! requesting process collects the deny or the expiry itself, once, by
 //! repeating the request.
 //!
 //! This registry is synchronous and holds no async state; the daemon drives
@@ -35,8 +36,8 @@ use std::{
 
 use splinterm_core::LairId;
 use splinterm_protocol::{
-    AccessScope, ConsentOfferEnd, ErrorCode, PENDING_ACCESS_LIFETIME_SECONDS, ProtocolError,
-    Response,
+    ACCESS_REQUEST_EXPIRED, AccessScope, ConsentOfferEnd, ErrorCode,
+    PENDING_ACCESS_LIFETIME_SECONDS, ProtocolError, Response,
 };
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -50,10 +51,11 @@ use crate::{
 pub const MAX_PENDING_TOTAL: usize = 8;
 /// A pending request expires this long after it opens.
 pub const PENDING_LIFETIME: Duration = Duration::from_secs(PENDING_ACCESS_LIFETIME_SECONDS);
-/// After a deny, new requests from the same executable identity for the same
-/// workspace are refused for this long.
+/// After a deny or an unanswered expiry, new requests from the same
+/// executable identity for the same workspace are refused for this long.
 pub const DENY_COOLDOWN: Duration = Duration::from_secs(10);
-/// Uncollected denials kept for their requesters, oldest dropped first.
+/// Uncollected denials and expiries kept for their requesters, oldest
+/// dropped first.
 const MAX_UNCOLLECTED_DENIALS: usize = 2 * MAX_PENDING_TOTAL;
 
 /// One requesting process. A later process reusing the PID has another
@@ -233,12 +235,36 @@ impl Entry {
     }
 }
 
+/// An uncollected deny or expiry: what the requester's next call returns.
 #[derive(Debug)]
 struct Denial {
     process: ProcessKey,
     lair_id: LairId,
     scopes: Vec<AccessScope>,
+    error: ProtocolError,
     until: Instant,
+}
+
+/// What a deny or an unanswered expiry remembers about its request.
+struct Unanswered {
+    identity: IdentityKey,
+    process: ProcessKey,
+    lair_id: LairId,
+    scopes: Vec<AccessScope>,
+    /// A call waits for the outcome now and learns it directly.
+    waiting: bool,
+}
+
+impl Unanswered {
+    fn of(entry: &Entry) -> Self {
+        Self {
+            identity: entry.identity.clone(),
+            process: entry.process.clone(),
+            lair_id: entry.lair_id,
+            scopes: entry.scopes.clone(),
+            waiting: entry.outcome.receiver_count() > 0,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -268,6 +294,36 @@ impl Inner {
 
     fn position(&self, request_id: u64) -> Option<usize> {
         self.entries.iter().position(|entry| entry.id == request_id)
+    }
+
+    /// Cools the identity down for this workspace and, unless a call learns
+    /// `error` directly, keeps it until `collect_until` for the requester to
+    /// collect once.
+    fn remember(
+        &mut self,
+        unanswered: Unanswered,
+        error: ProtocolError,
+        collect_until: Instant,
+        now: Instant,
+    ) {
+        self.cooldowns.push(Cooldown {
+            identity: unanswered.identity,
+            lair_id: unanswered.lair_id,
+            until: now + DENY_COOLDOWN,
+        });
+        if unanswered.waiting {
+            return;
+        }
+        if self.denials.len() == MAX_UNCOLLECTED_DENIALS {
+            self.denials.pop_front();
+        }
+        self.denials.push_back(Denial {
+            process: unanswered.process,
+            lair_id: unanswered.lair_id,
+            scopes: unanswered.scopes,
+            error,
+            until: collect_until,
+        });
     }
 
     /// Ends every matching request without a grant: queued and prompting
@@ -396,13 +452,14 @@ impl PendingAccess {
             .count()
     }
 
-    /// Admits one call: it collects its own uncollected deny, joins its
-    /// process's pending request for the same workspace and scopes, or opens
-    /// a new one. `open_pidfd` pins the requester and runs only for a new
-    /// request.
+    /// Admits one call: it collects its own uncollected deny or expiry, joins
+    /// its process's pending request for the same workspace and scopes, or
+    /// opens a new one. `open_pidfd` pins the requester and runs only for a
+    /// new request.
     ///
     /// # Errors
-    /// The requester's earlier deny (`consent_denied`, once); a different
+    /// The requester's earlier deny (`consent_denied`, once) or unanswered
+    /// expiry (`cancelled`, once); a different
     /// request already pending for this process and workspace
     /// (`resource_limit`, naming it); the deny cooldown (`rate_limited`); the
     /// daemon-wide bound (`resource_limit`); a requester that cannot be
@@ -431,11 +488,11 @@ impl PendingAccess {
             ));
         }
         inner.prune(now);
-        if let Some(index) = inner.denials.iter().position(|denial| {
+        let uncollected = inner.denials.iter().position(|denial| {
             denial.process == process && denial.lair_id == lair_id && denial.scopes == scopes
-        }) {
-            inner.denials.remove(index);
-            return Err(denied());
+        });
+        if let Some(denial) = uncollected.and_then(|index| inner.denials.remove(index)) {
+            return Err(denial.error);
         }
         if let Some(entry) = inner
             .entries
@@ -465,7 +522,7 @@ impl PendingAccess {
         {
             return Err(ProtocolError::new(
                 ErrorCode::RateLimited,
-                "access to this workspace was just denied; retry later",
+                "access to this workspace was just denied or expired unanswered; retry later",
             ));
         }
         if inner.entries.len() >= MAX_PENDING_TOTAL {
@@ -558,24 +615,9 @@ impl PendingAccess {
         }
         let entry = inner.entries.remove(index);
         self.ids.advance_revision();
-        inner.cooldowns.push(Cooldown {
-            identity: entry.identity.clone(),
-            lair_id: entry.lair_id,
-            until: now + DENY_COOLDOWN,
-        });
         // A call waiting now learns it directly; otherwise the requester
         // collects it by repeating the request.
-        if entry.outcome.receiver_count() == 0 {
-            if inner.denials.len() == MAX_UNCOLLECTED_DENIALS {
-                inner.denials.pop_front();
-            }
-            inner.denials.push_back(Denial {
-                process: entry.process.clone(),
-                lair_id: entry.lair_id,
-                scopes: entry.scopes.clone(),
-                until: entry.expires,
-            });
-        }
+        inner.remember(Unanswered::of(&entry), denied(), entry.expires, now);
         entry.deliver(Outcome::Failed(denied()));
         Some(Denied {
             peer: entry.peer,
@@ -596,13 +638,30 @@ impl PendingAccess {
         self.ended(count) == 1
     }
 
-    /// Ends one request when it has expired by `now`.
+    /// Ends one request when it has expired by `now`. An unanswered one counts
+    /// like a deny: its identity cools down for the workspace, and a requester
+    /// not waiting now collects the expiry once, within [`PENDING_LIFETIME`].
     pub fn expire(&self, request_id: u64, now: Instant) -> bool {
-        let count = self.inner().end_where(
-            &cancelled("the access request expired without an answer"),
-            ConsentOfferEnd::Expired,
-            |entry| entry.id == request_id && entry.expires <= now,
-        );
+        let error = cancelled(ACCESS_REQUEST_EXPIRED);
+        let mut inner = self.inner();
+        let unanswered = inner
+            .entries
+            .iter()
+            .find(|entry| {
+                entry.id == request_id
+                    && entry.expires <= now
+                    && matches!(entry.phase, Phase::Queued | Phase::Prompting)
+            })
+            .map(Unanswered::of);
+        let count = inner.end_where(&error, ConsentOfferEnd::Expired, |entry| {
+            entry.id == request_id && entry.expires <= now
+        });
+        if count == 1
+            && let Some(unanswered) = unanswered
+        {
+            inner.remember(unanswered, error, now + PENDING_LIFETIME, now);
+        }
+        drop(inner);
         self.ended(count) == 1
     }
 
@@ -913,6 +972,83 @@ mod tests {
     }
 
     #[test]
+    fn an_unanswered_expiry_cools_the_identity_down_and_is_collected_once() {
+        let pending = PendingAccess::default();
+        let now = Instant::now();
+        let lair = LairId::new();
+        let other_lair = LairId::new();
+        let peer = peer_with_start(1);
+        let admitted = admit(&pending, &peer, lair, LOOK, now).unwrap();
+        // Nobody waits on it when it expires.
+        drop(admitted.outcome);
+        let job = pending.next_prompt().unwrap();
+        let expired = now + PENDING_LIFETIME;
+        assert!(pending.expire(job.request_id, expired));
+        // The requester's next call learns that it expired, once; it does
+        // not open a new prompt. Then the cooldown applies to the identity.
+        let error = admit(&pending, &peer, lair, LOOK, expired).unwrap_err();
+        assert_eq!(error.code, ErrorCode::Cancelled);
+        assert_eq!(error.message, ACCESS_REQUEST_EXPIRED);
+        assert_eq!(
+            admit(&pending, &peer, lair, LOOK, expired)
+                .unwrap_err()
+                .code,
+            ErrorCode::RateLimited
+        );
+        assert_eq!(
+            admit(&pending, &peer_with_start(2), lair, TYPE, expired)
+                .unwrap_err()
+                .code,
+            ErrorCode::RateLimited
+        );
+        // Another workspace is unaffected, and the cooldown ends.
+        admit(&pending, &peer, other_lair, LOOK, expired).unwrap();
+        admit(&pending, &peer, lair, LOOK, expired + DENY_COOLDOWN).unwrap();
+    }
+
+    #[test]
+    fn a_waiting_call_learns_the_expiry_directly_and_a_queued_request_cools_down_too() {
+        let pending = PendingAccess::default();
+        let now = Instant::now();
+        let lair = LairId::new();
+        let peer = peer_with_start(1);
+        // Still queued, never shown, and a call waits on it.
+        let admitted = admit(&pending, &peer, lair, LOOK, now).unwrap();
+        let expired = now + PENDING_LIFETIME;
+        assert!(pending.expire(admitted.request_id, expired));
+        assert!(matches!(
+            &*admitted.outcome.borrow(),
+            Some(Outcome::Failed(error)) if error.code == ErrorCode::Cancelled
+        ));
+        assert_eq!(
+            admit(&pending, &peer, lair, LOOK, expired)
+                .unwrap_err()
+                .code,
+            ErrorCode::RateLimited
+        );
+        // Nothing is left to collect after the cooldown.
+        admit(&pending, &peer, lair, LOOK, expired + DENY_COOLDOWN).unwrap();
+    }
+
+    #[test]
+    fn an_expiry_during_commit_leaves_no_cooldown() {
+        let pending = PendingAccess::default();
+        let now = Instant::now();
+        let lair = LairId::new();
+        let peer = peer_with_start(1);
+        let admitted = admit(&pending, &peer, lair, LOOK, now).unwrap();
+        drop(admitted.outcome);
+        let job = pending.next_prompt().unwrap();
+        assert!(pending.begin_commit(job.request_id).is_some());
+        // The person answered: the committer decides, and the expiry is not
+        // a deny.
+        assert!(pending.expire(job.request_id, now + PENDING_LIFETIME));
+        let granted = Response::LairAccessRequestsCancelled { cancelled: 0 };
+        assert!(!pending.finish_commit(job.request_id, Outcome::Granted(Box::new(granted))));
+        admit(&pending, &peer, lair, LOOK, now + PENDING_LIFETIME).unwrap();
+    }
+
+    #[test]
     fn expiry_workspace_end_and_the_fence_end_requests() {
         let pending = PendingAccess::default();
         let now = Instant::now();
@@ -921,10 +1057,12 @@ mod tests {
         let first = admit(&pending, &peer_with_start(1), lair, LOOK, now).unwrap();
         assert!(!pending.expire(first.request_id, now));
         assert!(pending.expire(first.request_id, now + PENDING_LIFETIME));
-        admit(&pending, &peer_with_start(2), lair, LOOK, now).unwrap();
-        admit(&pending, &peer_with_start(3), other_lair, LOOK, now).unwrap();
+        // After the expiry's cooldown.
+        let later = now + PENDING_LIFETIME + DENY_COOLDOWN;
+        admit(&pending, &peer_with_start(2), lair, LOOK, later).unwrap();
+        admit(&pending, &peer_with_start(3), other_lair, LOOK, later).unwrap();
         assert_eq!(pending.end_lair(lair), 1);
-        let last = admit(&pending, &peer_with_start(4), lair, LOOK, now).unwrap();
+        let last = admit(&pending, &peer_with_start(4), lair, LOOK, later).unwrap();
         assert_eq!(pending.end_all_at_fence(), 2);
         assert!(matches!(
             &*last.outcome.borrow(),
