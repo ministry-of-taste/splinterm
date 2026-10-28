@@ -208,7 +208,7 @@ const DEFINITIONS: &[ToolDefinition] = &[
     tool_definition!("rename_dojo", "Sets one Dojo name.", false, false, true),
     tool_definition!(
         "rename_splint",
-        "Sets one logical Splint title.",
+        "Sets one logical Splint title, or with use_app_name undoes it so the running app's name shows.",
         false,
         false,
         true
@@ -283,6 +283,7 @@ const MAXIMUM_SCHEMA_DEPTH: usize = 32;
 const MAXIMUM_ARGV_ENCODED_BYTES: usize = 65_536;
 const MAXIMUM_INPUT_TEXT_BYTES: usize = 65_536;
 const AGENT_STATUS_DETAIL_PATTERN: &str = "^[^\\u0000-\\u001f\\u007f-\\u009f\\u061c\\u200e\\u200f\\u202a-\\u202e\\u2066-\\u2069\\u2028\\u2029]+$";
+const FOREGROUND_APP_PATTERN: &str = "^[^\\u0000-\\u001f\\u007f-\\u00a0\\u00ad\\u034f\\u061c\\u115f\\u1160\\u1680\\u17b4\\u17b5\\u180b-\\u180f\\u2000-\\u200f\\u2028-\\u202f\\u205f-\\u206f\\u3000\\u3164\\ufe00-\\ufe0f\\ufeff\\uffa0\\ufff0-\\ufffb]+$";
 
 struct Catalog {
     tools: Vec<Tool>,
@@ -675,6 +676,9 @@ fn matches_frozen_pattern(pattern: &str, value: &str) -> bool {
         AGENT_STATUS_DETAIL_PATTERN => {
             splinterm_protocol::validate_agent_status_detail(value).is_ok()
         }
+        // The daemon's own validator also enforces the 64-byte cap, edge spaces,
+        // and the astral invisible characters a schema pattern cannot list.
+        FOREGROUND_APP_PATTERN => splinterm_protocol::validate_foreground_app(value).is_ok(),
         "^splinterm://splints/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/terminal$" => {
             resource_uri(value, "terminal")
         }
@@ -1073,6 +1077,72 @@ mod tests {
             Ok(())
         );
         assert!(validate_output("splinterm.report_agent_status", &output(-1)).is_err());
+    }
+
+    // Plan 0069: `rename_splint` takes a title or `use_app_name`, never both.
+    #[test]
+    fn rename_splint_takes_exactly_one_of_a_title_and_use_app_name() {
+        let splint_id = "018f4d8c-2a18-4b31-8c2f-9e7c5de77103";
+        let name = "splinterm.rename_splint";
+        for arguments in [
+            json!({"splint_id": splint_id, "title": "editor"}),
+            json!({"splint_id": splint_id, "title": "shell"}),
+            json!({"splint_id": splint_id, "use_app_name": true}),
+        ] {
+            assert_eq!(validate_arguments(name, &arguments), Ok(()), "{arguments}");
+        }
+        for arguments in [
+            json!({"splint_id": splint_id}),
+            json!({"splint_id": splint_id, "use_app_name": false}),
+            json!({"splint_id": splint_id, "title": "editor", "use_app_name": true}),
+            json!({"splint_id": splint_id, "title": ""}),
+            json!({"title": "editor"}),
+        ] {
+            assert_eq!(
+                validate_arguments(name, &arguments),
+                Err(ValidationError::InvalidArgument),
+                "{arguments}"
+            );
+        }
+    }
+
+    // Plan 0069: the foreground app name is bounded untrusted display data.
+    #[test]
+    fn inspect_outputs_accept_only_valid_foreground_app_names() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/mcp/fixtures/valid");
+        let read = |fixture: &str| -> Value {
+            let bytes = fs::read(root.join(fixture)).unwrap();
+            serde_json::from_slice::<Value>(&bytes).unwrap()["document"].clone()
+        };
+        let mut splint = read("inspect_splint-foreground-app.output.json");
+        let mut topology = read("inspect_topology-foreground-app.output.json");
+        assert_eq!(validate_output("splinterm.inspect_splint", &splint), Ok(()));
+        assert_eq!(
+            validate_output("splinterm.inspect_topology", &topology),
+            Ok(())
+        );
+        for hostile in [
+            json!(""),
+            json!("x".repeat(33)),
+            json!("🦀".repeat(17)),
+            json!(" vim"),
+            json!("vim\u{202e}"),
+            json!("tag\u{e0041}"),
+            json!("line\nbreak"),
+            json!(7),
+        ] {
+            splint["data"]["foreground_app"] = hostile.clone();
+            assert!(
+                validate_output("splinterm.inspect_splint", &splint).is_err(),
+                "{hostile}"
+            );
+            topology["data"]["lairs"][0]["dojos"][0]["splints"][0]["foreground_app"] =
+                hostile.clone();
+            assert!(
+                validate_output("splinterm.inspect_topology", &topology).is_err(),
+                "{hostile}"
+            );
+        }
     }
 
     // Plan 0067 M2: terminal reads default to one plain-text string; the

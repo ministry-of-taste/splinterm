@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde::{Deserialize, Serialize};
 use splinterm_core::{
-    Axis, DojoId, Lair, LairId, LairRetention, SplintId, SplitRatio, SplitSide, Topology,
+    Axis, DojoId, Lair, LairId, LairRetention, Splint, SplintId, SplitRatio, SplitSide, Topology,
     TopologyRevision,
 };
 
@@ -113,6 +113,9 @@ pub const MAX_AGENT_STATUS_DETAIL_BYTES: usize = 240;
 pub const MIN_AGENT_STATUS_TTL_SECONDS: u32 = 10;
 pub const MAX_AGENT_STATUS_TTL_SECONDS: u32 = 900;
 pub const DEFAULT_AGENT_STATUS_ACTIVE_TTL_SECONDS: u32 = 120;
+/// Bounds on a Splint's foreground app name (Plan 0069).
+pub const MAX_FOREGROUND_APP_SCALARS: usize = 32;
+pub const MAX_FOREGROUND_APP_BYTES: usize = 64;
 /// Bytes in one opaque, single-use, generation-bound handoff resume ticket
 /// (ADR 0011). The fixed-size wire array bounds decoding.
 pub const HANDOFF_RESUME_TICKET_BYTES: usize = 32;
@@ -901,6 +904,13 @@ pub enum Request {
         expected_topology_revision: TopologyRevision,
         splint_id: SplintId,
         title: String,
+    },
+    /// Undoes a rename: restores the default title and lets windows show the
+    /// Splint's foreground app name again (Plan 0069). Authorized, audited,
+    /// and published exactly like [`Request::RenameSplint`].
+    ResetSplintTitle {
+        expected_topology_revision: TopologyRevision,
+        splint_id: SplintId,
     },
     Attach {
         splint_id: SplintId,
@@ -2198,6 +2208,11 @@ pub struct SplintRuntimeSummary {
     /// Explicitly reported display status of the live incarnation only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_status: Option<AgentStatusSummary>,
+    /// The basename of the live incarnation's foreground program, once it has
+    /// held the terminal for a while (Plan 0069). Untrusted terminal-derived
+    /// display data: a label only, never authority, identity, or evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub foreground_app: Option<String>,
 }
 
 impl SplintRuntimeSummary {
@@ -2206,6 +2221,11 @@ impl SplintRuntimeSummary {
         let valid_last = self.last_incarnation.is_none_or(|value| value > 0);
         if let Some(status) = &self.agent_status
             && (self.live_incarnation.is_none() || !status.validate())
+        {
+            return false;
+        }
+        if let Some(name) = &self.foreground_app
+            && (self.live_incarnation.is_none() || validate_foreground_app(name).is_err())
         {
             return false;
         }
@@ -2347,6 +2367,100 @@ pub fn validate_agent_status_detail(detail: &str) -> Result<(), ProtocolError> {
         ));
     }
     Ok(())
+}
+
+/// Characters a foreground app name never carries: controls, bidi and
+/// line-break formatting, zero-width and other invisible characters, and
+/// whitespace other than the ASCII space.
+fn is_foreground_app_forbidden_character(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{00a0}'
+                | '\u{00ad}'
+                | '\u{034f}'
+                | '\u{061c}'
+                | '\u{115f}'..='\u{1160}'
+                | '\u{1680}'
+                | '\u{17b4}'..='\u{17b5}'
+                | '\u{180b}'..='\u{180f}'
+                | '\u{2000}'..='\u{200f}'
+                | '\u{2028}'..='\u{202f}'
+                | '\u{205f}'..='\u{206f}'
+                | '\u{3000}'
+                | '\u{3164}'
+                | '\u{fe00}'..='\u{fe0f}'
+                | '\u{feff}'
+                | '\u{ffa0}'
+                | '\u{fff0}'..='\u{fffb}'
+                | '\u{e0000}'..='\u{e0fff}'
+        )
+}
+
+/// Validates a foreground app name.
+///
+/// # Errors
+///
+/// Returns `InvalidArgument` unless the name is nonempty, at most 32 Unicode
+/// scalars and 64 bytes, free of leading or trailing spaces, and free of the
+/// characters [`sanitize_foreground_app`] removes.
+pub fn validate_foreground_app(name: &str) -> Result<(), ProtocolError> {
+    if name.is_empty()
+        || name.len() > MAX_FOREGROUND_APP_BYTES
+        || name.chars().count() > MAX_FOREGROUND_APP_SCALARS
+        || name.trim_matches(' ') != name
+        || name.chars().any(is_foreground_app_forbidden_character)
+    {
+        return Err(ProtocolError::new(
+            ErrorCode::InvalidArgument,
+            "foreground app name is empty, oversized, or contains forbidden characters",
+        ));
+    }
+    Ok(())
+}
+
+/// Makes a displayable foreground app name from untrusted process bytes, or
+/// `None` when nothing displayable is left. Invalid UTF-8 becomes U+FFFD;
+/// forbidden characters are dropped, edge spaces trimmed, and the result cut
+/// at a character boundary within the scalar and byte caps. The result always
+/// passes [`validate_foreground_app`], so one hostile name never makes a
+/// snapshot invalid.
+#[must_use]
+pub fn sanitize_foreground_app(raw: &[u8]) -> Option<String> {
+    let decoded = String::from_utf8_lossy(raw);
+    let mut name = String::new();
+    let mut scalars = 0;
+    for character in decoded
+        .chars()
+        .filter(|character| !is_foreground_app_forbidden_character(*character))
+    {
+        if scalars == MAX_FOREGROUND_APP_SCALARS
+            || name.len() + character.len_utf8() > MAX_FOREGROUND_APP_BYTES
+        {
+            break;
+        }
+        if character == ' ' && name.is_empty() {
+            continue;
+        }
+        name.push(character);
+        scalars += 1;
+    }
+    let trimmed = name.trim_end_matches(' ');
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+/// The name a window shows for a Splint: its foreground app's name while the
+/// Splint keeps its default title and the daemon reports one, otherwise its
+/// title. A label only; never match, target, or authorize by it.
+#[must_use]
+pub fn splint_display_title<'a>(
+    splint: &'a Splint,
+    runtime: Option<&'a SplintRuntimeSummary>,
+) -> &'a str {
+    runtime
+        .filter(|runtime| splint.uses_default_title() && runtime.splint_id == splint.id)
+        .and_then(|runtime| runtime.foreground_app.as_deref())
+        .unwrap_or(&splint.title)
 }
 
 /// Daemon-held agent status for one live incarnation.
@@ -7231,6 +7345,7 @@ mod tests {
                 signal: None,
             }),
             agent_status: None,
+            foreground_app: None,
         };
         let snapshot = TopologySnapshot {
             revision: topology.revision(),
@@ -7264,6 +7379,7 @@ mod tests {
                     lifecycle: SplintLifecycle::Starting,
                     exit_status: None,
                     agent_status: None,
+                    foreground_app: None,
                 }
             })
             .collect();
@@ -8035,6 +8151,7 @@ mod tests {
             lifecycle: SplintLifecycle::Running,
             exit_status: None,
             agent_status: None,
+            foreground_app: None,
         };
         let value = serde_json::to_value(&runtime).unwrap();
         assert!(value.get("agent_status").is_none());
@@ -8058,6 +8175,204 @@ mod tests {
         exited.lifecycle = SplintLifecycle::Exited;
         exited.restorable = true;
         assert!(!exited.validate(), "exited incarnations carry no status");
+    }
+
+    #[test]
+    fn runtime_summary_foreground_app_is_optional_live_only_and_validated() {
+        let mut runtime = SplintRuntimeSummary {
+            splint_id: SplintId::new(),
+            live_incarnation: Some(2),
+            last_incarnation: Some(2),
+            restorable: false,
+            lifecycle: SplintLifecycle::Running,
+            exit_status: None,
+            agent_status: None,
+            foreground_app: None,
+        };
+        let value = serde_json::to_value(&runtime).unwrap();
+        assert!(value.get("foreground_app").is_none());
+        runtime.foreground_app = Some("nvim".into());
+        let value = serde_json::to_value(&runtime).unwrap();
+        assert_eq!(value["foreground_app"], "nvim");
+        assert_eq!(
+            serde_json::from_value::<SplintRuntimeSummary>(value).unwrap(),
+            runtime
+        );
+        assert!(runtime.validate());
+        let mut hostile = runtime.clone();
+        hostile.foreground_app = Some("vim\u{202e}".into());
+        assert!(!hostile.validate());
+        let mut exited = runtime;
+        exited.live_incarnation = None;
+        exited.lifecycle = SplintLifecycle::Exited;
+        exited.restorable = true;
+        assert!(!exited.validate(), "exited incarnations carry no app name");
+    }
+
+    #[test]
+    fn foreground_app_names_are_bounded_and_sanitized_into_valid_names() {
+        assert!(validate_foreground_app("nvim").is_ok());
+        assert!(validate_foreground_app("build.sh").is_ok());
+        assert!(validate_foreground_app("my script.sh").is_ok());
+        assert!(validate_foreground_app(&"x".repeat(32)).is_ok());
+        assert!(validate_foreground_app(&"界".repeat(21)).is_ok());
+        for invalid in [
+            String::new(),
+            "x".repeat(33),
+            "界".repeat(22),
+            " vim".into(),
+            "vim ".into(),
+            "line\nbreak".into(),
+            "tab\there".into(),
+            "esc\u{1b}[31m".into(),
+            "nel\u{85}".into(),
+            "rlo\u{202e}".into(),
+            "isolate\u{2066}".into(),
+            "zero\u{200b}width".into(),
+            "joiner\u{200d}".into(),
+            "word\u{2060}joiner".into(),
+            "bom\u{feff}".into(),
+            "soft\u{ad}hyphen".into(),
+            "nbsp\u{a0}".into(),
+            "tag\u{e0041}".into(),
+            "selector\u{fe0f}".into(),
+            "filler\u{3164}".into(),
+        ] {
+            assert_eq!(
+                validate_foreground_app(&invalid).unwrap_err().code,
+                ErrorCode::InvalidArgument,
+                "{invalid:?}"
+            );
+        }
+
+        assert_eq!(sanitize_foreground_app(b"nvim").as_deref(), Some("nvim"));
+        assert_eq!(
+            sanitize_foreground_app("  rlo\u{202e}vim\u{200b}  ".as_bytes()).as_deref(),
+            Some("rlovim")
+        );
+        assert_eq!(
+            sanitize_foreground_app(b"bad\xffutf8").as_deref(),
+            Some("bad\u{fffd}utf8")
+        );
+        assert_eq!(sanitize_foreground_app(b"\x1b\x07\n \t"), None);
+        assert_eq!(sanitize_foreground_app(b""), None);
+        assert_eq!(
+            sanitize_foreground_app("x".repeat(40).as_bytes()).as_deref(),
+            Some("x".repeat(32).as_str())
+        );
+        // 17 four-byte scalars exceed the byte cap; the cut keeps 16.
+        assert_eq!(
+            sanitize_foreground_app("🦀".repeat(17).as_bytes()).as_deref(),
+            Some("🦀".repeat(16).as_str())
+        );
+        // A cut that ends on a space never leaves a trailing space.
+        assert_eq!(
+            sanitize_foreground_app(format!("{} tail", "x".repeat(31)).as_bytes()).as_deref(),
+            Some("x".repeat(31).as_str())
+        );
+    }
+
+    // Property: whatever bytes a process shows, the sanitized name validates.
+    #[test]
+    fn sanitized_foreground_app_names_always_validate() {
+        const ALPHABET: &[&str] = &[
+            "a",
+            "Z",
+            "9",
+            ".",
+            "-",
+            "_",
+            "/",
+            " ",
+            "界",
+            "🦀",
+            "e\u{301}",
+            "\u{0}",
+            "\u{1b}",
+            "\u{7f}",
+            "\u{85}",
+            "\u{a0}",
+            "\u{ad}",
+            "\u{200b}",
+            "\u{200d}",
+            "\u{200e}",
+            "\u{202e}",
+            "\u{2028}",
+            "\u{2066}",
+            "\u{2069}",
+            "\u{feff}",
+            "\u{e0041}",
+            "\u{fe0f}",
+            "\u{3000}",
+            "\u{fffd}",
+        ];
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..4_000 {
+            let length = next() % 48;
+            let mut bytes = Vec::new();
+            for _ in 0..length {
+                let choice = next();
+                if choice % 7 == 0 {
+                    // Raw bytes, including invalid UTF-8.
+                    bytes.push(choice.to_be_bytes()[0]);
+                } else {
+                    let count = u64::try_from(ALPHABET.len()).unwrap();
+                    let index = usize::try_from(choice % count).unwrap();
+                    bytes.extend_from_slice(ALPHABET[index].as_bytes());
+                }
+            }
+            if let Some(name) = sanitize_foreground_app(&bytes) {
+                assert!(
+                    validate_foreground_app(&name).is_ok(),
+                    "{bytes:?} -> {name:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn display_title_follows_the_app_only_while_the_default_title_is_unset() {
+        let mut splint = Splint::shell(PathBuf::from("/tmp"));
+        let mut runtime = SplintRuntimeSummary {
+            splint_id: splint.id,
+            live_incarnation: Some(1),
+            last_incarnation: Some(1),
+            restorable: false,
+            lifecycle: SplintLifecycle::Running,
+            exit_status: None,
+            agent_status: None,
+            foreground_app: None,
+        };
+        assert_eq!(splint_display_title(&splint, Some(&runtime)), "shell");
+        runtime.foreground_app = Some("claude".into());
+        assert_eq!(splint_display_title(&splint, Some(&runtime)), "claude");
+        assert_eq!(splint_display_title(&splint, None), "shell");
+        let mut other = runtime.clone();
+        other.splint_id = SplintId::new();
+        assert_eq!(splint_display_title(&splint, Some(&other)), "shell");
+        // A rename wins, even one to the default text.
+        splint.title = "editor".into();
+        splint.title_set = true;
+        assert_eq!(splint_display_title(&splint, Some(&runtime)), "editor");
+        splint.title = "shell".into();
+        assert_eq!(splint_display_title(&splint, Some(&runtime)), "shell");
+    }
+
+    #[test]
+    fn reset_splint_title_round_trips_as_its_own_request() {
+        let request = Request::ResetSplintTitle {
+            expected_topology_revision: TopologyRevision::default(),
+            splint_id: SplintId::new(),
+        };
+        let value = round_trip_request(&request);
+        assert_eq!(value["type"], "reset_splint_title");
+        assert!(value.get("title").is_none());
     }
 
     #[test]

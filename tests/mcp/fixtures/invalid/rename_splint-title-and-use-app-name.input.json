@@ -1,0 +1,9 @@
+{
+  "$schema_file": "tools/rename_splint.input.schema.json",
+  "$expected_keyword": "oneOf",
+  "document": {
+    "splint_id": "018f4d8c-2a18-4b31-8c2f-9e7c5de77103",
+    "title": "editor",
+    "use_app_name": true
+  }
+}

@@ -110,6 +110,7 @@ fn reviewed_topology() -> TopologySnapshot {
             lifecycle: SplintLifecycle::Running,
             exit_status: None,
             agent_status: None,
+            foreground_app: None,
         }],
         presentation_offers: Vec::new(),
     }

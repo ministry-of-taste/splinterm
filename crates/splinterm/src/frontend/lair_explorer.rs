@@ -2218,6 +2218,7 @@ pub(super) mod tests {
                             },
                             agent_status: None,
                             working_directory: "/home/user/Projects/splinterm".into(),
+                            title_set: false,
                         }],
                     }],
                 },

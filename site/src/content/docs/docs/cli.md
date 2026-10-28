@@ -38,6 +38,7 @@ splinterm ratio SPLINT_ID 500
 splinterm rename-lair LAIR_ID NAME
 splinterm rename-dojo DOJO_ID NAME
 splinterm rename-splint SPLINT_ID TITLE
+splinterm rename-splint SPLINT_ID --use-app-name
 ```
 
 Arguments after `--` are executed directly as an argument vector. Splinterm does not rebuild them into shell text.

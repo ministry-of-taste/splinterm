@@ -651,6 +651,18 @@ reporter-supplied text and stays inside the existing `untrusted_terminal_data`
 outputs. The topology resource and its subscription do not carry agent status
 in this version.
 
+The same outputs also gain an optional `foreground_app` string while a live
+Splint's foreground job has held its terminal for 2 seconds: a sanitized
+basename such as `nvim` or `build.sh`, at most 32 characters, never a path or
+an argument. It is untrusted terminal-derived data, like a title, and is no
+identity, target, or evidence of what the Splint is doing; the topology
+resource does not carry it. Windows show it in place of a Splint's title only
+while the title is the unset default `shell`. `splinterm.rename_splint` with
+`{"splint_id": ..., "use_app_name": true}` in place of `title` undoes a rename
+so the app's name shows again (a Splint already on its app name keeps its
+revision); it needs the same `topology_name_mutate` scope and is audited as a
+rename.
+
 Agents that support command hooks need no MCP at all: wire
 `splinterm agent-status set ...` into the agent's hooks as shown in
 [automation.md](automation.md#hook-recipes), for example Claude Code's

@@ -12,7 +12,7 @@ use splinterm_core::{
 };
 use splinterm_protocol::{
     AgentState, AgentStatusSummary, ProcessExitStatus, SplintLifecycle, SplintRuntimeSummary,
-    TopologySnapshot,
+    TopologySnapshot, splint_display_title,
 };
 use unicode_width::UnicodeWidthChar;
 
@@ -291,6 +291,9 @@ pub struct NavigationSplint {
     pub exit_status: Option<ProcessExitStatus>,
     pub focused_here: bool,
     pub agent_status: Option<NavigationAgentStatus>,
+    /// Whether a rename or preset set the title, so the label never follows
+    /// the foreground app (Plan 0069).
+    pub title_set: bool,
 }
 
 /// One projected Dojo in canonical daemon order.
@@ -411,6 +414,9 @@ pub struct NavigationExplorerSplint {
     pub focused_here: bool,
     pub target: NavigationExplorerSplintTarget,
     pub agent_status: Option<NavigationAgentStatus>,
+    /// Whether a rename or preset set the title; only then does the row offer
+    /// to use the app name again.
+    pub title_set: bool,
     /// The Splint's working directory as the topology projection carries
     /// it, already bounded and sanitized: where the daemon launched or last
     /// relaunched it, not followed live as its shell changes directory.
@@ -638,6 +644,7 @@ impl NavigationProjection {
                     focused_here: splint.focused_here,
                     agent_status: splint.agent_status.clone(),
                     working_directory: splint.working_directory.clone(),
+                    title_set: splint.title_set,
                     target: NavigationExplorerSplintTarget {
                         topology_revision: self.topology_revision,
                         lair_id: dojo.lair_id,
@@ -1268,7 +1275,9 @@ fn collect_splints(
                         splint_id: splint.id,
                     },
                     parent: Some(parent),
-                    label: bounded_label(&splint.title),
+                    // The foreground app name while the title is the unset default:
+                    // a label only, never an identity the Explorer acts on.
+                    label: bounded_label(splint_display_title(splint, Some(runtime))),
                     lifecycle,
                     capabilities,
                 },
@@ -1278,6 +1287,7 @@ fn collect_splints(
                 exit_status: runtime.exit_status,
                 focused_here: active_here && context.window.focused_splint == Some(splint.id),
                 agent_status: NavigationAgentStatus::from_runtime(runtime),
+                title_set: splint.title_set,
             });
         }
         LayoutNode::Branch { first, second, .. } => {
@@ -1521,6 +1531,7 @@ mod tests {
             lifecycle,
             exit_status,
             agent_status: None,
+            foreground_app: None,
         }
     }
 
@@ -2897,6 +2908,43 @@ mod tests {
         let mut exited = snapshot.runtimes[0].clone();
         exited.live_incarnation = None;
         assert_eq!(NavigationAgentStatus::from_runtime(&exited), None);
+    }
+
+    #[test]
+    fn default_titled_splints_show_the_foreground_app_until_renamed() {
+        let lair = running_lair("forge");
+        let dojo_id = lair.dojos[0].id;
+        let mut named = snapshot(vec![lair], &[]);
+        named.runtimes[0].foreground_app = Some("nvim".to_owned());
+        let projection = NavigationProjection::build(&named, context(&[dojo_id])).unwrap();
+        let splint = &projection.lairs[0].dojos[0].splints[0];
+        assert_eq!(splint.node.label, "nvim");
+        assert!(!splint.title_set);
+        let view = projection.explorer_view();
+        assert_eq!(view.lairs[0].dojos[0].splints[0].label, "nvim");
+        assert!(!view.lairs[0].dojos[0].splints[0].title_set);
+
+        // A rename wins, even one back to the literal default.
+        for title in ["notes", "shell"] {
+            let mut lair = running_lair("forge");
+            let dojo_id = lair.dojos[0].id;
+            let focus = lair.dojos[0].default_focus;
+            let pane = lair.dojos[0].root.find_splint_mut(focus).unwrap();
+            pane.title = title.to_owned();
+            pane.title_set = true;
+            let mut renamed = snapshot(vec![lair], &[]);
+            renamed.runtimes[0].foreground_app = Some("nvim".to_owned());
+            let projection = NavigationProjection::build(&renamed, context(&[dojo_id])).unwrap();
+            let splint = &projection.lairs[0].dojos[0].splints[0];
+            assert_eq!(splint.node.label, title);
+            assert!(splint.title_set);
+            assert!(projection.explorer_view().lairs[0].dojos[0].splints[0].title_set);
+        }
+
+        // Without an app name the default title shows.
+        named.runtimes[0].foreground_app = None;
+        let projection = NavigationProjection::build(&named, context(&[dojo_id])).unwrap();
+        assert_eq!(projection.lairs[0].dojos[0].splints[0].node.label, "shell");
     }
 
     #[test]

@@ -100,7 +100,10 @@ pub const fn operation_for_request(request: &Request) -> AuditOperation {
         Request::RenameLair { .. } => AuditOperation::RenameLair,
         Request::RenameDojo { .. } => AuditOperation::RenameDojo,
         Request::SetDojoDefaultFocus { .. } => AuditOperation::SetDojoDefaultFocus,
-        Request::RenameSplint { .. } => AuditOperation::RenameSplint,
+        // A title reset is a rename back to the default title.
+        Request::RenameSplint { .. } | Request::ResetSplintTitle { .. } => {
+            AuditOperation::RenameSplint
+        }
         // Keep the frozen public audit vocabulary stable; content reads remain
         // an exact-incarnation terminal attachment operation in this phase.
         Request::Attach { .. } | Request::RequestImageContent { .. } => AuditOperation::Attach,

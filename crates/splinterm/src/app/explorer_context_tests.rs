@@ -262,6 +262,7 @@ fn explorer_observes_detached_stop_and_restore_without_revision_change() {
         lifecycle: SplintLifecycle::Running,
         exit_status: None,
         agent_status: None,
+        foreground_app: None,
     };
     let stopped = SplintRuntimeSummary {
         live_incarnation: None,
@@ -300,6 +301,7 @@ fn explorer_observation_tracks_revision_and_ignores_runtime_order() {
                 lifecycle: SplintLifecycle::Exited,
                 exit_status: None,
                 agent_status: None,
+                foreground_app: None,
             })
             .collect(),
         presentation_offers: Vec::new(),
@@ -650,6 +652,54 @@ fn pane_edits_revalidate_revision_parent_and_incarnation() {
     }
 }
 
+#[tokio::test]
+async fn use_app_name_resets_only_a_renamed_captured_splint() {
+    let (mut lair, mut target) = saved();
+    let dojo_id = lair.dojos[0].id;
+    let splint_id = lair.dojos[0].default_focus;
+    target.node = NavigationNodeId::Splint {
+        lair_id: lair.id,
+        dojo_id,
+        splint_id,
+    };
+    let command = WindowTopologyCommand::ResetSplintTitle { splint_id };
+    // A Splint still on its default title has nothing to reset.
+    assert!(
+        validate_explorer_context(target, &command, target.topology_revision, &[lair.clone()])
+            .is_err()
+    );
+    let (requests, updates) = routed(
+        target.command(command.clone()),
+        vec![catalog(&lair, target)],
+    )
+    .await;
+    assert_eq!(requests, vec![Request::ListLairs]);
+    assert!(matches!(
+        updates.as_slice(),
+        [WindowTopologyUpdate::TabFailed { .. }]
+    ));
+
+    let pane = lair.dojos[0].root.find_splint_mut(splint_id).unwrap();
+    pane.title = "notes".into();
+    pane.title_set = true;
+    let (requests, updates) = routed(
+        target.command(command),
+        vec![catalog(&lair, target), committed()],
+    )
+    .await;
+    assert_eq!(
+        requests,
+        vec![
+            Request::ListLairs,
+            Request::ResetSplintTitle {
+                expected_topology_revision: target.topology_revision,
+                splint_id,
+            },
+        ]
+    );
+    assert!(updates.is_empty());
+}
+
 fn topology_response(lair: Lair) -> Response {
     let mut ids = Vec::new();
     layout_splint_ids(&lair.dojos[0].root, &mut ids);
@@ -670,6 +720,7 @@ fn topology_response(lair: Lair) -> Response {
                 },
                 exit_status: None,
                 agent_status: None,
+                foreground_app: None,
             }
         })
         .collect();
@@ -1032,6 +1083,7 @@ fn explorer_observation_ignores_agent_status_age_and_sequence_but_not_state() {
             lifecycle: SplintLifecycle::Running,
             exit_status: None,
             agent_status: Some(summary(AgentState::Working, 1, false, 0)),
+            foreground_app: None,
         }],
         presentation_offers: Vec::new(),
     };
@@ -1055,6 +1107,44 @@ fn explorer_observation_ignores_agent_status_age_and_sequence_but_not_state() {
     assert!(observer.observe(&snapshot));
     snapshot.runtimes[0].agent_status = None;
     assert!(observer.observe(&snapshot));
+}
+
+// Plan 0069: the foreground app name changes with no topology revision, so
+// the Explorer must still see it.
+#[test]
+fn explorer_observation_sees_a_foreground_app_change_at_the_same_revision() {
+    use splinterm_protocol::{SplintLifecycle, SplintRuntimeSummary, TopologySnapshot};
+    let mut snapshot = TopologySnapshot {
+        topology: splinterm_core::Topology::new(),
+        revision: TopologyRevision::new(1),
+        runtimes: vec![SplintRuntimeSummary {
+            splint_id: SplintId::new(),
+            live_incarnation: Some(3),
+            last_incarnation: Some(3),
+            restorable: false,
+            lifecycle: SplintLifecycle::Running,
+            exit_status: None,
+            agent_status: None,
+            foreground_app: None,
+        }],
+        presentation_offers: Vec::new(),
+    };
+    let mut observer = ExplorerObservation::default();
+    assert!(observer.observe(&snapshot));
+    assert!(!observer.observe(&snapshot));
+    snapshot.runtimes[0].foreground_app = Some("nvim".to_owned());
+    assert!(
+        observer.observe(&snapshot),
+        "an app name appearing is presented"
+    );
+    assert!(!observer.observe(&snapshot));
+    snapshot.runtimes[0].foreground_app = Some("htop".to_owned());
+    assert!(observer.observe(&snapshot), "a new app name is presented");
+    snapshot.runtimes[0].foreground_app = None;
+    assert!(
+        observer.observe(&snapshot),
+        "the shell's return is presented"
+    );
 }
 
 /// Routes `command` against a read-only peer that answers `ListLairs` and
@@ -1205,6 +1295,7 @@ async fn picker_and_restore_previews_send_only_reads() {
             lifecycle: SplintLifecycle::Exited,
             exit_status: None,
             agent_status: None,
+            foreground_app: None,
         }],
         presentation_offers: Vec::new(),
     };

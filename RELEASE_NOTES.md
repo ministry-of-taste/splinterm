@@ -437,6 +437,12 @@ a hostile program running as your account.
 
 ## Dojos, tabs, and the Explorer
 
+- A Splint still titled `shell` is labelled in the Explorer, and in its agents
+  section, with the program running in it, such as `nvim` or `claude`, once
+  that program has held the terminal for 2 seconds, and goes back to `shell`
+  when the shell has the terminal again. A renamed Splint keeps its name;
+  **Use app name** on its menu, `splinterm rename-splint --use-app-name`, or
+  MCP `use_app_name` undoes the rename.
 - The Lair Explorer shows one line per row: the disclosure chevron and the
   name, then fixed icon columns on the right for agent access, agent status,
   whether the row is live (a filled or hollow dot), and whether a Lair is saved
@@ -701,6 +707,9 @@ a hostile program running as your account.
 
 - `splinterm-mcp` also accepts MCP protocol `2025-06-18`, so Codex can connect.
 - New tool `splinterm.report_agent_status`; the catalog now has 34 tools.
+- `splinterm.inspect_splint` and `splinterm.inspect_topology` report a Splint's
+  `foreground_app` name, and `splinterm.rename_splint` takes `use_app_name:
+  true` to undo a rename.
 - `splinterm.request_lair_access` asks for one of the easy agent access levels
   and can return a pending result while you have not answered yet; see "Easy
   agent access".

@@ -7,8 +7,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "splint_id",
-        "title"
+        "splint_id"
       ],
       "properties": {
         "splint_id": {
@@ -16,8 +15,26 @@
         },
         "title": {
           "$ref": "https://splinterm.oldjobobo.com/schemas/mcp/v2/common.schema.json#/$defs/name"
+        },
+        "use_app_name": {
+          "const": true,
+          "description": "Instead of title: undo the rename, so windows show the running app's name."
         }
       }
+    },
+    {
+      "oneOf": [
+        {
+          "required": [
+            "title"
+          ]
+        },
+        {
+          "required": [
+            "use_app_name"
+          ]
+        }
+      ]
     }
   ]
 }

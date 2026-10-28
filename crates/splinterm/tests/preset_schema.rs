@@ -62,6 +62,7 @@ fn runtime(splint_id: SplintId, incarnation: u64) -> SplintRuntimeSummary {
         lifecycle: SplintLifecycle::Running,
         exit_status: None,
         agent_status: None,
+        foreground_app: None,
     }
 }
 
@@ -231,6 +232,7 @@ fn preset_run_sends_one_atomic_tree_and_reconciles_stable_mappings() {
         launch: Box::new(splinterm_core::SplintLaunchMetadata::default()),
         last_incarnation: Some(incarnation),
         state: SplintState::Running,
+        title_set: true,
     };
     let created = Dojo {
         id: created_dojo_id,

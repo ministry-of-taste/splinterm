@@ -347,6 +347,7 @@ mod tests {
                     TabMenuActionId::FocusSplint,
                     TabMenuActionId::SplitBelow,
                     TabMenuActionId::SplitRight,
+                    TabMenuActionId::UseAppName,
                     TabMenuActionId::CloseSplint,
                 ]
                 .map(tab_menu_descriptor),

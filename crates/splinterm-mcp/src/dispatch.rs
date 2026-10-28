@@ -919,7 +919,7 @@ fn runtime_for(
 fn topology_splints(
     node: &LayoutNode,
     snapshot: &TopologySnapshot,
-    include_agent_status: bool,
+    include_runtime_labels: bool,
     output: &mut Vec<Value>,
 ) -> Result<(), DispatchFailure> {
     match node {
@@ -932,17 +932,34 @@ fn topology_splints(
                 "title": splint.title,
                 "state": state_name(runtime),
             });
-            if include_agent_status && let Some(status) = agent_status_value(runtime)? {
+            if include_runtime_labels && let Some(status) = agent_status_value(runtime)? {
                 value["agent_status"] = status;
+            }
+            if include_runtime_labels && let Some(name) = foreground_app_value(runtime)? {
+                value["foreground_app"] = name;
             }
             output.push(value);
             Ok(())
         }
         LayoutNode::Branch { first, second, .. } => {
-            topology_splints(first, snapshot, include_agent_status, output)?;
-            topology_splints(second, snapshot, include_agent_status, output)
+            topology_splints(first, snapshot, include_runtime_labels, output)?;
+            topology_splints(second, snapshot, include_runtime_labels, output)
         }
     }
+}
+
+/// Projects the foreground app name of a live incarnation only (Plan 0069):
+/// untrusted terminal-derived display data, never authority.
+fn foreground_app_value(runtime: &SplintRuntimeSummary) -> Result<Option<Value>, DispatchFailure> {
+    let Some(name) = &runtime.foreground_app else {
+        return Ok(None);
+    };
+    if runtime.live_incarnation.is_none()
+        || splinterm_protocol::validate_foreground_app(name).is_err()
+    {
+        return Err(DispatchFailure::internal());
+    }
+    Ok(Some(Value::String(name.clone())))
 }
 
 /// Projects explicitly reported display status of a live incarnation only.
@@ -962,12 +979,12 @@ fn agent_status_value(runtime: &SplintRuntimeSummary) -> Result<Option<Value>, D
     })))
 }
 
-/// Projects the full logical topology. Agent status rides only the
-/// `inspect_topology` tool; the topology resource does not carry it because
-/// status changes publish no resource update.
+/// Projects the full logical topology. Agent status and foreground app names
+/// ride only the `inspect_topology` tool; the topology resource does not carry
+/// them because their changes publish no resource update.
 pub(crate) fn topology_data(
     snapshot: &TopologySnapshot,
-    include_agent_status: bool,
+    include_runtime_labels: bool,
 ) -> Result<Value, DispatchFailure> {
     snapshot
         .validate()
@@ -977,7 +994,7 @@ pub(crate) fn topology_data(
         let mut dojos = Vec::new();
         for dojo in &lair.dojos {
             let mut splints = Vec::new();
-            topology_splints(&dojo.root, snapshot, include_agent_status, &mut splints)?;
+            topology_splints(&dojo.root, snapshot, include_runtime_labels, &mut splints)?;
             dojos.push(json!({
                 "dojo_id": dojo.id.to_string(),
                 "name": dojo.name,
@@ -2420,19 +2437,32 @@ async fn dispatch_mutation_to(
                     .await?;
             let (lair_id, dojo_id, incarnation) =
                 exact_splint_preparation(&preparation, splint_id)?;
-            let title = arguments["title"]
-                .as_str()
-                .ok_or_else(DispatchFailure::internal)?;
-            match session
-                .request(Request::RenameSplint {
-                    expected_topology_revision: preparation.topology_revision,
+            let expected_topology_revision = preparation.topology_revision;
+            // The input schema admits exactly one of a title and `use_app_name`.
+            let reset = arguments.get("use_app_name") == Some(&Value::Bool(true));
+            let request = if reset {
+                Request::ResetSplintTitle {
+                    expected_topology_revision,
+                    splint_id,
+                }
+            } else {
+                let title = arguments["title"]
+                    .as_str()
+                    .ok_or_else(DispatchFailure::internal)?;
+                Request::RenameSplint {
+                    expected_topology_revision,
                     splint_id,
                     title: title.to_owned(),
-                })
-                .await?
-            {
+                }
+            };
+            match session.request(request).await? {
                 Response::TopologyCommitted { topology_revision } => {
-                    let revision = next_topology_revision(&preparation, topology_revision)?;
+                    // A reset of a Splint already on its app name changes nothing.
+                    let revision = if reset && topology_revision == preparation.topology_revision {
+                        unchanged_topology_revision(&preparation, topology_revision)?
+                    } else {
+                        next_topology_revision(&preparation, topology_revision)?
+                    };
                     Ok(success(
                         tool,
                         splint_resource(lair_id, dojo_id, splint_id, incarnation, revision)?,
@@ -2571,6 +2601,9 @@ pub(crate) async fn dispatch(
                     let mut data = json!({"title": title, "state": state_name(&runtime)});
                     if let Some(status) = agent_status_value(&runtime)? {
                         data["agent_status"] = status;
+                    }
+                    if let Some(name) = foreground_app_value(&runtime)? {
+                        data["foreground_app"] = name;
                     }
                     Ok(success(
                         tool,
@@ -3374,6 +3407,7 @@ mod agent_status_tests {
                     stale: false,
                     reported_age_ms: 10,
                 }),
+                foreground_app: Some("nvim".to_owned()),
             }],
             presentation_offers: Vec::new(),
         };
@@ -3385,6 +3419,15 @@ mod agent_status_tests {
         assert!(
             splint(topology_data(&snapshot, false).unwrap())
                 .get("agent_status")
+                .is_none()
+        );
+        assert_eq!(
+            splint(topology_data(&snapshot, true).unwrap())["foreground_app"],
+            "nvim"
+        );
+        assert!(
+            splint(topology_data(&snapshot, false).unwrap())
+                .get("foreground_app")
                 .is_none()
         );
     }

@@ -54,9 +54,10 @@ pub(super) enum MachineMutation {
         dojo_id: DojoId,
         splint_id: SplintId,
     },
+    /// `None` undoes the rename (`--use-app-name`).
     RenameSplint {
         splint_id: SplintId,
-        title: String,
+        title: Option<String>,
     },
     Relaunch {
         splint_id: SplintId,
@@ -129,9 +130,14 @@ pub(super) fn extract_machine_mutation(
         Command::DojoFocusHint { dojo_id, splint_id } => {
             MachineMutation::Focus { dojo_id, splint_id }
         }
-        Command::RenameSplint { splint_id, title } => {
-            MachineMutation::RenameSplint { splint_id, title }
-        }
+        Command::RenameSplint {
+            splint_id,
+            title,
+            use_app_name,
+        } => MachineMutation::RenameSplint {
+            splint_id,
+            title: title.filter(|_| !use_app_name),
+        },
         Command::Relaunch {
             splint_id,
             cwd,
@@ -380,10 +386,16 @@ fn machine_mutation_request(
         }
         MachineMutation::RenameSplint { splint_id, title } => {
             topology_splint_location(topology, *splint_id)?;
-            Request::RenameSplint {
-                expected_topology_revision,
-                splint_id: *splint_id,
-                title: title.clone(),
+            match title {
+                Some(title) => Request::RenameSplint {
+                    expected_topology_revision,
+                    splint_id: *splint_id,
+                    title: title.clone(),
+                },
+                None => Request::ResetSplintTitle {
+                    expected_topology_revision,
+                    splint_id: *splint_id,
+                },
             }
         }
         MachineMutation::Relaunch {

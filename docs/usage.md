@@ -210,7 +210,8 @@ Up/Down, Enter, and Escape to choose, run, or cancel an action:
 - **Lairs:** Rename, New Dojo, Save layout, Pin/Unpin, saved-layout Preview,
   Restore, and Terminate.
 - **Dojos:** Open, Rename, Restore, Close tab when open, and Terminate.
-- **Splints:** Focus, Split below/right, Restore for restorable work, and Close.
+- **Splints:** Focus, Use app name for a renamed Splint, Split below/right,
+  Restore for restorable work, and Close.
 
 Only applicable actions appear. Saved and non-open Lairs/Dojos can be renamed or
 managed without switching tabs; Open and Focus explicitly navigate.
@@ -240,6 +241,21 @@ skip names already used by siblings. These are display labels, not renamed saved
 objects or CLI identifiers; numbering follows the current topology and can change
 when siblings are added or removed. Search, the navigation pickers, and the
 standalone Recent Dojos picker (`splinterm dojos`) use the same labels.
+
+A Splint that still has the default title `shell` is labelled with the program
+running in it, such as `nvim`, `claude`, or `build.sh`, once that program has
+held the terminal for 2 seconds, so a quick `ls` never shows. The label goes
+back to `shell` as soon as the shell has the terminal again. Splinterm names
+the job from its command, as a basename only: a script run by a shell or an
+interpreter such as `python3` shows the script's name. A renamed Splint keeps
+its name, even one renamed to `shell`. To go back to the app name, choose
+**Use app name** from the Splint's menu in the Explorer, run
+`splinterm rename-splint SPLINT_ID --use-app-name`, or call MCP
+`splinterm.rename_splint` with `use_app_name: true`. The name is only a label:
+any program can choose its own command line, so no command or agent targets
+or trusts a Splint by it, and it is not saved. The agents section and Explorer
+search use the same label; pane frames, tabs, and `splinterm list` keep the
+title.
 
 Each Explorer row is one line, or two with `row-lines=2` (below). On the left
 are an icon marking the current row (an eye unless `[explorer] current-marker`
@@ -418,7 +434,8 @@ state is a static icon.
   label *agents* start a list of every Splint that reports a status, whatever
   the filter or the search: most urgent first (needs input, error, working,
   done, idle, then stale statuses), in tree order within a state. Each row
-  shows the status icon, the Splint's name, and its Lair and Dojo, for example
+  shows the status icon, the Splint's name (the app's name for a Splint left
+  on its default title, as in the tree), and its Lair and Dojo, for example
   *work / editor*, when the panel has room; otherwise the location is
   ellipsized or dropped and the name is kept. The section takes up to five
   rows and at most a third of the list, but at least one, under its label

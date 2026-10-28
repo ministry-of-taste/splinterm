@@ -135,7 +135,7 @@ never contact the daemon; see [Set up an agent host](mcp.md#set-up-an-agent-host
 | `close-dojo DOJO_ID --yes` | `close_dojo` |
 | `rename-lair LAIR_ID NAME` | `rename_lair` |
 | `rename-dojo DOJO_ID NAME` | `rename_dojo` |
-| `rename-splint SPLINT_ID TITLE` | `rename_splint` |
+| `rename-splint SPLINT_ID TITLE\|--use-app-name` | `rename_splint` |
 | `dojo-focus-hint DOJO_ID SPLINT_ID` | `set_dojo_default_focus` |
 | `relaunch SPLINT_ID [-- ARGV...]` | `relaunch_splint` |
 | `restore SPLINT_ID` | `restore_splint` |

@@ -552,6 +552,7 @@ pub(crate) enum TabMenuActionId {
     FocusSplint,
     SplitBelow,
     SplitRight,
+    UseAppName,
     CloseSplint,
     ActivateTab,
     NewDojo,
@@ -579,7 +580,8 @@ impl TabMenuActionId {
             | Self::NewDojo
             | Self::FocusSplint
             | Self::SplitBelow
-            | Self::SplitRight => 0,
+            | Self::SplitRight
+            | Self::UseAppName => 0,
             Self::SaveLayout
             | Self::PinLair
             | Self::UnpinLair
@@ -609,8 +611,8 @@ impl TabMenuActionId {
             Self::CloseOtherTabs => Some(ActionId::CloseOtherTabs),
             Self::TerminateDojo => Some(ActionId::TerminateCurrentDojo),
             // Restore means a Lair, a Dojo or a pane; Focus and Activate
-            // have no current-target binding.
-            Self::Restore | Self::FocusSplint | Self::ActivateTab => None,
+            // have no current-target binding, and neither has Use app name.
+            Self::Restore | Self::FocusSplint | Self::ActivateTab | Self::UseAppName => None,
         }
     }
 
@@ -709,6 +711,7 @@ pub(crate) fn tab_menu_action_enabled(id: TabMenuActionId, context: &TabMenuCont
         | TabMenuActionId::FocusSplint
         | TabMenuActionId::SplitBelow
         | TabMenuActionId::SplitRight
+        | TabMenuActionId::UseAppName
         | TabMenuActionId::CloseSplint => false,
         TabMenuActionId::ActivateTab => !context.active,
         TabMenuActionId::CloseOtherTabs => !context.other_dojo_ids.is_empty(),
@@ -1023,6 +1026,13 @@ impl TabContextMenuUi {
                         },
                     ));
                 }
+                // A renamed Splint can go back to showing its app's name.
+                if splint.title_set {
+                    entries.push((
+                        TabMenuActionId::UseAppName,
+                        WindowTopologyCommand::ResetSplintTitle { splint_id },
+                    ));
+                }
                 if pane_controlled
                     && dojo.attachment == WindowAttachment::Here
                     && splint.lifecycle == NavigationLifecycle::Running
@@ -1246,6 +1256,7 @@ pub(crate) fn tab_menu_dispatch(
         | TabMenuActionId::FocusSplint
         | TabMenuActionId::SplitBelow
         | TabMenuActionId::SplitRight
+        | TabMenuActionId::UseAppName
         | TabMenuActionId::CloseSplint => None,
         TabMenuActionId::RenameTab => Some(TabMenuDispatch::Rename(context.action_target())),
         TabMenuActionId::ActivateTab => Some(TabMenuDispatch::Topology(
@@ -1324,6 +1335,10 @@ pub(crate) fn tab_menu_descriptor(id: TabMenuActionId) -> TabMenuActionDescripto
         TabMenuActionDescriptor {
             id: TabMenuActionId::SplitRight,
             title: "Split right",
+        },
+        TabMenuActionDescriptor {
+            id: TabMenuActionId::UseAppName,
+            title: "Use app name",
         },
         TabMenuActionDescriptor {
             id: TabMenuActionId::CloseSplint,
@@ -3219,6 +3234,49 @@ mod tests {
             TabContextMenuUi::for_explorer(&view, lair, Some(SplintId::new()), true, true)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn explorer_offers_use_app_name_only_for_a_renamed_splint() {
+        let mut view = super::super::lair_explorer::tests::view();
+        let node = view.lairs[0].dojos[0].splints[0].id;
+        let splint_id = view.lairs[0].dojos[0].splints[0].target.splint_id;
+        let menu = |view: &NavigationExplorerView| {
+            TabContextMenuUi::for_explorer(view, node, Some(SplintId::new()), false, true).unwrap()
+        };
+        assert!(
+            !menu(&view)
+                .actions()
+                .iter()
+                .any(|action| action.id == TabMenuActionId::UseAppName)
+        );
+        view.lairs[0].dojos[0].splints[0].title_set = true;
+        let renamed = menu(&view);
+        let titles = renamed
+            .actions()
+            .iter()
+            .map(|action| (action.id, action.title))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            titles,
+            vec![
+                (TabMenuActionId::FocusSplint, "Focus"),
+                (TabMenuActionId::UseAppName, "Use app name"),
+            ]
+        );
+        let Some(TabMenuDispatch::Topology(WindowTopologyCommand::ExplorerContext {
+            target,
+            command,
+        })) = renamed.dispatch(TabMenuActionId::UseAppName)
+        else {
+            panic!("expected a guarded reset")
+        };
+        assert_eq!(target.node, node);
+        assert_eq!(
+            *command,
+            WindowTopologyCommand::ResetSplintTitle { splint_id }
+        );
+        assert!(command.paused_during_handoff());
     }
 
     #[test]

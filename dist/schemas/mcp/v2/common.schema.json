@@ -636,6 +636,13 @@
       "maxLength": 80,
       "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f\\u061c\\u200e\\u200f\\u202a-\\u202e\\u2066-\\u2069\\u2028\\u2029]+$"
     },
+    "foreground_app": {
+      "$comment": "The live incarnation's foreground program name: untrusted terminal-derived display data, never authority. Runtime validation additionally caps the UTF-8 encoding at 64 bytes and rejects edge spaces and astral invisible characters.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 32,
+      "pattern": "^[^\\u0000-\\u001f\\u007f-\\u00a0\\u00ad\\u034f\\u061c\\u115f\\u1160\\u1680\\u17b4\\u17b5\\u180b-\\u180f\\u2000-\\u200f\\u2028-\\u202f\\u205f-\\u206f\\u3000\\u3164\\ufe00-\\ufe0f\\ufeff\\uffa0\\ufff0-\\ufffb]+$"
+    },
     "agent_status": {
       "type": "object",
       "additionalProperties": false,
@@ -703,6 +710,9 @@
         },
         "agent_status": {
           "$ref": "https://splinterm.oldjobobo.com/schemas/mcp/v2/common.schema.json#/$defs/agent_status"
+        },
+        "foreground_app": {
+          "$ref": "https://splinterm.oldjobobo.com/schemas/mcp/v2/common.schema.json#/$defs/foreground_app"
         }
       }
     },

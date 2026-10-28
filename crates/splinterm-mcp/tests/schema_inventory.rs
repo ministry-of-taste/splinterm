@@ -60,7 +60,7 @@ const ERROR_CODES: &[&str] = &[
 ];
 
 const REVIEWED_SCHEMA_FNV64: &[(&str, u64)] = &[
-    ("common.schema.json", 0x2fc5_267e_ce17_e7b8),
+    ("common.schema.json", 0x48fa_8a13_da28_baa8),
     ("error.schema.json", 0x9dd2_e2af_f101_25fe),
     ("resources/control.schema.json", 0xd4f3_1fbc_06b2_5c2b),
     ("resources/terminal.schema.json", 0x20c0_6b33_9e25_c903),
@@ -120,7 +120,7 @@ const REVIEWED_SCHEMA_FNV64: &[(&str, u64)] = &[
     ),
     (
         "tools/inspect_splint.output.schema.json",
-        0xa8eb_6c4b_ade4_1779,
+        0xb17a_faa3_6121_fc69,
     ),
     (
         "tools/inspect_topology.input.schema.json",
@@ -185,7 +185,7 @@ const REVIEWED_SCHEMA_FNV64: &[(&str, u64)] = &[
     ),
     (
         "tools/rename_splint.input.schema.json",
-        0x75a0_bd0d_f0ec_1172,
+        0x52cf_0e0e_0101_557a,
     ),
     (
         "tools/rename_splint.output.schema.json",

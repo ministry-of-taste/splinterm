@@ -327,6 +327,7 @@ fn reviewed_topology() -> TopologySnapshot {
             lifecycle: SplintLifecycle::Running,
             exit_status: None,
             agent_status: None,
+            foreground_app: None,
         }],
         presentation_offers: Vec::new(),
     }
@@ -467,6 +468,7 @@ fn adversarial_topology(payloads: &[&str; 4]) -> TopologySnapshot {
             lifecycle: SplintLifecycle::Running,
             exit_status: None,
             agent_status: None,
+            foreground_app: None,
         }],
         presentation_offers: Vec::new(),
     }
@@ -492,6 +494,7 @@ fn reviewed_restorable_topology() -> TopologySnapshot {
             signal: None,
         }),
         agent_status: None,
+        foreground_app: None,
     };
     snapshot
 }
@@ -2206,6 +2209,7 @@ fn successful_output_size_is_checked_after_schema_validation() {
                     lifecycle: SplintLifecycle::Running,
                     exit_status: None,
                     agent_status: None,
+                    foreground_app: None,
                 });
             }
             lair.insert_lair_at(lair.revision(), dojo).unwrap();
@@ -5191,6 +5195,80 @@ fn cancelled_mutation_discards_a_late_committed_result() {
     assert!(!server.seen().iter().any(|response| {
         response["id"] == 2 && response["result"]["structuredContent"]["ok"] == true
     }));
+    fs::remove_dir_all(directory).unwrap();
+}
+
+// Plan 0069: `use_app_name` undoes a rename through the reset request, under
+// the same rename preflight.
+#[test]
+fn rename_splint_use_app_name_sends_the_title_reset() {
+    let (directory, socket) = isolated_socket("plan0069-use-app-name");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let daemon = thread::spawn(move || {
+        let mut stream = accept_automation(&listener);
+        let ClientFrame::Request {
+            diagnostic_correlation: _,
+            request_id,
+            request: Request::PrepareMutation { mutation },
+        } = read_private_frame(&mut stream)
+        else {
+            panic!("expected rename preflight")
+        };
+        assert!(matches!(mutation, MutationPreflight::RenameSplint { .. }));
+        write_private_frame(
+            &mut stream,
+            &ServerFrame::Response {
+                request_id,
+                result: Response::MutationPrepared {
+                    preparation: mutation_preparation(mutation),
+                },
+            },
+        );
+        let ClientFrame::Request {
+            diagnostic_correlation: _,
+            request_id,
+            request,
+        } = read_private_frame(&mut stream)
+        else {
+            panic!("expected title reset")
+        };
+        assert_eq!(
+            request,
+            Request::ResetSplintTitle {
+                expected_topology_revision: TopologyRevision::new(7),
+                splint_id: "018f4d8c-2a18-4b31-8c2f-9e7c5de77103".parse().unwrap(),
+            }
+        );
+        write_private_frame(
+            &mut stream,
+            &ServerFrame::Response {
+                request_id,
+                result: Response::TopologyCommitted {
+                    topology_revision: TopologyRevision::new(8),
+                },
+            },
+        );
+    });
+    let mut server = Harness::spawn_with_socket(&socket, None);
+    server.initialize();
+    server.initialized();
+    let response = call_tool(
+        &mut server,
+        2,
+        "splinterm.rename_splint",
+        json!({
+            "splint_id":"018f4d8c-2a18-4b31-8c2f-9e7c5de77103",
+            "use_app_name": true
+        }),
+    );
+    assert_eq!(response["isError"], false, "{response}");
+    assert_eq!(
+        response["structuredContent"]["data"],
+        json!({"committed": true, "renamed": true})
+    );
+    server.close_input();
+    assert!(server.wait().success());
+    daemon.join().unwrap();
     fs::remove_dir_all(directory).unwrap();
 }
 

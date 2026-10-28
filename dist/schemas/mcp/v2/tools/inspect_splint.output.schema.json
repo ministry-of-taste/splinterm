@@ -35,6 +35,9 @@
             },
             "agent_status": {
               "$ref": "https://splinterm.oldjobobo.com/schemas/mcp/v2/common.schema.json#/$defs/agent_status"
+            },
+            "foreground_app": {
+              "$ref": "https://splinterm.oldjobobo.com/schemas/mcp/v2/common.schema.json#/$defs/foreground_app"
             }
           }
         },

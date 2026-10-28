@@ -540,6 +540,7 @@ async fn apply_topology_command(
         | WindowTopologyCommand::CloseTab { .. }
         | WindowTopologyCommand::CloseTabs { .. }
         | WindowTopologyCommand::ClearAgentStatus { .. }
+        | WindowTopologyCommand::ResetSplintTitle { .. }
         | WindowTopologyCommand::Access(_) => {
             unreachable!("session commands are handled by the topology manager")
         }
@@ -2114,6 +2115,20 @@ fn validate_explorer_context(
                 && target.live_incarnation.is_some()
                 && pane.last_incarnation == target.live_incarnation
         }
+        (
+            NavigationNodeId::Splint {
+                dojo_id, splint_id, ..
+            },
+            WindowTopologyCommand::ResetSplintTitle { splint_id: id },
+        ) => {
+            splint_id == *id
+                && lair
+                    .dojos
+                    .iter()
+                    .find(|dojo| dojo.id == dojo_id)
+                    .and_then(|dojo| dojo.root.find_splint(splint_id))
+                    .is_some_and(|splint| splint.title_set)
+        }
         _ => false,
     };
     anyhow::ensure!(
@@ -3180,6 +3195,35 @@ async fn handle_session_manager_command(
                         return TopologyManagerCommandOutcome::Stop;
                     }
                 }
+            }
+            TopologyManagerCommandOutcome::Continue
+        }
+        WindowTopologyCommand::ResetSplintTitle { splint_id } => {
+            let result = async {
+                // Only the Explorer offers this, so a captured guard is
+                // always present and supplies the revision it validated.
+                let guard = guard.context("app name reset lacks its Explorer capture")?;
+                let response = connection
+                    .request(Request::ResetSplintTitle {
+                        expected_topology_revision: guard.topology_revision,
+                        splint_id,
+                    })
+                    .await?;
+                anyhow::ensure!(
+                    matches!(response, Response::TopologyCommitted { .. }),
+                    "splinterd did not acknowledge the app name reset"
+                );
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+            if let Err(error) = result {
+                let _ = updates
+                    .send(WindowTopologyUpdate::TabFailed {
+                        explorer_target: None,
+                        dojo_id: None,
+                        message: format!("{error:#}"),
+                    })
+                    .await;
             }
             TopologyManagerCommandOutcome::Continue
         }
@@ -4320,6 +4364,7 @@ mod tests {
                 lifecycle: SplintLifecycle::Running,
                 exit_status: None,
                 agent_status: None,
+                foreground_app: None,
             }],
             presentation_offers: Vec::new(),
         };
