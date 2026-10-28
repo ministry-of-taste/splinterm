@@ -6592,6 +6592,9 @@ fn trusted_ui_request(request: &Request) -> bool {
             | Request::PrepareDaemonHandoff { .. }
             | Request::ClaimHandoffControl { .. }
             | Request::AcknowledgeHandoffPrepare { .. }
+            | Request::SubscribeConsentOffers { .. }
+            | Request::SetConsentPresence { .. }
+            | Request::AnswerConsentOffer { .. }
     )
 }
 
@@ -6601,8 +6604,20 @@ fn interactive_bypass(
     remote_interactive_client: bool,
     request: &Request,
 ) -> bool {
-    let trusted_local =
-        trusted_ui_client && matching_splinterm_executable && trusted_ui_request(request);
+    use splinterm_protocol::ConsentResponderKind;
+
+    let trusted_local = trusted_ui_client
+        && matching_splinterm_executable
+        && trusted_ui_request(request)
+        // The local client answers prompts only as the terminal approver;
+        // Window responders are remote Windows (ADR 0015).
+        && !matches!(
+            request,
+            Request::SubscribeConsentOffers {
+                kind: ConsentResponderKind::Window,
+                ..
+            } | Request::SetConsentPresence { .. }
+        );
     let remote_human = remote_interactive_client
         && trusted_ui_request(request)
         && !matches!(
@@ -6614,8 +6629,42 @@ fn interactive_bypass(
                 | Request::PrepareDaemonHandoff { .. }
                 | Request::ClaimHandoffControl { .. }
                 | Request::AcknowledgeHandoffPrepare { .. }
+                // The approver command runs on the daemon host itself.
+                | Request::SubscribeConsentOffers {
+                    kind: ConsentResponderKind::Terminal,
+                    ..
+                }
         );
     trusted_local || remote_human
+}
+
+/// Whether a consent responder request's kind fits the connection's role
+/// (ADR 0015): a Window responder is a remote Window's relay connection, and
+/// the terminal approver is the installed local client. The authorization
+/// table and [`interactive_bypass`] already admit by role and kind; the
+/// handler checks again before it acts.
+fn consent_responder_admitted(
+    trusted_ui_client: bool,
+    matching_splinterm_executable: bool,
+    remote_interactive_client: bool,
+    request: &Request,
+) -> bool {
+    use splinterm_protocol::ConsentResponderKind;
+
+    let trusted_local = trusted_ui_client && matching_splinterm_executable;
+    match request {
+        Request::SubscribeConsentOffers {
+            kind: ConsentResponderKind::Window,
+            ..
+        }
+        | Request::SetConsentPresence { .. } => remote_interactive_client,
+        Request::SubscribeConsentOffers {
+            kind: ConsentResponderKind::Terminal,
+            ..
+        } => trusted_local,
+        Request::AnswerConsentOffer { .. } => remote_interactive_client || trusted_local,
+        _ => false,
+    }
 }
 
 fn intrinsically_authorized(
@@ -7826,7 +7875,10 @@ async fn request_policy_resources(
         | Request::ClaimHandoffControl { .. }
         | Request::CancelLairAccessRequest { .. }
         | Request::CancelAllLairAccessRequests
-        | Request::AcknowledgeHandoffPrepare { .. } => Vec::new(),
+        | Request::AcknowledgeHandoffPrepare { .. }
+        | Request::SubscribeConsentOffers { .. }
+        | Request::SetConsentPresence { .. }
+        | Request::AnswerConsentOffer { .. } => Vec::new(),
         Request::ListLairs
         | Request::InspectTopology
         | Request::SubscribeTopology
@@ -11349,11 +11401,50 @@ async fn handle_authorized_request(
             require_trusted_local_ui(trusted_ui_client, peer)?;
             return Err(handoff_requests::no_pending_handoff_prepare());
         }
+        request @ (Request::SubscribeConsentOffers { .. }
+        | Request::SetConsentPresence { .. }
+        | Request::AnswerConsentOffer { .. }) => {
+            return Err(consent_responder_unsupported(
+                trusted_ui_client,
+                peer,
+                remote_interactive_client,
+                &request,
+            ));
+        }
     };
     Ok(Handled {
         response,
         subscription: None,
     })
+}
+
+/// Answers a consent responder request (ADR 0015) until the daemon routes
+/// prompts to responders: the role and kind check, then the request bounds,
+/// then `UnsupportedOperation`. Nothing is registered or answered.
+fn consent_responder_unsupported(
+    trusted_ui_client: bool,
+    peer: &PeerIdentity,
+    remote_interactive_client: bool,
+    request: &Request,
+) -> ProtocolError {
+    if !consent_responder_admitted(
+        trusted_ui_client,
+        peer.connection_matches_splinterm(),
+        remote_interactive_client,
+        request,
+    ) {
+        return ProtocolError::new(
+            ErrorCode::Unauthorized,
+            "this connection cannot be a consent responder of that kind",
+        );
+    }
+    if let Err(error) = request.validate_consent_responder() {
+        return error;
+    }
+    ProtocolError::new(
+        ErrorCode::UnsupportedOperation,
+        "this daemon does not yet offer consent prompts to responders",
+    )
 }
 
 /// Handoff requests are trusted-UI-only in the authorization table; this
@@ -11926,18 +12017,19 @@ impl<'a> HandoffAdmission<'a> {
 ///   splits, relaunches, restores, presets, renames, retention, focus
 ///   defaults, closes, kills, terminations, and the unused-Dojo close);
 ///   terminal input and resize; acquiring (a handoff control claim
-///   included), transferring, deciding, or forcing control; consent and new
-///   grants; and every new subscription or attachment (topology, terminal,
-///   control), which would need resnapshot authority on the next generation
-///   and changes attachment counts an unused close reads.
+///   included), transferring, deciding, or forcing control; consent, consent
+///   answers, and new grants; and every new subscription or attachment
+///   (topology, terminal, control, consent offers), which would need
+///   resnapshot authority on the next generation and changes attachment
+///   counts an unused close reads.
 /// - **Admitted:** read-only queries (including the mutation preflight and
 ///   image content for an existing attachment); advisory, connection-owned
-///   state no handoff captures (the published graphical focus and agent
-///   status, which Plan 0061 D6 drops across a handoff); requests that only
-///   reduce authority (detach, release control, revoke a grant); and the
-///   handoff preparation and acknowledgement themselves, so a dry run still
-///   reports, a Window can acknowledge, and the gate answers a second
-///   `Execute` itself.
+///   state no handoff captures (the published graphical focus, agent status,
+///   and a consent responder's presence, which Plan 0061 D6 and ADR 0015
+///   drop across a handoff); requests that only reduce authority (detach,
+///   release control, revoke a grant); and the handoff preparation and
+///   acknowledgement themselves, so a dry run still reports, a Window can
+///   acknowledge, and the gate answers a second `Execute` itself.
 ///
 /// Admitted requests that take the topology permit (topology inspection,
 /// the mutation preflight, grant revocation) wait for the fence to lift.
@@ -11975,7 +12067,8 @@ const fn handoff_fenced(request: &Request) -> bool {
         | Request::RevokeAccessEntry { .. }
         | Request::RevokeAllAccess { .. }
         | Request::PrepareDaemonHandoff { .. }
-        | Request::AcknowledgeHandoffPrepare { .. } => false,
+        | Request::AcknowledgeHandoffPrepare { .. }
+        | Request::SetConsentPresence { .. } => false,
         Request::CreateLair { .. }
         | Request::ClaimHandoffControl { .. }
         | Request::CreateLairAutomation { .. }
@@ -12011,7 +12104,9 @@ const fn handoff_fenced(request: &Request) -> bool {
         | Request::RequestLairAccess { .. }
         | Request::SubscribeTopology
         | Request::SubscribeControl { .. }
-        | Request::Attach { .. } => true,
+        | Request::Attach { .. }
+        | Request::SubscribeConsentOffers { .. }
+        | Request::AnswerConsentOffer { .. } => true,
     }
 }
 
@@ -18714,6 +18809,174 @@ mod tests {
             &peer,
             &[AccessScope::Input, AccessScope::Resize]
         ));
+    }
+
+    fn consent_responder_requests() -> [Request; 4] {
+        [
+            Request::SubscribeConsentOffers {
+                kind: splinterm_protocol::ConsentResponderKind::Window,
+                presence: Some(splinterm_protocol::ConsentPresence::default()),
+            },
+            Request::SubscribeConsentOffers {
+                kind: splinterm_protocol::ConsentResponderKind::Terminal,
+                presence: None,
+            },
+            Request::SetConsentPresence {
+                presence: splinterm_protocol::ConsentPresence::default(),
+            },
+            Request::AnswerConsentOffer {
+                daemon_generation: 1,
+                offer_id: 1,
+                nonce: splinterm_protocol::ConsentOfferNonce::new(
+                    [7; splinterm_protocol::CONSENT_OFFER_NONCE_BYTES],
+                ),
+                decision: ConsentDecision::Deny,
+            },
+        ]
+    }
+
+    /// ADR 0015: a Window responder is a remote Window's relay connection,
+    /// the terminal approver is the installed local client, both may answer,
+    /// and automation is never a responder.
+    #[test]
+    fn consent_responders_are_admitted_only_by_role_and_kind() {
+        let [window, terminal, presence, answer] = consent_responder_requests();
+        // (request, installed trusted UI admitted, remote Window admitted)
+        for (request, trusted_local, remote) in [
+            (&window, false, true),
+            (&terminal, true, false),
+            (&presence, false, true),
+            (&answer, true, true),
+        ] {
+            assert!(trusted_ui_request(request), "{request:?}");
+            // Neither development access nor policy admits them.
+            assert!(!intrinsically_authorized(
+                &authorization::for_request(request),
+                true
+            ));
+            assert_eq!(requested_operation_scopes(request), Some(Vec::new()));
+            for trusted_ui in [false, true] {
+                for matching_splinterm in [false, true] {
+                    for remote_interactive in [false, true] {
+                        let expected = (trusted_ui && matching_splinterm && trusted_local)
+                            || (remote_interactive && remote);
+                        assert_eq!(
+                            interactive_bypass(
+                                trusted_ui,
+                                matching_splinterm,
+                                remote_interactive,
+                                request
+                            ),
+                            expected,
+                            "{request:?} trusted_ui={trusted_ui} \
+                             matching={matching_splinterm} remote={remote_interactive}"
+                        );
+                        // The handler's own check agrees with the bypass for
+                        // every real role (a connection has exactly one).
+                        if !(trusted_ui && remote_interactive) {
+                            assert_eq!(
+                                consent_responder_admitted(
+                                    trusted_ui,
+                                    matching_splinterm,
+                                    remote_interactive,
+                                    request
+                                ),
+                                expected,
+                                "{request:?} trusted_ui={trusted_ui} \
+                                 matching={matching_splinterm} remote={remote_interactive}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(!consent_responder_admitted(
+            true,
+            true,
+            true,
+            &Request::Ping
+        ));
+    }
+
+    #[tokio::test]
+    async fn consent_responder_requests_are_unsupported_after_the_role_check() {
+        // Development terminal access never admits automation.
+        let state = test_state(true);
+        let mut peer = PeerIdentity::for_test();
+        peer.install_persistent_executable(
+            executable_identity::ExecutableIdentity::from_pid(std::process::id())
+                .expect("snapshot test executable"),
+        );
+        let [window, terminal, presence, answer] = consent_responder_requests();
+        for request in [&window, &terminal, &presence, &answer] {
+            // Automation, and a trusted UI role from a program that is not
+            // the installed client.
+            for (trusted_ui, remote_interactive) in [(false, false), (true, false)] {
+                let error =
+                    authorize_request(request, &state, &peer, 0, trusted_ui, remote_interactive)
+                        .await
+                        .unwrap_err();
+                assert_eq!(error.code, ErrorCode::Unauthorized, "{request:?}");
+                let error = handle_request(
+                    request.clone(),
+                    &state,
+                    &peer,
+                    1,
+                    0,
+                    trusted_ui,
+                    remote_interactive,
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(error.code, ErrorCode::Unauthorized, "{request:?}");
+            }
+            // The handler repeats the check for a trusted UI that is not the
+            // installed client.
+            assert_eq!(
+                consent_responder_unsupported(true, &peer, false, request).code,
+                ErrorCode::Unauthorized,
+                "{request:?}"
+            );
+        }
+
+        // A remote Window reaches the handler, which answers unsupported
+        // until the daemon routes prompts to responders.
+        for request in [&window, &presence, &answer] {
+            let error = handle_request(request.clone(), &state, &peer, 1, 0, false, true)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::UnsupportedOperation, "{request:?}");
+        }
+        // The approver kind is the installed local client's only.
+        let error = handle_request(terminal, &state, &peer, 1, 0, false, true)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Unauthorized);
+        // Out-of-bounds requests fail before the unsupported answer.
+        for request in [
+            Request::SetConsentPresence {
+                presence: splinterm_protocol::ConsentPresence {
+                    focused: true,
+                    active_lair: None,
+                    open_lairs: (0..=splinterm_protocol::MAX_CONSENT_PRESENCE_LAIRS)
+                        .map(|_| LairId::new())
+                        .collect(),
+                },
+            },
+            Request::AnswerConsentOffer {
+                daemon_generation: 0,
+                offer_id: 1,
+                nonce: splinterm_protocol::ConsentOfferNonce::new(
+                    [7; splinterm_protocol::CONSENT_OFFER_NONCE_BYTES],
+                ),
+                decision: ConsentDecision::Deny,
+            },
+        ] {
+            let error = handle_request(request, &state, &peer, 1, 0, false, true)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::InvalidArgument);
+        }
     }
 
     #[tokio::test]
@@ -26746,6 +27009,8 @@ mod tests {
                 .collect(),
                 level: details.level,
                 durations: details.durations,
+                respond_within_seconds: 0,
+                origin: splinterm_protocol::ConsentOrigin::Local,
             };
             assert_eq!(prompt.validate(), Ok(()));
         }

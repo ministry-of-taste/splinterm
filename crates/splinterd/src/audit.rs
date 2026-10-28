@@ -124,6 +124,11 @@ pub const fn operation_for_request(request: &Request) -> AuditOperation {
         Request::PrepareDaemonHandoff { .. } => AuditOperation::PrepareDaemonHandoff,
         Request::ClaimHandoffControl { .. } => AuditOperation::ClaimHandoffControl,
         Request::AcknowledgeHandoffPrepare { .. } => AuditOperation::AcknowledgeHandoffPrepare,
+        // A presence update belongs to its consent responder subscription.
+        Request::SubscribeConsentOffers { .. } | Request::SetConsentPresence { .. } => {
+            AuditOperation::SubscribeConsentOffers
+        }
+        Request::AnswerConsentOffer { .. } => AuditOperation::AnswerConsentOffer,
     }
 }
 

@@ -66,7 +66,7 @@ running daemon by themselves.
 
 ## Behaviour changes
 
-- Private protocol 44 (0.1.1 used 36). Old and new clients, daemons, and relays
+- Private protocol 45 (0.1.1 used 36). Old and new clients, daemons, and relays
   do not interoperate. Upgrade both ends of a remote connection, and keep
   `splinterm-mcp` at the same version.
 - The agent access prompt no longer grants on Enter: Enter denies, and only `G`

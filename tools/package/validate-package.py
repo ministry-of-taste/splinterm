@@ -70,7 +70,7 @@ MCP_REQUIRED = {
     "usr/share/licenses/splinterm-mcp/LICENSE",
     "usr/share/licenses/splinterm-mcp/THIRD_PARTY.md",
 }
-PRIVATE_PROTOCOL_VERSION = 44
+PRIVATE_PROTOCOL_VERSION = 45
 PACKAGE_PAIR_CAPABILITIES = (
     PRIVATE_PROTOCOL_VERSION, PRIVATE_PROTOCOL_VERSION, 1, 1, 2, 2, 1, 1
 )
