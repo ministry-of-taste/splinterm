@@ -805,6 +805,22 @@ pub(super) fn paint(lines: &[DialogLine], columns: usize) -> Vec<String> {
     rows
 }
 
+/// How many terminal rows `rows`, painted for `columns`, take: a row of
+/// wide characters wider than the terminal wraps onto more.
+pub(super) fn terminal_rows(rows: &[String], columns: usize) -> usize {
+    use unicode_width::UnicodeWidthStr as _;
+
+    let columns = columns.max(1);
+    rows.iter()
+        .map(|row| {
+            let text = [BOLD, DIM, REVERSE, RESET]
+                .iter()
+                .fold(row.clone(), |text, code| text.replace(code, ""));
+            text.width().div_ceil(columns).max(1)
+        })
+        .sum()
+}
+
 // ---------------------------------------------------------------------------
 // The daemon.
 
@@ -1038,7 +1054,7 @@ impl<S: Screen> Session<S> {
             return;
         };
         let mut painted = paint(&lines, columns);
-        let fits = painted.len() <= rows;
+        let fits = columns >= MIN_COLUMNS && terminal_rows(&painted, columns) <= rows;
         if !fits && let Some(lines) = self.approver.lines(now, false) {
             painted = paint(&lines, columns);
         }
@@ -1281,13 +1297,14 @@ impl TtyScreen {
 }
 
 impl Screen for TtyScreen {
+    /// The terminal's size, or the classic 80 by 24 when it reports none.
     fn size(&self) -> (usize, usize) {
-        rustix::termios::tcgetwinsize(io::stdout()).map_or((80, 24), |size| {
-            (
-                usize::from(size.ws_col).max(MIN_COLUMNS),
-                usize::from(size.ws_row).max(1),
-            )
-        })
+        rustix::termios::tcgetwinsize(io::stdout())
+            .ok()
+            .filter(|size| size.ws_col > 0 && size.ws_row > 0)
+            .map_or((80, 24), |size| {
+                (usize::from(size.ws_col), usize::from(size.ws_row))
+            })
     }
 
     fn flush_input(&mut self) {
@@ -1438,8 +1455,8 @@ mod tests {
 
     use super::{
         ARMING_DELAY, AnswerResult, Approver, Attempt, BOLD, Choice, DIM, Effect, Flow, Input, Key,
-        RESET, REVERSE, SELECTION_ARMING_DELAY, Screen, Session, TerminalFacts, TerminalRefusal,
-        check_terminal, classify_refusal, decode_keys, paint, waiting_line,
+        MIN_COLUMNS, RESET, REVERSE, SELECTION_ARMING_DELAY, Screen, Session, TerminalFacts,
+        TerminalRefusal, check_terminal, classify_refusal, decode_keys, paint, waiting_line,
     };
 
     const GENERATION: u64 = 7;
@@ -1991,6 +2008,26 @@ mod tests {
             panic!("Escape did not deny");
         };
         assert_eq!(sent.decision, ConsentDecision::Deny);
+    }
+
+    #[test]
+    fn wide_names_and_narrow_terminals_count_the_rows_the_terminal_takes() {
+        assert_eq!(super::terminal_rows(&["abc".to_owned()], 20), 1);
+        assert_eq!(super::terminal_rows(&[String::new()], 20), 1);
+        // Twelve wide characters take 24 cells: two rows of 20.
+        let wide = format!("{BOLD}{}{RESET}", "漢".repeat(12));
+        assert_eq!(super::terminal_rows(&[wide], 20), 2);
+        // A terminal narrower than the prompt is ever wrapped only denies.
+        let now = Instant::now();
+        let (mut session, _sender) = session((MIN_COLUMNS - 1, 500));
+        let effects = session.approver.offered(offer(1), GENERATION, now);
+        session.apply(effects, now);
+        let armed = now + ARMING_DELAY;
+        session.keys(armed, &[Key::Down]);
+        assert_eq!(
+            session.keys(armed + SELECTION_ARMING_DELAY, &[Key::Enter]),
+            None
+        );
     }
 
     #[test]
