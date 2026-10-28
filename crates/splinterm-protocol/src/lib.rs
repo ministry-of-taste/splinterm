@@ -1090,6 +1090,22 @@ pub fn validate_consent_answer(daemon_generation: u64, offer_id: u64) -> Result<
     Ok(())
 }
 
+/// The `Unauthorized` reason the daemon gives a `Hello` claiming the
+/// trusted-UI role from anything but the installed client. The terminal
+/// approver tells this refusal apart by it.
+pub const TRUSTED_UI_REQUIRES_INSTALLED_CLIENT: &str =
+    "trusted UI role requires the installed graphical client";
+
+/// The `Unauthorized` reason a consent responder gets once its process no
+/// longer runs the installed relay or client it ran at `Hello`.
+pub const CONSENT_RESPONDER_IDENTITY_CHANGED: &str =
+    "this connection no longer runs the installed relay or client";
+
+/// The `Unauthorized` reason a terminal approver gets without its session's
+/// controlling terminal on standard input and output.
+pub const CONSENT_APPROVER_NEEDS_TERMINAL: &str =
+    "the approver needs its own terminal on standard input and output";
+
 /// Who answers a [`Request::SubscribeConsentOffers`] responder's offers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

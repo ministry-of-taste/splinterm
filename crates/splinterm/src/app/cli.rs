@@ -121,6 +121,7 @@ pub(crate) async fn run() -> Result<()> {
             | Command::Launch { .. }
             | Command::XdgLaunch { .. }
             | Command::Consent
+            | Command::Approvals
             | Command::Upgrade { .. }
             | Command::UpgradeDialog
             | Command::LauncherCheck { .. }
@@ -205,6 +206,7 @@ pub(crate) async fn run() -> Result<()> {
         && matches!(
             command,
             Command::Consent
+                | Command::Approvals
                 | Command::UpgradeDialog
                 | Command::Upgrade { .. }
                 | Command::LauncherCheck { .. }
@@ -232,6 +234,9 @@ pub(crate) async fn run() -> Result<()> {
     // (and the desktop entry, which runs through the same path) owns the Window.
     if remotes_self_detaches(&command, detach_terminal) {
         return splinterm::remote_launch::open_remote_chooser();
+    }
+    if matches!(command, Command::Approvals) {
+        return Box::pin(super::approvals::run()).await;
     }
     if let Command::Upgrade { now } = command {
         return super::upgrade::run(now).await;
@@ -703,6 +708,7 @@ async fn run_headless_on(
         | Command::Launch { .. }
         | Command::XdgLaunch { .. }
         | Command::Consent
+        | Command::Approvals
         | Command::Upgrade { .. }
         | Command::UpgradeDialog
         | Command::LauncherCheck { .. }

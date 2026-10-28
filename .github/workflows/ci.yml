@@ -169,7 +169,7 @@ jobs:
               --test checkpoint --test images --test iterm --test kitty --test memory_layout \
               --test oracle_fixtures --test snapshot -- --test-threads=1
             cargo test --frozen -p splinterm \
-              --test automation_cli --test diagnostics_subprocess --test keymap_cli --test mcp_setup_cli \
+              --test approvals_cli --test automation_cli --test diagnostics_subprocess --test keymap_cli --test mcp_setup_cli \
               --test policy_cli --test preset_schema --test remote_askpass --test remote_cli \
               --test remote_session --test shell_cli --test window_resume_exec \
               -- --test-threads=1

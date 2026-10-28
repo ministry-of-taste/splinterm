@@ -178,17 +178,21 @@ graphical clients do not use persistent policy and remain connected.
 A headless computer cannot show an [easy agent access](automation.md#easy-agent-access)
 prompt itself, so a request that needs one fails at once with
 `consent_unavailable`: "no Splinterm Window or approver connected to this
-computer can show the prompt". Policy rules keep working without one. The
-daemon can already pass such prompts to connected approvers; the Window and
-terminal approvers that answer them are not available yet.
+computer can show the prompt". Policy rules keep working without one. To answer
+such prompts, run `splinterm approvals` directly in your own terminal on that
+computer, for example in an SSH login, not inside a Splinterm pane or a tmux or
+screen session ([Usage](usage.md#answering-access-prompts-in-a-terminal)).
+Remote Window approvers are not available yet.
 
 The daemon refuses an approver that runs inside a Splint's or the requesting
 agent's process tree or session, or, when workloads run in systemd units,
-inside a Splint scope or Dojo slice. A same-user process that leaves all of
-these on purpose, or anyone holding your SSH key for this computer, can still
-see and answer prompts. A bogus approver can also deny a request or leave it
-waiting until it expires, and one process may hold at most 2 of the daemon's
-16 approver places. See
+inside a Splint scope or Dojo slice, and it never offers a request to an
+approver inside that agent's tree or session. A same-user process that leaves
+all of these on purpose, or anyone holding your SSH key for this computer, can
+still see and answer prompts, and a program that types into an approver run
+inside tmux or screen can answer them. A bogus approver can also deny a
+request or leave it waiting until it expires, and one process may hold at most
+2 of the daemon's 16 approver places. See
 [ADR 0015](adr/0015-remote-consent.md#consequences) for the details.
 
 ## Runtime, state, restart, and recovery

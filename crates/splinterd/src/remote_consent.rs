@@ -35,8 +35,9 @@ use std::{
 };
 
 use splinterm_protocol::{
-    CONSENT_OFFER_NONCE_BYTES, ConsentDecision, ConsentOffer, ConsentOfferEnd, ConsentOfferNonce,
-    ConsentResponderKind, ErrorCode, OfferedConsentPrompt, ProtocolError, SubscriptionEvent,
+    CONSENT_APPROVER_NEEDS_TERMINAL, CONSENT_OFFER_NONCE_BYTES, CONSENT_RESPONDER_IDENTITY_CHANGED,
+    ConsentDecision, ConsentOffer, ConsentOfferEnd, ConsentOfferNonce, ConsentResponderKind,
+    ErrorCode, OfferedConsentPrompt, ProtocolError, SubscriptionEvent,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
@@ -133,11 +134,11 @@ pub enum Ineligible {
 impl Ineligible {
     pub const fn message(self) -> &'static str {
         match self {
-            Self::Identity => "this connection no longer runs the installed relay or client",
+            Self::Identity => CONSENT_RESPONDER_IDENTITY_CHANGED,
             Self::Unverified => "this connection's process could not be verified",
             Self::InsideSplint => "a consent responder must run outside every Splint",
             Self::InsideRequester => "a consent responder must run outside the requester",
-            Self::NoTerminal => "the approver needs its own terminal on standard input and output",
+            Self::NoTerminal => CONSENT_APPROVER_NEEDS_TERMINAL,
         }
     }
 }

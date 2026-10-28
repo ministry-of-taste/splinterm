@@ -467,6 +467,17 @@ If nothing can show the prompt, the request fails with `consent_unavailable`
 at once: "no Splinterm Window or approver connected to this computer can show
 the prompt".
 
+On a computer without a Window, such as a headless host, run
+`splinterm approvals` in your own terminal there to answer prompts as text
+([Usage](usage.md#answering-access-prompts-in-a-terminal)). It shows the same
+request and starts on Deny. splinterd refuses it inside a Splint, inside the
+requesting agent's process tree or session, and, when workloads run in systemd
+units, inside a Splint scope or Dojo slice, where a tmux or screen session
+started from a pane stays; it never offers a request to an approver inside that
+agent's tree or session. A same-user program that leaves all of these on
+purpose, or one that types into the approver's terminal, can still answer; see
+the residual risks in [ADR 0015](adr/0015-remote-consent.md#consequences).
+
 ### Seeing and revoking access
 
 `splinterm access list` shows every grant of every duration, with the agent's
