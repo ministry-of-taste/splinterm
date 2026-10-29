@@ -428,6 +428,12 @@ a hostile program running as your account.
   is never echoed, logged, or put on the clipboard, and an unanswered prompt
   ends the attempt after 120 seconds. Host keys are still never accepted
   through it.
+- Remotes find your ssh-agent even when the Window was launched without
+  `SSH_AUTH_SOCK`: Splinterm looks for the systemd, GNOME gcr, gnome-keyring
+  and gpg-agent sockets under `XDG_RUNTIME_DIR`. After you type a key's
+  passphrase once, the key is added to the agent (`AddKeysToAgent=yes`) unless
+  your ssh config already sets `AddKeysToAgent`, so the next remote does not ask
+  again. See [Remote Windows](docs/remote.md#finding-the-ssh-agent).
 - A launch whose command ends before its Window opens, such as
   `splinterm-xdg-terminal-exec -- true`, now prints "splinterm: the command
   ended before its Window opened." and succeeds instead of failing.

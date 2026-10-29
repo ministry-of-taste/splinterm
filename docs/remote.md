@@ -320,7 +320,8 @@ passphrase, PIN, or hardware-token interaction.
 Without a terminal, OpenSSH chooses who answers in this order:
 
 1. **ssh-agent.** OpenSSH always tries agent keys first and asks for nothing
-   when one is accepted. This is the preferred setup.
+   when one is accepted. This is the preferred setup. See
+   [Finding the ssh-agent](#finding-the-ssh-agent).
 2. **Your own `SSH_ASKPASS`.** Splinterm requires the value to name an absolute
    executable local file, then runs OpenSSH with exactly that program and
    `SSH_ASKPASS_REQUIRE=force`. A set but unusable `SSH_ASKPASS` is reported as
@@ -339,6 +340,30 @@ Without a terminal, OpenSSH chooses who answers in this order:
 Non-graphical commands such as `remote check` never use Splinterm's prompt;
 without a terminal or `SSH_ASKPASS`, an interactive prompt is reported as
 unavailable.
+
+### Finding the ssh-agent
+
+A Window launched from the desktop often lacks `SSH_AUTH_SOCK`, because only
+the login shell sets it. Without it OpenSSH cannot see the agent and asks for
+the key's passphrase although the agent holds the key. So, for `--remote`,
+in-app remotes and `remote check`:
+
+- An `SSH_AUTH_SOCK` that is set and not empty is used exactly as it is.
+- Otherwise Splinterm looks under `XDG_RUNTIME_DIR`, in this order, for
+  `ssh-agent.socket` (the systemd user agent), `gcr/ssh` (GNOME gcr),
+  `keyring/ssh` (gnome-keyring) and `gnupg/S.gpg-agent.ssh` (gpg-agent). The
+  first that is a Unix socket owned by you is passed to OpenSSH as
+  `SSH_AUTH_SOCK`. `XDG_RUNTIME_DIR` must be an absolute path.
+
+When an agent is reachable, Splinterm also asks OpenSSH to add a key to it
+after you type the key's passphrase once (`AddKeysToAgent=yes`), so the next
+remote does not ask again until the agent stops, normally at logout. It runs
+`ssh -G` with the remote's options first, which connects nowhere, and adds the
+option only when your ssh config leaves `AddKeysToAgent` at its default. A
+config that sets `ask`, `confirm`, `yes` or a time limit is kept. An explicit
+`AddKeysToAgent no` reads the same as the default to `ssh -G`, so it is
+overridden; to decide each time, set `AddKeysToAgent ask`. If `ssh -G` fails
+or takes more than two seconds, nothing is added.
 
 Splinterm's prompt is a fallback with fixed limits:
 
