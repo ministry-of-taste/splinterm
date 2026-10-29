@@ -94,6 +94,7 @@ fn no_terminal() -> AuthEnvironment {
     AuthEnvironment {
         terminal: false,
         user_askpass: None,
+        ..AuthEnvironment::default()
     }
 }
 
@@ -227,6 +228,7 @@ async fn the_users_askpass_is_preferred_and_a_terminal_forces_nothing() {
     let environment = AuthEnvironment {
         terminal: false,
         user_askpass: Some(user_askpass.clone().into_os_string()),
+        ..AuthEnvironment::default()
     };
     let session = connect(&ssh, &environment, Some(&prompt)).await.unwrap();
     let recorded = recorded_environment(&directory);
@@ -242,6 +244,7 @@ async fn the_users_askpass_is_preferred_and_a_terminal_forces_nothing() {
     let terminal = AuthEnvironment {
         terminal: true,
         user_askpass: Some(user_askpass.into_os_string()),
+        ..AuthEnvironment::default()
     };
     let error = connect(&ssh, &terminal, Some(&prompt)).await.unwrap_err();
     let recorded = recorded_environment(&directory);

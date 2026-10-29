@@ -4,8 +4,11 @@ use std::{
     collections::VecDeque,
     ffi::{OsStr, OsString},
     io::IsTerminal as _,
-    os::{fd::OwnedFd, unix::fs::PermissionsExt as _},
-    path::Path,
+    os::{
+        fd::OwnedFd,
+        unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _},
+    },
+    path::{Path, PathBuf},
     pin::Pin,
     process::Stdio,
     sync::{Arc, Mutex},
@@ -35,6 +38,17 @@ const AUTHENTICATION_GRACE_PERIOD: Duration = Duration::from_secs(120);
 /// sequential questions each get their full prompt timeout while a helper that
 /// keeps asking still ends.
 const MAX_NATIVE_PROMPT_PAUSE: Duration = Duration::from_secs(10 * 60);
+/// How long `ssh -G` may take to print the effective config for a remote.
+const SSH_CONFIG_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
+/// ssh-agent sockets under `$XDG_RUNTIME_DIR`, in the order they are tried
+/// when the Window has no `SSH_AUTH_SOCK`: the systemd user agent, GNOME
+/// gcr, gnome-keyring, and gpg-agent.
+const AGENT_SOCKETS: [&str; 4] = [
+    "ssh-agent.socket",
+    "gcr/ssh",
+    "keyring/ssh",
+    "gnupg/S.gpg-agent.ssh",
+];
 
 /// Stable high-level classes for remote startup and transport failures.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -229,7 +243,13 @@ impl RemoteSession {
     /// Returns a categorized failure when process construction, SSH, relay
     /// negotiation, or lifecycle setup fails.
     pub async fn connect(profile: &RemoteProfile) -> Result<Self> {
-        Self::connect_with_program(profile, OsStr::new("ssh")).await
+        let program = OsStr::new("ssh");
+        let negotiation_timeout = Duration::from_secs(u64::from(profile.connect_timeout_seconds()))
+            .saturating_add(AUTHENTICATION_GRACE_PERIOD);
+        let environment = AuthEnvironment::current()
+            .with_agent(profile, program)
+            .await;
+        Self::connect_with_options(profile, program, negotiation_timeout, &environment, None).await
     }
 
     #[doc(hidden)]
@@ -250,13 +270,17 @@ impl RemoteSession {
         profile: &RemoteProfile,
         prompt: &NativePrompt,
     ) -> Result<Self> {
+        let program = OsStr::new("ssh");
         let negotiation_timeout = Duration::from_secs(u64::from(profile.connect_timeout_seconds()))
             .saturating_add(AUTHENTICATION_GRACE_PERIOD);
+        let environment = AuthEnvironment::current()
+            .with_agent(profile, program)
+            .await;
         Self::connect_with_options(
             profile,
-            OsStr::new("ssh"),
+            program,
             negotiation_timeout,
-            &AuthEnvironment::current(),
+            &environment,
             Some(prompt),
         )
         .await
@@ -553,6 +577,13 @@ fn ssh_command(
 ) -> Command {
     let plan = profile.ssh_plan();
     let mut command = Command::new(program);
+    if environment.agent.add_keys {
+        // The fixed plan never sets AddKeysToAgent, so this is the only value.
+        command.arg("-o").arg("AddKeysToAgent=yes");
+    }
+    if let Some(socket) = &environment.agent.socket {
+        command.env("SSH_AUTH_SOCK", socket);
+    }
     command
         .args(plan.arguments())
         .env_remove(askpass::SOCKET_ENV)
@@ -596,17 +627,149 @@ pub enum PromptProvider {
 pub struct AuthEnvironment {
     pub terminal: bool,
     pub user_askpass: Option<OsString>,
+    pub agent: AgentSetup,
 }
 
 impl AuthEnvironment {
-    /// Reads whether stdin is a terminal and the inherited `SSH_ASKPASS`.
+    /// Reads whether stdin is a terminal and the inherited `SSH_ASKPASS`. The
+    /// ssh-agent setup starts empty; see [`Self::with_agent`].
     #[must_use]
     pub fn current() -> Self {
         Self {
             terminal: std::io::stdin().is_terminal(),
             user_askpass: std::env::var_os("SSH_ASKPASS"),
+            agent: AgentSetup::default(),
         }
     }
+
+    /// Finds the user's ssh-agent and asks OpenSSH whether this remote's
+    /// config already decides if a key goes into it (Plan 0070).
+    #[must_use]
+    pub async fn with_agent(mut self, profile: &RemoteProfile, program: &OsStr) -> Self {
+        let found = find_agent_socket(
+            std::env::var_os("SSH_AUTH_SOCK").as_deref(),
+            std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+            rustix::process::geteuid().as_raw(),
+        );
+        self.agent = agent_setup(found, ssh_config_query(profile, program)).await;
+        self
+    }
+}
+
+/// Where OpenSSH finds the user's ssh-agent, and whether it adds a key there
+/// after the user types its passphrase once.
+#[doc(hidden)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AgentSetup {
+    /// An agent socket found under `$XDG_RUNTIME_DIR` because the Window has
+    /// no `SSH_AUTH_SOCK`; OpenSSH gets it as `SSH_AUTH_SOCK`.
+    pub socket: Option<PathBuf>,
+    /// Pass `-o AddKeysToAgent=yes`: an agent is reachable and this remote's
+    /// ssh config leaves the setting at its default.
+    pub add_keys: bool,
+}
+
+/// The ssh-agent the Window can reach.
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AgentSocket {
+    /// The Window has `SSH_AUTH_SOCK`, kept as is; `reachable` when it names
+    /// a socket, `gpg_agent` when that socket is gpg-agent's.
+    Inherited { reachable: bool, gpg_agent: bool },
+    /// No `SSH_AUTH_SOCK`; this socket under `$XDG_RUNTIME_DIR` is the agent.
+    Found(PathBuf),
+    /// No agent found.
+    Missing,
+}
+
+/// Finds the ssh-agent: a non-empty `SSH_AUTH_SOCK` is used as is; otherwise
+/// the first of [`AGENT_SOCKETS`] under an absolute `$XDG_RUNTIME_DIR` that
+/// is a socket owned by `uid`.
+#[doc(hidden)]
+#[must_use]
+pub fn find_agent_socket(
+    inherited: Option<&OsStr>,
+    runtime_dir: Option<&OsStr>,
+    uid: u32,
+) -> AgentSocket {
+    if let Some(inherited) = inherited.filter(|value| !value.is_empty()) {
+        let reachable = Path::new(inherited)
+            .metadata()
+            .is_ok_and(|metadata| metadata.file_type().is_socket());
+        return AgentSocket::Inherited {
+            reachable,
+            gpg_agent: is_gpg_agent(Path::new(inherited)),
+        };
+    }
+    let Some(runtime_dir) = runtime_dir.map(Path::new).filter(|path| path.is_absolute()) else {
+        return AgentSocket::Missing;
+    };
+    AGENT_SOCKETS
+        .iter()
+        .map(|name| runtime_dir.join(name))
+        .find(|path| {
+            path.symlink_metadata()
+                .is_ok_and(|metadata| metadata.file_type().is_socket() && metadata.uid() == uid)
+        })
+        .map_or(AgentSocket::Missing, AgentSocket::Found)
+}
+
+/// Whether the socket is gpg-agent's ssh socket.
+fn is_gpg_agent(socket: &Path) -> bool {
+    socket.file_name() == Some(OsStr::new("S.gpg-agent.ssh"))
+}
+
+/// `ssh -G` with this remote's options and host: prints the effective config
+/// without connecting.
+fn ssh_config_query(profile: &RemoteProfile, program: &OsStr) -> Command {
+    let plan = profile.ssh_plan();
+    let mut command = Command::new(program);
+    command.arg("-G");
+    // Everything but the remote command, which ends the plan.
+    if let Some((_, options)) = plan.arguments().split_last() {
+        command.args(options);
+    }
+    command
+}
+
+/// Decides the agent setup. The config query runs only when an agent that
+/// holds keys until logout is reachable; a query that fails, times out, or prints anything but the
+/// default leaves `AddKeysToAgent` to the user's config.
+async fn agent_setup(found: AgentSocket, mut query: Command) -> AgentSetup {
+    // gpg-agent saves an added key on disk, past logout: never add there.
+    let (socket, may_add) = match found {
+        AgentSocket::Inherited {
+            reachable,
+            gpg_agent,
+        } => (None, reachable && !gpg_agent),
+        AgentSocket::Found(path) => {
+            let may_add = !is_gpg_agent(&path);
+            (Some(path), may_add)
+        }
+        AgentSocket::Missing => (None, false),
+    };
+    let add_keys = may_add && {
+        query
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        matches!(
+            tokio::time::timeout(SSH_CONFIG_QUERY_TIMEOUT, query.output()).await,
+            Ok(Ok(output)) if output.status.success() && leaves_keys_out_of_agent(&output.stdout)
+        )
+    };
+    AgentSetup { socket, add_keys }
+}
+
+/// Whether `ssh -G` output leaves `AddKeysToAgent` at its default. An
+/// explicit `AddKeysToAgent no` prints the same and cannot be told apart.
+#[doc(hidden)]
+#[must_use]
+pub fn leaves_keys_out_of_agent(config: &[u8]) -> bool {
+    String::from_utf8_lossy(config)
+        .lines()
+        .any(|line| line.trim() == "addkeystoagent false")
 }
 
 /// Chooses the prompt provider: a terminal, then the user's `SSH_ASKPASS`,
@@ -1092,6 +1255,7 @@ mod tests {
         let environment = |terminal, askpass: Option<&std::path::Path>| AuthEnvironment {
             terminal,
             user_askpass: askpass.map(|path| path.as_os_str().to_owned()),
+            ..AuthEnvironment::default()
         };
         let select = |environment: &AuthEnvironment, native| {
             select_prompt_provider(environment, native).unwrap()
@@ -1128,12 +1292,14 @@ mod tests {
         let empty = AuthEnvironment {
             terminal: false,
             user_askpass: Some(OsString::new()),
+            ..AuthEnvironment::default()
         };
         assert_eq!(select(&empty, true), PromptProvider::NativePrompt);
         // An explicit but broken SSH_ASKPASS is reported, never replaced.
         let broken = AuthEnvironment {
             terminal: false,
             user_askpass: Some(OsString::from("relative-askpass")),
+            ..AuthEnvironment::default()
         };
         assert!(select_prompt_provider(&broken, true).is_err());
         let missing = environment(false, Some(&directory.join("missing")));
@@ -1259,5 +1425,252 @@ mod tests {
             .await,
             Some("negotiated")
         );
+    }
+
+    fn scratch_directory(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("splinterm-{label}-{nonce}"));
+        fs::create_dir(&directory).unwrap();
+        directory
+    }
+
+    fn agent_profile() -> RemoteProfile {
+        crate::remote::RemoteCatalog::parse(
+            "version = 1\n[remotes.test]\nhost = \"example.invalid\"\nport = 2222\n",
+            None,
+        )
+        .unwrap()
+        .get("test")
+        .unwrap()
+        .clone()
+    }
+
+    #[test]
+    fn agent_discovery_keeps_ssh_auth_sock_then_tries_runtime_sockets_in_order() {
+        let uid = rustix::process::geteuid().as_raw();
+        let directory = scratch_directory("agent");
+        let runtime = directory.as_os_str();
+
+        // Nothing there, or no usable runtime directory: no agent.
+        assert_eq!(
+            find_agent_socket(None, Some(runtime), uid),
+            AgentSocket::Missing
+        );
+        assert_eq!(find_agent_socket(None, None, uid), AgentSocket::Missing);
+        assert_eq!(
+            find_agent_socket(None, Some(OsStr::new("relative/run")), uid),
+            AgentSocket::Missing
+        );
+
+        // A plain file where a socket belongs is not an agent.
+        fs::create_dir(directory.join("gcr")).unwrap();
+        fs::write(directory.join("gcr/ssh"), "not a socket").unwrap();
+        assert_eq!(
+            find_agent_socket(None, Some(runtime), uid),
+            AgentSocket::Missing
+        );
+
+        // gnome-keyring's socket is found; the systemd agent, earlier in the
+        // order, wins once it exists.
+        fs::create_dir(directory.join("keyring")).unwrap();
+        let _keyring =
+            std::os::unix::net::UnixListener::bind(directory.join("keyring/ssh")).unwrap();
+        assert_eq!(
+            find_agent_socket(None, Some(runtime), uid),
+            AgentSocket::Found(directory.join("keyring/ssh"))
+        );
+        let _systemd =
+            std::os::unix::net::UnixListener::bind(directory.join("ssh-agent.socket")).unwrap();
+        assert_eq!(
+            find_agent_socket(None, Some(runtime), uid),
+            AgentSocket::Found(directory.join("ssh-agent.socket"))
+        );
+        // A socket owned by someone else is skipped.
+        assert_eq!(
+            find_agent_socket(None, Some(runtime), uid.wrapping_add(1)),
+            AgentSocket::Missing
+        );
+
+        // A set SSH_AUTH_SOCK is kept as is, reachable only when it is a
+        // socket; an empty one counts as unset.
+        let systemd = directory.join("ssh-agent.socket");
+        assert_eq!(
+            find_agent_socket(Some(systemd.as_os_str()), Some(runtime), uid),
+            AgentSocket::Inherited {
+                reachable: true,
+                gpg_agent: false
+            }
+        );
+        assert_eq!(
+            find_agent_socket(Some(directory.join("gone").as_os_str()), Some(runtime), uid),
+            AgentSocket::Inherited {
+                reachable: false,
+                gpg_agent: false
+            }
+        );
+        assert_eq!(
+            find_agent_socket(Some(OsStr::new("")), Some(runtime), uid),
+            AgentSocket::Found(systemd)
+        );
+        assert_eq!(
+            find_agent_socket(
+                Some(OsStr::new("/run/user/0/gnupg/S.gpg-agent.ssh")),
+                None,
+                uid
+            ),
+            AgentSocket::Inherited {
+                reachable: false,
+                gpg_agent: true
+            }
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn only_the_default_add_keys_setting_is_overridden() {
+        let config = |value: &str| format!("user me\naddkeystoagent {value}\nport 22\n");
+        assert!(leaves_keys_out_of_agent(config("false").as_bytes()));
+        for kept in ["true", "ask", "confirm", "true 3600", "confirm 8h"] {
+            assert!(!leaves_keys_out_of_agent(config(kept).as_bytes()), "{kept}");
+        }
+        assert!(!leaves_keys_out_of_agent(b""));
+        assert!(!leaves_keys_out_of_agent(b"user me\n"));
+    }
+
+    #[test]
+    fn the_config_query_is_ssh_g_with_the_remote_options_and_no_command() {
+        let profile = agent_profile();
+        let query = ssh_config_query(&profile, OsStr::new("ssh"));
+        let arguments: Vec<_> = query.as_std().get_args().collect();
+        let plan = profile.ssh_plan();
+        assert_eq!(arguments[0], OsStr::new("-G"));
+        let (command, options) = plan.arguments().split_last().unwrap();
+        assert_eq!(
+            &arguments[1..],
+            options.iter().map(OsString::as_os_str).collect::<Vec<_>>()
+        );
+        assert!(!arguments.contains(&command.as_os_str()));
+        assert_eq!(arguments.last(), Some(&OsStr::new("example.invalid")));
+    }
+
+    #[tokio::test]
+    async fn agent_setup_adds_keys_only_when_an_agent_is_reachable_and_config_is_default() {
+        let directory = scratch_directory("agent-setup");
+        // Run through /bin/sh so the script itself is never executed.
+        let script = directory.join("fake-ssh-g");
+        let query = |output: &str| {
+            let body = format!("[ \"$1\" = -G ] || exit 9\nprintf '{output}'\n");
+            fs::write(&script, body).unwrap();
+            let mut command = Command::new("/bin/sh");
+            command.arg(&script).arg("-G").arg("example.invalid");
+            command
+        };
+        let found = AgentSocket::Found(directory.join("ssh-agent.socket"));
+
+        let setup = agent_setup(found.clone(), query("addkeystoagent false\\n")).await;
+        assert_eq!(setup.socket, Some(directory.join("ssh-agent.socket")));
+        assert!(setup.add_keys);
+        // The user's config already decides: keep it.
+        let kept = agent_setup(found.clone(), query("addkeystoagent confirm\\n")).await;
+        assert!(!kept.add_keys);
+        // A failing query changes nothing.
+        let mut failing = Command::new("/bin/sh");
+        failing.arg("-c").arg("echo addkeystoagent false; exit 1");
+        assert!(!agent_setup(found, failing).await.add_keys);
+
+        // An inherited reachable agent: the socket is left alone.
+        let inherited = agent_setup(
+            AgentSocket::Inherited {
+                reachable: true,
+                gpg_agent: false,
+            },
+            query("addkeystoagent false\\n"),
+        )
+        .await;
+        assert_eq!(
+            inherited,
+            AgentSetup {
+                socket: None,
+                add_keys: true
+            }
+        );
+        // gpg-agent would keep an added key on disk: its socket is used,
+        // but no key is added and no query runs.
+        let gpg = directory.join("gnupg/S.gpg-agent.ssh");
+        let mut never = Command::new("/bin/sh");
+        never.arg("-c").arg("echo addkeystoagent false");
+        assert_eq!(
+            agent_setup(AgentSocket::Found(gpg.clone()), never).await,
+            AgentSetup {
+                socket: Some(gpg),
+                add_keys: false
+            }
+        );
+        // No reachable agent, or an inherited gpg-agent: nothing added.
+        for found in [
+            AgentSocket::Inherited {
+                reachable: false,
+                gpg_agent: false,
+            },
+            AgentSocket::Inherited {
+                reachable: true,
+                gpg_agent: true,
+            },
+            AgentSocket::Missing,
+        ] {
+            let mut never = Command::new("/bin/sh");
+            never.arg("-c").arg("echo addkeystoagent false");
+            assert_eq!(agent_setup(found, never).await, AgentSetup::default());
+        }
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn the_openssh_command_carries_the_agent_setup() {
+        let profile = agent_profile();
+        let environment = |agent| AuthEnvironment {
+            agent,
+            ..AuthEnvironment::default()
+        };
+        let command = |environment: &AuthEnvironment| {
+            ssh_command(
+                &profile,
+                OsStr::new("ssh"),
+                PromptProvider::Unavailable,
+                environment,
+                None,
+            )
+        };
+        let auth_sock = |command: &Command| {
+            command
+                .as_std()
+                .get_envs()
+                .find(|(key, _)| *key == OsStr::new("SSH_AUTH_SOCK"))
+                .map(|(_, value)| value.map(OsStr::to_owned))
+        };
+        let plan = profile.ssh_plan();
+
+        // Default: exactly the fixed plan and no SSH_AUTH_SOCK change.
+        let fixed: Vec<_> = plan.arguments().iter().map(OsString::as_os_str).collect();
+        let unchanged = command(&environment(AgentSetup::default()));
+        assert_eq!(unchanged.as_std().get_args().collect::<Vec<_>>(), fixed);
+        assert_eq!(auth_sock(&unchanged), None);
+
+        // A found agent and a default config: the socket and AddKeysToAgent.
+        let socket = PathBuf::from("/run/user/1000/ssh-agent.socket");
+        let full = command(&environment(AgentSetup {
+            socket: Some(socket.clone()),
+            add_keys: true,
+        }));
+        let arguments: Vec<_> = full.as_std().get_args().collect();
+        assert_eq!(
+            &arguments[..2],
+            [OsStr::new("-o"), OsStr::new("AddKeysToAgent=yes")]
+        );
+        assert_eq!(&arguments[2..], fixed);
+        assert_eq!(auth_sock(&full), Some(Some(socket.into_os_string())));
     }
 }

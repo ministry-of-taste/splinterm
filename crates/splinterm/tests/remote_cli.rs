@@ -98,6 +98,9 @@ fn remote_check_uses_configured_nixos_executable_and_only_read_only_probes() {
             .env("SPLINTERM_REMOTES", &profiles)
             .env("PATH", &home)
             .env_remove("SSH_ASKPASS")
+            // No agent, so no `ssh -G` query reaches the fake.
+            .env_remove("SSH_AUTH_SOCK")
+            .env("XDG_RUNTIME_DIR", &home)
             .args(["remote", "check", "test"]),
     );
     assert!(checked.status.success(), "{:?}", checked.stderr);
@@ -137,6 +140,8 @@ fn global_remote_routes_authenticated_reads_and_surfaces_daemon_denials() {
                 .env("SPLINTERM_FAKE_SSH_MODE", mode)
                 .env("PATH", &home)
                 .env_remove("SSH_ASKPASS")
+                .env_remove("SSH_AUTH_SOCK")
+                .env("XDG_RUNTIME_DIR", &home)
                 .args(["--remote", "test", command]),
         );
         assert_eq!(result.status.success(), succeeds, "{:?}", result.stderr);
