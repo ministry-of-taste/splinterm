@@ -410,13 +410,13 @@ built-in icon data could not be loaded, Splinterm would show the ASCII
 fallbacks instead of a missing-glyph box. Icons are visual only:
 accessible text and search use the state words.
 
-A fresh **working** status is a Braille spinner (`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`), the one moving
-part, in the Explorer and on Dojo tabs. Splinterm draws Braille itself, so it
-needs neither the icon data nor a font. It steps at most four times a second
-on the same event-loop wakeup as the cursor blink, and only while the Window
-has keyboard focus: in an unfocused Window, with `SPLINTERM_REDUCED_MOTION=1`,
-and for a stale working status it holds its first frame, `⠋`. Every other
-state is a static icon.
+A fresh **working** status is a Braille spinner (`⠋⠙⠸⢰⣠⣄⡆⠇`, three dots
+circling the cell), the one moving part, in the Explorer and on Dojo tabs.
+Splinterm draws Braille itself, so it needs neither the icon data nor a font.
+It steps at most four times a second on the same event-loop wakeup as the
+cursor blink, and only while the Window has keyboard focus: in an unfocused
+Window, with `SPLINTERM_REDUCED_MOTION=1`, and for a stale working status it
+holds its first frame, `⠋`. Every other state is a static icon.
 
 - **Splint rows** show the icon in the agent status column, and the footer's
   status line names the selected row's state, for example *needs input ·

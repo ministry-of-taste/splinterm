@@ -35,8 +35,9 @@ pub(crate) const UNAVAILABLE_TEXT: &str = "Agent status unavailable";
 
 /// The working state's Braille spinner frames, in order. The renderer draws
 /// Braille cells itself, so the spinner needs neither the embedded icon face
-/// nor a font and is the same in both glyph styles.
-pub(crate) const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+/// nor a font and is the same in both glyph styles. Three dots circle all
+/// eight dot positions, so the frames turn around the middle of the cell.
+pub(crate) const SPINNER_FRAMES: [char; 8] = ['⠋', '⠙', '⠸', '⢰', '⣠', '⣄', '⡆', '⠇'];
 
 /// One frame of the working spinner. [`Self::STATIC`], the first frame, is
 /// what a stale, unfocused, or reduced-motion working status shows.
@@ -602,11 +603,8 @@ mod tests {
     }
 
     #[test]
-    fn spinner_cycles_ten_braille_frames_from_the_first() {
-        assert_eq!(
-            SPINNER_FRAMES,
-            ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
-        );
+    fn spinner_cycles_eight_braille_frames_from_the_first() {
+        assert_eq!(SPINNER_FRAMES, ['⠋', '⠙', '⠸', '⢰', '⣠', '⣄', '⡆', '⠇']);
         assert_eq!(AgentSpinner::default(), AgentSpinner::STATIC);
         assert!(AgentSpinner::STATIC.is_static());
         let mut spinner = AgentSpinner::STATIC;
@@ -689,7 +687,7 @@ mod tests {
             assert!(
                 glyph_column(Some(&fresh), glyphs, frame)
                     .text()
-                    .starts_with('⠸')
+                    .starts_with('⢰')
             );
             assert!(
                 glyph_column(Some(&stale), glyphs, frame)
@@ -703,7 +701,7 @@ mod tests {
                     .text()
                     .to_owned()
             };
-            assert!(badge(&[fresh]).starts_with('⠸'));
+            assert!(badge(&[fresh]).starts_with('⢰'));
             assert!(badge(&[stale]).starts_with('⠋'));
         }
     }

@@ -377,8 +377,10 @@ a hostile program running as your account.
   tabs show one badge with a count. A fresh `working` status is a Braille
   spinner that steps at most four times a second, only in the focused Window,
   and holds still with `SPLINTERM_REDUCED_MOTION=1`; every other state is a
-  static icon. States differ by shape and by text, never by colour or motion
-  alone.
+  static icon. The spinner is three dots circling all eight Braille dots,
+  drawn in chrome with round dots a little larger than terminal Braille, so it
+  turns around the middle of the text beside it. States differ by shape and by
+  text, never by colour or motion alone.
 - Status glyphs take herdr's colours from the theme: `working` in warning,
   `needs_input` and `error` in danger (each with its own glyph), `done` in
   info, `idle` in success, and a stale status faint. The access "Asking"
