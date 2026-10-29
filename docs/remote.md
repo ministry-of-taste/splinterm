@@ -352,8 +352,8 @@ in-app remotes and `remote check`:
 - Otherwise Splinterm looks under `XDG_RUNTIME_DIR`, in this order, for
   `ssh-agent.socket` (the systemd user agent), `gcr/ssh` (GNOME gcr),
   `keyring/ssh` (gnome-keyring) and `gnupg/S.gpg-agent.ssh` (gpg-agent). The
-  first that is a Unix socket owned by you is passed to OpenSSH as
-  `SSH_AUTH_SOCK`. `XDG_RUNTIME_DIR` must be an absolute path.
+  first that is a Unix socket owned by you, not a symlink, is passed to
+  OpenSSH as `SSH_AUTH_SOCK`. `XDG_RUNTIME_DIR` must be an absolute path.
 
 When an agent is reachable, Splinterm also asks OpenSSH to add a key to it
 after you type the key's passphrase once (`AddKeysToAgent=yes`), so the next
@@ -363,7 +363,13 @@ option only when your ssh config leaves `AddKeysToAgent` at its default. A
 config that sets `ask`, `confirm`, `yes` or a time limit is kept. An explicit
 `AddKeysToAgent no` reads the same as the default to `ssh -G`, so it is
 overridden; to decide each time, set `AddKeysToAgent ask`. If `ssh -G` fails
-or takes more than two seconds, nothing is added.
+or takes more than two seconds, nothing is added. `ssh -G` evaluates your
+config as a connection would, so a `Match exec` command runs for it too.
+
+This applies to any reachable agent, including an inherited or forwarded one,
+except gpg-agent: it stores an added key on disk past logout, so Splinterm
+never adds keys there. `remote inspect` shows the fixed plan; the agent socket
+and `AddKeysToAgent` option are decided when the remote connects.
 
 Splinterm's prompt is a fallback with fixed limits:
 

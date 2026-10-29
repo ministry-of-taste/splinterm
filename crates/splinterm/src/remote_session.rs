@@ -674,8 +674,8 @@ pub struct AgentSetup {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AgentSocket {
     /// The Window has `SSH_AUTH_SOCK`, kept as is; `reachable` when it names
-    /// a socket.
-    Inherited { reachable: bool },
+    /// a socket, `gpg_agent` when that socket is gpg-agent's.
+    Inherited { reachable: bool, gpg_agent: bool },
     /// No `SSH_AUTH_SOCK`; this socket under `$XDG_RUNTIME_DIR` is the agent.
     Found(PathBuf),
     /// No agent found.
@@ -696,7 +696,10 @@ pub fn find_agent_socket(
         let reachable = Path::new(inherited)
             .metadata()
             .is_ok_and(|metadata| metadata.file_type().is_socket());
-        return AgentSocket::Inherited { reachable };
+        return AgentSocket::Inherited {
+            reachable,
+            gpg_agent: is_gpg_agent(Path::new(inherited)),
+        };
     }
     let Some(runtime_dir) = runtime_dir.map(Path::new).filter(|path| path.is_absolute()) else {
         return AgentSocket::Missing;
@@ -709,6 +712,11 @@ pub fn find_agent_socket(
                 .is_ok_and(|metadata| metadata.file_type().is_socket() && metadata.uid() == uid)
         })
         .map_or(AgentSocket::Missing, AgentSocket::Found)
+}
+
+/// Whether the socket is gpg-agent's ssh socket.
+fn is_gpg_agent(socket: &Path) -> bool {
+    socket.file_name() == Some(OsStr::new("S.gpg-agent.ssh"))
 }
 
 /// `ssh -G` with this remote's options and host: prints the effective config
@@ -724,16 +732,23 @@ fn ssh_config_query(profile: &RemoteProfile, program: &OsStr) -> Command {
     command
 }
 
-/// Decides the agent setup. The config query runs only when an agent is
-/// reachable; a query that fails, times out, or prints anything but the
+/// Decides the agent setup. The config query runs only when an agent that
+/// holds keys until logout is reachable; a query that fails, times out, or prints anything but the
 /// default leaves `AddKeysToAgent` to the user's config.
 async fn agent_setup(found: AgentSocket, mut query: Command) -> AgentSetup {
-    let (socket, reachable) = match found {
-        AgentSocket::Inherited { reachable } => (None, reachable),
-        AgentSocket::Found(path) => (Some(path), true),
+    // gpg-agent saves an added key on disk, past logout: never add there.
+    let (socket, may_add) = match found {
+        AgentSocket::Inherited {
+            reachable,
+            gpg_agent,
+        } => (None, reachable && !gpg_agent),
+        AgentSocket::Found(path) => {
+            let may_add = !is_gpg_agent(&path);
+            (Some(path), may_add)
+        }
         AgentSocket::Missing => (None, false),
     };
-    let add_keys = reachable && {
+    let add_keys = may_add && {
         query
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -1484,15 +1499,32 @@ mod tests {
         let systemd = directory.join("ssh-agent.socket");
         assert_eq!(
             find_agent_socket(Some(systemd.as_os_str()), Some(runtime), uid),
-            AgentSocket::Inherited { reachable: true }
+            AgentSocket::Inherited {
+                reachable: true,
+                gpg_agent: false
+            }
         );
         assert_eq!(
             find_agent_socket(Some(directory.join("gone").as_os_str()), Some(runtime), uid),
-            AgentSocket::Inherited { reachable: false }
+            AgentSocket::Inherited {
+                reachable: false,
+                gpg_agent: false
+            }
         );
         assert_eq!(
             find_agent_socket(Some(OsStr::new("")), Some(runtime), uid),
             AgentSocket::Found(systemd)
+        );
+        assert_eq!(
+            find_agent_socket(
+                Some(OsStr::new("/run/user/0/gnupg/S.gpg-agent.ssh")),
+                None,
+                uid
+            ),
+            AgentSocket::Inherited {
+                reachable: false,
+                gpg_agent: true
+            }
         );
         fs::remove_dir_all(directory).unwrap();
     }
@@ -1551,7 +1583,10 @@ mod tests {
 
         // An inherited reachable agent: the socket is left alone.
         let inherited = agent_setup(
-            AgentSocket::Inherited { reachable: true },
+            AgentSocket::Inherited {
+                reachable: true,
+                gpg_agent: false,
+            },
             query("addkeystoagent false\\n"),
         )
         .await;
@@ -1562,9 +1597,28 @@ mod tests {
                 add_keys: true
             }
         );
-        // No reachable agent: no query, nothing added.
+        // gpg-agent would keep an added key on disk: its socket is used,
+        // but no key is added and no query runs.
+        let gpg = directory.join("gnupg/S.gpg-agent.ssh");
+        let mut never = Command::new("/bin/sh");
+        never.arg("-c").arg("echo addkeystoagent false");
+        assert_eq!(
+            agent_setup(AgentSocket::Found(gpg.clone()), never).await,
+            AgentSetup {
+                socket: Some(gpg),
+                add_keys: false
+            }
+        );
+        // No reachable agent, or an inherited gpg-agent: nothing added.
         for found in [
-            AgentSocket::Inherited { reachable: false },
+            AgentSocket::Inherited {
+                reachable: false,
+                gpg_agent: false,
+            },
+            AgentSocket::Inherited {
+                reachable: true,
+                gpg_agent: true,
+            },
             AgentSocket::Missing,
         ] {
             let mut never = Command::new("/bin/sh");
