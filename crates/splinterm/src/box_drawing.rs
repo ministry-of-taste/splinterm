@@ -45,17 +45,19 @@ pub(crate) fn chrome_braille(character: char, width: u32, height: u32) -> Option
     }
     let dots = u8::try_from(u32::from(character) - 0x2800).ok()?;
     let (cell_width, cell_height) = (i64::from(width), i64::from(height));
-    // Four rows on an even pitch with margins above and below; two columns
-    // no further apart than the rows. A dot's radius is about 0.38 of the
-    // pitch, so neighbouring dots keep a clear gap.
-    let row_pitch = cell_height * UNIT * 10 / 46;
+    // Rows on an even pitch, with the three six-dot rows centred in the
+    // cell, because spinner frames use only those, and the fourth row below
+    // them still inside the cell. Two columns no further apart than the
+    // rows. A dot's radius is about 0.38 of the pitch, so neighbouring dots
+    // keep a clear gap.
+    let row_pitch = cell_height * UNIT * 100 / 476;
     let column_pitch = row_pitch.min(cell_width * UNIT * 10 / 23);
     let radius = (row_pitch * 38 / 100).min(column_pitch * 40 / 100);
     if radius < UNIT / 2 {
         return None;
     }
     let left = (cell_width * UNIT - column_pitch) / 2;
-    let top = (cell_height * UNIT - 3 * row_pitch) / 2;
+    let top = (cell_height * UNIT - 2 * row_pitch) / 2;
     let mut mask = BoxMask {
         width,
         height,
@@ -614,6 +616,30 @@ mod tests {
         let small = ink(&chrome_braille('\u{2801}', width, height).expect("Braille supported"));
         let large = ink(&chrome_braille('\u{2801}', 16, 34).expect("Braille supported"));
         assert!((3.4..4.6).contains(&(large / small)));
+    }
+
+    #[test]
+    fn chrome_braille_centres_the_spinner_rows_and_keeps_the_fourth_row_whole() {
+        for (width, height) in [(8_u32, 17_u32), (16, 34), (9, 20)] {
+            // '⠿' is dots 1-6, the rows every spinner frame uses.
+            let six = chrome_braille('\u{283f}', width, height).expect("Braille supported");
+            let (mut weighted, mut total) = (0.0, 0.0);
+            for (index, alpha) in six.data.iter().enumerate() {
+                let row = f64::from(u32::try_from(index).unwrap() / width);
+                weighted += (row + 0.5) * f64::from(*alpha);
+                total += f64::from(*alpha);
+            }
+            let centre = weighted / total;
+            let middle = f64::from(height) / 2.0;
+            assert!(
+                (centre - middle).abs() < 0.5,
+                "{width}x{height}: six-dot rows centre at {centre:.2}, cell middle {middle}"
+            );
+            // Dot 7 in the fourth row is not clipped by the cell's bottom.
+            let first = ink(&chrome_braille('\u{2801}', width, height).unwrap());
+            let seventh = ink(&chrome_braille('\u{2840}', width, height).unwrap());
+            assert!((seventh - first).abs() < first * 0.15);
+        }
     }
 
     #[test]
