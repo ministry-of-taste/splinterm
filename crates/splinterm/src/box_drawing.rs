@@ -32,25 +32,30 @@ pub(crate) fn default_thickness(width: u32, height: u32, scale_120: u16) -> u32 
 }
 
 /// Draws a Braille character for trusted chrome, such as the agent spinner:
-/// the same eight dot positions as [`generate`], but with dots as large as
-/// the cell allows and one-unit gaps, so a lone spinner frame reads at the
-/// size of the text beside it instead of as Foot's sparse terminal dots.
-/// Terminal cells always use [`generate`]. `None` outside U+2800–U+28FF or
-/// for a cell too small to hold four rows of dots.
+/// the same eight dot positions as [`generate`], but with round, smoothed
+/// dots somewhat larger than Foot's square terminal dots, so a lone spinner
+/// frame reads beside the text without turning into a block. Terminal cells
+/// always use [`generate`]. `None` outside U+2800–U+28FF or for a cell too
+/// small for a one-pixel dot.
 pub(crate) fn chrome_braille(character: char, width: u32, height: u32) -> Option<BoxMask> {
+    // Geometry is in sixteenths of a pixel; each pixel samples a 4x4 grid.
+    const UNIT: i64 = 16;
     if !('\u{2800}'..='\u{28ff}').contains(&character) {
         return None;
     }
     let dots = u8::try_from(u32::from(character) - 0x2800).ok()?;
-    let gap = (height / 17).max(1);
-    // Four dot rows with three gaps between them and one above and below;
-    // two dot columns with one gap between them, filling the width if needed.
-    let dot = (height.checked_sub(gap * 5)? / 4).min(width.checked_sub(gap)? / 2);
-    if dot == 0 {
+    let (cell_width, cell_height) = (i64::from(width), i64::from(height));
+    // Four rows on an even pitch with margins above and below; two columns
+    // no further apart than the rows. A dot's radius is about 0.38 of the
+    // pitch, so neighbouring dots keep a clear gap.
+    let row_pitch = cell_height * UNIT * 10 / 46;
+    let column_pitch = row_pitch.min(cell_width * UNIT * 10 / 23);
+    let radius = (row_pitch * 38 / 100).min(column_pitch * 40 / 100);
+    if radius < UNIT / 2 {
         return None;
     }
-    let x0 = (width - (dot * 2 + gap)) / 2;
-    let y0 = (height - (dot * 4 + gap * 3)) / 2;
+    let left = (cell_width * UNIT - column_pitch) / 2;
+    let top = (cell_height * UNIT - 3 * row_pitch) / 2;
     let mut mask = BoxMask {
         width,
         height,
@@ -72,9 +77,9 @@ pub(crate) fn chrome_braille(character: char, width: u32, height: u32) -> Option
         if dots & (1 << bit) == 0 {
             continue;
         }
-        let x = x0 + column * (dot + gap);
-        let y = y0 + row * (dot + gap);
-        mask.fill(x, y, x + dot, y + dot);
+        let centre_x = left + i64::from(column) * column_pitch;
+        let centre_y = top + i64::from(row) * row_pitch;
+        mask.fill_disc(centre_x, centre_y, radius, UNIT);
     }
     Some(mask)
 }
@@ -406,6 +411,38 @@ impl BoxMask {
             }
         }
     }
+
+    /// Adds a smoothed disc, in `unit`ths of a pixel, sampling each pixel it
+    /// touches on a 4x4 grid. A pixel keeps its larger coverage.
+    fn fill_disc(&mut self, centre_x: i64, centre_y: i64, radius: i64, unit: i64) {
+        let step = unit / 4;
+        let pixels = |centre: i64, size: u32| {
+            let first = ((centre - radius) / unit).max(0);
+            let last = ((centre + radius) / unit + 1).min(i64::from(size));
+            first..last
+        };
+        for y in pixels(centre_y, self.height) {
+            for x in pixels(centre_x, self.width) {
+                let mut covered = 0_u32;
+                for sample_y in 0..4 {
+                    for sample_x in 0..4 {
+                        let dx = x * unit + step / 2 + sample_x * step - centre_x;
+                        let dy = y * unit + step / 2 + sample_y * step - centre_y;
+                        if dx * dx + dy * dy <= radius * radius {
+                            covered += 1;
+                        }
+                    }
+                }
+                if covered == 0 {
+                    continue;
+                }
+                let alpha = u8::try_from(covered * 255 / 16).expect("coverage fits a byte");
+                let index = usize::try_from(y * i64::from(self.width) + x)
+                    .expect("cell mask index fits usize");
+                self.data[index] = self.data[index].max(alpha);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -541,27 +578,42 @@ mod tests {
         mask.data.iter().filter(|alpha| **alpha != 0).count()
     }
 
+    /// Total coverage in whole pixels.
+    fn ink(mask: &BoxMask) -> f64 {
+        mask.data.iter().map(|alpha| f64::from(*alpha)).sum::<f64>() / 255.0
+    }
+
     #[test]
-    fn chrome_braille_dots_are_larger_than_the_terminal_dots_in_the_same_cell() {
-        // A 14 px chrome cell: Foot's terminal geometry gives 2 px dots.
+    fn chrome_braille_dots_are_round_and_moderately_larger_than_the_terminal_dots() {
+        // A 14 px chrome cell: Foot's terminal geometry gives 2 px square
+        // dots (32 px of ink for all eight).
         let (width, height) = (8, 17);
         let full = chrome_braille('\u{28ff}', width, height).expect("Braille supported");
         assert_eq!((full.width, full.height), (width, height));
-        assert_eq!(inked(&full), 8 * 3 * 3, "eight 3 px dots");
         let terminal = generate('\u{28ff}', width, height, 1).expect("Braille supported");
-        assert!(inked(&full) > inked(&terminal) * 2);
+        let ratio = ink(&full) / ink(&terminal);
+        assert!(
+            (1.2..1.8).contains(&ratio),
+            "chrome dots carry {ratio:.2}x the terminal ink, not a solid block"
+        );
+        assert!(
+            full.data.iter().any(|alpha| (1..255).contains(alpha)),
+            "dot edges are smoothed"
+        );
 
         // Each spinner frame keeps its dot pattern: '⠋' is dots 1, 2 and 4.
         let frame = chrome_braille('⠋', width, height).expect("Braille supported");
-        assert_eq!(inked(&frame), 3 * 9);
+        let per_dot = ink(&full) / 8.0;
+        assert!((ink(&frame) - 3.0 * per_dot).abs() < per_dot * 0.3);
         assert_eq!(
             inked(&chrome_braille('\u{2800}', width, height).expect("Braille supported")),
             0
         );
 
-        // Doubled output scale doubles the dots and the gaps.
-        let large = chrome_braille('\u{2801}', 16, 34).expect("Braille supported");
-        assert_eq!(inked(&large), 6 * 6);
+        // Doubled output scale gives each dot about four times the ink.
+        let small = ink(&chrome_braille('\u{2801}', width, height).expect("Braille supported"));
+        let large = ink(&chrome_braille('\u{2801}', 16, 34).expect("Braille supported"));
+        assert!((3.4..4.6).contains(&(large / small)));
     }
 
     #[test]
