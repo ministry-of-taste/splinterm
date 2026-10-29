@@ -45,10 +45,12 @@ pub(crate) fn chrome_braille(character: char, width: u32, height: u32) -> Option
     }
     let dots = u8::try_from(u32::from(character) - 0x2800).ok()?;
     let (cell_width, cell_height) = (i64::from(width), i64::from(height));
-    // Four rows on an even pitch, centred in the cell, so a spinner that
-    // circles all eight dots turns around the middle of the text beside it.
-    // Two columns no further apart than the rows. A dot's radius is about
-    // 0.38 of the pitch, so neighbouring dots keep a clear gap.
+    // Four rows on an even pitch, centred in the cell and then raised by a
+    // seventeenth of it (1 px in a 17 px cell), so a spinner that circles
+    // all eight dots turns around the middle of the text beside it without
+    // its bottom row reading low under the baseline. Two columns no further
+    // apart than the rows. A dot's radius is about 0.38 of the pitch, so
+    // neighbouring dots keep a clear gap.
     let row_pitch = cell_height * UNIT * 10 / 46;
     let column_pitch = row_pitch.min(cell_width * UNIT * 10 / 23);
     let radius = (row_pitch * 38 / 100).min(column_pitch * 40 / 100);
@@ -56,7 +58,7 @@ pub(crate) fn chrome_braille(character: char, width: u32, height: u32) -> Option
         return None;
     }
     let left = (cell_width * UNIT - column_pitch) / 2;
-    let top = (cell_height * UNIT - 3 * row_pitch) / 2;
+    let top = ((cell_height * UNIT - 3 * row_pitch) / 2 - cell_height * UNIT / 17).max(radius);
     let mut mask = BoxMask {
         width,
         height,
@@ -618,7 +620,7 @@ mod tests {
     }
 
     #[test]
-    fn chrome_braille_centres_all_four_rows_and_keeps_them_whole() {
+    fn chrome_braille_centres_four_rows_a_little_high_and_keeps_them_whole() {
         for (width, height) in [(8_u32, 17_u32), (16, 34), (9, 20)] {
             // '⣿' lights all eight dots, the positions the spinner circles.
             let all = chrome_braille('\u{28ff}', width, height).expect("Braille supported");
@@ -629,12 +631,13 @@ mod tests {
                 total += f64::from(*alpha);
             }
             let centre = weighted / total;
-            let middle = f64::from(height) / 2.0;
+            // Centred, then raised by a seventeenth of the cell.
+            let middle = f64::from(height) / 2.0 - f64::from(height) / 17.0;
             assert!(
                 (centre - middle).abs() < 0.5,
-                "{width}x{height}: the dots centre at {centre:.2}, cell middle {middle}"
+                "{width}x{height}: the dots centre at {centre:.2}, expected {middle:.2}"
             );
-            // Dot 7 in the fourth row is not clipped by the cell's bottom.
+            // Neither dot 1 nor dot 7 is clipped by the cell.
             let first = ink(&chrome_braille('\u{2801}', width, height).unwrap());
             let seventh = ink(&chrome_braille('\u{2840}', width, height).unwrap());
             assert!((seventh - first).abs() < first * 0.15);
