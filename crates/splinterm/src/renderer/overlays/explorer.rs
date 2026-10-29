@@ -4591,8 +4591,8 @@ mod tests {
             // Spinner frames are distinct shapes in the same cell.
             let mut frames = Vec::new();
             let mut spinner = AgentSpinner::STATIC;
-            // All ten frames.
-            for _ in 0..10 {
+            // All eight frames.
+            for _ in 0..8 {
                 let column = ChromeSource::from(format!("{}   ", spinner.glyph()));
                 let (painted, _, _, _, _) = paint_row(&context, agent_row(column), scale);
                 let what = format!("spinner {spinner:?} at scale {scale}");

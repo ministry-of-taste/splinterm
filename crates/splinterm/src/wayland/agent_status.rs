@@ -443,7 +443,7 @@ mod tests {
             .iter()
             .map(|badge| badge.text().to_owned())
             .collect::<Vec<_>>();
-        assert_eq!(frames, ["⠋", "⠙", "⠹", "⠸", "⠼"], "after {passes} passes");
+        assert_eq!(frames, ["⠋", "⠙", "⠸", "⢰", "⣠"], "after {passes} passes");
         // The Explorer alone keeps it moving, as recorded by the last draw.
         let mut explorer_only = TabAgentStatus::new(true, AgentStatusStyle::default());
         explorer_only.explorer_working = true;
