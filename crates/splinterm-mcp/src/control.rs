@@ -150,6 +150,9 @@ impl State {
 
     /// Remembers that `token` expired with its daemon connection.
     fn expire(&mut self, token: &str) {
+        if self.expired.iter().any(|expired| expired == token) {
+            return;
+        }
         if self.expired.len() == MAXIMUM_EXPIRED_HANDLES {
             self.expired.pop_front();
         }
@@ -1130,6 +1133,12 @@ async fn controller_actor(
                     {
                         Err(error) if is_connection_loss(&error) => {
                             lost = true;
+                            // Record the expiry before replying: the failed
+                            // call drops the handle at once, and a call
+                            // straight after must still say it expired.
+                            if let Some(inner) = inner.upgrade() {
+                                inner.state.lock().await.expire(&token);
+                            }
                             Err(expired_during_call())
                         }
                         result => result.map_err(|error| dispatch::map_client_error(&error)),
@@ -2370,7 +2379,7 @@ mod tests {
     fn only_an_unauthorized_takeover_names_the_grant_it_needs() {
         let unauthorized = needs_takeover_grant(dispatch::DispatchFailure::new(
             "unauthorized",
-            "the exact policy scope or resource is not authorized",
+            dispatch::UNAUTHORIZED,
             false,
         ));
         assert_eq!(unauthorized.code, "unauthorized");
@@ -2626,9 +2635,6 @@ mod tests {
             unauthorized(),
         )
         .await;
-        assert_eq!(
-            acquire.message,
-            "the exact policy scope or resource is not authorized"
-        );
+        assert_eq!(acquire.message, dispatch::UNAUTHORIZED);
     }
 }

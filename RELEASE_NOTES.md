@@ -748,8 +748,11 @@ a hostile program running as your account.
   are using when its active tab is in that Lair, or else in another Window
   showing it; it never takes focus or switches your tab.
 - Relaunching or closing a running Splint, or closing a Dojo with one, says to
-  `kill_splint` it first. `restore_dojo` and `restore_lair` no longer count a
-  pane that is already running as failed.
+  `kill_splint` it, and that a Window showing an unsaved Lair then closes the
+  pane itself. `restore_dojo` and `restore_lair` no longer count a pane that is
+  already running as failed.
+- A refusal for a Splint, Dojo or Lair that no longer exists says so, instead
+  of only that it is not authorized.
 
 ## Security and robustness
 

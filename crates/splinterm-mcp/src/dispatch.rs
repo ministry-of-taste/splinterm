@@ -367,15 +367,20 @@ pub(crate) const NOBODY_CONTROLS: &str =
 pub(crate) const TRANSFER_ALREADY_PENDING: &str = "another control transfer of this Splint is waiting for an answer; call again once it ends (at most 15 seconds)";
 
 /// What a relaunch says for a Splint that has not exited (Plan 0067 M5).
-pub(crate) const STILL_RUNNING_RELAUNCH: &str = "this Splint is still running; kill_splint it first, or acquire_control and use input to restart what runs in it";
+/// A Window showing an unsaved Lair closes an exited pane at once, so a
+/// kill there leaves nothing to relaunch.
+pub(crate) const STILL_RUNNING_RELAUNCH: &str = "this Splint is still running; acquire_control and use input to restart what runs in it, or kill_splint it and then relaunch it. A Window showing an unsaved Lair closes a killed pane, so there use split_splint for a new one";
 
 /// What a close says for a Splint that has not exited (Plan 0067 M5).
-pub(crate) const STILL_RUNNING_CLOSE: &str =
-    "this Splint is still running; kill_splint it first, then close it";
+pub(crate) const STILL_RUNNING_CLOSE: &str = "this Splint is still running; kill_splint it. A Window showing an unsaved Lair then closes the pane itself; otherwise close it after the kill";
 
 /// What closing a Dojo says while one of its Splints runs (Plan 0067 M5).
-pub(crate) const DOJO_STILL_RUNNING: &str =
-    "this Dojo still has a running Splint; kill_splint each running one first, then close it";
+pub(crate) const DOJO_STILL_RUNNING: &str = "this Dojo still has a running Splint; kill_splint each running one. A Window showing an unsaved Lair then closes the Dojo itself; otherwise close it after the kills";
+
+/// What any other refusal says. The daemon gives the same refusal for a
+/// Splint, Dojo or Lair that no longer exists, as after a kill closed it.
+pub(crate) const UNAUTHORIZED: &str =
+    "the exact policy scope or resource is not authorized, or it no longer exists";
 
 /// What restoring one Splint says when it is already running
 /// (Plan 0067 M5).
@@ -459,11 +464,9 @@ fn map_protocol_error(error: &splinterm_protocol::ProtocolError) -> DispatchFail
         ErrorCode::Unauthorized if error.message == NO_WORKSPACE_GRANT => {
             ("unauthorized", NO_WORKSPACE_GRANT, false)
         }
-        ErrorCode::Unauthorized | ErrorCode::DevelopmentFeatureDisabled => (
-            "unauthorized",
-            "the exact policy scope or resource is not authorized",
-            false,
-        ),
+        ErrorCode::Unauthorized | ErrorCode::DevelopmentFeatureDisabled => {
+            ("unauthorized", UNAUTHORIZED, false)
+        }
         // Plan 0067 M4: a control refusal with a known reason says what to
         // do next.
         ErrorCode::ControllerUnavailable if error.message == SPLINT_ALREADY_CONTROLLED => {
@@ -3219,10 +3222,8 @@ mod protocol_error_tests {
             ErrorCode::Unauthorized,
             "no exact persistent policy rule authorizes this request",
         ));
-        assert_eq!(
-            other.message,
-            "the exact policy scope or resource is not authorized"
-        );
+        assert_eq!(other.message, UNAUTHORIZED);
+        assert!(UNAUTHORIZED.contains("no longer exists"));
     }
 
     /// Plan 0067 M4: each control refusal with a known reason says the next
@@ -3269,7 +3270,8 @@ mod protocol_error_tests {
     }
 
     /// Plan 0067 M5: a relaunch or close of a Splint that has not exited says
-    /// to kill it first, in fixed adapter text.
+    /// to kill it, and what a Window showing an unsaved Lair does then, in
+    /// fixed adapter text.
     #[test]
     fn lifecycle_refusals_say_the_next_step() {
         use splinterm_protocol::{DOJO_STILL_LIVE, SPLINT_NOT_EXITED, SPLINT_STILL_LIVE};
@@ -3285,8 +3287,10 @@ mod protocol_error_tests {
             assert_eq!(failure.message, message);
             assert!(!failure.retryable);
             assert!(message.contains("kill_splint"));
+            assert!(message.contains("unsaved Lair"));
         }
         assert!(STILL_RUNNING_RELAUNCH.contains("acquire_control"));
+        assert!(STILL_RUNNING_RELAUNCH.contains("split_splint"));
         // An older splinterd named the Splint in its reason; that keeps the
         // general text.
         let older = map_protocol_error(&ProtocolError::new(

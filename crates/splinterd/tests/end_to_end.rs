@@ -6916,7 +6916,8 @@ async fn agent_status_mcp_adapter_reports_from_inside_the_splint() {
         assert!(reported["data"]["expires_at_ms"].as_u64().is_some());
         assert!(!reported.to_string().contains("waiting for approval"));
         assert_eq!(
-            document["elsewhere"]["error"], "the exact policy scope or resource is not authorized",
+            document["elsewhere"]["error"],
+            "the exact policy scope or resource is not authorized, or it no longer exists",
             "a Splint process cannot report for another live Splint without a grant: {document}"
         );
 

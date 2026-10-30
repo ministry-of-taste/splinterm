@@ -368,12 +368,19 @@ read whose text would be small.
 ### Relaunching, restoring, and closing
 
 `relaunch_splint`, `close_splint`, and `close_dojo` need exited Splints. On a
-running one they fail with `invalid_argument` and say to `kill_splint` it
-first; a relaunch also says `acquire_control` and `input` can restart what
-runs in it. `restore_splint` on a running Splint says there is nothing to
-restore. `restore_dojo` and `restore_lair` count a pane that is already running
-or starting as neither restored nor failed, so `partial` and `failed_count`
-cover only panes that failed to start.
+running one they fail with `invalid_argument` and say to `kill_splint` it; a
+relaunch also says `acquire_control` and `input` can restart what runs in it.
+A Window showing a Lair that is not saved or pinned closes an exited pane at
+once, and a Dojo with its last pane, so after a kill there is nothing left to
+close or relaunch; use `split_splint` or `new_dojo` for a new process. A saved
+or pinned Lair, or one no Window shows, keeps the exited pane for
+`relaunch_splint` or `close_splint`. `restore_splint` on a running Splint says
+there is nothing to restore. `restore_dojo` and `restore_lair` count a pane
+that is already running or starting as neither restored nor failed, so
+`partial` and `failed_count` cover only panes that failed to start.
+
+Any other refusal is `unauthorized`, including a Splint, Dojo or Lair that no
+longer exists, and the message says so. `inspect_topology` shows what is left.
 
 ### Interactive access to a live Lair
 
