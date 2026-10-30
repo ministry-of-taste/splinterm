@@ -1332,7 +1332,8 @@ pub(crate) struct AccessMarks {
     waiting: HashMap<LairId, u32>,
     /// A daemon-wide policy rule reaches every workspace.
     every_lair: AccessReach,
-    /// Some agent a grant or rule covers is connected now.
+    /// Some agent is connected now, through a grant, a rule, or a request
+    /// still waiting for an answer.
     connected: bool,
 }
 
@@ -1351,12 +1352,14 @@ impl AccessMarks {
             let reach = AccessReach::of(entry);
             match (entry.kind, entry.state) {
                 (AccessEntryKind::Pending, _) => {
+                    marks.connected |= entry.connections > 0;
                     if let Some(workspace) = &entry.workspace {
                         let waiting = marks.waiting.entry(workspace.lair_id).or_default();
                         *waiting = waiting.saturating_add(1);
                     }
                 }
                 (AccessEntryKind::PersistentPolicy, AccessEntryState::Active) => {
+                    marks.connected |= reach == AccessReach::Connected;
                     if entry
                         .policy_scopes
                         .iter()
@@ -1364,7 +1367,6 @@ impl AccessMarks {
                     {
                         continue;
                     }
-                    marks.connected |= reach == AccessReach::Connected;
                     for resource in &entry.policy_resources {
                         match resource {
                             AccessPolicyResource::Daemon => {

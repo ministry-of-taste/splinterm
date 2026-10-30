@@ -887,7 +887,8 @@ retains the last valid palette.
 Agent status glyphs take herdr's colours: working in warning, needs input
 and error in danger (each with its own glyph), done in info, idle in
 success, and a stale status, its marker included, in faint text. The access
-"Asking" marker is warning and the remote host tag is remote-marker. A tab
+"Asking" marker is warning, the "can't reach" robot is muted text, and the
+remote host tag is remote-marker. A tab
 badge colours its glyph, not its count. Each colour is checked against the
 opaque colour it is drawn on, the Explorer panel or its selected row, the
 tab strip or the selected tab's body, and mixed toward readable text until
@@ -896,8 +897,8 @@ glyphs reach 3:1 and text, the remote tag and the ASCII `A?` marker,
 that contrast, as it does for ordinary chrome text. Status is never colour
 alone: every state has its own glyph shape in both `explorer.status-glyphs`
 styles, and accessible text and search always use state words.
-`explorer.status-colors=no` draws status glyphs and the "Asking" marker in
-the colour of the text around them; the remote tag is not a status and
+`explorer.status-colors=no` draws status glyphs, the "Asking" marker, and
+the "can't reach" robot in the colour of the text around them; the remote tag is not a status and
 stays remote-marker. JSON and built-in themes take the same roles from
 their ANSI colours. A colour a [role key](#role-overrides) sets is drawn as
 given, without that mixing.

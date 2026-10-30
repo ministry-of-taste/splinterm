@@ -219,6 +219,9 @@ content.
 - License: Apache-2.0
 - Embedded file and provenance: `crates/splinterm/assets/icons/`, including the
   original and subset SHA-256 digests and the exact commands
+- Changes: the three glyphs are subset from the original font, scaled from 512
+  to 1000 units per em, raised 25 units, given the Tabler faces' vertical
+  metrics, and merged into the Tabler subset face
 
 Pictogrammers Free License
 --------------------------

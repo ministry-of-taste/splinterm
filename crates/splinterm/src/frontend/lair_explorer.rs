@@ -104,7 +104,15 @@ fn row_mark_text(
     waiting: u32,
     unreachable: bool,
 ) -> Option<String> {
-    mark_text(whole, part, waiting).or_else(|| unreachable.then(|| UNREACHABLE_TEXT.to_owned()))
+    let text = mark_text(whole, part, waiting);
+    if !unreachable {
+        return text;
+    }
+    // Nothing covers the row, so only a waiting request can come before it.
+    Some(text.map_or_else(
+        || UNREACHABLE_TEXT.to_owned(),
+        |text| format!("{text} · {UNREACHABLE_TEXT}"),
+    ))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3696,6 +3704,47 @@ pub(super) mod tests {
         assert!(marks(&mut explorer).iter().all(|row| {
             row.1 != Some(LairExplorerAccess::Unreachable) && !row.2.contains("can't reach")
         }));
+    }
+
+    /// Plan 0071: an agent only waiting for an answer is connected too. The
+    /// Lair it asks for says both, and the other Lair is unreachable.
+    #[test]
+    fn rows_a_waiting_agent_cannot_reach_say_so() {
+        use crate::frontend::agent_access::{AccessSnapshot, tests::entry};
+        use splinterm_protocol::{AccessEntryKey, AccessEntryKind, RememberedStoreStatus};
+        let view = view();
+        let NavigationNodeId::Lair(notes) = view.lairs[1].id else {
+            unreachable!()
+        };
+        let mut explorer = LairExplorerUi::default();
+        explorer.set_view(view);
+        let mut pending = entry(
+            AccessEntryKey::Pending { request_id: 4 },
+            AccessEntryKind::Pending,
+            notes,
+        );
+        pending.connections = 1;
+        let mut snapshot = AccessSnapshot::new(9, RememberedStoreStatus::Available);
+        snapshot.entries = vec![pending];
+        assert!(explorer.set_access_marks(AccessMarks::from_snapshot(&snapshot)));
+        let rows = expanded_rows(&mut explorer);
+        let mark = |label: &str| rows.iter().find(|row| row.label == label).unwrap();
+        assert_eq!(mark("work").access, Some(LairExplorerAccess::Unreachable));
+        let notes_row = mark("notes");
+        assert_eq!(notes_row.access, Some(LairExplorerAccess::Asking));
+        assert!(
+            notes_row
+                .accessible_status
+                .starts_with("Agent asking for access · Agent can't reach · "),
+            "{}",
+            notes_row.accessible_status
+        );
+        assert!(
+            notes_row.status.starts_with("asking for access · ")
+                && notes_row.status.ends_with("agent can't reach"),
+            "{}",
+            notes_row.status
+        );
     }
 
     #[test]
