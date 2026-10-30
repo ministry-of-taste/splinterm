@@ -108,6 +108,9 @@ impl PointerHandler for App {
                             self.extend_selection(position);
                         }
                     } else if let Some(position) = cell {
+                        // Reports name grid cells, which a cropped view
+                        // shows higher up.
+                        let position = self.panes.pane.application_cell(position);
                         let active_press = self
                             .input
                             .pressed_buttons
@@ -229,8 +232,12 @@ impl PointerHandler for App {
                             modifiers,
                         } => {
                             if let Some(position) = cell
-                                && let Some(report) =
-                                    mouse_report(MouseAction::Press(code), position, modifiers, sgr)
+                                && let Some(report) = mouse_report(
+                                    MouseAction::Press(code),
+                                    self.panes.pane.application_cell(position),
+                                    modifiers,
+                                    sgr,
+                                )
                             {
                                 self.send_command(WindowCommand::Input(report));
                             }
@@ -268,7 +275,7 @@ impl PointerHandler for App {
                             if let Some(position) = cell.or(self.panes.pane.pointer_cell)
                                 && let Some(report) = mouse_report(
                                     MouseAction::Release(code),
-                                    position,
+                                    self.panes.pane.application_cell(position),
                                     modifiers,
                                     sgr,
                                 )

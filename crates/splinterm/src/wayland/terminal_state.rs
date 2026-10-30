@@ -955,4 +955,36 @@ mod tests {
         viewport.observe_history_change(1, &current.scrollback_rows, &cleared);
         assert!(viewport.is_live());
     }
+
+    #[test]
+    fn a_view_into_a_taller_grids_hidden_rows_holds_its_place_through_bursts() {
+        let mut snapshot = held_case_snapshot(1..=100, 4);
+        for (index, row) in snapshot.visible_rows.iter_mut().enumerate() {
+            row.row_id = Some(1_000 + u64::try_from(index).unwrap());
+        }
+        let mut viewport = ScrollbackViewport::default();
+        viewport.set_local_rows(Some(2), Some(&snapshot));
+        assert_eq!(
+            ids(&viewport.visible_rows(&snapshot)),
+            [Some(1_002), Some(1_003)]
+        );
+        viewport.scroll_up(1, &snapshot);
+        let before = ids(&viewport.visible_rows(&snapshot));
+        assert_eq!(before, [Some(1_001), Some(1_002)]);
+
+        for _ in 0..3 {
+            let update = burst(&snapshot, 40);
+            update_for_viewport(&mut snapshot, update, &mut viewport);
+            assert!(!viewport.is_live(), "output never sends the view live");
+            assert_eq!(ids(&viewport.visible_rows(&snapshot)), before);
+        }
+        assert_eq!(viewport.offset_from_bottom(), 1);
+
+        viewport.scroll_down(usize::MAX, &snapshot);
+        assert!(viewport.is_live());
+        assert_eq!(
+            ids(&viewport.visible_rows(&snapshot)),
+            [Some(223), Some(224)]
+        );
+    }
 }
