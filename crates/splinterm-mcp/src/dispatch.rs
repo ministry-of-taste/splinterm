@@ -369,7 +369,7 @@ pub(crate) const TRANSFER_ALREADY_PENDING: &str = "another control transfer of t
 /// What a relaunch says for a Splint that has not exited (Plan 0067 M5).
 /// A Window showing an unsaved Lair closes an exited pane at once, so a
 /// kill there leaves nothing to relaunch.
-pub(crate) const STILL_RUNNING_RELAUNCH: &str = "this Splint is still running; acquire_control and use input to restart what runs in it, or kill_splint it and then relaunch it. A Window showing an unsaved Lair closes a killed pane, so there use split_splint for a new one";
+pub(crate) const STILL_RUNNING_RELAUNCH: &str = "this Splint is still running; acquire_control and use input to restart what runs in it, or kill_splint it and then relaunch it. A Window showing an unsaved Lair closes a killed pane, so there use split_splint for a new one, or new_dojo if it was the Dojo's last pane";
 
 /// What a close says for a Splint that has not exited (Plan 0067 M5).
 pub(crate) const STILL_RUNNING_CLOSE: &str = "this Splint is still running; kill_splint it. A Window showing an unsaved Lair then closes the pane itself; otherwise close it after the kill";
@@ -3291,6 +3291,7 @@ mod protocol_error_tests {
         }
         assert!(STILL_RUNNING_RELAUNCH.contains("acquire_control"));
         assert!(STILL_RUNNING_RELAUNCH.contains("split_splint"));
+        assert!(STILL_RUNNING_RELAUNCH.contains("new_dojo"));
         // An older splinterd named the Splint in its reason; that keeps the
         // general text.
         let older = map_protocol_error(&ProtocolError::new(

@@ -379,8 +379,9 @@ there is nothing to restore. `restore_dojo` and `restore_lair` count a pane
 that is already running or starting as neither restored nor failed, so
 `partial` and `failed_count` cover only panes that failed to start.
 
-Any other refusal is `unauthorized`, including a Splint, Dojo or Lair that no
-longer exists, and the message says so. `inspect_topology` shows what is left.
+A Splint, Dojo or Lair that no longer exists is refused as `unauthorized`, the
+same as a missing grant, and the message says it may no longer exist.
+`inspect_topology` shows what is left.
 
 ### Interactive access to a live Lair
 
