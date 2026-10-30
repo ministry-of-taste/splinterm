@@ -1332,6 +1332,8 @@ pub(crate) struct AccessMarks {
     waiting: HashMap<LairId, u32>,
     /// A daemon-wide policy rule reaches every workspace.
     every_lair: AccessReach,
+    /// Some agent a grant or rule covers is connected now.
+    connected: bool,
 }
 
 impl AccessMarks {
@@ -1362,6 +1364,7 @@ impl AccessMarks {
                     {
                         continue;
                     }
+                    marks.connected |= reach == AccessReach::Connected;
                     for resource in &entry.policy_resources {
                         match resource {
                             AccessPolicyResource::Daemon => {
@@ -1385,6 +1388,7 @@ impl AccessMarks {
                     | AccessEntryKind::Remembered,
                     AccessEntryState::Active,
                 ) => {
+                    marks.connected |= reach == AccessReach::Connected;
                     if let Some(splint_id) = entry.splint_id {
                         raise(&mut marks.splints, splint_id, reach);
                     } else if let Some(workspace) = &entry.workspace {
@@ -1414,6 +1418,12 @@ impl AccessMarks {
 
     pub(crate) fn splint(&self, splint_id: SplintId) -> AccessReach {
         self.splints.get(&splint_id).copied().unwrap_or_default()
+    }
+
+    /// Whether some agent a grant or rule covers is connected now, so rows
+    /// nothing covers say it cannot reach them.
+    pub(crate) const fn agent_connected(&self) -> bool {
+        self.connected
     }
 
     /// Requests waiting for an answer about this workspace.

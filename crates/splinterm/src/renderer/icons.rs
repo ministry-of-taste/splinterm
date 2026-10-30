@@ -1,13 +1,15 @@
-//! Embedded Tabler interface icons for trusted chrome text.
+//! Embedded Tabler and Material Design interface icons for trusted chrome
+//! text.
 //!
 //! One subset face holds icons from Tabler's outline webfont and, for the
-//! `-filled` current-row markers, its filled webfont. The face is compiled
+//! `-filled` current-row markers, its filled webfont, plus the three agent
+//! access robots from the Material Design Icons webfont. The face is compiled
 //! into the executable, copied once into a sealed mapping, and rasterized
 //! through the same `FreeType` grayscale path as chrome text. Icons are placed only by trusted interface code through
-//! [`super::ChromeSource`]; their Tabler-assigned codepoints, mostly
+//! [`super::ChromeSource`]; their assigned codepoints, mostly
 //! private-use, are never interpreted in labels, titles, agent detail, or
 //! terminal content. Provenance, hashes,
-//! and the license are in `crates/splinterm/assets/icons/`.
+//! and the licenses are in `crates/splinterm/assets/icons/`.
 
 use std::{
     cell::RefCell,
@@ -30,7 +32,8 @@ pub(super) const ICON_FACE: usize = usize::MAX - 1;
 /// Bounds retained rasters across font generations and output scales.
 const ICON_RASTER_BUDGET: usize = 256;
 
-/// One icon from the embedded Tabler subset, named after its Tabler icon.
+/// One icon from the embedded subset, named after its Tabler or Material
+/// Design icon.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) enum ChromeIcon {
     MessageQuestion,
@@ -44,10 +47,13 @@ pub(crate) enum ChromeIcon {
     Pin,
     /// A pinned Lair.
     Pinned,
-    /// An agent can reach the row.
-    Plug,
-    /// An agent is connected to the row.
-    PlugConnected,
+    /// An agent can reach the row (Material Design `robot-outline`).
+    RobotOutline,
+    /// An agent is connected to the row (Material Design `robot`).
+    Robot,
+    /// An agent is connected, but nothing covers the row (Material Design
+    /// `robot-off-outline`).
+    RobotOffOutline,
     /// An agent is asking for access.
     LockQuestion,
     // The `[explorer] current-marker` choices; the last five come from the
@@ -66,7 +72,7 @@ pub(crate) enum ChromeIcon {
 }
 
 impl ChromeIcon {
-    pub(crate) const ALL: [Self; 23] = [
+    pub(crate) const ALL: [Self; 24] = [
         Self::MessageQuestion,
         Self::AlertCircle,
         Self::CircleCheck,
@@ -76,8 +82,9 @@ impl ChromeIcon {
         Self::ChevronDown,
         Self::Pin,
         Self::Pinned,
-        Self::Plug,
-        Self::PlugConnected,
+        Self::RobotOutline,
+        Self::Robot,
+        Self::RobotOffOutline,
         Self::LockQuestion,
         Self::Eye,
         Self::CurrentLocation,
@@ -109,8 +116,9 @@ impl ChromeIcon {
             Self::ChevronDown => "chevron-down",
             Self::Pin => "pin",
             Self::Pinned => "pinned",
-            Self::Plug => "plug",
-            Self::PlugConnected => "plug-connected",
+            Self::RobotOutline => "robot-outline",
+            Self::Robot => "robot",
+            Self::RobotOffOutline => "robot-off-outline",
             Self::LockQuestion => "lock-question",
             Self::Eye => "eye",
             Self::CurrentLocation => "current-location",
@@ -127,7 +135,9 @@ impl ChromeIcon {
     }
 
     /// Codepoint in `@tabler/icons-webfont` 3.49.0: in its outline face, or
-    /// in its filled face for the `-filled` icons. No codepoint is in both.
+    /// in its filled face for the `-filled` icons. The robots are from
+    /// `@mdi/font` 7.4.47, in supplementary private use. No codepoint is in
+    /// two faces.
     const fn codepoint(self) -> char {
         match self {
             Self::MessageQuestion => '\u{f98b}',
@@ -139,8 +149,9 @@ impl ChromeIcon {
             Self::ChevronDown => '\u{ea5f}',
             Self::Pin => '\u{ec9c}',
             Self::Pinned => '\u{ed60}',
-            Self::Plug => '\u{ebd9}',
-            Self::PlugConnected => '\u{f00a}',
+            Self::RobotOutline => '\u{f167a}',
+            Self::Robot => '\u{f06a9}',
+            Self::RobotOffOutline => '\u{f167b}',
             Self::LockQuestion => '\u{f931}',
             Self::Eye => '\u{ea9a}',
             Self::CurrentLocation => '\u{ecef}',
@@ -463,6 +474,9 @@ mod tests {
             let slot_width = i32::try_from(cell.width * ChromeIcon::CELLS).unwrap();
             for (icon, slack) in [
                 (ChromeIcon::Eye, 1),
+                (ChromeIcon::Robot, 1),
+                (ChromeIcon::RobotOutline, 1),
+                (ChromeIcon::RobotOffOutline, 1),
                 (ChromeIcon::ChevronDown, 1),
                 (ChromeIcon::ChevronRight, 1),
                 (ChromeIcon::AlertCircle, 1),

@@ -273,7 +273,10 @@ a hostile program running as your account.
 - The Explorer marks, with an icon and in words, which workspaces, Dojos, and
   Splints an agent can reach: **Agent can reach** (no covered agent
   connected) or **Agent connected**. When only some of a workspace is covered,
-  its row says **Agent can reach part** or **Agent connected to part**. The
+  its row says **Agent can reach part** or **Agent connected to part**. While
+  an agent is connected, a row nothing covers says **Agent can't reach**. The
+  icons are robots from Material Design Icons: outline for can reach, filled
+  for connected, greyed with a slash for can't reach. The
   words appear in the footer for the selected row and in every row's
   accessible text; a waiting request has its own lock icon with a question
   mark.

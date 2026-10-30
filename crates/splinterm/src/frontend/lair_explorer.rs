@@ -74,20 +74,37 @@ pub(crate) enum LairExplorerAccess {
     Connected,
     /// An agent is asking for access to the Lair: the most prominent mark.
     Asking,
+    /// An agent is connected, but nothing covers the row, any part of it, or
+    /// the Lair or Dojo it is in.
+    Unreachable,
 }
 
 impl LairExplorerAccess {
     /// The strongest mark of a row, asking first.
-    fn of(whole: AccessReach, part: AccessReach, waiting: u32) -> Option<Self> {
+    fn of(whole: AccessReach, part: AccessReach, waiting: u32, unreachable: bool) -> Option<Self> {
         if waiting > 0 {
             return Some(Self::Asking);
         }
         match whole.max(part) {
-            AccessReach::None => None,
+            AccessReach::None => unreachable.then_some(Self::Unreachable),
             AccessReach::Reachable => Some(Self::Reachable),
             AccessReach::Connected => Some(Self::Connected),
         }
     }
+}
+
+/// A row's unreachable mark in words.
+const UNREACHABLE_TEXT: &str = "Agent can't reach";
+
+/// The marks one row shows, in words, including that a connected agent
+/// cannot reach it.
+fn row_mark_text(
+    whole: AccessReach,
+    part: AccessReach,
+    waiting: u32,
+    unreachable: bool,
+) -> Option<String> {
+    mark_text(whole, part, waiting).or_else(|| unreachable.then(|| UNREACHABLE_TEXT.to_owned()))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -477,6 +494,22 @@ impl LairExplorerUi {
         }
         self.access_marks = marks;
         true
+    }
+
+    /// Whether a connected agent cannot reach a row: nothing covers it, any
+    /// part of it, or (`above`) the Lair or Dojo it is in.
+    fn unreachable(&self, above: AccessReach, whole: AccessReach, part: AccessReach) -> bool {
+        self.access_marks.agent_connected() && above.max(whole).max(part) == AccessReach::None
+    }
+
+    fn lair_whole(
+        &self,
+        lair: &crate::navigation_projection::NavigationExplorerLair,
+    ) -> AccessReach {
+        match lair.id {
+            NavigationNodeId::Lair(lair_id) => self.access_marks.lair(lair_id),
+            _ => AccessReach::None,
+        }
     }
 
     fn splint_reach(&self, splint: &NavigationExplorerSplint) -> AccessReach {
@@ -1069,8 +1102,9 @@ impl LairExplorerUi {
                     .filter_map(|splint| splint.agent_status.as_ref()),
             );
             let (whole, part, waiting) = self.lair_reach(lair);
+            let unreachable = self.unreachable(AccessReach::None, whole, part);
             let accessible_status = with_access_mark(
-                mark_text(whole, part, waiting),
+                row_mark_text(whole, part, waiting, unreachable),
                 format!(
                     "{} · {}{}",
                     lifecycle_label(lair.lifecycle()),
@@ -1083,7 +1117,7 @@ impl LairExplorerUi {
                 self.aggregate_brief(&aggregate),
                 lifecycle_brief(lair.lifecycle()),
                 retention_brief(lair.retention),
-                mark_text(whole, part, 0).map(|text| lower_first(&text)),
+                row_mark_text(whole, part, 0, unreachable).map(|text| lower_first(&text)),
             ]);
             // A rail row switches to its Lair, or expands the tree where
             // nothing opens at once, so it waits only while its switch is
@@ -1107,7 +1141,7 @@ impl LairExplorerUi {
                     .flat_map(|dojo| &dojo.splints)
                     .any(|splint| is_live(splint.lifecycle)),
                 retention: lair.retention.is_protected().then_some(lair.retention),
-                access: LairExplorerAccess::of(whole, part, waiting),
+                access: LairExplorerAccess::of(whole, part, waiting, unreachable),
                 accessible_status,
                 status,
                 level: 1,
@@ -1123,16 +1157,19 @@ impl LairExplorerUi {
                 continue;
             }
             for dojo in &lair.dojos {
-                self.push_dojo_rows(&mut rows, dojo, searching, lair_matches, &query);
+                self.push_dojo_rows(&mut rows, dojo, whole, searching, lair_matches, &query);
             }
         }
         rows
     }
 
+    /// The Dojo row and its Splint rows; `above` is how far an agent reaches
+    /// the Lair.
     fn push_dojo_rows(
         &self,
         rows: &mut Vec<LairExplorerRow>,
         dojo: &NavigationExplorerDojo,
+        above: AccessReach,
         searching: bool,
         lair_matches: bool,
         query: &[String],
@@ -1162,8 +1199,9 @@ impl LairExplorerUi {
         );
         let base = format!("{} · {attachment}", lifecycle_label(dojo.lifecycle()));
         let (whole, part) = self.dojo_reach(dojo);
+        let unreachable = self.unreachable(above, whole, part);
         let accessible_status = with_access_mark(
-            mark_text(whole, part, 0),
+            row_mark_text(whole, part, 0, unreachable),
             row_status(
                 pending,
                 &format!("{base}{}", self.aggregate_suffix(&aggregate)),
@@ -1180,7 +1218,7 @@ impl LairExplorerUi {
             lifecycle_brief(dojo.lifecycle()),
             attachment_brief,
             blocker.map(str::to_owned),
-            mark_text(whole, part, 0).map(|text| lower_first(&text)),
+            row_mark_text(whole, part, 0, unreachable).map(|text| lower_first(&text)),
         ]);
         rows.push(LairExplorerRow {
             id: dojo.id,
@@ -1191,7 +1229,7 @@ impl LairExplorerUi {
             agent_working: self.aggregate_working(&aggregate),
             live: dojo.splints.iter().any(|splint| is_live(splint.lifecycle)),
             retention: None,
-            access: LairExplorerAccess::of(whole, part, 0),
+            access: LairExplorerAccess::of(whole, part, 0, unreachable),
             accessible_status,
             status,
             level: 2,
@@ -1212,11 +1250,12 @@ impl LairExplorerUi {
             if searching && !lair_matches && !dojo_matches && !self.splint_matches(splint, query) {
                 continue;
             }
-            rows.push(self.splint_row(splint));
+            rows.push(self.splint_row(splint, above.max(whole)));
         }
     }
 
-    fn splint_row(&self, splint: &NavigationExplorerSplint) -> LairExplorerRow {
+    /// A Splint row; `above` is how far an agent reaches its Lair or Dojo.
+    fn splint_row(&self, splint: &NavigationExplorerSplint, above: AccessReach) -> LairExplorerRow {
         let (enabled, blocker) = availability(splint.target.capability.availability);
         let state = format!(
             "{}{}",
@@ -1227,9 +1266,10 @@ impl LairExplorerUi {
             .pending
             .is_some_and(|pending| pending.id() == splint.id);
         let reach = self.splint_reach(splint);
+        let unreachable = self.unreachable(above, reach, AccessReach::None);
         let detail = self.splint_detail(splint);
         let mut accessible_status = with_access_mark(
-            mark_text(reach, AccessReach::None, 0),
+            row_mark_text(reach, AccessReach::None, 0, unreachable),
             row_status(pending, &state, blocker),
         );
         // The agent's detail is already in the state words; a directory
@@ -1243,7 +1283,7 @@ impl LairExplorerUi {
             self.splint_brief(splint.agent_status.as_ref()),
             lifecycle_brief(splint.lifecycle),
             blocker.map(str::to_owned),
-            mark_text(reach, AccessReach::None, 0).map(|text| lower_first(&text)),
+            row_mark_text(reach, AccessReach::None, 0, unreachable).map(|text| lower_first(&text)),
         ]);
         LairExplorerRow {
             id: splint.id,
@@ -1256,7 +1296,7 @@ impl LairExplorerUi {
                 && agent_status::shows_working(splint.agent_status.as_ref()),
             live: is_live(splint.lifecycle),
             retention: None,
-            access: LairExplorerAccess::of(reach, AccessReach::None, 0),
+            access: LairExplorerAccess::of(reach, AccessReach::None, 0, unreachable),
             accessible_status,
             status,
             level: 3,
@@ -1312,7 +1352,8 @@ impl LairExplorerUi {
                         continue;
                     };
                     let location = format!("{} / {}", lair.label, dojo.label);
-                    let mut row = self.splint_row(splint);
+                    let above = self.lair_whole(lair).max(self.dojo_reach(dojo).0);
+                    let mut row = self.splint_row(splint, above);
                     row.level = 1;
                     row.accessible_status = format!("{location} · {}", row.accessible_status);
                     agents.push((
@@ -3560,6 +3601,103 @@ pub(super) mod tests {
         );
     }
 
+    /// Plan 0071: while an agent is connected, rows nothing covers, at or
+    /// under them or in their Lair or Dojo, say it cannot reach them.
+    #[test]
+    fn rows_a_connected_agent_cannot_reach_say_so() {
+        use crate::frontend::agent_access::{
+            AccessSnapshot,
+            tests::{entry, remembered_key},
+        };
+        use splinterm_protocol::{AccessEntryKey, AccessEntryKind, RememberedStoreStatus};
+        type Mark = (String, Option<LairExplorerAccess>, String, String);
+        fn marks(explorer: &mut LairExplorerUi) -> Vec<Mark> {
+            expanded_rows(explorer)
+                .into_iter()
+                .map(|row| (row.label, row.access, row.accessible_status, row.status))
+                .collect()
+        }
+        fn mark(rows: &[Mark], label: &str) -> Mark {
+            rows.iter().find(|row| row.0 == label).unwrap().clone()
+        }
+        let view = view();
+        let NavigationNodeId::Lair(work) = view.lairs[0].id else {
+            unreachable!()
+        };
+        let NavigationNodeId::Lair(notes) = view.lairs[1].id else {
+            unreachable!()
+        };
+        let NavigationNodeId::Splint { splint_id, .. } = view.lairs[0].dojos[0].splints[0].id
+        else {
+            unreachable!()
+        };
+        let mut explorer = LairExplorerUi::default();
+        explorer.set_view(view);
+        let session = |connections| {
+            let mut session = entry(
+                AccessEntryKey::Grant { grant_id: 18 },
+                AccessEntryKind::WorkspaceSession,
+                work,
+            );
+            session.connections = connections;
+            session
+        };
+
+        // A connected grant for the whole "work" Lair: its Dojo and Splint
+        // rows are covered by it, and "notes" is not.
+        let mut snapshot = AccessSnapshot::new(9, RememberedStoreStatus::Available);
+        snapshot.entries = vec![session(1)];
+        assert!(explorer.set_access_marks(AccessMarks::from_snapshot(&snapshot)));
+        let rows = marks(&mut explorer);
+        assert_eq!(mark(&rows, "work").1, Some(LairExplorerAccess::Connected));
+        assert_eq!(mark(&rows, "editor").1, None);
+        assert_eq!(mark(&rows, "shell").1, None);
+        let notes_row = mark(&rows, "notes");
+        assert_eq!(notes_row.1, Some(LairExplorerAccess::Unreachable));
+        assert!(
+            notes_row.2.starts_with("Agent can't reach · "),
+            "{}",
+            notes_row.2
+        );
+        assert!(
+            notes_row.3.ends_with("agent can't reach"),
+            "{}",
+            notes_row.3
+        );
+
+        // A connected grant for one Splint: its Dojo and Lair reach part,
+        // and the other Lair is unreachable.
+        let mut once = entry(
+            AccessEntryKey::Grant { grant_id: 17 },
+            AccessEntryKind::Once,
+            work,
+        );
+        once.splint_id = Some(splint_id);
+        once.incarnation = Some(3);
+        once.connections = 1;
+        snapshot.entries = vec![once];
+        assert!(explorer.set_access_marks(AccessMarks::from_snapshot(&snapshot)));
+        let rows = marks(&mut explorer);
+        assert_eq!(mark(&rows, "work").1, Some(LairExplorerAccess::Connected));
+        assert_eq!(mark(&rows, "editor").1, Some(LairExplorerAccess::Connected));
+        assert_eq!(mark(&rows, "shell").1, Some(LairExplorerAccess::Connected));
+        assert_eq!(
+            mark(&rows, "notes").1,
+            Some(LairExplorerAccess::Unreachable)
+        );
+
+        // With no agent connected, uncovered rows stay unmarked.
+        let mut remembered = entry(remembered_key(), AccessEntryKind::Remembered, notes);
+        remembered.connections = 0;
+        snapshot.entries = vec![session(0), remembered];
+        let idle = AccessMarks::from_snapshot(&snapshot);
+        assert!(!idle.agent_connected());
+        assert!(explorer.set_access_marks(idle));
+        assert!(marks(&mut explorer).iter().all(|row| {
+            row.1 != Some(LairExplorerAccess::Unreachable) && !row.2.contains("can't reach")
+        }));
+    }
+
     #[test]
     fn rows_carry_live_retention_and_access_icon_marks() {
         let mut view = view();
@@ -3599,16 +3737,25 @@ pub(super) mod tests {
         assert!(!row("scratch").status.contains("disposable"));
         assert!(rows.iter().all(|row| row.access.is_none()));
         assert_eq!(
-            LairExplorerAccess::of(AccessReach::Reachable, AccessReach::Connected, 0),
+            LairExplorerAccess::of(AccessReach::Reachable, AccessReach::Connected, 0, false),
             Some(LairExplorerAccess::Connected)
         );
         assert_eq!(
-            LairExplorerAccess::of(AccessReach::Connected, AccessReach::None, 1),
+            LairExplorerAccess::of(AccessReach::Connected, AccessReach::None, 1, true),
             Some(LairExplorerAccess::Asking)
         );
         assert_eq!(
-            LairExplorerAccess::of(AccessReach::None, AccessReach::None, 0),
+            LairExplorerAccess::of(AccessReach::None, AccessReach::None, 0, false),
             None
+        );
+        assert_eq!(
+            LairExplorerAccess::of(AccessReach::None, AccessReach::None, 0, true),
+            Some(LairExplorerAccess::Unreachable)
+        );
+        // A covered row is never unreachable.
+        assert_eq!(
+            LairExplorerAccess::of(AccessReach::Reachable, AccessReach::None, 0, true),
+            Some(LairExplorerAccess::Reachable)
         );
     }
 
