@@ -584,7 +584,12 @@ and in words in the selected row's footer and each row's accessible text:
 **Agent can reach** (a grant or matching policy rule covers it, but no agent
 it covers is connected) or **Agent connected** (one is connected or holds
 control now), on the workspace, or **…part** when only some of its Dojos or
-Splints are covered. **Agent asking for access** marks a workspace with a
+Splints are covered. While an agent is connected, a row that nothing covers,
+neither the row, any part of it, nor the Lair or Dojo it is in, is marked
+**Agent can't reach**; with no agent connected such rows stay unmarked. The
+icons are robots: outline for can reach, filled for connected, and greyed with a
+slash for can't reach.
+**Agent asking for access** marks a workspace with a
 request waiting for your answer, and while any request waits the Window title
 ends with **AGENT ACCESS REQUEST WAITING** and **Agent access** in the palette
 shows how many wait. The prompt's keys stay inert until you click it or press

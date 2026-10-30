@@ -7,7 +7,7 @@ pkgrel=1
 arch=('x86_64')
 options=('!strip')
 url='https://github.com/ministry-of-taste/splinterm'
-license=('MIT')
+license=('MIT' 'Apache-2.0')
 makedepends=('cargo' 'pkgconf' 'rust')
 # Match the immutable renderer fixtures in .github/workflows/ci.yml.
 _font_base='https://raw.githubusercontent.com/ryanoasis/nerd-fonts/fa7b859994228a9c8759f99c55a8d31ee92a1b5e/patched-fonts/JetBrainsMono/Ligatures'

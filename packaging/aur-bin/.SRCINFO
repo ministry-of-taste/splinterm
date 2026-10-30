@@ -4,6 +4,7 @@ pkgbase = splinterm-bin
 	url = https://github.com/ministry-of-taste/splinterm
 	arch = x86_64
 	license = MIT
+	license = Apache-2.0
 	noextract = splinterm-0.2.0-x86_64.pkg.tar.zst
 	noextract = splinterm-mcp-0.2.0-x86_64.pkg.tar.zst
 	options = !strip

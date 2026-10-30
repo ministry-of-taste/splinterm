@@ -781,12 +781,14 @@ pub(crate) enum ChromeTint {
     Asking,
     /// The access "Asking" marker in ASCII, `A?`, which is text.
     AskingText,
+    /// The access "Unreachable" marker icon, muted.
+    Unreachable,
     /// The remote host tag, which is text.
     Remote,
 }
 
 impl ChromeTint {
-    const ALL: [Self; 9] = [
+    const ALL: [Self; 10] = [
         Self::StatusNeedsInput,
         Self::StatusError,
         Self::StatusWorking,
@@ -795,6 +797,7 @@ impl ChromeTint {
         Self::StatusStale,
         Self::Asking,
         Self::AskingText,
+        Self::Unreachable,
         Self::Remote,
     ];
 
@@ -808,7 +811,8 @@ impl ChromeTint {
             Self::StatusStale => 5,
             Self::Asking => 6,
             Self::AskingText => 7,
-            Self::Remote => 8,
+            Self::Unreachable => 8,
+            Self::Remote => 9,
         }
     }
 
@@ -821,6 +825,7 @@ impl ChromeTint {
             Self::StatusIdle => Role::StatusIdle,
             Self::StatusStale => Role::StatusStale,
             Self::Asking | Self::AskingText => Role::Warning,
+            Self::Unreachable => Role::TextMuted,
             Self::Remote => Role::RemoteMarker,
         }
     }
@@ -838,7 +843,7 @@ impl ChromeTint {
 /// Every [`ChromeTint`]'s color on one background, each kept at its floor
 /// against that background by mixing toward `text` corrected for it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ChromeTints([u32; 9]);
+pub(crate) struct ChromeTints([u32; 10]);
 
 impl ChromeTints {
     #[must_use]

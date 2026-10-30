@@ -265,7 +265,7 @@ columns line up on every row:
 
 | Column | Shows |
 | --- | --- |
-| Agent access | `plug` when an agent can reach the row, `plug-connected` when one is connected, `lock-question` when an agent is asking for access to the Lair |
+| Agent access | an outline robot when an agent can reach the row, a filled robot when one is connected, a greyed robot with a slash through it when an agent is connected but cannot reach the row, `lock-question` when an agent is asking for access to the Lair |
 | Agent status | the agent's state (see [below](#agent-status-in-the-explorer-and-on-dojo-tabs)) |
 | Live | a filled dot `●` while a Splint in the row is running or starting, a hollow dot `○` otherwise |
 | Retention | `pin` for a saved Lair, `pinned` for a pinned Lair |

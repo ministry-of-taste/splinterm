@@ -1177,15 +1177,21 @@ impl ExplorerColumns {
 fn push_access(source: &mut ChromeSource, access: Option<LairExplorerAccess>, icons: bool) {
     match (access, icons) {
         (None, _) => source.push_str("  "),
-        (Some(LairExplorerAccess::Reachable), true) => source.push_icon(ChromeIcon::Plug),
-        (Some(LairExplorerAccess::Connected), true) => source.push_icon(ChromeIcon::PlugConnected),
+        (Some(LairExplorerAccess::Reachable), true) => source.push_icon(ChromeIcon::RobotOutline),
+        (Some(LairExplorerAccess::Connected), true) => source.push_icon(ChromeIcon::Robot),
         (Some(LairExplorerAccess::Asking), true) => {
             source.push_tinted(ChromeTint::Asking, |source| {
                 source.push_icon(ChromeIcon::LockQuestion);
             })
         }
+        (Some(LairExplorerAccess::Unreachable), true) => {
+            source.push_tinted(ChromeTint::Unreachable, |source| {
+                source.push_icon(ChromeIcon::RobotOffOutline);
+            })
+        }
         (Some(LairExplorerAccess::Reachable), false) => source.push_str("a "),
         (Some(LairExplorerAccess::Connected), false) => source.push_str("A "),
+        (Some(LairExplorerAccess::Unreachable), false) => source.push_str("x "),
         (Some(LairExplorerAccess::Asking), false) => {
             source.push_tinted(ChromeTint::AskingText, |source| {
                 source.push_str("A?");
@@ -4642,7 +4648,11 @@ mod tests {
                 scale,
             );
             let mut marks = vec![blank_access.clone()];
-            for access in [LairExplorerAccess::Connected, LairExplorerAccess::Asking] {
+            for access in [
+                LairExplorerAccess::Connected,
+                LairExplorerAccess::Asking,
+                LairExplorerAccess::Unreachable,
+            ] {
                 let (painted, _, _, _, _) = paint_row(
                     &context,
                     reference(false, Some(LairRetention::Saved), Some(access)),

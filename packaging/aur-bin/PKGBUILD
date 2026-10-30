@@ -8,7 +8,7 @@ pkgrel=1
 _commit=7bba5a91fd4624f2f2699dd95af01d97d6200bc2
 arch=('x86_64')
 url='https://github.com/ministry-of-taste/splinterm'
-license=('MIT')
+license=('MIT' 'Apache-2.0')
 options=('!strip' '!debug')
 source=(
   "splinterm-$pkgver-$CARCH.pkg.tar.zst::https://github.com/ministry-of-taste/splinterm/releases/download/v0.2.0/splinterm-$_commit-$CARCH.pkg.tar.zst"

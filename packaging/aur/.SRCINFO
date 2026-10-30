@@ -4,6 +4,7 @@ pkgbase = splinterm
 	url = https://github.com/ministry-of-taste/splinterm
 	arch = x86_64
 	license = MIT
+	license = Apache-2.0
 	makedepends = cargo
 	makedepends = fontconfig
 	makedepends = freetype2
