@@ -449,9 +449,25 @@ pub(super) fn retain_history_for_viewport(
     if viewport.is_live()
         || next.history_generation != current.history_generation
         || next.active_screen == ActiveScreen::Alternate
-        || next.available_scrollback_rows == 0
-        || current.scrollback_rows.is_empty()
     {
+        return;
+    }
+    if next.available_scrollback_rows == 0 || current.scrollback_rows.is_empty() {
+        // A view on a taller grid's top rows needs no cache, but its anchor
+        // must stay shown: when `next` lacks it, hold the screen it is on.
+        let on = |rows: &[TerminalRow], id| rows.iter().any(|row| row.row_id == Some(id));
+        let screen = viewport.held_screen().unwrap_or(&current.visible_rows);
+        if let Some(anchor) = viewport.anchor_row_id()
+            && on(screen, anchor)
+            && !on(&next.scrollback_rows, anchor)
+            && !on(&next.visible_rows, anchor)
+        {
+            viewport.hold(current.visible_rows.clone());
+            if current.scrollback_rows.is_empty() {
+                next.scrollback_rows.clear();
+                next.omitted_oldest_scrollback_rows = next.available_scrollback_rows;
+            }
+        }
         return;
     }
     let joined_at = (!viewport.is_holding())
@@ -986,5 +1002,94 @@ mod tests {
             ids(&viewport.visible_rows(&snapshot)),
             [Some(223), Some(224)]
         );
+    }
+
+    /// `snapshot`'s screen rows, identified from `first` up.
+    fn identify_screen(snapshot: &mut TerminalSnapshot, first: u64) {
+        for (index, row) in snapshot.visible_rows.iter_mut().enumerate() {
+            row.row_id = Some(first + u64::try_from(index).unwrap());
+        }
+    }
+
+    #[test]
+    fn a_resync_keeps_a_view_on_a_taller_grids_top_rows_without_a_cache() {
+        // The cache was dropped while live, as `discard_lagging_history` does.
+        let mut current = held_case_snapshot(1..=100, 4);
+        identify_screen(&mut current, 1_000);
+        current.scrollback_rows.clear();
+        current.omitted_oldest_scrollback_rows = current.available_scrollback_rows;
+        let mut viewport = ScrollbackViewport::default();
+        viewport.set_local_rows(Some(2), Some(&current));
+        viewport.scroll_up(1, &current);
+        let before = ids(&viewport.visible_rows(&current));
+        assert_eq!(before, [Some(1_001), Some(1_002)]);
+
+        // An authoritative snapshot whose rows no longer include the anchor.
+        let mut next = held_case_snapshot(200..=215, 4);
+        identify_screen(&mut next, 3_000);
+        next.oldest_available_scrollback_row_id = Some(1);
+        next.available_scrollback_rows = 215;
+        retain_history_for_viewport(&current, &mut next, &mut viewport);
+        assert!(viewport.is_holding());
+        assert!(next.scrollback_rows.is_empty());
+        viewport.observe_history_change(1, &current.scrollback_rows, &next);
+        assert!(!viewport.is_live());
+        assert_eq!(ids(&viewport.visible_rows(&next)), before);
+
+        // A snapshot that still has the anchor needs no hold.
+        let mut viewport = ScrollbackViewport::default();
+        viewport.set_local_rows(Some(2), Some(&current));
+        viewport.scroll_up(1, &current);
+        let mut same = current.clone();
+        same.revision += 1;
+        retain_history_for_viewport(&current, &mut same, &mut viewport);
+        assert!(!viewport.is_holding());
+    }
+
+    #[test]
+    fn a_view_on_a_fresh_sessions_taller_grid_holds_through_its_first_history() {
+        let mut snapshot = held_case_snapshot(1..=100, 4);
+        identify_screen(&mut snapshot, 1_000);
+        snapshot.scrollback_rows.clear();
+        snapshot.available_scrollback_rows = 0;
+        snapshot.omitted_oldest_scrollback_rows = 0;
+        snapshot.oldest_available_scrollback_row_id = None;
+        snapshot.newest_available_scrollback_row_id = None;
+        let mut viewport = ScrollbackViewport::default();
+        viewport.set_local_rows(Some(2), Some(&snapshot));
+        viewport.scroll_up(1, &snapshot);
+        let before = ids(&viewport.visible_rows(&snapshot));
+        assert_eq!(before, [Some(1_001), Some(1_002)]);
+
+        // Six rows of output: the first history, bounded to its newest two.
+        let update = TerminalUpdate {
+            base_revision: snapshot.revision,
+            revision: snapshot.revision + 1,
+            rows: (0..snapshot.rows)
+                .map(|index| {
+                    let mut row = blank_row(1);
+                    row.row_id = Some(2_000 + u64::try_from(index).unwrap());
+                    row.cells[0].content = format!("n{index}");
+                    splinterm_protocol::TerminalRowPatch { index, row }
+                })
+                .collect(),
+            scrollback: Some(splinterm_protocol::TerminalScrollbackUpdate {
+                transition: HistoryTransition::Append {
+                    appended_rows: 6,
+                    trimmed_rows: 0,
+                },
+                history_generation: snapshot.history_generation,
+                oldest_available_row_id: Some(1),
+                newest_available_row_id: Some(6),
+                available_rows: 6,
+                omitted_oldest_rows: 4,
+                rows: (5..=6).map(|id| history_row(id, 1)).collect(),
+            }),
+            ..burst(&held_case_snapshot(1..=100, 4), 1)
+        };
+        update_for_viewport(&mut snapshot, update, &mut viewport);
+        assert!(viewport.is_holding());
+        assert!(!viewport.is_live());
+        assert_eq!(ids(&viewport.visible_rows(&snapshot)), before);
     }
 }

@@ -1903,18 +1903,55 @@ impl PaneView {
         })
     }
 
-    /// The shown row a cursor blink repaints. A live view that leaves out
-    /// the grid's top rows shows the cursor that many rows higher.
-    fn cursor_blink_row(&self) -> Option<usize> {
+    /// The shown row the live cursor is drawn on, if any: moved down by the
+    /// view's offset and up by the content rows it leaves out. A held view
+    /// shows an older screen, which the live cursor is not on.
+    fn shown_cursor_row(&self) -> Option<i32> {
         let snapshot = self.snapshot.as_ref()?;
-        let row = usize::try_from(snapshot.cursor_row)
-            .ok()
-            .filter(|row| *row < snapshot.rows)?;
-        if self.scrollback_viewport.is_live() {
-            row.checked_sub(self.scrollback_viewport.hidden_screen_rows(snapshot))
-        } else {
-            Some(row)
+        let viewport = &self.scrollback_viewport;
+        if viewport.is_holding() {
+            return None;
         }
+        viewport_cursor_row(
+            snapshot.cursor_row,
+            viewport.offset_from_bottom(),
+            viewport.hidden_screen_rows(snapshot),
+            viewport.rows_shown(snapshot),
+        )
+    }
+
+    /// The shown row a cursor blink repaints.
+    fn cursor_blink_row(&self) -> Option<usize> {
+        self.shown_cursor_row()
+            .and_then(|row| usize::try_from(row).ok())
+    }
+
+    /// Scrolls the history view `lines` rows, as a wheel or page key does.
+    /// Returns whether the view moved and whether it is near enough the
+    /// oldest loaded row to fetch older history.
+    fn scroll_viewport(&mut self, action: MouseAction, lines: usize) -> Result<(bool, bool)> {
+        self.discard_lagging_history();
+        let snapshot = self.snapshot.as_ref().context("scroll requires snapshot")?;
+        let viewport = &mut self.scrollback_viewport;
+        let previous_offset = viewport.offset_from_bottom();
+        match action {
+            MouseAction::WheelUp => viewport.scroll_up(lines, snapshot),
+            MouseAction::WheelDown => viewport.scroll_down(lines, snapshot),
+            _ => return Ok((false, false)),
+        }
+        let current_offset = viewport.offset_from_bottom();
+        request_return_live_resync(
+            self.commands.as_ref(),
+            &mut self.resync_pending,
+            previous_offset,
+            current_offset,
+        )?;
+        let remaining = viewport.max_offset(snapshot).saturating_sub(current_offset);
+        let prefetch_distance = viewport.rows_shown(snapshot).saturating_mul(2).max(32);
+        let near_oldest = action == MouseAction::WheelUp && remaining <= prefetch_distance;
+        // Scrolling back to live ends a hold; its cache no longer joins the screen.
+        self.discard_lagging_history();
+        Ok((current_offset != previous_offset, near_oldest))
     }
 
     /// The grid cell an application mouse report names for a shown cell.
@@ -1932,17 +1969,7 @@ impl PaneView {
         if viewport.shows_screen_unchanged(snapshot) {
             return Some(snapshot.clone());
         }
-        // A held viewport shows an older screen; the live cursor is not on it.
-        let cursor_row = (!viewport.is_holding())
-            .then(|| {
-                viewport_cursor_row(
-                    snapshot.cursor_row,
-                    viewport.offset_from_bottom(),
-                    viewport.hidden_screen_rows(snapshot),
-                    viewport.rows_shown(snapshot),
-                )
-            })
-            .flatten();
+        let cursor_row = self.shown_cursor_row();
         let mut input_modes = snapshot.input_modes;
         if cursor_row.is_none() {
             input_modes.cursor_visible = false;
@@ -5372,47 +5399,10 @@ impl App {
 
     fn scroll_history(&mut self, action: MouseAction, lines: usize) -> Result<bool> {
         self.cancel_clipboard_image();
-        self.panes.pane.discard_lagging_history();
-        let snapshot = self
-            .panes
-            .pane
-            .snapshot
-            .as_ref()
-            .context("scroll requires snapshot")?;
-        let previous_offset = self.panes.pane.scrollback_viewport.offset_from_bottom();
-        match action {
-            MouseAction::WheelUp => self
-                .panes
-                .pane
-                .scrollback_viewport
-                .scroll_up(lines, snapshot),
-            MouseAction::WheelDown => self
-                .panes
-                .pane
-                .scrollback_viewport
-                .scroll_down(lines, snapshot),
-            _ => return Ok(false),
+        let (moved, near_oldest) = self.panes.pane.scroll_viewport(action, lines)?;
+        if near_oldest {
+            self.request_older_history()?;
         }
-        let current_offset = self.panes.pane.scrollback_viewport.offset_from_bottom();
-        let moved = current_offset != previous_offset;
-        request_return_live_resync(
-            self.panes.pane.commands.as_ref(),
-            &mut self.panes.pane.resync_pending,
-            previous_offset,
-            current_offset,
-        )?;
-        if action == MouseAction::WheelUp {
-            let viewport = &self.panes.pane.scrollback_viewport;
-            let remaining = viewport
-                .max_offset(snapshot)
-                .saturating_sub(viewport.offset_from_bottom());
-            let prefetch_distance = viewport.rows_shown(snapshot).saturating_mul(2).max(32);
-            if remaining <= prefetch_distance {
-                self.request_older_history()?;
-            }
-        }
-        // Scrolling back to live ends a hold; its cache no longer joins the screen.
-        self.panes.pane.discard_lagging_history();
         if !moved {
             return Ok(false);
         }
@@ -17883,6 +17873,103 @@ mod tests {
             pane.display_snapshot().unwrap().visible_rows.last(),
             snapshot.visible_rows.last()
         );
+    }
+
+    #[test]
+    fn a_cursor_blink_repaints_the_row_the_cursor_is_drawn_on() {
+        let (mut pane, _commands) = viewer_pane(3, 6);
+        pane.snapshot.as_mut().unwrap().cursor_row = 2;
+        let snapshot = pane.snapshot.clone().unwrap();
+        // The controller, scrolled back two rows, draws the cursor lower.
+        pane.scrollback_viewport.scroll_up(2, &snapshot);
+        assert_eq!(pane.cursor_blink_row(), Some(4));
+        assert_eq!(pane.display_snapshot().unwrap().cursor_row, 4);
+        // A held view shows an older screen without the live cursor.
+        pane.scrollback_viewport.hold(snapshot.visible_rows.clone());
+        assert_eq!(pane.cursor_blink_row(), None);
+        assert_eq!(pane.display_snapshot().unwrap().cursor_row, -1);
+
+        // A cropped viewer one row back from a cursor on its last row.
+        let (mut pane, _commands) = viewer_pane(3, 6);
+        let snapshot = pane.snapshot.clone().unwrap();
+        pane.scrollback_viewport
+            .set_local_rows(Some(4), Some(&snapshot));
+        pane.scrollback_viewport.scroll_up(1, &snapshot);
+        assert_eq!(pane.cursor_blink_row(), None, "below the view");
+        pane.scrollback_viewport.scroll_down(1, &snapshot);
+        assert_eq!(pane.cursor_blink_row(), Some(3));
+    }
+
+    #[test]
+    fn the_history_strip_counts_a_cropped_grids_rows_above_the_view() {
+        let (mut pane, _commands) = viewer_pane(3, 6);
+        let snapshot = pane.snapshot.clone().unwrap();
+        pane.scrollback_viewport
+            .set_local_rows(Some(4), Some(&snapshot));
+        pane.scrollback_viewport.scroll_up(1, &snapshot);
+        assert_eq!(
+            history_overlay_status(&pane.scrollback_viewport, Some(&snapshot)),
+            Some(HistoryOverlayStatus {
+                offset_from_bottom: 1,
+                available_rows: 5,
+                unseen_rows: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn a_cropped_viewer_on_the_alternate_screen_shows_its_bottom_rows() {
+        let (mut pane, _commands) = viewer_pane(0, 6);
+        pane.snapshot.as_mut().unwrap().active_screen = ActiveScreen::Alternate;
+        let snapshot = pane.snapshot.clone().unwrap();
+        pane.scrollback_viewport
+            .set_local_rows(Some(4), Some(&snapshot));
+        let display = pane.display_snapshot().unwrap();
+        assert_eq!(
+            display_row_ids(&display),
+            [Some(3), Some(4), Some(5), Some(6)]
+        );
+        assert_eq!(display.cursor_row, 3);
+        let top = CellPosition { row: 0, column: 1 };
+        assert_eq!(
+            pane.application_cell(top),
+            CellPosition { row: 2, column: 1 }
+        );
+        // The alternate screen has no history to scroll through.
+        pane.scrollback_viewport.scroll_up(1, &snapshot);
+        assert!(pane.scrollback_viewport.is_live());
+    }
+
+    #[test]
+    fn page_keys_on_a_cropped_view_page_by_the_panes_rows() {
+        let (mut pane, mut commands) = viewer_pane(10, 6);
+        let snapshot = pane.snapshot.clone().unwrap();
+        pane.scrollback_viewport
+            .set_local_rows(Some(4), Some(&snapshot));
+        let step = pane.history_page_rows();
+        assert_eq!(step, 3);
+        let shown = |pane: &PaneView| display_row_ids(&pane.display_snapshot().unwrap());
+        assert_eq!(shown(&pane), [Some(13), Some(14), Some(15), Some(16)]);
+
+        assert_eq!(
+            pane.scroll_viewport(MouseAction::WheelUp, step).unwrap(),
+            (true, true)
+        );
+        assert_eq!(shown(&pane), [Some(10), Some(11), Some(12), Some(13)]);
+        pane.scroll_viewport(MouseAction::WheelUp, step).unwrap();
+        assert_eq!(shown(&pane), [Some(7), Some(8), Some(9), Some(10)]);
+        assert_eq!(
+            pane.scroll_viewport(MouseAction::WheelDown, step).unwrap(),
+            (true, false)
+        );
+        assert_eq!(shown(&pane), [Some(10), Some(11), Some(12), Some(13)]);
+        pane.scroll_viewport(MouseAction::WheelDown, step).unwrap();
+        assert!(pane.scrollback_viewport.is_live());
+        assert_eq!(shown(&pane), [Some(13), Some(14), Some(15), Some(16)]);
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            WindowCommand::Resynchronize
+        ));
     }
 
     #[test]

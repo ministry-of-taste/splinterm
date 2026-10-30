@@ -80,7 +80,11 @@ pub(in crate::wayland) fn history_overlay_status(
     let snapshot = snapshot?;
     (!viewport.is_live()).then_some(HistoryOverlayStatus {
         offset_from_bottom: viewport.offset_from_bottom().min(999),
-        available_rows: snapshot.available_scrollback_rows.min(999),
+        // The offset counts the content rows above a cropped view too.
+        available_rows: snapshot
+            .available_scrollback_rows
+            .saturating_add(viewport.hidden_screen_rows(snapshot))
+            .min(999),
         unseen_rows: viewport.unseen_rows().min(999),
     })
 }

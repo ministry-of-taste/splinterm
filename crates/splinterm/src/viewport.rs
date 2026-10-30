@@ -1,6 +1,6 @@
 //! Client-owned bounded scrollback viewport state.
 
-use splinterm_protocol::{ActiveScreen, TerminalRow, TerminalSnapshot};
+use splinterm_protocol::{ActiveScreen, CellAttributes, TerminalRow, TerminalSnapshot};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ScrollbackViewport {
@@ -14,8 +14,8 @@ pub struct ScrollbackViewport {
     /// the cache never moves or clears what the user is reading.
     held_screen: Option<Vec<TerminalRow>>,
     /// The rows the pane's area shows, once known. A grid taller than this,
-    /// as when another Window sets the size, shows its bottom rows while
-    /// live; its top rows are reached by scrolling, like history.
+    /// as when another Window sets the size, shows the bottom of its content
+    /// while live; the rows above are reached by scrolling, like history.
     local_rows: Option<usize>,
 }
 
@@ -69,17 +69,58 @@ impl ScrollbackViewport {
             .map_or(snapshot.rows, |rows| rows.min(snapshot.rows))
     }
 
-    /// The grid's top rows a live view leaves out: none unless the grid is
-    /// taller than the pane.
+    /// Whether the grid is taller than the pane, which then shows part of it.
+    fn crops(&self, snapshot: &TerminalSnapshot) -> bool {
+        self.local_rows.is_some_and(|rows| rows < snapshot.rows)
+    }
+
+    /// The grid rows this viewport composes below history. A grid the pane
+    /// fits is composed whole. A taller one is composed down to its content's
+    /// last row, the cursor's or the last with anything on it, so a live view
+    /// shows the content's bottom and leaves out only blank rows below it;
+    /// never fewer rows than the pane shows.
+    fn screen_rows(&self, snapshot: &TerminalSnapshot) -> usize {
+        let screen = self.screen(snapshot);
+        if !self.crops(snapshot) {
+            return screen.len();
+        }
+        // A held screen is an older one; the live cursor is not on it.
+        let cursor = (!self.is_holding() && snapshot.input_modes.cursor_visible)
+            .then(|| usize::try_from(snapshot.cursor_row).ok())
+            .flatten()
+            .map(|row| row.saturating_add(1));
+        let content = screen
+            .iter()
+            .rposition(|row| !row_is_blank(row, snapshot))
+            .map(|row| row.saturating_add(1));
+        cursor
+            .max(content)
+            .unwrap_or(0)
+            .max(self.rows_shown(snapshot))
+            .min(screen.len())
+    }
+
+    /// The composed screen rows: the screen down to its content's bottom.
+    fn composed_screen<'a>(&'a self, snapshot: &'a TerminalSnapshot) -> &'a [TerminalRow] {
+        &self.screen(snapshot)[..self.screen_rows(snapshot)]
+    }
+
+    /// The content rows above the pane's that a live view leaves out: none
+    /// unless the grid is taller than the pane and its content is too.
     #[must_use]
     pub fn hidden_screen_rows(&self, snapshot: &TerminalSnapshot) -> usize {
-        snapshot.rows.saturating_sub(self.rows_shown(snapshot))
+        if self.crops(snapshot) {
+            self.screen_rows(snapshot)
+                .saturating_sub(self.rows_shown(snapshot))
+        } else {
+            0
+        }
     }
 
     /// Whether this viewport shows `snapshot`'s screen exactly as it is.
     #[must_use]
     pub fn shows_screen_unchanged(&self, snapshot: &TerminalSnapshot) -> bool {
-        self.is_live() && self.hidden_screen_rows(snapshot) == 0
+        self.is_live() && !self.crops(snapshot)
     }
 
     /// The furthest this viewport scrolls up: past the grid's hidden top
@@ -149,7 +190,7 @@ impl ScrollbackViewport {
         snapshot
             .scrollback_rows
             .len()
-            .saturating_add(self.screen(snapshot).len())
+            .saturating_add(self.screen_rows(snapshot))
     }
 
     /// Where `row_id` is among the composed rows: history, then screen.
@@ -157,7 +198,7 @@ impl ScrollbackViewport {
         snapshot
             .scrollback_rows
             .iter()
-            .chain(self.screen(snapshot))
+            .chain(self.composed_screen(snapshot))
             .position(|row| row.row_id == Some(row_id))
     }
 
@@ -218,7 +259,7 @@ impl ScrollbackViewport {
             let (start, end) = self.shown_range(snapshot);
             // A screen row is in view unless a grid taller than the pane
             // keeps it out; then the view moves just far enough to show it.
-            if self.hidden_screen_rows(snapshot) == 0 || (start..end).contains(&index) {
+            if !self.crops(snapshot) || (start..end).contains(&index) {
                 return true;
             }
             if index < start {
@@ -296,7 +337,14 @@ impl ScrollbackViewport {
         self.offset_from_bottom = self.offset_with_top(snapshot, anchor_index);
         self.unseen_rows = self.unseen_rows.saturating_add(appended);
         if self.offset_from_bottom == 0 {
-            self.return_to_live();
+            // Output alone never returns a detached view to live, as when a
+            // reverse scroll moves its top row down to the live view's.
+            if self.max_offset(snapshot) == 0 {
+                self.return_to_live();
+            } else {
+                self.offset_from_bottom = 1;
+                self.update_anchor(snapshot);
+            }
         }
     }
 
@@ -335,7 +383,7 @@ impl ScrollbackViewport {
             .or_else(|| {
                 start
                     .checked_sub(history.len())
-                    .and_then(|row| self.screen(snapshot).get(row))
+                    .and_then(|row| self.composed_screen(snapshot).get(row))
             })
             .and_then(|row| row.row_id);
         if self.anchor_row_id.is_none() {
@@ -347,15 +395,29 @@ impl ScrollbackViewport {
     pub fn visible_rows<'a>(&'a self, snapshot: &'a TerminalSnapshot) -> Vec<&'a TerminalRow> {
         if self.is_live() || snapshot.active_screen == ActiveScreen::Alternate {
             let rows = &snapshot.visible_rows;
+            let rows = &rows[..self.screen_rows(snapshot).min(rows.len())];
             let start = rows.len().saturating_sub(self.rows_shown(snapshot));
             return rows[start..].iter().collect();
         }
         let mut rows = Vec::with_capacity(self.total_rows(snapshot));
         rows.extend(snapshot.scrollback_rows.iter());
-        rows.extend(self.screen(snapshot).iter());
+        rows.extend(self.composed_screen(snapshot).iter());
         let (start, end) = self.shown_range(snapshot);
         rows[start..end].to_vec()
     }
+}
+
+/// Whether `row` shows nothing: no text, default attributes, no image.
+fn row_is_blank(row: &TerminalRow, snapshot: &TerminalSnapshot) -> bool {
+    row.cells.iter().all(|cell| {
+        cell.content.chars().all(|character| character == ' ')
+            && cell.attributes == CellAttributes::default()
+    }) && !snapshot.images.as_ref().is_some_and(|plane| {
+        plane
+            .placements
+            .iter()
+            .any(|placement| row.row_id == Some(placement.row_id))
+    })
 }
 
 #[cfg(test)]
@@ -748,5 +810,85 @@ mod tests {
         controller.scroll_down(usize::MAX, &state);
         assert!(controller.is_live());
         assert!(controller.shows_screen_unchanged(&state));
+    }
+
+    /// Writes text on grid row `row`, so the row has content.
+    fn write(state: &mut TerminalSnapshot, row: usize) {
+        state.visible_rows[row].cells = vec![splinterm_protocol::TerminalCell {
+            content: "$".to_owned(),
+            spacer_remaining: None,
+            attributes: CellAttributes::default(),
+        }];
+    }
+
+    #[test]
+    fn a_cropped_live_view_shows_the_bottom_of_the_content_not_blank_rows() {
+        // A fresh shell, or one just cleared: the prompt on the top row.
+        let mut state = grid(3, 6);
+        state.cursor_row = 0;
+        write(&mut state, 0);
+        let mut viewport = ScrollbackViewport::default();
+        viewport.set_local_rows(Some(4), Some(&state));
+        assert_eq!(shown(&viewport, &state), [4, 5, 6, 7]);
+        assert_eq!(viewport.hidden_screen_rows(&state), 0);
+        assert_eq!(viewport.max_offset(&state), 3, "history only");
+        assert_eq!(viewport.screen_row_for_shown(0, &state), 0);
+
+        // Content grows past the pane: the view follows the cursor.
+        state.cursor_row = 4;
+        assert_eq!(shown(&viewport, &state), [5, 6, 7, 8]);
+        assert_eq!(viewport.hidden_screen_rows(&state), 1);
+        assert_eq!(viewport.screen_row_for_shown(3, &state), 4);
+        // A hidden cursor counts only the rows with content.
+        state.input_modes.cursor_visible = false;
+        write(&mut state, 5);
+        assert_eq!(shown(&viewport, &state), [6, 7, 8, 9]);
+        state.visible_rows[5].cells.clear();
+        assert_eq!(shown(&viewport, &state), [4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn a_view_scrolled_back_stays_put_while_the_content_grows() {
+        let mut state = grid(3, 6);
+        state.cursor_row = 4;
+        let mut viewport = ScrollbackViewport::default();
+        viewport.set_local_rows(Some(4), Some(&state));
+        assert_eq!(shown(&viewport, &state), [5, 6, 7, 8]);
+        viewport.scroll_up(2, &state);
+        let before = shown(&viewport, &state);
+        assert_eq!(before, [3, 4, 5, 6]);
+
+        let mut grown = state.clone();
+        grown.revision += 1;
+        grown.cursor_row = 5;
+        viewport.observe_history_change(1, &state.scrollback_rows, &grown);
+        assert!(!viewport.is_live());
+        assert_eq!(viewport.offset_from_bottom(), 3);
+        assert_eq!(shown(&viewport, &grown), before);
+        viewport.scroll_down(usize::MAX, &grown);
+        assert_eq!(shown(&viewport, &grown), [6, 7, 8, 9]);
+    }
+
+    #[test]
+    fn a_reverse_scroll_never_returns_a_detached_view_to_live() {
+        let state = grid(3, 6);
+        let mut viewport = ScrollbackViewport::default();
+        viewport.set_local_rows(Some(4), Some(&state));
+        viewport.scroll_up(1, &state);
+        assert_eq!(shown(&viewport, &state), [5, 6, 7, 8]);
+
+        // Reverse index at the top: a new top row, the rest one lower.
+        let mut reversed = state.clone();
+        reversed.revision += 1;
+        reversed.visible_rows.rotate_right(1);
+        reversed.visible_rows[0].row_id = Some(10);
+        viewport.observe_history_change(1, &state.scrollback_rows, &reversed);
+        assert!(!viewport.is_live(), "output never sends the view live");
+        assert_eq!(viewport.offset_from_bottom(), 1);
+        assert_eq!(shown(&viewport, &reversed), [4, 5, 6, 7]);
+
+        // The viewer's own Window growing to the live bottom still is live.
+        viewport.set_local_rows(Some(5), Some(&reversed));
+        assert!(viewport.is_live());
     }
 }
