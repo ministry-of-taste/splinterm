@@ -728,9 +728,12 @@ pub(crate) fn paint_handoff_banner(
 }
 
 /// What a pane an agent asks to control shows (Plan 0067 M4): the notice
-/// and the keys that answer it, as `(key, verb)` pairs.
+/// and the keys that answer it, as `(key, verb)` pairs, under `title` in
+/// the frame. A pane whose display stream is lost shows one with no keys
+/// (Plan 0073).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ControlTransferStrip<'a> {
+    pub(crate) title: &'a str,
     pub(crate) label: &'a str,
     pub(crate) legend: &'a [(&'a str, &'a str)],
 }
@@ -787,7 +790,7 @@ pub(crate) fn control_transfer_notice_layout(
 }
 
 /// Paints the control transfer notice in `pane` and returns its panel, or
-/// `None` when the pane is too small for it: `control` in the frame, the
+/// `None` when the pane is too small for it: its title in the frame, the
 /// warning `!` and the notice, and the answering keys in the bottom edge,
 /// on the popup surface with the frame in the theme's warning colour. It is
 /// a picture only: it takes no keys and no clicks.
@@ -840,7 +843,7 @@ pub(crate) fn paint_control_transfer_notice(
     };
     let cell = painter.box_cell()?;
     let chrome = ChromeBox {
-        title: "control",
+        title: notice.title,
         right_label: &[],
         right_active: None,
         legend: notice.legend,
@@ -1525,6 +1528,7 @@ mod tests {
             1,
             palette,
             ControlTransferStrip {
+                title: "control",
                 label: "An agent asks to control this pane",
                 legend: &legend,
             },

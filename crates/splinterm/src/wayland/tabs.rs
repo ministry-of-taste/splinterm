@@ -575,10 +575,7 @@ impl DojoTabView {
                     hold_on_disconnect,
                     "hidden pane update stream disconnected unexpectedly"
                 );
-                pane.controller_active = false;
-                pane.commands = None;
-                pane.pending_control_transfer = None;
-                pane.updates = None;
+                pane.end_stream();
                 held = true;
             }
             for update in pending {

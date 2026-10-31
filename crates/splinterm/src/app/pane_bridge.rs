@@ -1,5 +1,6 @@
 //! Daemon-to-frontend pane protocol bridge.
 
+use std::future::Future;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -10,11 +11,13 @@ use anyhow::{Result, bail};
 #[cfg(test)]
 use splinterm::automation::response_protocol_error;
 use splinterm::automation::{
-    Connection, ImageContentLeaseSet, SharedImageContentCache, protocol_error,
+    Connection, DaemonChange, DaemonIdentity, ImageContentLeaseSet, SharedImageContentCache,
+    protocol_error,
 };
 use splinterm::config::AppConfig;
+use splinterm::diagnostics::{DiagnosticErrorCode, DiagnosticEventCode, DiagnosticLevel};
 use splinterm::endpoint::{ConnectionFactory, ForcedControlTransfer, ImageTransport};
-use splinterm::handoff_status::HandoffStatusSource;
+use splinterm::handoff_status::{HandoffStatusHub, HandoffStatusSource};
 use splinterm::{
     AuthorityStatus, PerfTraceCorrelation, TerminalGridLimits, WindowCommand, WindowPaneOptions,
     WindowUpdate,
@@ -1487,21 +1490,29 @@ pub(in crate::app) async fn prepare_live_pane_at_incarnation(
         resize_delay_ms,
         cancellation.clone(),
     ));
-    let task_updates = updates.clone();
     let detach_on_cancel = Arc::new(AtomicBool::new(false));
-    let task = tokio::spawn(run_pane_subscription(
-        connection,
-        attachment,
-        controller,
-        resyncs,
-        task_updates,
-        splint_id,
-        incarnation,
-        factory.capabilities().image_transport,
-        image_cache.clone(),
-        cancellation.clone(),
-        Arc::clone(&detach_on_cancel),
-    ));
+    let task = spawn_pane_subscription(
+        factory,
+        PaneStream {
+            connection,
+            attachment,
+        },
+        PaneSubscription {
+            controller,
+            controller_completed: false,
+            resyncs,
+            updates,
+            splint_id,
+            incarnation,
+            image_transport: factory.capabilities().image_transport,
+            image_cache: image_cache.clone(),
+            cancellation: cancellation.clone(),
+            detach_on_cancel: Arc::clone(&detach_on_cancel),
+            lagged: false,
+            control_lost_owed: false,
+            retry: StreamRetry::default(),
+        },
+    );
     Ok(PreparedPane {
         options: WindowPaneOptions {
             snapshot,
@@ -1514,6 +1525,42 @@ pub(in crate::app) async fn prepare_live_pane_at_incarnation(
         },
         task: PaneTask::new(cancellation, task, detach_on_cancel),
     })
+}
+
+/// Starts a pane's display subscription, which reattaches through
+/// `factory` to the daemon `stream` is connected to when the stream fails
+/// (Plan 0073).
+fn spawn_pane_subscription(
+    factory: &ConnectionFactory,
+    stream: PaneStream,
+    pane: PaneSubscription,
+) -> tokio::task::JoinHandle<Result<()>> {
+    let daemon = DaemonIdentity::of(&stream.connection);
+    let (splint_id, incarnation) = (pane.splint_id, pane.incarnation);
+    let image_transport = pane.image_transport;
+    let image_cache = pane.image_cache.clone();
+    let reconnect_factory = factory.clone();
+    tokio::spawn(run_pane_subscription(
+        stream,
+        pane,
+        factory.handoff_status().clone(),
+        move || {
+            let factory = reconnect_factory.clone();
+            let image_cache = image_cache.clone();
+            async move {
+                let connected = factory.connect().await;
+                reattach_pane_stream(
+                    connected,
+                    daemon,
+                    splint_id,
+                    incarnation,
+                    image_transport,
+                    &image_cache,
+                )
+                .await
+            }
+        },
+    ))
 }
 
 pub(in crate::app) fn lease_snapshot_images(
@@ -1613,192 +1660,680 @@ async fn finish_pane_controller(
     Ok(())
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    clippy::too_many_lines,
-    reason = "subscription ordering and controller resynchronization form one pane lifecycle"
-)]
-pub(in crate::app) async fn run_pane_subscription(
-    mut connection: Connection,
-    mut attachment: Attachment,
-    mut controller: tokio::task::JoinHandle<Result<()>>,
-    mut resyncs: mpsc::Receiver<()>,
-    updates: mpsc::Sender<WindowUpdate>,
-    splint_id: SplintId,
-    incarnation: u64,
-    image_transport: ImageTransport,
-    image_cache: SharedImageContentCache,
-    cancellation: tokio_util::sync::CancellationToken,
-    detach_on_cancel: Arc<AtomicBool>,
-) -> Result<()> {
-    let mut last_revision = attachment.snapshot.revision;
-    let mut last_sequence = 0_u64;
-    let mut controller_completed = false;
-    loop {
+/// Plan 0073: the first pause before a pane's lost display stream
+/// reconnects. Each failed attempt doubles it, up to
+/// [`PANE_STREAM_RETRY_MAX`].
+const PANE_STREAM_RETRY_INITIAL: Duration = Duration::from_millis(250);
+/// Plan 0073: the longest pause between a pane's display reconnections.
+const PANE_STREAM_RETRY_MAX: Duration = Duration::from_secs(5);
+/// Plan 0073: bounds one display reconnection, as when a remote link stalls
+/// mid-handshake.
+const PANE_STREAM_ATTEMPT_DEADLINE: Duration = Duration::from_secs(15);
+/// Plan 0073: how long a pane's display may stay lost before the pane says so.
+const PANE_STREAM_NOTICE_DELAY: Duration = Duration::from_secs(2);
+/// Plan 0073: how long a reattached display stream must stay up before its
+/// next loss starts a new outage. One lost sooner continues the outage
+/// before it, so a stream that fails again at once backs off.
+const PANE_STREAM_STABLE: Duration = Duration::from_secs(30);
+/// Plan 0073: how long the subscription waits for room in its pane's update
+/// queue. A Window that leaves it full longer (a stalled Window, or a pane
+/// held back while the Dojo picker is open) would stop this task reading its
+/// connection until splinterd drops the connection for a stalled write. The
+/// subscription keeps reading instead, drops what it reads, and gives the
+/// Window an authoritative snapshot once the queue has room.
+const PANE_UPDATE_SEND_GRACE: Duration = Duration::from_secs(1);
+
+/// A pane's display subscription: its connection and its attachment.
+pub(in crate::app) struct PaneStream {
+    pub(in crate::app) connection: Connection,
+    pub(in crate::app) attachment: Attachment,
+}
+
+/// What one attempt to reattach a pane's display found.
+pub(in crate::app) enum StreamReconnect {
+    Attached(Box<PaneStream>),
+    /// The pane's process ended or another took its place meanwhile: the
+    /// Window takes the exit path the lost stream would have started.
+    Exited,
+    /// Retrying cannot help, for the reason given: the Splint is gone,
+    /// splinterd restarted, or it refuses this client. The Window's topology
+    /// and lifecycle paths handle the pane from here.
+    Stop(&'static str),
+    /// splinterd was upgraded: the handoff's coordinator replaces the pane,
+    /// so it stops trying without a word.
+    Handoff,
+}
+
+/// Plan 0073: a pane's reconnection backoff, which outlives each outage.
+#[derive(Debug)]
+pub(in crate::app) struct StreamRetry {
+    /// The pause before the next reconnection attempt.
+    delay: Duration,
+    /// When the current outage began, counting reattachments it outlived.
+    outage_since: Option<tokio::time::Instant>,
+    /// When the stream was last reattached.
+    reattached_at: Option<tokio::time::Instant>,
+}
+
+impl Default for StreamRetry {
+    fn default() -> Self {
+        Self {
+            delay: PANE_STREAM_RETRY_INITIAL,
+            outage_since: None,
+            reattached_at: None,
+        }
+    }
+}
+
+impl StreamRetry {
+    /// The stream was lost at `now`; returns when the Window is to be told.
+    /// A stream lost within [`PANE_STREAM_STABLE`] of its reattachment
+    /// continues the outage before it: the pause grows, and the notice
+    /// counts from that outage's start.
+    fn lost(&mut self, now: tokio::time::Instant) -> tokio::time::Instant {
+        let continued = self
+            .reattached_at
+            .take()
+            .is_some_and(|at| now.duration_since(at) < PANE_STREAM_STABLE);
+        if continued {
+            self.backed_off();
+        } else {
+            self.delay = PANE_STREAM_RETRY_INITIAL;
+            self.outage_since = None;
+        }
+        let since = *self.outage_since.get_or_insert(now);
+        (since + PANE_STREAM_NOTICE_DELAY).max(now)
+    }
+
+    fn backed_off(&mut self) {
+        self.delay = self.delay.saturating_mul(2).min(PANE_STREAM_RETRY_MAX);
+    }
+}
+
+/// What became of one update given to the Window.
+enum Delivery {
+    Sent,
+    /// The Window left its queue full past [`PANE_UPDATE_SEND_GRACE`]; the
+    /// update was dropped.
+    Lagged,
+    /// The Window is gone, or the pane is closing.
+    Closed,
+}
+
+/// The pane-lifetime half of a display subscription, which outlives each
+/// of its connections (Plan 0073): the controller, the resynchronization
+/// requests the controller forwards, and the Window's update queue.
+pub(in crate::app) struct PaneSubscription {
+    pub(in crate::app) controller: tokio::task::JoinHandle<Result<()>>,
+    pub(in crate::app) controller_completed: bool,
+    pub(in crate::app) resyncs: mpsc::Receiver<()>,
+    pub(in crate::app) updates: mpsc::Sender<WindowUpdate>,
+    pub(in crate::app) splint_id: SplintId,
+    pub(in crate::app) incarnation: u64,
+    pub(in crate::app) image_transport: ImageTransport,
+    pub(in crate::app) image_cache: SharedImageContentCache,
+    pub(in crate::app) cancellation: tokio_util::sync::CancellationToken,
+    pub(in crate::app) detach_on_cancel: Arc<AtomicBool>,
+    /// An update was dropped while the Window's queue stayed full: the
+    /// Window is owed an authoritative snapshot once the queue has room.
+    pub(in crate::app) lagged: bool,
+    /// The controller ended while the Window's queue was full: the Window
+    /// is owed `Control(false)` once the queue has room.
+    pub(in crate::app) control_lost_owed: bool,
+    pub(in crate::app) retry: StreamRetry,
+}
+
+impl PaneSubscription {
+    async fn deliver(&mut self, update: WindowUpdate) -> Delivery {
+        let delivery = tokio::select! {
+            biased;
+            () = self.cancellation.cancelled() => Delivery::Closed,
+            sent = tokio::time::timeout(PANE_UPDATE_SEND_GRACE, self.updates.send(update)) => {
+                match sent {
+                    Ok(Ok(())) => Delivery::Sent,
+                    Ok(Err(_)) => Delivery::Closed,
+                    Err(_) => Delivery::Lagged,
+                }
+            }
+        };
+        if matches!(delivery, Delivery::Lagged) {
+            self.lagged = true;
+        }
+        delivery
+    }
+
+    /// Gives the Window `update`; returns whether the pane goes on.
+    async fn deliver_or_lag(&mut self, update: WindowUpdate) -> bool {
+        !matches!(self.deliver(update).await, Delivery::Closed)
+    }
+
+    /// Gives the Window its pane's last notice, however long that takes.
+    async fn deliver_final(&self, update: WindowUpdate) {
         tokio::select! {
-            () = cancellation.cancelled() => {
-                if detach_on_cancel.load(Ordering::Acquire) {
-                    let _ = connection
-                        .request_with_deadline(
-                            Request::Detach {
-                                subscription_id: attachment.subscription_id,
-                            },
-                            PANE_DETACH_DEADLINE,
-                        )
-                        .await;
-                }
-                return finish_pane_controller(&mut controller, controller_completed).await;
-            }
-            result = &mut controller, if !controller_completed => {
-                report_pane_controller_result(result);
-                controller_completed = true;
-                let _ = updates.send(WindowUpdate::Control(false)).await;
-            }
-            Some(()) = resyncs.recv() => {
-                attachment = resynchronize(
-                    &mut connection, attachment.subscription_id, splint_id, incarnation,
-                ).await?;
-                last_revision = attachment.snapshot.revision;
-                last_sequence = 0;
-                resolve_image_contents(
-                    image_transport, &mut connection, &attachment.snapshot, &image_cache,
-                ).await?;
-                let image_sources = lease_snapshot_images(&image_cache, &attachment.snapshot)?;
-                if updates.send(WindowUpdate::Snapshot {
-                    snapshot: attachment.snapshot.clone(),
-                    image_sources,
-                    authoritative: true,
-                }).await.is_err() {
-                    return finish_pane_controller(&mut controller, controller_completed).await;
-                }
-            }
-            frame = connection.next_server_frame() => {
-                let ServerFrame::Event { subscription_id, sequence, event } = frame? else {
-                    bail!("splinterd sent an unexpected frame while subscribed");
-                };
-                match classify_subscription_event(
-                    attachment.subscription_id, last_sequence, subscription_id, sequence, event,
-                ) {
-                    EventAction::Ignore => {}
-                    EventAction::Skip { sequence } => last_sequence = sequence,
-                    EventAction::Snapshot { sequence, snapshot } => {
-                        validate_attached_snapshot(&snapshot, splint_id, incarnation)?;
-                        last_revision = snapshot.revision;
-                        resolve_image_contents(
-                            image_transport, &mut connection, &snapshot, &image_cache,
-                        ).await?;
-                        let image_sources = lease_snapshot_images(&image_cache, &snapshot)?;
-                        if updates.send(WindowUpdate::Snapshot {
-                            snapshot,
-                            image_sources,
-                            authoritative: false,
-                        }).await.is_err() {
-                            return finish_pane_controller(&mut controller, controller_completed).await;
-                        }
-                        last_sequence = sequence;
+            biased;
+            () = self.cancellation.cancelled() => {}
+            _ = self.updates.send(update) => {}
+        }
+    }
+
+    /// Gives the Window `snapshot` as authoritative, which ends any hold or
+    /// resynchronization it waits on; returns whether the pane goes on.
+    async fn deliver_snapshot(&mut self, snapshot: &TerminalSnapshot) -> Result<bool> {
+        let image_sources = lease_snapshot_images(&self.image_cache, snapshot)?;
+        self.lagged = false;
+        let snapshot = WindowUpdate::Snapshot {
+            snapshot: snapshot.clone(),
+            image_sources,
+            authoritative: true,
+        };
+        if !self.deliver_or_lag(snapshot).await {
+            return Ok(false);
+        }
+        if self.control_lost_owed && !self.lagged {
+            return Ok(self.deliver_control_lost().await);
+        }
+        Ok(true)
+    }
+
+    /// Tells the Window its pane's controller ended, or owes it that once
+    /// the queue has room; returns whether the pane goes on.
+    async fn deliver_control_lost(&mut self) -> bool {
+        match self.deliver(WindowUpdate::Control(false)).await {
+            Delivery::Sent => self.control_lost_owed = false,
+            Delivery::Lagged => self.control_lost_owed = true,
+            Delivery::Closed => return false,
+        }
+        true
+    }
+
+    /// Attaches again on `stream`'s connection and gives the Window that
+    /// snapshot; returns whether the pane goes on.
+    async fn resnapshot(&mut self, stream: &mut PaneStream) -> Result<bool> {
+        stream.attachment = resynchronize(
+            &mut stream.connection,
+            stream.attachment.subscription_id,
+            self.splint_id,
+            self.incarnation,
+        )
+        .await?;
+        resolve_image_contents(
+            self.image_transport,
+            &mut stream.connection,
+            &stream.attachment.snapshot,
+            &self.image_cache,
+        )
+        .await?;
+        self.deliver_snapshot(&stream.attachment.snapshot).await
+    }
+
+    async fn detach_if_closing(&self, stream: &mut PaneStream) {
+        if self.detach_on_cancel.load(Ordering::Acquire) {
+            let _ = stream
+                .connection
+                .request_with_deadline(
+                    Request::Detach {
+                        subscription_id: stream.attachment.subscription_id,
+                    },
+                    PANE_DETACH_DEADLINE,
+                )
+                .await;
+        }
+    }
+
+    async fn finish(mut self) -> Result<()> {
+        finish_pane_controller(&mut self.controller, self.controller_completed).await
+    }
+
+    /// Follows `stream` until the pane closes, its Splint exits, or the
+    /// Window goes (`Ok`), or until the stream fails. A `fresh` stream's
+    /// attachment is given to the Window first, as authoritative.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "subscription ordering and resynchronization form one loop"
+    )]
+    async fn follow(&mut self, stream: &mut PaneStream, fresh: bool) -> Result<()> {
+        if fresh && !self.deliver_snapshot(&stream.attachment.snapshot).await? {
+            return Ok(());
+        }
+        let mut last_revision = stream.attachment.snapshot.revision;
+        let mut last_sequence = 0_u64;
+        loop {
+            tokio::select! {
+                () = self.cancellation.cancelled() => return Ok(()),
+                result = &mut self.controller, if !self.controller_completed => {
+                    report_pane_controller_result(result);
+                    self.controller_completed = true;
+                    if !self.deliver_control_lost().await {
+                        return Ok(());
                     }
-                    EventAction::Update { sequence, update }
-                        if update_advances_from(&update, last_revision) => {
-                        if perf_trace_enabled() {
-                            emit_perf_trace(
-                                "splinterm",
-                                "client_receive",
-                                PerfTraceEvent {
-                                    splint_id: Some(splint_id),
-                                    incarnation: Some(incarnation),
-                                    base_revision: Some(update.base_revision),
-                                    revision: Some(update.revision),
-                                    subscription_id: Some(attachment.subscription_id),
-                                    transaction_sequence: Some(sequence),
-                                    rows: Some(u64::try_from(update.rows.len()).unwrap_or(u64::MAX)),
-                                    count: Some(1),
-                                    ..PerfTraceEvent::default()
-                                },
-                            );
+                }
+                Some(()) = self.resyncs.recv() => {
+                    if !self.resnapshot(stream).await? {
+                        return Ok(());
+                    }
+                    last_revision = stream.attachment.snapshot.revision;
+                    last_sequence = 0;
+                }
+                // Room again: the Window takes the snapshot it is owed.
+                open = async { self.updates.reserve().await.is_ok() }, if self.lagged => {
+                    if !open || !self.resnapshot(stream).await? {
+                        return Ok(());
+                    }
+                    last_revision = stream.attachment.snapshot.revision;
+                    last_sequence = 0;
+                }
+                frame = stream.connection.next_server_frame() => {
+                    let ServerFrame::Event { subscription_id, sequence, event } = frame? else {
+                        bail!("splinterd sent an unexpected frame while subscribed");
+                    };
+                    let action = classify_subscription_event(
+                        stream.attachment.subscription_id, last_sequence, subscription_id, sequence, event,
+                    );
+                    // Read and dropped while the Window's queue stays full:
+                    // the snapshot it is owed covers it.
+                    if self.lagged && !matches!(action, EventAction::Exited | EventAction::Shutdown) {
+                        continue;
+                    }
+                    match action {
+                        EventAction::Exited => {
+                            self.deliver_final(WindowUpdate::Exited { splint_id: self.splint_id }).await;
+                            return Ok(());
                         }
-                        last_revision = update.revision;
-                        resolve_update_images(
-                            image_transport,
-                            &mut connection,
-                            &update,
-                            splint_id,
-                            incarnation,
-                            &image_cache,
-                        ).await?;
-                        let image_sources = lease_update_images(&image_cache, &update)?;
-                        let base_revision = update.base_revision;
-                        let revision = update.revision;
-                        let queue_depth = updates.max_capacity().saturating_sub(updates.capacity());
-                        let enqueue_started = perf_trace_enabled().then(Instant::now);
-                        if updates
-                            .send(WindowUpdate::Update {
-                                update,
+                        EventAction::Shutdown => {
+                            self.deliver_final(WindowUpdate::Shutdown).await;
+                            return Ok(());
+                        }
+                        EventAction::Ignore => {}
+                        EventAction::Skip { sequence } => last_sequence = sequence,
+                        EventAction::Snapshot { sequence, snapshot } => {
+                            validate_attached_snapshot(&snapshot, self.splint_id, self.incarnation)?;
+                            last_revision = snapshot.revision;
+                            resolve_image_contents(
+                                self.image_transport, &mut stream.connection, &snapshot, &self.image_cache,
+                            ).await?;
+                            let image_sources = lease_snapshot_images(&self.image_cache, &snapshot)?;
+                            if !self.deliver_or_lag(WindowUpdate::Snapshot {
+                                snapshot,
                                 image_sources,
-                                trace: perf_trace_enabled().then_some(PerfTraceCorrelation {
-                                    base_revision,
-                                    revision,
-                                    subscription_id: attachment.subscription_id,
-                                    transaction_sequence: sequence,
-                                }),
-                            })
-                            .await
-                            .is_err()
-                        {
-                            return finish_pane_controller(&mut controller, controller_completed).await;
+                                authoritative: false,
+                            }).await {
+                                return Ok(());
+                            }
+                            last_sequence = sequence;
                         }
-                        if let Some(started) = enqueue_started {
-                            emit_perf_trace(
-                                "splinterm",
-                                "client_enqueue",
-                                PerfTraceEvent {
-                                    splint_id: Some(splint_id),
-                                    incarnation: Some(incarnation),
-                                    base_revision: Some(base_revision),
-                                    revision: Some(revision),
-                                    subscription_id: Some(attachment.subscription_id),
-                                    transaction_sequence: Some(sequence),
-                                    duration_ns: Some(
-                                        u64::try_from(started.elapsed().as_nanos())
-                                            .unwrap_or(u64::MAX),
-                                    ),
-                                    queue_depth: Some(
-                                        u64::try_from(queue_depth).unwrap_or(u64::MAX),
-                                    ),
-                                    ..PerfTraceEvent::default()
-                                },
-                            );
+                        EventAction::Update { sequence, update }
+                            if update_advances_from(&update, last_revision) => {
+                            let splint_id = self.splint_id;
+                            let incarnation = self.incarnation;
+                            let subscription_id = stream.attachment.subscription_id;
+                            if perf_trace_enabled() {
+                                emit_perf_trace(
+                                    "splinterm",
+                                    "client_receive",
+                                    PerfTraceEvent {
+                                        splint_id: Some(splint_id),
+                                        incarnation: Some(incarnation),
+                                        base_revision: Some(update.base_revision),
+                                        revision: Some(update.revision),
+                                        subscription_id: Some(subscription_id),
+                                        transaction_sequence: Some(sequence),
+                                        rows: Some(u64::try_from(update.rows.len()).unwrap_or(u64::MAX)),
+                                        count: Some(1),
+                                        ..PerfTraceEvent::default()
+                                    },
+                                );
+                            }
+                            last_revision = update.revision;
+                            resolve_update_images(
+                                self.image_transport,
+                                &mut stream.connection,
+                                &update,
+                                splint_id,
+                                incarnation,
+                                &self.image_cache,
+                            ).await?;
+                            let image_sources = lease_update_images(&self.image_cache, &update)?;
+                            let base_revision = update.base_revision;
+                            let revision = update.revision;
+                            let queue_depth =
+                                self.updates.max_capacity().saturating_sub(self.updates.capacity());
+                            let enqueue_started = perf_trace_enabled().then(Instant::now);
+                            if !self
+                                .deliver_or_lag(WindowUpdate::Update {
+                                    update,
+                                    image_sources,
+                                    trace: perf_trace_enabled().then_some(PerfTraceCorrelation {
+                                        base_revision,
+                                        revision,
+                                        subscription_id,
+                                        transaction_sequence: sequence,
+                                    }),
+                                })
+                                .await
+                            {
+                                return Ok(());
+                            }
+                            if let Some(started) = enqueue_started {
+                                emit_perf_trace(
+                                    "splinterm",
+                                    "client_enqueue",
+                                    PerfTraceEvent {
+                                        splint_id: Some(splint_id),
+                                        incarnation: Some(incarnation),
+                                        base_revision: Some(base_revision),
+                                        revision: Some(revision),
+                                        subscription_id: Some(subscription_id),
+                                        transaction_sequence: Some(sequence),
+                                        duration_ns: Some(
+                                            u64::try_from(started.elapsed().as_nanos())
+                                                .unwrap_or(u64::MAX),
+                                        ),
+                                        queue_depth: Some(
+                                            u64::try_from(queue_depth).unwrap_or(u64::MAX),
+                                        ),
+                                        ..PerfTraceEvent::default()
+                                    },
+                                );
+                            }
+                            last_sequence = sequence;
                         }
-                        last_sequence = sequence;
-                    }
-                    EventAction::Update { .. } | EventAction::Resynchronize => {
-                        attachment = resynchronize(
-                            &mut connection, attachment.subscription_id, splint_id, incarnation,
-                        ).await?;
-                        last_revision = attachment.snapshot.revision;
-                        last_sequence = 0;
-                        resolve_image_contents(
-                            image_transport, &mut connection, &attachment.snapshot, &image_cache,
-                        ).await?;
-                        let image_sources = lease_snapshot_images(&image_cache, &attachment.snapshot)?;
-                        if updates.send(WindowUpdate::Snapshot {
-                            snapshot: attachment.snapshot.clone(),
-                            image_sources,
-                            authoritative: true,
-                        }).await.is_err() {
-                            return finish_pane_controller(&mut controller, controller_completed).await;
+                        EventAction::Update { .. } | EventAction::Resynchronize => {
+                            if !self.resnapshot(stream).await? {
+                                return Ok(());
+                            }
+                            last_revision = stream.attachment.snapshot.revision;
+                            last_sequence = 0;
                         }
-                    }
-                    EventAction::Exited => {
-                        let _ = updates.send(WindowUpdate::Exited { splint_id }).await;
-                        return finish_pane_controller(&mut controller, controller_completed).await;
-                    }
-                    EventAction::Shutdown => {
-                        let _ = updates.send(WindowUpdate::Shutdown).await;
-                        return finish_pane_controller(&mut controller, controller_completed).await;
                     }
                 }
             }
         }
+    }
+
+    /// Waits out a lost display stream, reconnecting through `reconnect`
+    /// with backoff until it is back (`Some`) or the pane closes (`None`).
+    /// Meanwhile the controller's resynchronization requests are taken and
+    /// coalesced (the reattachment answers them), the Window is told once
+    /// the display stays lost for [`PANE_STREAM_NOTICE_DELAY`], and no
+    /// attempt is made while a daemon handoff pauses the Window: its
+    /// coordinator replaces the pane. A process that ended meanwhile is
+    /// delivered as an exit, so the Window takes its usual exit path. A
+    /// reconnection that cannot succeed stops the attempts; the pane then
+    /// waits to be closed. The backoff outlives the outage (see
+    /// [`StreamRetry`]).
+    #[allow(
+        clippy::too_many_lines,
+        reason = "an outage's notice, attempts and pane lifetime form one loop"
+    )]
+    async fn recover<R, F>(
+        &mut self,
+        error: &anyhow::Error,
+        hub: &HandoffStatusHub,
+        reconnect: &mut R,
+    ) -> Option<PaneStream>
+    where
+        R: FnMut() -> F,
+        F: Future<Output = Result<StreamReconnect>>,
+    {
+        let splint_id = self.splint_id;
+        let lost_at = tokio::time::Instant::now();
+        let mut notice_at = Some(self.retry.lost(lost_at));
+        let mut next_attempt = Some(lost_at + self.retry.delay);
+        // Reported with the first attempt's outcome, not now: a loss during
+        // a handoff is expected (its coordinator replaces the pane), and the
+        // connection can end just before the Window learns of the handoff.
+        let mut loss = Some(error);
+        let mut attempts = 0_u32;
+        let mut reconnecting = true;
+        loop {
+            tokio::select! {
+                biased;
+                () = self.cancellation.cancelled() => return None,
+                () = self.updates.closed() => return None,
+                result = &mut self.controller, if !self.controller_completed => {
+                    report_pane_controller_result(result);
+                    self.controller_completed = true;
+                    self.control_lost_owed = true;
+                }
+                // Room again: the Window learns its controller ended.
+                open = async { self.updates.reserve().await.is_ok() }, if self.control_lost_owed => {
+                    if !open {
+                        return None;
+                    }
+                    if self.updates.try_send(WindowUpdate::Control(false)).is_ok() {
+                        self.control_lost_owed = false;
+                    }
+                }
+                // The reattachment's snapshot answers it.
+                Some(()) = self.resyncs.recv() => {}
+                // The handoff banner speaks for the Window while it is paused.
+                () = sleep_until_some(notice_at) => {
+                    let later = Some(tokio::time::Instant::now() + PANE_STREAM_RETRY_INITIAL);
+                    notice_at = if hub.input_paused() {
+                        later
+                    } else {
+                        match self.updates.try_send(WindowUpdate::StreamLost { reconnecting }) {
+                            Err(mpsc::error::TrySendError::Full(_)) => later,
+                            _ => None,
+                        }
+                    };
+                }
+                () = sleep_until_some(next_attempt) => {
+                    if hub.input_paused() {
+                        next_attempt = Some(tokio::time::Instant::now() + self.retry.delay);
+                        continue;
+                    }
+                    attempts += 1;
+                    let attempt = tokio::select! {
+                        biased;
+                        () = self.cancellation.cancelled() => return None,
+                        attempt = tokio::time::timeout(PANE_STREAM_ATTEMPT_DEADLINE, reconnect()) => {
+                            attempt.unwrap_or_else(|_| {
+                                Err(anyhow::anyhow!("splinterd did not answer in time"))
+                            })
+                        }
+                    };
+                    if !hub.input_paused() && !matches!(attempt, Ok(StreamReconnect::Handoff)) {
+                        if let Some(error) = loss.take() {
+                            report_pane_stream_loss(splint_id, error);
+                        }
+                    }
+                    match attempt {
+                        Ok(StreamReconnect::Attached(stream)) => {
+                            eprintln!(
+                                "splinterm pane {splint_id}: display stream reconnected after {attempts} attempt(s)"
+                            );
+                            self.retry.reattached_at = Some(tokio::time::Instant::now());
+                            return Some(*stream);
+                        }
+                        Ok(StreamReconnect::Exited) => {
+                            eprintln!(
+                                "splinterm pane {splint_id}: its process ended while the display was lost"
+                            );
+                            self.deliver_final(WindowUpdate::Exited { splint_id }).await;
+                            return None;
+                        }
+                        Ok(StreamReconnect::Stop(reason)) => {
+                            eprintln!("splinterm pane {splint_id}: display stream not reconnected: {reason}");
+                            next_attempt = None;
+                            // The pane stops saying it is reconnecting.
+                            reconnecting = false;
+                            notice_at = Some(tokio::time::Instant::now());
+                        }
+                        // The handoff's coordinator replaces the pane.
+                        Ok(StreamReconnect::Handoff) => {
+                            next_attempt = None;
+                            notice_at = None;
+                        }
+                        Err(error) => {
+                            if attempts.is_power_of_two() {
+                                eprintln!(
+                                    "splinterm pane {splint_id}: display reconnection attempt {attempts} failed: {error:#}"
+                                );
+                            }
+                            self.retry.backed_off();
+                            next_attempt = Some(tokio::time::Instant::now() + self.retry.delay);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Plan 0073: says that a pane's display stream was lost and is reconnecting.
+fn report_pane_stream_loss(splint_id: SplintId, error: &anyhow::Error) {
+    eprintln!("splinterm pane {splint_id}: display stream lost: {error:#}; reconnecting");
+    if let Some(diagnostics) = splinterm::diagnostics::global() {
+        diagnostics.emit(
+            DiagnosticLevel::Warn,
+            DiagnosticEventCode::PaneStreamFailure,
+            Some(DiagnosticErrorCode::PaneStream),
+        );
+    }
+}
+
+async fn sleep_until_some(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Plan 0073: a pane's display subscription. It follows `stream`, and when
+/// the stream fails it reattaches through `reconnect` with backoff for as
+/// long as the pane lives, so a dropped connection never leaves the pane
+/// frozen: the Window gets the reattachment's snapshot as authoritative and
+/// live updates after it. The controller's resynchronization requests stay
+/// taken across outages, so the controller never finds them refused.
+pub(in crate::app) async fn run_pane_subscription<R, F>(
+    mut stream: PaneStream,
+    mut pane: PaneSubscription,
+    hub: HandoffStatusHub,
+    mut reconnect: R,
+) -> Result<()>
+where
+    R: FnMut() -> F,
+    F: Future<Output = Result<StreamReconnect>>,
+{
+    let mut fresh = false;
+    loop {
+        let followed = pane.follow(&mut stream, fresh).await;
+        if pane.cancellation.is_cancelled() {
+            pane.detach_if_closing(&mut stream).await;
+            return pane.finish().await;
+        }
+        let Err(error) = followed else {
+            return pane.finish().await;
+        };
+        // Closed first: a remote Window's relay counts this channel.
+        drop(stream);
+        let Some(next) = pane.recover(&error, &hub, &mut reconnect).await else {
+            return pane.finish().await;
+        };
+        stream = next;
+        fresh = true;
+    }
+}
+
+/// Plan 0073: attaches a pane's Splint again on `connected`, a new
+/// connection to the daemon `before` served it from, as
+/// [`prepare_live_pane_at_incarnation`] first did: access, attachment and
+/// images. A process that ended or was replaced is reported as exited; a
+/// Splint that is gone, a restarted daemon, and refused access or trust stop
+/// the reconnection, and an upgraded daemon leaves the pane to its handoff;
+/// any other failure is retried.
+pub(in crate::app) async fn reattach_pane_stream(
+    connected: Result<Connection>,
+    before: DaemonIdentity,
+    splint_id: SplintId,
+    incarnation: u64,
+    image_transport: ImageTransport,
+    image_cache: &SharedImageContentCache,
+) -> Result<StreamReconnect> {
+    let mut connection = match connected {
+        Err(error) if refused_as_untrusted(&error) => {
+            return Ok(StreamReconnect::Stop(
+                "splinterd no longer trusts this client build",
+            ));
+        }
+        connected => connected?,
+    };
+    match before.change_to(DaemonIdentity::of(&connection)) {
+        DaemonChange::Same => {}
+        DaemonChange::Upgraded { .. } => return Ok(StreamReconnect::Handoff),
+        DaemonChange::Restarted => return Ok(StreamReconnect::Stop("splinterd restarted")),
+    }
+    let Some(inspected) = unless_splint_gone(
+        connection
+            .request(Request::InspectSplint { splint_id })
+            .await,
+    )?
+    else {
+        return Ok(StreamReconnect::Stop("the Splint is gone"));
+    };
+    let Response::Splint { runtime, .. } = inspected else {
+        bail!("splinterd did not return the selected Splint identity");
+    };
+    if runtime.splint_id != splint_id {
+        bail!("splinterd returned a different Splint");
+    }
+    // Ended since, or ending now: the process this pane showed is gone.
+    let ended = StreamReconnect::Exited;
+    if runtime.live_incarnation != Some(incarnation) {
+        return Ok(ended);
+    }
+    match connection
+        .request(Request::RequestAccess {
+            splint_id,
+            incarnation,
+            scopes: pane_access_scopes(),
+        })
+        .await
+    {
+        Ok(Response::AccessGranted { .. }) => {}
+        Ok(_) => bail!("splinterd did not grant requested terminal access"),
+        Err(error) if refused_as_untrusted(&error) => {
+            return Ok(StreamReconnect::Stop("splinterd refused terminal access"));
+        }
+        Err(error) if splint_gone(&error) => return Ok(ended),
+        Err(error) => return Err(error),
+    }
+    let Some(attachment) =
+        unless_splint_gone(attach(&mut connection, splint_id, incarnation).await)?
+    else {
+        return Ok(ended);
+    };
+    resolve_image_contents(
+        image_transport,
+        &mut connection,
+        &attachment.snapshot,
+        image_cache,
+    )
+    .await?;
+    Ok(StreamReconnect::Attached(Box::new(PaneStream {
+        connection,
+        attachment,
+    })))
+}
+
+/// Whether the daemon says the Splint is gone or its process changed, as
+/// when it was removed during an upgrade (review S8).
+pub(in crate::app) fn splint_gone(error: &anyhow::Error) -> bool {
+    protocol_error(error).is_some_and(|error| {
+        matches!(
+            error.code,
+            ErrorCode::NotFound | ErrorCode::StaleIncarnation
+        )
+    })
+}
+
+/// `Some` value, `None` when the Splint is gone, or the other error.
+pub(in crate::app) fn unless_splint_gone<T>(result: Result<T>) -> Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if splint_gone(&error) => Ok(None),
+        Err(error) => Err(error),
     }
 }
 
