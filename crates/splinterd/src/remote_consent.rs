@@ -46,7 +46,8 @@ use std::{
 use splinterm_protocol::{
     CONSENT_APPROVER_NEEDS_TERMINAL, CONSENT_OFFER_NONCE_BYTES, CONSENT_RESPONDER_IDENTITY_CHANGED,
     ConsentDecision, ConsentOffer, ConsentOfferEnd, ConsentOfferNonce, ConsentResponderKind,
-    ErrorCode, OfferedConsentPrompt, ProtocolError, SubscriptionEvent,
+    ErrorCode, FORCED_TAKEOVER_AGENT_PROMPT_OPEN, FORCED_TAKEOVER_ALREADY_CONFIRMING,
+    OfferedConsentPrompt, ProtocolError, SubscriptionEvent,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
@@ -80,9 +81,11 @@ pub const ROUTES_CLOSED: &str = "the Window or approver showing the prompt close
 /// (Plan 0072 M3). Nothing else is asked.
 pub const NO_WINDOW_ROUTE: &str =
     "this Window cannot show the forced-control confirmation (are remote agent prompts off?)";
-/// Why it ends so when that Window's responder already shows a prompt.
-pub const WINDOW_ROUTE_BUSY: &str =
-    "this Window is showing another prompt; answer it, then force control again";
+/// Why it ends so when that Window shows an agent's access prompt, which a
+/// person might otherwise take for the confirmation.
+pub const WINDOW_SHOWS_AGENT_PROMPT: &str = FORCED_TAKEOVER_AGENT_PROMPT_OPEN;
+/// Why it ends so when that Window already confirms another takeover.
+pub const WINDOW_SHOWS_TAKEOVER: &str = FORCED_TAKEOVER_ALREADY_CONFIRMING;
 /// Why such a takeover ends `consent_denied` when its confirmation was left
 /// unanswered: an expired prompt is a Deny.
 pub const TAKEOVER_EXPIRED: &str = "the forced-control confirmation expired unanswered";
@@ -524,11 +527,18 @@ impl Inner {
     /// Whether the responder on `connection_id` has an offer outstanding in
     /// any round: a Window shows one prompt at a time.
     fn busy(&self, connection_id: u64) -> bool {
-        self.rounds.values().any(|round| {
+        self.showing(connection_id).is_some()
+    }
+
+    /// What the responder on `connection_id` shows now, if anything: the
+    /// workspace prompt (`true`) or a takeover confirmation (`false`).
+    fn showing(&self, connection_id: u64) -> Option<bool> {
+        self.rounds.iter().find_map(|(id, round)| {
             round
                 .offers
                 .values()
                 .any(|offer| offer.connection_id == connection_id)
+                .then_some(self.workspace_round == Some(*id))
         })
     }
 
@@ -915,7 +925,8 @@ impl ConsentResponders {
     /// # Errors
     /// [`NO_WINDOW_ROUTE`] at once when that Window has no eligible
     /// responder, or its offer could not be made or sent;
-    /// [`WINDOW_ROUTE_BUSY`] when its responder already shows a prompt.
+    /// [`WINDOW_SHOWS_AGENT_PROMPT`] or [`WINDOW_SHOWS_TAKEOVER`] when its
+    /// responder already shows a prompt.
     pub async fn open_takeover_round(
         self: &Arc<Self>,
         requester: &PeerIdentity,
@@ -976,8 +987,12 @@ impl ConsentResponders {
         {
             return Err(no_route);
         }
-        if inner.busy(connection_id) {
-            return Err(Unavailable(WINDOW_ROUTE_BUSY));
+        if let Some(workspace) = inner.showing(connection_id) {
+            return Err(Unavailable(if workspace {
+                WINDOW_SHOWS_AGENT_PROMPT
+            } else {
+                WINDOW_SHOWS_TAKEOVER
+            }));
         }
         let (offer_id, offer) = inner
             .offer(
@@ -2443,7 +2458,7 @@ mod tests {
         offered(&mut other);
         assert_eq!(
             open(window.clone()).await,
-            Err(Unavailable(WINDOW_ROUTE_BUSY))
+            Err(Unavailable(WINDOW_SHOWS_AGENT_PROMPT))
         );
         drop(workspace);
         assert_eq!(withdrawn(&mut own).0, shown.offer_id);
@@ -2468,7 +2483,7 @@ mod tests {
         // A second takeover from the same Window while one shows is busy.
         assert_eq!(
             open(window.clone()).await,
-            Err(Unavailable(WINDOW_ROUTE_BUSY))
+            Err(Unavailable(WINDOW_SHOWS_TAKEOVER))
         );
         // An unanswered confirmation is withdrawn with why it ended.
         takeover.end_with(ConsentOfferEnd::Expired);

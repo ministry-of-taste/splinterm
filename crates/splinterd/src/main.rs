@@ -9215,6 +9215,7 @@ async fn append_request_result_audit(
     authorization: &RequestAuthorizationContext,
     resource: Option<splinterm_protocol::AuditResource>,
     result: &Result<Handled, ProtocolError>,
+    refusal_reason: Option<&'static str>,
 ) {
     let denied = result.as_ref().err().is_some_and(|error| {
         matches!(
@@ -9248,7 +9249,7 @@ async fn append_request_result_audit(
         .ok()
         .and_then(|handled| handled.audit_reason);
     let reason = if denied {
-        "authorization_denied"
+        refusal_reason.unwrap_or("authorization_denied")
     } else if revoked {
         "grant_revoked"
     } else if let Some(reason) = handled_reason {
@@ -9729,6 +9730,11 @@ async fn handle_request(
             ));
         }
     }
+    let refusal_reason = remote_force_refusal_reason(
+        &request,
+        remote_forcing_window(trusted_ui_client, remote_interactive_client, peer),
+        &result,
+    );
     append_request_result_audit(
         state,
         peer,
@@ -9736,9 +9742,40 @@ async fn handle_request(
         &authorization,
         audit_resource,
         &result,
+        refusal_reason,
     )
     .await;
     result
+}
+
+/// Whether a `ForceControlTransfer` from this connection is a remote
+/// Window's, which confirms it in its own dialog (Plan 0072 M3).
+fn remote_forcing_window(
+    trusted_ui_client: bool,
+    remote_interactive_client: bool,
+    peer: &PeerIdentity,
+) -> bool {
+    remote_interactive_client && !(trusted_ui_client && peer.connection_matches_splinterm())
+}
+
+/// The request audit's reason for a remote Window's refused forced
+/// takeover (Plan 0072 M3), by how its handler refused it: its relay was
+/// not eligible, the person denied it or let it expire, or its Window could
+/// not show the confirmation. `None` for any other request or result.
+fn remote_force_refusal_reason(
+    request: &Request,
+    remote_window: bool,
+    result: &Result<Handled, ProtocolError>,
+) -> Option<&'static str> {
+    if !remote_window || !matches!(request, Request::ForceControlTransfer { .. }) {
+        return None;
+    }
+    match result.as_ref().err()?.code {
+        ErrorCode::Unauthorized => Some("forced_transfer_refused_inside_splint"),
+        ErrorCode::ConsentDenied => Some("forced_transfer_denied_in_remote_window"),
+        ErrorCode::ConsentUnavailable => Some("forced_transfer_unroutable"),
+        _ => None,
+    }
 }
 
 /// Runs one authorized request. `admission` is the request's hold on the
@@ -11784,7 +11821,8 @@ async fn handle_authorized_request(
             let trusted_local = trusted_ui_client && peer.connection_matches_splinterm();
             // Plan 0072 M3: a remote Window forces control too, and confirms
             // it in its own dialog, never on this host's display.
-            let remote_window = !trusted_local && remote_interactive_client;
+            let remote_window =
+                remote_forcing_window(trusted_ui_client, remote_interactive_client, peer);
             if !trusted_local
                 && !remote_window
                 && !authorization.policy_authorized()
@@ -11808,10 +11846,15 @@ async fn handle_authorized_request(
                     .consent_responders
                     .check_remote_window(connection_id, peer, context.clone())
                     .await
-                    .map_err(|_| {
+                    .map_err(|why| {
                         ProtocolError::new(
                             ErrorCode::Unauthorized,
-                            "a remote Window inside a Splint cannot force control",
+                            match why {
+                                remote_consent::Ineligible::InsideSplint => {
+                                    "a remote Window inside a Splint cannot force control"
+                                }
+                                other => other.message(),
+                            },
                         )
                     })?;
                 Some(context)
@@ -12790,6 +12833,7 @@ async fn window_acknowledgement(
         &RequestAuthorizationContext::default(),
         None,
         &result,
+        None,
     )
     .await;
     Some(result)
@@ -20732,6 +20776,7 @@ mod tests {
             &authorization,
             None,
             &Err(handoff_requests::invalid_handoff_ticket()),
+            None,
         )
         .await;
         let page = state.audit.lock().await.page(None, 16);
@@ -31365,9 +31410,15 @@ mod tests {
             "the holder keeps the pane"
         );
         assert!(other.quiet());
+        // Each refusal says how, and that it was a remote Window's.
         assert_eq!(
             force_audit_reasons(&state).await,
-            ["authorization_denied"; 4]
+            [
+                "forced_transfer_unroutable",
+                "forced_transfer_unroutable",
+                "forced_transfer_denied_in_remote_window",
+                "forced_transfer_unroutable",
+            ]
         );
     }
 
@@ -31390,24 +31441,42 @@ mod tests {
             .unwrap();
         let remote = with_start_time(remote_window_peer());
         state.remote_window_connections.lock().unwrap().insert(602);
+        state.remote_window_connections.lock().unwrap().insert(603);
         let mut own = TestResponder::subscribe_as(&state, 611, remote.clone(), false).await;
         let leaders = splint_leaders(&state).await;
         assert!(!leaders.is_empty());
         state
             .consent_responders
             .set_probe(Arc::new(move |connection_id, context| {
-                let Some(context) = context.filter(|_| connection_id == 602) else {
+                let Some(context) = context.filter(|_| matches!(connection_id, 602 | 603)) else {
                     return Ok(());
                 };
                 assert_eq!(context.splint_leaders, leaders);
                 assert!(context.requester.is_none());
-                Err(remote_consent::Ineligible::InsideSplint)
+                Err(if connection_id == 602 {
+                    remote_consent::Ineligible::InsideSplint
+                } else {
+                    remote_consent::Ineligible::Identity
+                })
             }));
 
         let inside = forced(spawn_force(&state, &remote, 602, true, target))
             .await
             .unwrap_err();
         assert_eq!(inside.code, ErrorCode::Unauthorized);
+        assert_eq!(
+            inside.message,
+            "a remote Window inside a Splint cannot force control"
+        );
+        // Any other failed check says what failed.
+        let changed = forced(spawn_force(&state, &remote, 603, true, target))
+            .await
+            .unwrap_err();
+        assert_eq!(changed.code, ErrorCode::Unauthorized);
+        assert_eq!(
+            changed.message,
+            remote_consent::Ineligible::Identity.message()
+        );
         let agent = handle_request(
             Request::ForceControlTransfer {
                 splint_id,
@@ -31451,7 +31520,8 @@ mod tests {
         assert_eq!(
             force_audit_reasons(&state).await,
             [
-                "authorization_denied",
+                "forced_transfer_refused_inside_splint",
+                "forced_transfer_refused_inside_splint",
                 "policy_rejected",
                 "authorization_denied",
                 "trusted_or_owned_authority",

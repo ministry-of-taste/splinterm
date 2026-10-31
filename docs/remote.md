@@ -156,14 +156,21 @@ immediately without policy publication or Window restart.
 
 Force control (Ctrl+Shift+U, or **Force control transfer** in the action menu) works
 in a remote Window too. The remote daemon asks for the confirmation in that
-Window only, through its agent-prompt responder: "Just this once" or Deny,
-with the usual 20-second countdown. It is never shown on the daemon host, nor
-in another Window. Deny or letting it expire leaves the pane a viewer, and the
-Window title says why. With `[integration] remote-agent-prompts = no`, or
-while the Window shows another prompt, the force fails at once with a notice;
-nothing waits. The relay must run outside every Splint, so an agent cannot
-force a takeover by running the relay itself. The audit records the takeover
-as `forced_transfer_confirmed_in_remote_window`.
+Window only, through its agent-prompt responder: a **Force control** dialog,
+"Take control of this pane from whoever holds it now?", with **Take control**
+and **Cancel** and the usual 20-second countdown. It is never shown on the
+daemon host, nor in another Window, and the Window shows it only while one of
+its own panes is forcing that pane; any other is denied unseen. Cancel or
+letting it expire leaves the pane a viewer, and the Window title says why.
+With `[integration] remote-agent-prompts = no` the Window cannot show the
+dialog, so Force control is unavailable there; Reload configuration follows
+the setting. While an agent's access prompt is open in the Window, the force
+fails at once and the title says that prompt is not the confirmation: deny or
+answer it first. Nothing waits. The relay must run outside every Splint, so an
+agent cannot force a takeover by running the relay itself. The audit records
+the takeover as `forced_transfer_confirmed_in_remote_window`, and a refusal as
+`forced_transfer_refused_inside_splint`, `forced_transfer_denied_in_remote_window`,
+or `forced_transfer_unroutable`.
 
 A Window remains bound to exactly one endpoint: it binds when its terminal
 opens and never changes, and the profile list, status screen, and Dojo list

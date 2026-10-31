@@ -1186,6 +1186,18 @@ pub const DOJO_STILL_LIVE: &str = "the Dojo still contains a live Splint";
 pub const CONSENT_APPROVER_NEEDS_TERMINAL: &str =
     "the approver needs its own terminal on standard input and output";
 
+/// The `ConsentUnavailable` reason a remote Window's forced takeover gets
+/// while an agent's access prompt is open in that Window (Plan 0072 M3). The
+/// Window tells it apart by it, and says the open prompt is not the
+/// confirmation.
+pub const FORCED_TAKEOVER_AGENT_PROMPT_OPEN: &str =
+    "an agent's prompt is open in this Window, not the force confirmation: deny or answer it first";
+
+/// The `ConsentUnavailable` reason a remote Window's forced takeover gets
+/// while that Window already confirms another one (Plan 0072 M3).
+pub const FORCED_TAKEOVER_ALREADY_CONFIRMING: &str =
+    "this Window already shows a forced-control confirmation; answer it first";
+
 /// Who answers a [`Request::SubscribeConsentOffers`] responder's offers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -3226,6 +3238,22 @@ impl ConsentContent<'_> {
             .iter()
             .any(|offer| offer.duration == duration && offer.withheld.is_none())
     }
+
+    fn is_forced_takeover(&self) -> bool {
+        matches!(self.target, ConsentTarget::Splint { .. })
+            && self.scopes == [AccessScope::ControlTakeover]
+            && self.level.is_none()
+            && self.agent_name.is_none()
+            && matches!(
+                self.durations,
+                [ConsentDurationOffer {
+                    duration: GrantDuration::Once,
+                    withheld: None,
+                    shared_by: None,
+                    replaces: None,
+                }]
+            )
+    }
 }
 
 impl ConsentPrompt {
@@ -3252,6 +3280,14 @@ impl ConsentPrompt {
     #[must_use]
     pub fn offers(&self, duration: GrantDuration) -> bool {
         self.content().offers(duration)
+    }
+
+    /// Whether its content is a forced-takeover confirmation, as
+    /// [`OfferedConsentPrompt::is_forced_takeover`] says. The daemon's own
+    /// dialog for a local Window's forced takeover has the same content.
+    #[must_use]
+    pub fn is_forced_takeover(&self) -> bool {
+        self.content().is_forced_takeover()
     }
 
     /// This prompt's content as a [`ConsentOffer`] carries it.
@@ -3305,19 +3341,7 @@ impl OfferedConsentPrompt {
     /// responder.
     #[must_use]
     pub fn is_forced_takeover(&self) -> bool {
-        matches!(self.target, ConsentTarget::Splint { .. })
-            && self.scopes == [AccessScope::ControlTakeover]
-            && self.level.is_none()
-            && self.agent_name.is_none()
-            && matches!(
-                self.durations.as_slice(),
-                [ConsentDurationOffer {
-                    duration: GrantDuration::Once,
-                    withheld: None,
-                    shared_by: None,
-                    replaces: None,
-                }]
-            )
+        self.content().is_forced_takeover()
     }
 
     /// Whether the offered prompt offers `duration`.
@@ -9665,17 +9689,18 @@ mod tests {
         offer.request_id = 0;
         offer.prompt = prompt.clone();
         assert_eq!(offer.validate(), Ok(()));
-        // The dialog a remote Window builds from it is valid too.
+        // The dialog a remote Window builds from it is valid too, and is
+        // still a forced takeover.
         let origin = ConsentOrigin::Remote {
             profile: "loop".to_owned(),
             daemon_hostname: None,
         };
-        assert_eq!(
-            prompt
-                .into_prompt(vec![9; CONSENT_CAPABILITY_BYTES], 18, origin)
-                .validate(),
-            Ok(())
-        );
+        let shown = prompt.into_prompt(vec![9; CONSENT_CAPABILITY_BYTES], 18, origin);
+        assert_eq!(shown.validate(), Ok(()));
+        assert!(shown.is_forced_takeover());
+        let mut agent = shown;
+        agent.agent_name = Some("agent".to_owned());
+        assert!(!agent.is_forced_takeover());
 
         let refused = |change: fn(&mut OfferedConsentPrompt)| {
             let mut prompt = takeover();

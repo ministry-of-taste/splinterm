@@ -1135,6 +1135,7 @@ fn assemble_app(
             keyboard_focused: false,
             graphical_focus: options.graphical_focus,
             forced_control_transfer: options.forced_control_transfer,
+            forced_control_follows_remote_prompts: options.forced_control_follows_remote_prompts,
             optimistic_remote_splits: options.optimistic_remote_splits,
             input_generation: 0,
             pending_terminal_input: VecDeque::new(),
@@ -2624,6 +2625,7 @@ struct InputState {
     keyboard_focused: bool,
     graphical_focus: Option<tokio::sync::watch::Sender<Option<SplintId>>>,
     forced_control_transfer: bool,
+    forced_control_follows_remote_prompts: bool,
     optimistic_remote_splits: bool,
     input_generation: u64,
     pending_terminal_input: VecDeque<PendingTerminalInput>,
@@ -7019,6 +7021,10 @@ impl App {
                     .reload(loaded.config.theme_colors());
                 self.clipboard.image_directory = loaded.config.clipboard_image_directory;
                 self.clipboard.middle_click_paste = loaded.config.middle_click_paste;
+                if self.input.forced_control_follows_remote_prompts {
+                    // Plan 0072 M3: only while this Window can confirm one.
+                    self.input.forced_control_transfer = loaded.config.remote_agent_prompts;
+                }
                 self.input.keymap = loaded.config.keymap;
                 self.input.prefix_timeout =
                     std::time::Duration::from_millis(loaded.config.prefix_timeout_ms);

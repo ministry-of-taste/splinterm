@@ -16,7 +16,9 @@ use splinterm::automation::{
 };
 use splinterm::config::AppConfig;
 use splinterm::diagnostics::{DiagnosticErrorCode, DiagnosticEventCode, DiagnosticLevel};
-use splinterm::endpoint::{ConnectionFactory, ForcedControlTransfer, ImageTransport};
+use splinterm::endpoint::{
+    ConnectionFactory, ForcedControlTransfer, ForcesInFlight, ImageTransport,
+};
 use splinterm::handoff_status::{HandoffStatusHub, HandoffStatusSource};
 use splinterm::{
     AuthorityStatus, PerfTraceCorrelation, TerminalGridLimits, WindowCommand, WindowPaneOptions,
@@ -24,7 +26,8 @@ use splinterm::{
 };
 use splinterm_core::{LayoutNode, SplintId};
 use splinterm_protocol::{
-    AccessGrant, AccessScope, ControlMode, ControlTransferOutcome, ErrorCode, HandoffStatusPhase,
+    AccessGrant, AccessScope, ControlMode, ControlTransferOutcome, ErrorCode,
+    FORCED_TAKEOVER_AGENT_PROMPT_OPEN, FORCED_TAKEOVER_ALREADY_CONFIRMING, HandoffStatusPhase,
     LairAccessGrant, Request, Response, ServerFrame, ServerLimits, SubscriptionEvent,
     TerminalSnapshot, TerminalUpdate,
     perf_trace::{PerfTraceEvent, emit_perf_trace, perf_trace_enabled},
@@ -326,6 +329,9 @@ pub(in crate::app) struct ControllerOutputs {
     /// M3.12a). The controller reports what its control subscription hears,
     /// and drops paused commands whichever pane heard the pause first.
     pub(in crate::app) handoff: HandoffStatusSource,
+    /// The Window's forced takeovers in flight, which this pane's force
+    /// joins while it waits (Plan 0072 M3).
+    pub(in crate::app) forces: ForcesInFlight,
 }
 
 type PaneResize = (u16, u16, u16, u16);
@@ -1263,7 +1269,11 @@ pub(in crate::app) async fn drive_controller(
                     else {
                         continue;
                     };
-                    active_controller = match control.request(request).await {
+                    // Its Window shows a confirmation only while it waits.
+                    let in_flight = outputs.forces.begin(splint_id, incarnation);
+                    let forced = control.request(request).await;
+                    drop(in_flight);
+                    active_controller = match forced {
                         Ok(Response::ControlGranted { controller_id, .. }) => Some(controller_id),
                         Err(error) if handoff_refused(&error) => continue,
                         // Plan 0072 M3: the pane stays a viewer and says why.
@@ -1384,17 +1394,30 @@ fn forced_control_request(
 
 /// The Window's notice for a forced takeover the daemon refused, or whose
 /// confirmation was denied, expired, or could not be shown (Plan 0072 M3);
-/// `None` for an error that still ends the pane.
+/// `None` for an error that still ends the pane, as `ControllerUnavailable`
+/// does: the daemon and this pane disagree about its lease.
 fn forced_control_refusal(error: &anyhow::Error) -> Option<&'static str> {
-    Some(match protocol_error(error)?.code {
+    let error = protocol_error(error)?;
+    Some(match error.code {
         ErrorCode::ConsentDenied => "Force control: not confirmed",
+        // The open prompt is an agent's: it must not pass for this one.
+        ErrorCode::ConsentUnavailable if error.message == FORCED_TAKEOVER_AGENT_PROMPT_OPEN => {
+            FORCE_BLOCKED_BY_AGENT_PROMPT
+        }
+        ErrorCode::ConsentUnavailable if error.message == FORCED_TAKEOVER_ALREADY_CONFIRMING => {
+            "Force control: answer the confirmation this Window already shows"
+        }
         ErrorCode::ConsentUnavailable => "Force control: this Window cannot show the confirmation",
         ErrorCode::Unauthorized => "Force control: not allowed from here",
         ErrorCode::ControlTransferUnavailable => "Force control: nobody else holds this pane",
-        ErrorCode::ControllerUnavailable => "Force control: this pane already has control",
         _ => return None,
     })
 }
+
+/// The notice for a force refused while an agent's access prompt is open
+/// in the Window, which a person might take for the confirmation.
+const FORCE_BLOCKED_BY_AGENT_PROMPT: &str =
+    "Force control: deny the agent's prompt open in this Window first; it isn't the confirmation";
 
 /// Bounds the explicit detach a closing tab waits for.
 const PANE_DETACH_DEADLINE: Duration = Duration::from_secs(2);
@@ -1606,6 +1629,7 @@ pub(in crate::app) async fn prepare_live_pane_at_incarnation(
             updates: controller_updates,
             resyncs: resync_sender,
             handoff: factory.handoff_status().source(),
+            forces: factory.forces_in_flight().clone(),
         },
         controller_id,
         splint_id,
@@ -2691,6 +2715,35 @@ mod tests {
             !refused_as_untrusted(&refused),
             "an adopting daemon is retried"
         );
+    }
+
+    /// Plan 0072 M3: a force refused while an agent's prompt is open in the
+    /// Window says that prompt is not the confirmation, told apart by the
+    /// protocol's own reason, never by other text.
+    #[test]
+    fn a_force_blocked_by_an_agents_prompt_says_it_is_not_the_confirmation() {
+        use splinterm_protocol::ProtocolError;
+
+        let refusal = |code, message: &str| {
+            forced_control_refusal(&response_protocol_error(ProtocolError::new(code, message)))
+        };
+        let unavailable = ErrorCode::ConsentUnavailable;
+        assert_eq!(
+            refusal(unavailable, FORCED_TAKEOVER_AGENT_PROMPT_OPEN),
+            Some(FORCE_BLOCKED_BY_AGENT_PROMPT)
+        );
+        assert_eq!(
+            refusal(unavailable, FORCED_TAKEOVER_ALREADY_CONFIRMING),
+            Some("Force control: answer the confirmation this Window already shows")
+        );
+        for other in ["no route", "an agent's prompt is open in this Window"] {
+            assert_eq!(
+                refusal(unavailable, other),
+                Some("Force control: this Window cannot show the confirmation")
+            );
+        }
+        // A lease the daemon and the pane disagree about still ends it.
+        assert_eq!(refusal(ErrorCode::ControllerUnavailable, "held"), None);
     }
 
     #[test]

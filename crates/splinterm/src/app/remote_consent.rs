@@ -5,7 +5,9 @@
 //! window }`). The daemon offers it every workspace access prompt at the same
 //! time as its other routes, and the first valid answer wins. It is also
 //! where the Window confirms its own forced takeover (Ctrl+Shift+U, Plan
-//! 0072 M3): the daemon offers that confirmation to this responder alone.
+//! 0072 M3): the daemon offers that confirmation to this responder alone,
+//! and the Window shows it only while one of its panes forces that Splint.
+//! Any other is denied at once, unseen.
 //!
 //! For each offer the Window shows the trusted consent dialog itself, as
 //! `/proc/self/exe consent`, the same image as the Window and the same child
@@ -43,10 +45,11 @@ use splinterm::{
     endpoint::{ConnectionFactory, RemoteConsent, RemoteDisplayIdentity},
     handoff_status::WindowHandoffPhase,
 };
+use splinterm_core::SplintId;
 use splinterm_protocol::{
     ConsentDecision, ConsentOffer, ConsentOrigin, ConsentPrompt, ConsentReply,
-    ConsentResponderKind, ErrorCode, MAX_CONSENT_FRAME_BYTES, MAX_CONSENT_RESPOND_WITHIN_SECONDS,
-    Request, Response, ServerFrame, SubscriptionEvent,
+    ConsentResponderKind, ConsentTarget, ErrorCode, MAX_CONSENT_FRAME_BYTES,
+    MAX_CONSENT_RESPOND_WITHIN_SECONDS, Request, Response, ServerFrame, SubscriptionEvent,
 };
 use tokio::{sync::watch, time::Instant};
 use tokio_util::sync::CancellationToken;
@@ -83,6 +86,9 @@ pub(in crate::app) trait ResponderLink: Send + Sync + 'static {
     fn window_reconnecting(&self) -> bool;
     /// A number that changes whenever the Window's handoff status does.
     fn handoff_revision(&self) -> u64;
+    /// Whether one of the Window's panes forces `splint_id` at
+    /// `incarnation` now (Plan 0072 M3).
+    fn force_in_flight(&self, splint_id: SplintId, incarnation: u64) -> bool;
 }
 
 impl ResponderLink for ConnectionFactory {
@@ -100,6 +106,23 @@ impl ResponderLink for ConnectionFactory {
     fn handoff_revision(&self) -> u64 {
         self.handoff_status().view().revision
     }
+
+    fn force_in_flight(&self, splint_id: SplintId, incarnation: u64) -> bool {
+        self.forces_in_flight().contains(splint_id, incarnation)
+    }
+}
+
+/// Whether `offer` confirms a forced takeover this Window did not ask for:
+/// none of its panes forces that Splint now.
+fn unasked_takeover<L: ResponderLink>(link: &L, offer: &ConsentOffer) -> bool {
+    let ConsentTarget::Splint {
+        splint_id,
+        incarnation,
+    } = offer.prompt.target
+    else {
+        return false;
+    };
+    offer.prompt.is_forced_takeover() && !link.force_in_flight(splint_id, incarnation)
 }
 
 /// How the responder asks the person: the trusted consent dialog.
@@ -502,6 +525,18 @@ async fn run_subscription<L: ResponderLink, D: ConsentDialog>(
             OfferEvent::Offered(offer) => {
                 let arrived = Instant::now();
                 subscription.accept(&offer)?;
+                if unasked_takeover(link, &offer) {
+                    // Never shown: nobody here asked to force that Splint.
+                    eprintln!("splinterm: denied a force confirmation nobody here asked for");
+                    answer(
+                        &mut connection,
+                        &mut subscription,
+                        &offer,
+                        ConsentDecision::Deny,
+                    )
+                    .await?;
+                    continue;
+                }
                 let capability = match offer_capability(&offer) {
                     Ok(capability) => capability,
                     Err(error) => {
@@ -867,6 +902,8 @@ mod tests {
         revision: Arc<AtomicU64>,
         /// What the responder reported, one entry per report.
         reports: Arc<Mutex<Vec<String>>>,
+        /// The Window's forced takeovers in flight.
+        forces: splinterm::endpoint::ForcesInFlight,
     }
 
     impl FakeLink {
@@ -945,6 +982,10 @@ mod tests {
 
         fn handoff_revision(&self) -> u64 {
             self.revision.load(Ordering::SeqCst)
+        }
+
+        fn force_in_flight(&self, splint_id: SplintId, incarnation: u64) -> bool {
+            self.forces.contains(splint_id, incarnation)
         }
     }
 
@@ -1237,7 +1278,20 @@ mod tests {
     /// Window's origin.
     #[test]
     fn a_forced_takeover_confirmation_is_shown() {
-        let mut takeover = offer(1, 18);
+        let takeover = takeover_offer(1, SplintId::new(), 2);
+        Subscription::new(5, GENERATION).accept(&takeover).unwrap();
+        let prompt = prompt_for(&takeover).unwrap();
+        assert_eq!(prompt.validate(), Ok(()));
+        assert_eq!(prompt.origin, origin());
+        assert_eq!(prompt.durations.len(), 1);
+        assert_eq!(prompt.respond_within_seconds, 18);
+        assert!(prompt.is_forced_takeover());
+    }
+
+    /// The confirmation of a forced takeover of `splint_id` at
+    /// `incarnation`, as the daemon offers it, with an 18 second countdown.
+    fn takeover_offer(offer_id: u64, splint_id: SplintId, incarnation: u64) -> ConsentOffer {
+        let mut takeover = offer(offer_id, 18);
         takeover.request_id = 0;
         takeover.prompt = OfferedConsentPrompt {
             requester: "/usr/bin/splinterm-relay".to_owned(),
@@ -1245,8 +1299,8 @@ mod tests {
             requester_uid: 1000,
             agent_name: None,
             target: ConsentTarget::Splint {
-                splint_id: splinterm_core::SplintId::new(),
-                incarnation: 2,
+                splint_id,
+                incarnation,
             },
             scopes: vec![splinterm_protocol::AccessScope::ControlTakeover],
             level: None,
@@ -1257,12 +1311,58 @@ mod tests {
                 replaces: None,
             }],
         };
-        Subscription::new(5, GENERATION).accept(&takeover).unwrap();
-        let prompt = prompt_for(&takeover).unwrap();
-        assert_eq!(prompt.validate(), Ok(()));
-        assert_eq!(prompt.origin, origin());
-        assert_eq!(prompt.durations.len(), 1);
-        assert_eq!(prompt.respond_within_seconds, 18);
+        takeover
+    }
+
+    /// Plan 0072 M3: a takeover confirmation shows only while one of this
+    /// Window's panes forces that Splint at that incarnation. Any other is
+    /// denied at once, unseen, so a daemon cannot make the Window show one
+    /// nobody asked for.
+    #[tokio::test]
+    async fn a_takeover_confirmation_shows_only_while_this_window_forces_it() {
+        let link = FakeLink::default();
+        let splint_id = SplintId::new();
+        let _forcing = link.forces.begin(splint_id, 2);
+        let unasked = takeover_offer(3, splint_id, 1);
+        let asked = takeover_offer(4, splint_id, 2);
+        link.script(move |mut daemon| async move {
+            daemon.subscribe().await;
+            daemon.offer(1, unasked).await;
+            let Some((
+                request_id,
+                Request::AnswerConsentOffer {
+                    offer_id, decision, ..
+                },
+            )) = daemon.request().await
+            else {
+                panic!("expected the unasked confirmation's denial");
+            };
+            assert_eq!((offer_id, decision), (3, ConsentDecision::Deny));
+            daemon
+                .respond(request_id, Response::ConsentOfferAnswered)
+                .await;
+            daemon.offer(2, asked).await;
+            let Some((
+                request_id,
+                Request::AnswerConsentOffer {
+                    offer_id, decision, ..
+                },
+            )) = daemon.request().await
+            else {
+                panic!("expected the confirmation's answer");
+            };
+            assert_eq!((offer_id, decision), (4, GRANT_ONCE));
+            daemon
+                .respond(request_id, Response::ConsentOfferAnswered)
+                .await;
+        });
+        let dialog = FakeDialog::with([Person::Answers(GRANT_ONCE, Duration::ZERO)]);
+        let (_settings, task) = start(&link, &dialog, true);
+        link.finished().await;
+        let prompts = dialog.prompts();
+        assert_eq!(prompts.len(), 1, "only the confirmation asked for shows");
+        assert!(prompts[0].is_forced_takeover());
+        task.abort();
     }
 
     #[test]

@@ -182,6 +182,7 @@ async fn run_case_in_window(
                 updates,
                 resyncs,
                 handoff: hub.source(),
+                forces: ForcesInFlight::default(),
             },
             owned.then_some(1),
             splint_id,
@@ -914,6 +915,7 @@ async fn cancellation_stops_a_chain_of_coalescing_barriers() {
                 updates,
                 resyncs,
                 handoff: HandoffStatusHub::default().source(),
+                forces: ForcesInFlight::default(),
             },
             Some(1),
             id,
@@ -1166,6 +1168,7 @@ async fn handoff_phase_after_connection_loss(
                 updates,
                 resyncs,
                 handoff: hub.source(),
+                forces: ForcesInFlight::default(),
             },
             None,
             id,
@@ -1589,6 +1592,7 @@ async fn a_resynchronization_during_an_outage_never_ends_the_controller() {
         updates: updates.clone(),
         resyncs: resync_sender,
         handoff: hub.source(),
+        forces: ForcesInFlight::default(),
     };
     let token = cancellation.clone();
     let controller = tokio::spawn(async move {
@@ -2550,20 +2554,24 @@ async fn a_refused_force_keeps_the_pane_and_says_why() {
     }
 }
 
-/// Any other failure of a forced takeover still ends the pane task.
+/// Any other failure of a forced takeover still ends the pane task, as
+/// `ControllerUnavailable` does: the daemon and the pane disagree about its
+/// lease.
 #[tokio::test]
 async fn a_failed_force_of_another_kind_still_ends_the_pane() {
-    let id = SplintId::new();
-    let (result, updates, _) = run_case(
-        id,
-        false,
-        vec![WindowCommand::ForceControlTransfer],
-        vec![(force(id), Err(ErrorCode::Internal))],
-    )
-    .await;
-    assert!(result.is_err());
-    let refused = updates
-        .iter()
-        .any(|update| matches!(update, WindowUpdate::ForceRefused(_)));
-    assert!(!refused);
+    for code in [ErrorCode::Internal, ErrorCode::ControllerUnavailable] {
+        let id = SplintId::new();
+        let (result, updates, _) = run_case(
+            id,
+            false,
+            vec![WindowCommand::ForceControlTransfer],
+            vec![(force(id), Err(code))],
+        )
+        .await;
+        assert!(result.is_err(), "{code:?}");
+        let refused = updates
+            .iter()
+            .any(|update| matches!(update, WindowUpdate::ForceRefused(_)));
+        assert!(!refused, "{code:?}");
+    }
 }

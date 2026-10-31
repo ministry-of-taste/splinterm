@@ -180,8 +180,9 @@ answers in that same remote Window.
 - The daemon first checks the forcing relay connection as it checks a
   reclaim and a consent responder (ADR 0015): the installed relay it ran at
   `Hello`, outside every Splint's process tree, scope, and Dojo slice.
-  Failing that, it is refused as unauthorized, audited as denied, and nobody
-  is asked.
+  Failing that, it is refused as unauthorized with the check's own reason,
+  audited as denied (`forced_transfer_refused_inside_splint`), and nobody is
+  asked.
 - The confirmation goes through the remote-consent route (ADR 0015's
   amendment): only to the consent responder on the forcing connection's own
   relay process, which is that Window's. It is never shown on the daemon
@@ -189,13 +190,29 @@ answers in that same remote Window.
   approver. A Window without a responder that may show it (remote agent
   prompts turned off, the responder refused or not yet subscribed, or
   already showing another prompt) fails at once with `consent_unavailable`;
-  nothing waits and nothing falls back to the local dialog.
+  nothing waits and nothing falls back to the local dialog. While an agent's
+  access prompt is open in that Window, the reason says so
+  (`FORCED_TAKEOVER_AGENT_PROMPT_OPEN`), and the Window's notice says that
+  prompt is not the confirmation, so nobody approves the agent thinking it
+  is.
+- The Window shows the confirmation as a **Force control** dialog, "Take
+  control of this pane from whoever holds it now?", with **Take control** and
+  **Cancel** and no duration, only while one of its own panes is forcing
+  that Splint at that incarnation. It denies any other unseen, so the remote
+  daemon cannot make it show one nobody asked for. No agent request can take
+  that wording: the daemon offers a responder no other Splint prompt, and the
+  Window sets the origin itself. A Window that cannot show it, with
+  `remote-agent-prompts = no` or no responder, does not offer Force control.
+  The daemon's own dialog for a local Window keeps its earlier wording.
 - The prompt offers "Just this once" only. A Deny, or a confirmation left
   unanswered for its 20 seconds, ends the force with `consent_denied`; the
   holder keeps the pane.
 - A takeover confirmed so is audited with the reason
   `forced_transfer_confirmed_in_remote_window`, and the answer itself as
-  `answered_in_remote_window`, as a remote grant is.
+  `answered_in_remote_window`, as a remote grant is. A refused one is
+  audited as denied, with `forced_transfer_denied_in_remote_window` for a
+  Deny or expiry and `forced_transfer_unroutable` when the Window could not
+  show it, or its responder went.
 - This is still not trusted-UI identity. Automation connections, policy
   rules, and agent grants are unchanged: no policy scope reaches the remote
   path, and an agent's own grant-based force is as before.
@@ -211,7 +228,11 @@ Residual risk. A forced takeover now has a remote path, with a dialog:
   daemon host.
 - `ssh localhost`, and the other ways out of the Splint cgroups that ADR
   0007's amendment lists, give a same-user process on the daemon host such a
-  relay and responder too, with the same reach as a reclaim.
+  relay and responder too, with the same reach as a reclaim. The easiest is
+  `systemd-run --user`, for a Splint that can reach the user's systemd bus.
+- A process that inherits a relay connection's descriptor, or takes it with
+  `ptrace`, uses it without being identified again: ADR 0007's general
+  residual for an inherited descriptor.
 - The confirmation can be no stronger than the remote Window's own account:
   a compromised viewer account or relay can forge the answer, as it can for
   a workspace prompt (ADR 0015).

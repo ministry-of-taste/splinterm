@@ -176,6 +176,7 @@ fn spawn_single_pane_controller(
         updates,
         resyncs: resync_sender,
         handoff: factory.handoff_status().source(),
+        forces: factory.forces_in_flight().clone(),
     };
     let forced_control_transfer = factory.capabilities().forced_control_transfer;
     let token = cancellation.clone();
@@ -760,7 +761,7 @@ async fn run_live_multipane_window_inner(
     // Beside the focus reporter, a remote Window answers its daemon's agent
     // access prompts (ADR 0015) for as long as it lasts, following Reload
     // configuration; a local Window never starts one.
-    let _remote_consent = spawn_remote_consent_responder(
+    let remote_consent = spawn_remote_consent_responder(
         &factory,
         remote_display_identity.as_ref(),
         topology_settings_receiver.clone(),
@@ -769,8 +770,12 @@ async fn run_live_multipane_window_inner(
     let local_endpoint = factory.is_local();
     let handoff_status = factory.handoff_status().clone();
     let (layout_ledger, _window_anchor) = spawn_window_anchor(&factory, app_id.clone());
-    let forced_control_transfer =
-        factory.capabilities().forced_control_transfer == ForcedControlTransfer::Enabled;
+    let (forced_control_transfer, follows_remote_prompts) = forced_control_offer(
+        factory.capabilities().forced_control_transfer,
+        local_endpoint,
+        remote_consent.is_some(),
+        config.remote_agent_prompts,
+    );
     let optimistic_remote_splits =
         factory.capabilities().launch_semantics == LaunchSemantics::RemoteInteractive;
     let theme_task = AbortOnDropTask::new(tokio::spawn(watch_theme(
@@ -829,6 +834,7 @@ async fn run_live_multipane_window_inner(
                 topology_settings: Some(topology_settings),
                 graphical_focus,
                 forced_control_transfer,
+                forced_control_follows_remote_prompts: follows_remote_prompts,
                 remote_display_identity,
                 optimistic_remote_splits,
                 local_endpoint,
@@ -987,7 +993,7 @@ pub(super) async fn run_live_window(
     // keeps the opt-out it opened with, for as long as the Window lasts.
     let (_remote_consent_settings, remote_consent_settings) =
         watch::channel(TopologyReloadSettings::from_config(&config));
-    let _remote_consent = spawn_remote_consent_responder(
+    let remote_consent = spawn_remote_consent_responder(
         &factory,
         remote_display_identity.as_ref(),
         remote_consent_settings,
@@ -995,8 +1001,14 @@ pub(super) async fn run_live_window(
     .map(AbortOnDropTask::new);
     let local_endpoint = factory.is_local();
     let handoff_status = factory.handoff_status().clone();
-    let forced_control_transfer =
-        factory.capabilities().forced_control_transfer == ForcedControlTransfer::Enabled;
+    // Its responder keeps the opt-out it opened with, and so does Force
+    // control.
+    let (forced_control_transfer, _) = forced_control_offer(
+        factory.capabilities().forced_control_transfer,
+        local_endpoint,
+        remote_consent.is_some(),
+        config.remote_agent_prompts,
+    );
     let mut window = tokio::task::spawn_blocking(move || {
         run_window(WindowOptions {
             snapshot: Some(initial_snapshot),
@@ -1383,16 +1395,56 @@ pub(super) async fn run_live_window(
     }
 }
 
+/// Whether a Window offers Force control (Plan 0072 M3), and whether that
+/// follows the viewer's `remote-agent-prompts` on Reload configuration. Its
+/// endpoint must allow it (`capability`). A remote Window confirms a force
+/// in its own dialog, so it offers Force control only when it runs a
+/// consent `responder` and the viewer allows remote prompts; otherwise
+/// every force would fail.
+fn forced_control_offer(
+    capability: ForcedControlTransfer,
+    local: bool,
+    responder: bool,
+    remote_agent_prompts: bool,
+) -> (bool, bool) {
+    let enabled = capability == ForcedControlTransfer::Enabled;
+    if local {
+        return (enabled, false);
+    }
+    let follows = enabled && responder;
+    (follows && remote_agent_prompts, follows)
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
     use anyhow::Result;
 
+    use splinterm::endpoint::ForcedControlTransfer;
+
     use super::{
-        AbortOnDropTask, COMMAND_ENDED_LINE, WhileParked, first_dojo_gone, resolved_window_app_id,
-        while_parked,
+        AbortOnDropTask, COMMAND_ENDED_LINE, WhileParked, first_dojo_gone, forced_control_offer,
+        resolved_window_app_id, while_parked,
     };
+
+    /// Plan 0072 M3: a remote Window offers Force control only while it can
+    /// show the confirmation; a local Window whenever its endpoint allows.
+    #[test]
+    fn a_remote_window_offers_force_control_only_while_it_can_confirm_it() {
+        // (capability, local, responder, remote prompts) → (offered, follows)
+        let on = ForcedControlTransfer::Enabled;
+        let off = ForcedControlTransfer::Disabled;
+        let offer = forced_control_offer;
+        assert_eq!(offer(on, true, false, false), (true, false));
+        assert_eq!(offer(off, true, false, true), (false, false));
+        assert_eq!(offer(on, false, true, true), (true, true));
+        // Remote prompts off: offered again once a reload turns them on.
+        assert_eq!(offer(on, false, true, false), (false, true));
+        // Without a responder, never.
+        assert_eq!(offer(on, false, false, true), (false, false));
+        assert_eq!(offer(off, false, true, true), (false, false));
+    }
 
     #[tokio::test(start_paused = true)]
     async fn parked_work_ends_at_a_close_or_its_deadline_and_runs_unbounded_unparked() {

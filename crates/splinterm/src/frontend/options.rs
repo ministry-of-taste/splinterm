@@ -700,6 +700,10 @@ pub struct WindowOptions {
     pub graphical_focus: Option<WatchSender<Option<SplintId>>>,
     /// Whether trusted graphical force-transfer actions may be offered or dispatched.
     pub forced_control_transfer: bool,
+    /// Whether Reload configuration turns them on and off with
+    /// `remote-agent-prompts`: a remote Window confirms a force in its own
+    /// dialog (Plan 0072 M3).
+    pub forced_control_follows_remote_prompts: bool,
     /// Render a client-local placeholder before dispatching a remote split.
     pub optimistic_remote_splits: bool,
     /// Stable identity for the initial managed Dojo; absent for legacy/evidence windows.
@@ -792,6 +796,7 @@ impl Default for WindowOptions {
             topology_settings: None,
             graphical_focus: None,
             forced_control_transfer: true,
+            forced_control_follows_remote_prompts: false,
             optimistic_remote_splits: false,
             initial_dojo: None,
             initial_tab_strip_visible: true,

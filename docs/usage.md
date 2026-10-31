@@ -673,10 +673,11 @@ Only one connection controls a live Splint at a time. Other Windows may remain
 observers. Request/release/accept/deny operations are explicit, and forced
 takeover (`Ctrl+Shift+U`) asks for a separate trusted confirmation, "Just this
 once" only. A local Window shows it in this computer's own dialog. A remote
-Window shows it in that same Window, through its agent-prompt responder, never
-on the remote host; with `[integration] remote-agent-prompts = no` it fails at
-once. A denied, expired, or refused force leaves the pane a viewer
-and says why in the Window title.
+Window shows it in that same Window, as a **Force control** dialog with **Take
+control** and **Cancel**, never on the remote host; with `[integration]
+remote-agent-prompts = no` Force control is unavailable in a remote Window. A
+denied, expired, or refused force leaves the pane a viewer and says why in the
+Window title.
 
 When an agent asks to control a pane (MCP `splinterm.request_control_transfer`),
 that pane shows a notice at its bottom centre until you answer or the request

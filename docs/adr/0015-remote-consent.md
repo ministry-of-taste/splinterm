@@ -234,7 +234,11 @@ Ctrl+Shift+U). Its confirmation goes through this route, with these rules:
   is asked. The target responder is checked again before the offer, without
   the "outside the requester" rule, since the requester is that Window.
 - **No fallback, no waiting.** Without such a responder, or while it shows
-  another offer, the force fails at once with `consent_unavailable`. A
+  another offer, the force fails at once with `consent_unavailable`. While
+  that offer is an agent's workspace prompt, the reason is
+  `FORCED_TAKEOVER_AGENT_PROMPT_OPEN`, and the Window says the open prompt is
+  not the confirmation; while it is another takeover's, it is
+  `FORCED_TAKEOVER_ALREADY_CONFIRMING`. A
   responder holds one outstanding offer at a time, so a workspace prompt
   that opens meanwhile is not offered to that Window; with no other route it
   is unavailable at once, as with no route at all, and the agent may ask
@@ -245,14 +249,28 @@ Ctrl+Shift+U). Its confirmation goes through this route, with these rules:
   (`OfferedConsentPrompt::is_forced_takeover`); its `request_id` is 0, since
   no agent request names it. Any other Splint prompt still fails validation,
   so no agent's Splint request reaches a responder.
+- **Shown only when asked.** The Window shows it only while one of its own
+  panes is forcing that Splint at that incarnation, and denies any other at
+  once, unseen. A terminal approver ignores it. The Window shows it as a
+  **Force control** dialog ("Take control of this pane from whoever holds it
+  now?", **Take control** or **Cancel**, no duration), never in an agent
+  request's words. Since only a forced takeover can be a Splint offer and
+  the Window sets the origin, no agent's request can take that wording.
 - **Answers.** "Just this once" moves the lease. Deny ends the force with
   `consent_denied`, and so does expiry after 20 seconds (an expired prompt
   counts as a Deny); the offer is withdrawn as `expired`. A longer duration
   is refused as `InvalidArgument` and leaves the offer open, as for any
   prompt.
 - **Audit.** The answer is audited as `answered_in_remote_window`, and the
-  forced takeover as `forced_transfer_confirmed_in_remote_window`.
+  forced takeover as `forced_transfer_confirmed_in_remote_window`. A refusal
+  is audited as denied: `forced_transfer_refused_inside_splint` when the relay
+  failed its check, `forced_transfer_denied_in_remote_window` for a Deny or
+  expiry, and `forced_transfer_unroutable` when the Window could not show it.
 
 The residual risks are ADR 0010's amendment and this ADR's: a relay that
-leaves the Splint cgroups, or one reached with the user's SSH key, can force
-and answer its own confirmation, with no more reach than a resize reclaim.
+leaves the Splint cgroups (most easily with `systemd-run --user`, for a
+Splint that can reach the user's systemd bus), or one reached with the
+user's SSH key, can force and answer its own confirmation, with no more
+reach than a resize reclaim. A process that inherits a relay connection's
+descriptor, or takes it with `ptrace`, uses it unidentified, as ADR 0007's
+general residual says.
