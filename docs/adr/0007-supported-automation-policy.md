@@ -362,8 +362,9 @@ rule that a Window does not take a pane from an agent without the person's
 answer.
 
 - Only the installed client and remote Windows may send it. No policy scope
-  names it, so no policy rule, grant, or development access lets an agent or
-  any other automation send it.
+  names it, so no policy rule, grant, or development access gives an agent or
+  any other automation connection the right to send it. A remote Window's
+  relay connection must also run outside every Splint (ADR 0010's amendment).
 - The lease it takes is never bound to a grant. A pending transfer of the
   Splint is cancelled. A connection still holds one lease.
 - The connection that lost the lease gets a control status with
@@ -371,8 +372,24 @@ answer.
   is refused with the same reason. Nobody is told which Window took it.
 - Each reclaim is audited as `reclaim_control`; the reason names who took
   control (a Window or a remote Window) and from whom (nobody, itself, a
-  Window, a remote Window, or an agent).
+  Window, a remote Window, an agent, or a connection that was closing).
 - The confirmed forced takeover is unchanged.
+
+Residual risk. These bound a cooperating agent, not a hostile same-user
+process (ADR 0014), and each is worth slightly more than before, because a
+reclaim has no dialog:
+
+- A same-user process that leaves every Splint's process tree and cgroup
+  (`setsid` with `systemd-run --user`, `ssh localhost`, or a daemon without
+  workload units) can start a relay that passes the remote Window check.
+  ADR 0015 lists the same escape for consent responders.
+- A process that inherits a trusted connection's descriptor uses it without
+  being identified again.
+- A client running the sealed snapshot that an adopted daemon pinned for the
+  upgrade handoff is a trusted client.
+- Code loaded into the installed client, for example with `LD_PRELOAD`, runs
+  as that trusted client.
+- Remote holders of the user's SSH key are covered in ADR 0010's amendment.
 
 ## Threat-model conclusions
 

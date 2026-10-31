@@ -149,3 +149,21 @@ This belongs to the relay's human-interactive role. It is not trusted-UI
 identity, which SSH still never grants: the relay connection still cannot
 send the confirmed forced takeover, whose dialog shows on the daemon host, or
 the requests kept for the local client, such as daemon handoff.
+
+Running the relay in `--graphical-stdio` mode needs no SSH, so the daemon
+checks a reclaiming relay connection as it checks a remote consent responder
+(ADR 0015): the installed relay it ran at `Hello`, outside every Splint's
+process tree, scope, and Dojo slice. A connection that fails is refused as
+unauthorized, and the refusal is audited as denied.
+
+Residual risk. Each of these is worth slightly more than before, because a
+reclaim has no dialog:
+
+- Any holder of the user's SSH credentials for the daemon host, including an
+  agent on another host using the user's key, gets an sshd-spawned relay that
+  passes the check and can take any pane by resizing it. The operator accepted
+  remote reclaim. Before protocol 47 that connection could only ask the pane's
+  owner for control. The key already gives a shell on the daemon host.
+- `ssh localhost` gives a same-user process on the daemon host such a relay
+  too, as do the other ways out of the Splint cgroups that ADR 0007's
+  amendment lists.

@@ -231,8 +231,9 @@ processes. Public input and resize commands therefore use an atomic same-connect
 workflow: acquire control, perform the action, and release control during cleanup.
 The machine CLI does not expose reusable controller IDs, standalone acquire/release
 commands, transfer requests or decisions, or forced takeover. Observation and control-status subscriptions never acquire control.
-Automation can never take control the way a Window does when a person resizes
-a pane: no policy scope or grant covers it.
+No policy scope or grant lets automation take control the way a Window does
+when a person resizes a pane. This bounds cooperating agents, not a hostile
+same-user process; see ADR 0007 for the residual risks.
 
 Machine mode never prompts. It requires `--yes` for killing a process, closing a
 Splint, closing a Dojo, and revoking authorization. Create, split, restore,

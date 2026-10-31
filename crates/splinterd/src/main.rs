@@ -1222,6 +1222,10 @@ struct DaemonState {
     /// Every automation-role connection and its verified peer, so the
     /// access inventory can show which grants are in use now.
     automation_connections: Mutex<access_inventory::AutomationPeers>,
+    /// Every open remote-interactive connection, so a resize reclaim's audit
+    /// can tell a remote Window's lease from a closed connection's
+    /// (Plan 0072).
+    remote_window_connections: StdMutex<HashSet<u64>>,
     controller: Mutex<ControllerState>,
     control_events: broadcast::Sender<ControlNotice>,
     connection_revocations: broadcast::Sender<u64>,
@@ -3605,6 +3609,7 @@ fn build_daemon_state(inputs: DaemonStateInputs) -> Arc<DaemonState> {
         daemon_audit_peer,
         policy_reloads,
         automation_connections: Mutex::new(HashMap::new()),
+        remote_window_connections: StdMutex::default(),
         controller: Mutex::new(ControllerState::default()),
         control_events,
         connection_revocations,
@@ -4412,6 +4417,11 @@ async fn cleanup_connection(state: &DaemonState, connection_id: u64) {
         .unwrap()
         .remove_connection(connection_id);
     state
+        .remote_window_connections
+        .lock()
+        .unwrap()
+        .remove(&connection_id);
+    state
         .topology_hub
         .lock()
         .await
@@ -4678,6 +4688,13 @@ async fn serve_authenticated(
             peer.pid,
             peer.start_time(),
         );
+    }
+    if remote_interactive_client {
+        state
+            .remote_window_connections
+            .lock()
+            .unwrap()
+            .insert(connection_id);
     }
     if role == ClientRole::Automation {
         state
@@ -11823,6 +11840,24 @@ async fn handle_authorized_request(
             let requester = if trusted_local {
                 ReclaimRequester::Window
             } else if remote_interactive_client {
+                // The relay role needs no SSH, so an agent could run the
+                // relay itself; as for a consent responder (ADR 0015), it
+                // must run outside every Splint.
+                let context = remote_consent::TreeContext {
+                    splint_leaders: splint_leaders(state).await,
+                    workload_slices: workload_slices(state),
+                    requester: None,
+                };
+                state
+                    .consent_responders
+                    .check_remote_window(connection_id, peer, context)
+                    .await
+                    .map_err(|_| {
+                        ProtocolError::new(
+                            ErrorCode::Unauthorized,
+                            "a remote Window resizing from inside a Splint cannot take control",
+                        )
+                    })?;
                 ReclaimRequester::RemoteWindow
             } else {
                 return Err(ProtocolError::new(
@@ -12188,13 +12223,15 @@ enum ReclaimedFrom {
     /// The requester already held it.
     Itself,
     Holder(ControlHolder),
+    /// A connection that was closing, already gone from every registry.
+    ClosedConnection,
 }
 
 /// The request audit's reason for a resize reclaim: who took control, and
 /// from whom (Plan 0072).
 const fn reclaim_audit_reason(requester: ReclaimRequester, from: ReclaimedFrom) -> &'static str {
     use ControlHolder::{Agent, RemoteWindow, Window};
-    use ReclaimedFrom::{Holder, Itself, Nobody};
+    use ReclaimedFrom::{ClosedConnection, Holder, Itself, Nobody};
 
     match (requester, from) {
         (ReclaimRequester::Window, Nobody) => "resize_reclaim_by_window_from_nobody",
@@ -12215,33 +12252,47 @@ const fn reclaim_audit_reason(requester: ReclaimRequester, from: ReclaimedFrom) 
         (ReclaimRequester::RemoteWindow, Holder(Agent)) => {
             "resize_reclaim_by_remote_window_from_agent"
         }
+        (ReclaimRequester::Window, ClosedConnection) => {
+            "resize_reclaim_by_window_from_closed_connection"
+        }
+        (ReclaimRequester::RemoteWindow, ClosedConnection) => {
+            "resize_reclaim_by_remote_window_from_closed_connection"
+        }
     }
 }
 
-/// Which kind of connection held `lease`. A grant-bound lease and an
-/// automation connection's are an agent's; a trusted-UI connection is a
-/// Window; the only other role is a remote Window. A holder whose
-/// connection closed meanwhile is counted as a remote Window; only the
-/// audit reason reads this.
-async fn control_holder(state: &DaemonState, lease: ControllerLease) -> ControlHolder {
-    if lease.grant_id.is_some()
+/// What `lease` was taken from, by its connection's role. A grant-bound
+/// lease and an automation connection's are an agent's. A connection found
+/// in no registry was closing: its cleanup leaves the registries before it
+/// releases its lease. Only the audit reason reads this.
+async fn reclaimed_from(state: &DaemonState, lease: ControllerLease) -> ReclaimedFrom {
+    let connection_id = lease.connection_id;
+    let holder = if lease.grant_id.is_some()
         || state
             .automation_connections
             .lock()
             .await
-            .contains_key(&lease.connection_id)
+            .contains_key(&connection_id)
     {
         ControlHolder::Agent
     } else if state
         .handoff_windows
         .lock()
         .unwrap()
-        .is_trusted_ui_connection(lease.connection_id)
+        .is_trusted_ui_connection(connection_id)
     {
         ControlHolder::Window
-    } else {
+    } else if state
+        .remote_window_connections
+        .lock()
+        .unwrap()
+        .contains(&connection_id)
+    {
         ControlHolder::RemoteWindow
-    }
+    } else {
+        return ReclaimedFrom::ClosedConnection;
+    };
+    ReclaimedFrom::Holder(holder)
 }
 
 /// Takes a Splint's controller for a Window whose pane a person resized
@@ -12269,7 +12320,7 @@ async fn reclaim_control(
     let from = match reclaim.previous {
         _ if reclaim.already_held => ReclaimedFrom::Itself,
         None => ReclaimedFrom::Nobody,
-        Some(previous) => ReclaimedFrom::Holder(control_holder(state, previous).await),
+        Some(previous) => reclaimed_from(state, previous).await,
     };
     if let Some(transfer) = reclaim.cancelled {
         publish_control_notice(
@@ -18232,6 +18283,7 @@ mod tests {
             },
             policy_reloads: broadcast::channel(1).0,
             automation_connections: Mutex::new(HashMap::new()),
+            remote_window_connections: StdMutex::default(),
             controller: Mutex::new(ControllerState::default()),
             control_events,
             connection_revocations: broadcast::channel(CONNECTION_LIMIT).0,
@@ -30806,6 +30858,8 @@ mod tests {
             window.pid,
             window.start_time(),
         );
+        state.remote_window_connections.lock().unwrap().insert(601);
+        state.consent_responders.set_probe(Arc::new(|_, _| Ok(())));
         let reclaim = reclaim_request(splint_id, incarnation);
 
         let local = granted_controller(
@@ -30854,6 +30908,79 @@ mod tests {
                 "resize_reclaim_by_remote_window_from_window",
                 "resize_reclaim_by_remote_window_already_held",
                 "resize_reclaim_by_window_from_remote_window",
+            ]
+        );
+    }
+
+    /// Plan 0072, ADR 0015: the relay role needs no SSH, so a relay inside a
+    /// Splint (an agent running it itself) cannot take a pane by resizing; the
+    /// refusal is audited as denied and the lease stays. A holder whose
+    /// connection already left every registry is audited as a closed one.
+    #[tokio::test]
+    async fn a_relay_inside_a_splint_cannot_reclaim_and_a_closing_holder_is_named() {
+        let state = test_state_with_backend(false, test_pty_backend());
+        let handle = live_cat_splints(&state, 1).await.remove(0);
+        let (splint_id, incarnation) = (handle.splint_id, handle.incarnation.value());
+        let leaders = splint_leaders(&state).await;
+        assert!(!leaders.is_empty());
+        let checked = Arc::new(StdMutex::new(Vec::new()));
+        let probe_checked = Arc::clone(&checked);
+        state
+            .consent_responders
+            .set_probe(Arc::new(move |connection_id, context| {
+                let context = context.expect("a reclaim is checked against the Splints");
+                assert!(context.requester.is_none());
+                probe_checked
+                    .lock()
+                    .unwrap()
+                    .push((connection_id, context.splint_leaders.clone()));
+                if connection_id == 602 {
+                    Err(remote_consent::Ineligible::InsideSplint)
+                } else {
+                    Ok(())
+                }
+            }));
+        let remote = remote_window_peer();
+        state.remote_window_connections.lock().unwrap().insert(601);
+        state.remote_window_connections.lock().unwrap().insert(602);
+        let reclaim = reclaim_request(splint_id, incarnation);
+
+        let held = granted_controller(
+            handle_request(reclaim.clone(), &state, &remote, 601, 0, false, true).await,
+        );
+        let refused = handle_request(reclaim.clone(), &state, &remote, 602, 0, false, true)
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code, ErrorCode::Unauthorized);
+        let again = handle_request(reclaim.clone(), &state, &remote, 601, 0, false, true).await;
+        assert_eq!(granted_controller(again), held);
+        assert_eq!(
+            *checked.lock().unwrap(),
+            [
+                (601, leaders.clone()),
+                (602, leaders.clone()),
+                (601, leaders)
+            ]
+        );
+
+        // Connection cleanup leaves the registries before it releases its
+        // lease, so a reclaim in between finds a holder in none of them.
+        state.remote_window_connections.lock().unwrap().remove(&601);
+        let pinned = Arc::new(consent::PinnedClientSnapshot::own_executable_for_test());
+        let window = pinned_window_peer(&pinned);
+        state.handoff_windows.lock().unwrap().register_connection(
+            501,
+            window.pid,
+            window.start_time(),
+        );
+        granted_controller(handle_request(reclaim, &state, &window, 501, 0, true, false).await);
+        assert_eq!(
+            reclaim_audit_reasons(&state).await,
+            [
+                "resize_reclaim_by_remote_window_from_nobody",
+                "authorization_denied",
+                "resize_reclaim_by_remote_window_already_held",
+                "resize_reclaim_by_window_from_closed_connection",
             ]
         );
     }
