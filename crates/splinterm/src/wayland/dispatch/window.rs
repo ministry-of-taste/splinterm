@@ -214,6 +214,11 @@ impl WindowHandler for App {
         }
         let initial_configure = !self.surface.configured;
         self.surface.configured = true;
+        // Plan 0072 M2b: the opening grace runs from the first configure.
+        let since_opened = self.surface.configured_at.map(|at| at.elapsed());
+        if initial_configure {
+            self.surface.configured_at = Some(std::time::Instant::now());
+        }
         if initial_configure || resized {
             debug_assert!(terminal_resize_allowed(
                 TerminalResizeCause::SurfaceConfigure,
@@ -221,8 +226,7 @@ impl WindowHandler for App {
             ));
             // Plan 0072 M2b: a person's resize of the focused Window takes
             // control of its panes. One the inline picker defers does not.
-            let cause =
-                configure_resize_cause(initial_configure, resized, self.input.keyboard_focused);
+            let cause = configure_resize_cause(since_opened, resized, self.input.keyboard_focused);
             let resize = if self.modal.inline_picker_open() {
                 self.panes.restored_frontend_needs_resize = true;
                 Ok(())

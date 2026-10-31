@@ -942,6 +942,7 @@ impl WaylandSession {
             logical_width: initial_width,
             logical_height: initial_height,
             configured: false,
+            configured_at: None,
             scale_120: SCALE_DENOMINATOR,
             integer_fallback_scale: 1,
             mapped_notify: options.mapped.take(),
@@ -2521,6 +2522,9 @@ struct SurfaceState {
     logical_width: u32,
     logical_height: u32,
     configured: bool,
+    /// Plan 0072 M2b: when the first configure was acked, as the Window
+    /// maps; [`OPENING_RESIZE_GRACE`] runs from here.
+    configured_at: Option<Instant>,
     scale_120: u32,
     integer_fallback_scale: u32,
     /// Signals the Window's owner once the first buffer commit maps it.
@@ -3689,17 +3693,25 @@ enum PaneResizeCause {
     User,
 }
 
-/// Plan 0072 M2b: the cause of the pane resizes a toplevel configure makes.
-/// A configure after the first that changed the Window's size while it has
-/// keyboard focus is the person's, so of two tiled Windows laid out again
-/// together only the focused one takes control. The compositor does not say
-/// why it resized, so a scripted resize of the focused Window counts too.
-const fn configure_resize_cause(
-    initial_configure: bool,
+/// Plan 0072 M2b: how long after its first configure a Window is still
+/// settling: a compositor rule, a placement script, or the first re-tile
+/// may move or resize it just after it maps, which is not the person's.
+const OPENING_RESIZE_GRACE: Duration = Duration::from_secs(1);
+
+/// Plan 0072 M2b: the cause of the pane resizes a toplevel configure makes,
+/// `since_opened` after the Window's first configure (`None` for the first).
+/// A configure that changed the Window's size while it has keyboard focus,
+/// once the Window has settled, is the person's, so of two tiled Windows laid
+/// out again together only the focused one takes control. The compositor does
+/// not say why it resized, so a scripted resize of the focused Window counts
+/// too.
+fn configure_resize_cause(
+    since_opened: Option<Duration>,
     resized: bool,
     keyboard_focused: bool,
 ) -> PaneResizeCause {
-    if !initial_configure && resized && keyboard_focused {
+    let settled = since_opened.is_some_and(|elapsed| elapsed >= OPENING_RESIZE_GRACE);
+    if settled && resized && keyboard_focused {
         PaneResizeCause::User
     } else {
         PaneResizeCause::Layout
@@ -18880,27 +18892,36 @@ mod tests {
         (pane, command_receiver)
     }
 
-    /// Plan 0072 M2b: only a configure after the first that changed the
-    /// size of the Window with keyboard focus is the person's resize.
+    /// Plan 0072 M2b: only a configure that changed the size of the Window
+    /// with keyboard focus, once it has settled after opening, is the
+    /// person's resize.
     #[test]
     fn only_a_later_resize_of_the_focused_window_is_the_persons() {
-        // (initial configure, resized, keyboard focused)
-        for (initial, resized, focused) in [
-            (true, true, true),
-            (true, false, true),
-            (true, true, false),
-            (false, false, true),
-            (false, true, false),
-            (false, false, false),
+        let settled = Some(OPENING_RESIZE_GRACE);
+        let settling = Some(OPENING_RESIZE_GRACE - Duration::from_millis(1));
+        // (since opened, resized, keyboard focused)
+        for (since_opened, resized, focused) in [
+            (None, true, true),
+            (None, false, true),
+            (None, true, false),
+            (Some(Duration::ZERO), true, true),
+            (settling, true, true),
+            (settled, false, true),
+            (settled, true, false),
+            (settled, false, false),
         ] {
             assert_eq!(
-                configure_resize_cause(initial, resized, focused),
+                configure_resize_cause(since_opened, resized, focused),
                 PaneResizeCause::Layout,
-                "initial {initial}, resized {resized}, focused {focused}"
+                "since opened {since_opened:?}, resized {resized}, focused {focused}"
             );
         }
         assert_eq!(
-            configure_resize_cause(false, true, true),
+            configure_resize_cause(settled, true, true),
+            PaneResizeCause::User
+        );
+        assert_eq!(
+            configure_resize_cause(Some(Duration::from_secs(60)), true, true),
             PaneResizeCause::User
         );
     }
