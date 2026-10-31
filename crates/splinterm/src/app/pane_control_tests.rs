@@ -1679,7 +1679,7 @@ async fn a_display_lost_for_a_while_says_so_until_its_reattachment() {
     ));
     assert!(matches!(
         next_update(&mut window).await,
-        WindowUpdate::StreamLost
+        WindowUpdate::StreamLost { reconnecting: true }
     ));
     assert_eq!(started.elapsed(), PANE_STREAM_NOTICE_DELAY);
     let WindowUpdate::Snapshot {
@@ -1777,14 +1777,32 @@ async fn a_reconnection_that_cannot_succeed_stops_and_the_pane_waits_to_close() 
         ),
         HandoffStatusHub::default(),
         scripted_reconnect(
-            vec![Ok(StreamReconnect::Stop("the Splint is gone"))],
+            vec![
+                Err(anyhow::anyhow!("connection refused")),
+                Err(anyhow::anyhow!("connection refused")),
+                Err(anyhow::anyhow!("connection refused")),
+                Ok(StreamReconnect::Stop("the Splint is gone")),
+            ],
             &attempts,
         ),
     ));
+    let started = tokio::time::Instant::now();
+    assert!(matches!(
+        next_update(&mut window).await,
+        WindowUpdate::StreamLost { reconnecting: true }
+    ));
+    // The last attempt, at 0.25 + 0.5 + 1 + 2 s, stops reconnecting, and
+    // the pane says so at once.
+    assert!(matches!(
+        next_update(&mut window).await,
+        WindowUpdate::StreamLost {
+            reconnecting: false
+        }
+    ));
+    assert_eq!(started.elapsed(), Duration::from_millis(3750));
     tokio::time::sleep(Duration::from_secs(60)).await;
-    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(attempts.load(Ordering::SeqCst), 4);
     // The pane keeps its queue open: a closed queue would end the Window.
-    assert!(matches!(window.try_recv(), Ok(WindowUpdate::StreamLost)));
     assert!(matches!(
         window.try_recv(),
         Err(mpsc::error::TryRecvError::Empty)

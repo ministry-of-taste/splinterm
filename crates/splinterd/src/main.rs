@@ -15300,20 +15300,23 @@ struct SubscriptionOutputs {
 }
 
 /// Plan 0073: a terminal subscription ends with `ResyncRequired`, so its
-/// client must attach again; says which and why.
+/// client must attach again; says which and why. A subscriber that fell
+/// behind is ordinary backpressure the client recovers from, so it logs at
+/// debug (`limit` false); a limit that ended it logs at warn.
 fn log_subscription_resync(
     outputs: &SubscriptionOutputs,
     subscription_id: u64,
     splint_id: SplintId,
     reason: &str,
+    limit: bool,
 ) {
-    warn!(
-        connection_id = outputs.connection_id,
-        subscription_id,
-        %splint_id,
-        reason,
-        "ending a terminal subscription; its client must resynchronize"
-    );
+    let connection_id = outputs.connection_id;
+    let message = "ending a terminal subscription; its client must resynchronize";
+    if limit {
+        warn!(connection_id, subscription_id, %splint_id, reason, "{message}");
+    } else {
+        debug!(connection_id, subscription_id, %splint_id, reason, "{message}");
+    }
 }
 
 struct SubscriptionAudit {
@@ -15526,6 +15529,7 @@ fn spawn_subscription(
                         id,
                         handle.splint_id,
                         "the subscriber fell behind the terminal's updates",
+                        false,
                     );
                     let revision = current_revision(&handle, access.scrollback_rows).await;
                     let _ = outputs
@@ -15605,6 +15609,7 @@ fn spawn_subscription(
                                 id,
                                 handle.splint_id,
                                 "an update exceeds the grant's returned-bytes limit",
+                                true,
                             );
                             let revision = current_revision(&handle, access.scrollback_rows).await;
                             let _ = outputs
@@ -15646,6 +15651,7 @@ fn spawn_subscription(
                                 id,
                                 handle.splint_id,
                                 "terminal publication memory is exhausted",
+                                true,
                             );
                             let revision = current_revision(&handle, access.scrollback_rows).await;
                             let _ = outputs
@@ -15681,6 +15687,7 @@ fn spawn_subscription(
                                 id,
                                 handle.splint_id,
                                 "the connection's outbound queue is full or closed",
+                                false,
                             );
                             let revision = current_revision(&handle, access.scrollback_rows).await;
                             let _ = outputs
@@ -27907,26 +27914,8 @@ mod tests {
     /// its connection's writes, and the daemon says which connection and why.
     #[tokio::test(start_paused = true)]
     async fn a_stalled_write_ends_the_writer_and_logs_why() {
-        #[derive(Clone, Default)]
-        struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for Captured {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(bytes);
-                Ok(bytes.len())
-            }
-
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let logs = Captured::default();
-        let sink = logs.clone();
-        let _logging = tracing::subscriber::set_default(
-            tracing_subscriber::fmt()
-                .with_ansi(false)
-                .with_writer(move || sink.clone())
-                .finish(),
-        );
+        let logs = CapturedLogs::default();
+        let _logging = logs.install();
         let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
         server.set_nonblocking(true).unwrap();
         let (_reader, writer) = UnixStream::from_std(server).unwrap().into_split();
@@ -27958,12 +27947,81 @@ mod tests {
             .expect("a stalled write ends the writer")
             .unwrap();
         producer.await.unwrap();
-        let logs = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        let logs = logs.text();
         assert!(
-            logs.contains("connection_id=77") && logs.contains("its client read nothing"),
+            logs.contains("WARN")
+                && logs.contains("connection_id=77")
+                && logs.contains("its client read nothing"),
             "{logs}"
         );
         drop(client);
+    }
+
+    /// Plan 0073: this thread's tracing output at every level.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl CapturedLogs {
+        fn install(&self) -> tracing::subscriber::DefaultGuard {
+            let sink = self.clone();
+            tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::TRACE)
+                    .with_writer(move || sink.clone())
+                    .finish(),
+            )
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    /// Plan 0073: a subscriber that fell behind is routine backpressure and
+    /// logs at debug, so heavy output never floods the journal; a limit that
+    /// ended a subscription logs at warn.
+    #[test]
+    fn a_routine_resynchronization_logs_at_debug_and_a_limit_at_warn() {
+        let (outbound, _outbound_rx) = mpsc::channel(1);
+        let (control, _control_rx) = mpsc::channel(1);
+        let outputs = SubscriptionOutputs {
+            outbound,
+            control,
+            connection_id: 5,
+        };
+        let splint_id = SplintId::new();
+        let routine = CapturedLogs::default();
+        {
+            let _logging = routine.install();
+            log_subscription_resync(&outputs, 1, splint_id, "fell behind", false);
+        }
+        let limit = CapturedLogs::default();
+        {
+            let _logging = limit.install();
+            log_subscription_resync(&outputs, 2, splint_id, "over the limit", true);
+        }
+        let (routine, limit) = (routine.text(), limit.text());
+        assert!(
+            routine.contains("DEBUG") && routine.contains("subscription_id=1"),
+            "{routine}"
+        );
+        assert!(!routine.contains("WARN"), "{routine}");
+        assert!(
+            limit.contains("WARN") && limit.contains("subscription_id=2"),
+            "{limit}"
+        );
     }
 
     #[tokio::test]

@@ -2012,6 +2012,7 @@ impl PaneSubscription {
         let mut delay = PANE_STREAM_RETRY_INITIAL;
         let mut next_attempt = Some(lost_at + delay);
         let mut attempts = 0_u32;
+        let mut reconnecting = true;
         loop {
             tokio::select! {
                 biased;
@@ -2030,7 +2031,7 @@ impl PaneSubscription {
                     notice_at = if hub.input_paused() {
                         later
                     } else {
-                        match self.updates.try_send(WindowUpdate::StreamLost) {
+                        match self.updates.try_send(WindowUpdate::StreamLost { reconnecting }) {
                             Err(mpsc::error::TrySendError::Full(_)) => later,
                             _ => None,
                         }
@@ -2068,6 +2069,9 @@ impl PaneSubscription {
                         Ok(StreamReconnect::Stop(reason)) => {
                             eprintln!("splinterm pane {splint_id}: display stream not reconnected: {reason}");
                             next_attempt = None;
+                            // The pane stops saying it is reconnecting.
+                            reconnecting = false;
+                            notice_at = Some(tokio::time::Instant::now());
                         }
                         Err(error) => {
                             if attempts.is_power_of_two() {
