@@ -15754,13 +15754,18 @@ fn spawn_control_subscription(
         let mut sequence = 1_u64;
         // Plan 0074 M2: a Window's subscription carries the Splint's OSC 52
         // requests while its connection holds the controller lease.
-        let (_clipboard_route, mut clipboard_deliveries) = if window {
+        let (route, deliveries) = if window {
             let routes = &state.clipboard;
             let (route, deliveries) = routes.register(connection_id, splint_id, incarnation);
             (Some(route), Some(deliveries))
         } else {
             (None, None)
         };
+        let mut clipboard_deliveries = deliveries;
+        // Declared after the receiver, so it drops first when the task ends:
+        // its waiting query then ends at once, and a later one finds no route.
+        #[allow(clippy::no_effect_underscore_binding, reason = "held for its drop")]
+        let _clipboard_route = route;
         let mut clipboard_open = clipboard_deliveries.is_some();
         let mut clipboard_pacer = clipboard::SetPacer::default();
         loop {

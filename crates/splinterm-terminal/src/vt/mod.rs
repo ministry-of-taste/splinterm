@@ -550,11 +550,17 @@ impl Parser {
                         0xf0..=0xf4 => 3,
                         _ => 0,
                     };
+                    // An OSC 52 string grows past the OSC limit when it reaches
+                    // it, also one a checkpoint restored.
+                    if self.string.len() == self.string_limit
+                        && self.string_limit < OSC52_STRING_LIMIT
+                        && self.string.starts_with(b"52;")
+                    {
+                        self.string_limit = OSC52_STRING_LIMIT;
+                    }
                     self.push_string(byte);
                     if self.string == b"1337;File=" {
                         self.start_string(State::ItermControl, 1024);
-                    } else if self.string == b"52;" {
-                        self.string_limit = self.string_limit.max(OSC52_STRING_LIMIT);
                     }
                     (None, false)
                 }

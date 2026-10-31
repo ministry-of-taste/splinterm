@@ -117,9 +117,10 @@ clipboard, and a reply names the letter the program asked for. A set carries
 at most 1 MiB of UTF-8 text; anything larger, not valid base64, or not text is
 ignored. A read answers with text only. It answers empty when the clipboard
 holds no text, does not answer within about a second, or holds more than the
-program's input queue takes at once: about 768 KiB, less while input is still
-queued. Replies reach the program in the order it asked; a program already
-waiting on 16 reads gets no reply to another.
+program's input queue takes at once while leaving room for your keys: about
+720 KiB, less while input is still queued. Replies reach the program in the
+order it asked; a program already waiting on 16 reads gets no reply to
+another.
 
 Only the Window that controls the pane, by typing in it or resizing it, sets
 or reads its clipboard. That holds for a pane in a background tab or in a
@@ -163,6 +164,10 @@ Known limits:
   the read is answered gets the DA1 reply first.
 - A read's reply can arrive between the pieces of a large paste you are
   making into the same program.
+- A Window answers a read of a selection it set from its own copy. If
+  another program took that selection at the same moment, the read can still
+  return the text this Window set, such as the program's own set, rather than
+  the newer text; nothing else leaks.
 
 ## Supported keys
 

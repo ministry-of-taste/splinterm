@@ -538,7 +538,9 @@ async fn route_query(
     let (connection_id, query_id, answer) = match refusal {
         Ok(started) => started,
         Err(reason) => {
-            finish_query(state, key, seq, &[], reason).await;
+            // Off the broker loop, which never waits on an actor.
+            let state = Arc::clone(state);
+            tokio::spawn(async move { finish_query(&state, key, seq, &[], reason).await });
             return;
         }
     };

@@ -4152,6 +4152,26 @@ mod tests {
     }
 
     #[test]
+    fn a_set_in_progress_at_a_checkpoint_may_still_grow_past_the_osc_limit() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+        let mut terminal = terminal(8, 2);
+        terminal.advance(b"\x1b]52;c;");
+        let checkpoint = terminal.encode_checkpoint().unwrap();
+        let mut restored =
+            Terminal::restore_checkpoint(&checkpoint, TerminalConfig::default()).unwrap();
+        let text = vec![b'x'; 6 * 1024];
+        let encoded = STANDARD.encode(&text);
+        assert!(encoded.len() > TerminalConfig::default().osc_limit);
+        restored.advance(encoded.as_bytes());
+        restored.advance(b"\x07");
+        assert_eq!(
+            clipboard_events(&mut restored),
+            vec![clipboard_set(ClipboardSelection::Clipboard, &text)]
+        );
+    }
+
+    #[test]
     fn a_query_in_progress_at_a_checkpoint_is_still_asked_after_restore() {
         let mut terminal = terminal(8, 2);
         terminal.advance(b"\x1b]52;s;");
