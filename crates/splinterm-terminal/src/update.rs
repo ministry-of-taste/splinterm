@@ -170,10 +170,13 @@ impl TerminalUpdate {
             )?;
         for event in &self.events {
             let body = match event {
-                TerminalEvent::PtyWrite(bytes) => bytes.capacity(),
+                TerminalEvent::PtyWrite(bytes) | TerminalEvent::ClipboardSet { bytes, .. } => {
+                    bytes.capacity()
+                }
                 TerminalEvent::TitleChanged(title) => title.capacity(),
                 TerminalEvent::Bell
                 | TerminalEvent::PaletteChanged { .. }
+                | TerminalEvent::ClipboardQuery { .. }
                 | TerminalEvent::UnsupportedSequence(_)
                 | TerminalEvent::ImageRejected(_)
                 | TerminalEvent::StringTruncated(_)

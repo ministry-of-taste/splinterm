@@ -357,6 +357,15 @@ whole topology for changes still needs a daemon policy rule.
 
 - No level includes clipboard access. A request that asks for a clipboard scope
   is rejected as invalid.
+  OSC 52 sets and reads go only to the Window that controls a pane, never to
+  an automation or MCP connection, nor to a relay running inside a pane. A
+  program an agent starts in a pane can still read the clipboard through
+  OSC 52 once your Window controls that pane again, as any program there can,
+  and an agent with **Look and type** can then read the answer from the
+  screen. Set `[clipboard] osc52=copy` or `off` to prevent it
+  ([Programs and the clipboard](configuration.md#programs-and-the-clipboard-osc-52)).
+  The audit records OSC 52 requests with byte counts only, at most 16 a
+  minute per pane.
 - No level includes authorization inspection or revocation, audit inspection,
   or creating a new Lair. These are not consent scopes at all and stay available
   only through the policy file.

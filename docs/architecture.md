@@ -76,6 +76,16 @@ ends the pane. The daemon accepts it only from the installed client and from
 remote Windows' relays running outside every Splint, and no policy grants it;
 the connection that lost the lease is told a Window took it, not which. ADR 0007
 and ADR 0010 list the residual risks.
+A program's OSC 52 clipboard set or query leaves its terminal actor as a
+bounded daemon event, never as terminal output or update history, and reaches
+only the control subscription of the Window connection, installed client or
+remote Window whose relay runs outside every Splint, that holds the pane's
+controller lease. The Window applies `clipboard.osc52`; a query nobody answers
+within two seconds gets the empty reply. The actor writes replies in the order
+the program asked, answers an owed query empty after three seconds or before a
+live-upgrade capture, and keeps at most 16 owed; no terminal reply is written
+into the middle of a partly written input chunk. Audit records hold byte
+counts, not contents, at most 16 a minute per Splint.
 Literal search runs inside the owning terminal actor with fixed query/result/
 preview/deadline bounds and opaque cursors tied to incarnation, terminal
 revision, and history generation. See

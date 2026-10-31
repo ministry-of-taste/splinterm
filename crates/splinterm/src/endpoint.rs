@@ -7,7 +7,7 @@ use splinterm_automation_client::Connection;
 use splinterm_core::SplintId;
 
 use crate::{
-    handoff_control::HandoffControlRestore, handoff_status::HandoffStatusHub,
+    handoff_control::HandoffControlRestore, handoff_status::HandoffStatusHub, osc52::Osc52Hub,
     remote::RemoteProfile, remote_askpass::NativePrompt, remote_session::RemoteSession,
 };
 
@@ -117,6 +117,9 @@ pub struct ConnectionFactory {
     handoff_control: HandoffControlRestore,
     /// The forced takeovers this Window's panes wait on (Plan 0072 M3).
     forces: ForcesInFlight,
+    /// The OSC 52 requests this Window's panes hand its frontend (Plan 0074
+    /// M2).
+    osc52: Osc52Hub,
 }
 
 /// The forced takeovers a Window's panes wait on now (Plan 0072 M3), shared
@@ -182,6 +185,7 @@ impl ConnectionFactory {
             handoff_status: HandoffStatusHub::default(),
             handoff_control: HandoffControlRestore::default(),
             forces: ForcesInFlight::default(),
+            osc52: Osc52Hub::default(),
         }
     }
 
@@ -229,6 +233,7 @@ impl ConnectionFactory {
             handoff_status: HandoffStatusHub::default(),
             handoff_control: HandoffControlRestore::default(),
             forces: ForcesInFlight::default(),
+            osc52: Osc52Hub::default(),
         }
     }
 
@@ -277,6 +282,12 @@ impl ConnectionFactory {
     #[must_use]
     pub fn forces_in_flight(&self) -> &ForcesInFlight {
         &self.forces
+    }
+
+    /// The OSC 52 requests this Window's panes hand its frontend.
+    #[must_use]
+    pub fn osc52(&self) -> &Osc52Hub {
+        &self.osc52
     }
 
     /// Returns the explicit endpoint behavior contract.

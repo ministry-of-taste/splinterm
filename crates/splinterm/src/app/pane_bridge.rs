@@ -20,6 +20,7 @@ use splinterm::endpoint::{
     ConnectionFactory, ForcedControlTransfer, ForcesInFlight, ImageTransport,
 };
 use splinterm::handoff_status::{HandoffStatusHub, HandoffStatusSource};
+use splinterm::osc52::{Osc52Hub, QUERY_ANSWER_TIMEOUT};
 use splinterm::{
     AuthorityStatus, PerfTraceCorrelation, TerminalGridLimits, WindowCommand, WindowPaneOptions,
     WindowUpdate,
@@ -92,7 +93,9 @@ pub(in crate::app) fn classify_subscription_event(
         | SubscriptionEvent::ControlTransferResolved { .. }
         | SubscriptionEvent::AgentStatusChanged { .. }
         | SubscriptionEvent::ConsentOffered { .. }
-        | SubscriptionEvent::ConsentOfferWithdrawn { .. } => EventAction::Ignore,
+        | SubscriptionEvent::ConsentOfferWithdrawn { .. }
+        | SubscriptionEvent::ClipboardSet { .. }
+        | SubscriptionEvent::ClipboardQuery { .. } => EventAction::Ignore,
     }
 }
 
@@ -332,6 +335,10 @@ pub(in crate::app) struct ControllerOutputs {
     /// The Window's forced takeovers in flight, which this pane's force
     /// joins while it waits (Plan 0072 M3).
     pub(in crate::app) forces: ForcesInFlight,
+    /// The Window's OSC 52 requests: the controller hands its control
+    /// subscription's clipboard sets and queries to the frontend (Plan 0074
+    /// M2).
+    pub(in crate::app) osc52: Osc52Hub,
 }
 
 type PaneResize = (u16, u16, u16, u16);
@@ -900,6 +907,87 @@ pub(in crate::app) async fn reclaim_pane_control(
     Ok(refused_request || active_controller.is_some())
 }
 
+/// A program's OSC 52 query this pane waits to answer (Plan 0074 M2).
+pub(in crate::app) struct PendingOsc52Answer {
+    query_id: u64,
+    answer: tokio::sync::oneshot::Receiver<Vec<u8>>,
+    deadline: tokio::time::Instant,
+}
+
+/// Hands a control-subscription clipboard event to the Window's frontend
+/// and returns `None`, or returns any other frame unchanged. A query
+/// replaces one still waiting: the daemon already answered that one empty.
+pub(in crate::app) fn route_osc52_event(
+    frame: ServerFrame,
+    subscription_id: u64,
+    hub: &Osc52Hub,
+    pending: &mut Option<PendingOsc52Answer>,
+) -> Option<ServerFrame> {
+    match frame {
+        ServerFrame::Event {
+            subscription_id: event_subscription,
+            event: SubscriptionEvent::ClipboardSet { selection, data },
+            ..
+        } if event_subscription == subscription_id => {
+            hub.set(selection, &data);
+            None
+        }
+        ServerFrame::Event {
+            subscription_id: event_subscription,
+            event:
+                SubscriptionEvent::ClipboardQuery {
+                    query_id,
+                    selection,
+                },
+            ..
+        } if event_subscription == subscription_id => {
+            *pending = Some(PendingOsc52Answer {
+                query_id,
+                answer: hub.query(selection),
+                deadline: tokio::time::Instant::now() + QUERY_ANSWER_TIMEOUT,
+            });
+            None
+        }
+        frame => Some(frame),
+    }
+}
+
+/// The waiting query's ID and answer: the frontend's text, or empty when
+/// it dropped the query or did not answer by the deadline.
+pub(in crate::app) async fn next_osc52_answer(
+    pending: &mut Option<PendingOsc52Answer>,
+) -> (u64, Vec<u8>) {
+    let Some(waiting) = pending.as_mut() else {
+        return std::future::pending().await;
+    };
+    let text = tokio::time::timeout_at(waiting.deadline, &mut waiting.answer)
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default();
+    let query_id = waiting.query_id;
+    *pending = None;
+    (query_id, text)
+}
+
+/// Sends the daemon a query's answer. A refused answer is no failure of the
+/// pane: the program has its empty reply already.
+pub(in crate::app) async fn answer_osc52_query(
+    control: &mut Connection,
+    query_id: u64,
+    text: &[u8],
+) -> Result<()> {
+    let data = splinterm_protocol::encode_clipboard_data(text).unwrap_or_default();
+    match control
+        .request(Request::AnswerClipboardQuery { query_id, data })
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(error) if protocol_error(&error).is_some() => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 pub(in crate::app) async fn handle_control_event(
     frame: ServerFrame,
     subscription_id: u64,
@@ -1010,6 +1098,7 @@ pub(in crate::app) async fn drive_controller(
     let mut coalescing_barrier = None;
     let mut paste_close_pending = false;
     let mut reclaim_refusal_logged = false;
+    let mut osc52_answer = None;
     let resize_delay = Duration::from_millis(resize_delay_ms);
     let Response::ControlSubscribed {
         subscription_id: control_subscription,
@@ -1045,6 +1134,14 @@ pub(in crate::app) async fn drive_controller(
                             outputs.handoff.observe(generation, phase);
                             continue;
                         }
+                        let Some(frame) = route_osc52_event(
+                            frame,
+                            control_subscription,
+                            &outputs.osc52,
+                            &mut osc52_answer,
+                        ) else {
+                            continue;
+                        };
                         let control_acquired = handle_control_event(
                             frame,
                             control_subscription,
@@ -1072,6 +1169,12 @@ pub(in crate::app) async fn drive_controller(
                     // The async block takes the barrier only when this branch wins.
                     command = async { coalescing_barrier.take() }, if coalescing_barrier.is_some() => {
                         (command, true)
+                    }
+                    // Plan 0074 M2: the Window's answer to a program's OSC 52
+                    // query, or empty once it takes too long.
+                    (query_id, text) = next_osc52_answer(&mut osc52_answer), if osc52_answer.is_some() => {
+                        answer_osc52_query(&mut control, query_id, &text).await?;
+                        continue;
                     }
                     command = commands.recv() => (command, true),
                     () = wait_for_resize_deadline(resize_deadline) => {
@@ -1837,6 +1940,7 @@ pub(in crate::app) async fn prepare_live_pane_at_incarnation(
             resyncs: resync_sender,
             handoff: factory.handoff_status().source(),
             forces: factory.forces_in_flight().clone(),
+            osc52: factory.osc52().clone(),
         },
         controller_id,
         splint_id,

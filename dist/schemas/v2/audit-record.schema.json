@@ -52,7 +52,8 @@
       "minLength": 1,
       "maxLength": 255,
       "pattern": "^[^/]+$"
-    }
+    },
+    "byte_count": { "type": "integer", "minimum": 0 }
   },
   "$defs": {
     "uuid": {
@@ -131,7 +132,9 @@
         "acknowledge_handoff_prepare",
         "subscribe_consent_offers",
         "answer_consent_offer",
-        "claim_dojo_presentation"
+        "claim_dojo_presentation",
+        "clipboard_set",
+        "clipboard_query"
       ]
     },
     "peer": {

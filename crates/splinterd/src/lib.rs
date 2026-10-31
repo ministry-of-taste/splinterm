@@ -45,12 +45,13 @@ pub use candidate_bootstrap::{
 #[doc(hidden)]
 pub use handoff_manifest::encode_manifest_pair_for_integration_test;
 pub use live::{
-    ActorHandoffEvidence, CheckpointReservation, CompactSubscription, HandedOffSplint,
-    HandoffCheckpointBudget, LiveAdoptionFailure, LiveAdoptionInputs, LiveCell, LiveError,
-    LiveEvent, LiveRow, LiveRuntimeMetrics, LiveScrollbackPage, LiveSearchPage, LiveSnapshot,
-    LiveSplintConfig, LiveSplintHandle, LiveSplintRuntime, PreparedPtyHandoff, ProcessExit,
-    ProcessIncarnation, ProcessPlacement, RootProcessProbe, StagedLiveSplint, Subscription,
-    SubscriptionReceive, TerminalPublicationMemoryLease,
+    ActorHandoffEvidence, CheckpointReservation, ClipboardEvent, ClipboardRequest,
+    CompactSubscription, HandedOffSplint, HandoffCheckpointBudget, LiveAdoptionFailure,
+    LiveAdoptionInputs, LiveCell, LiveError, LiveEvent, LiveRow, LiveRuntimeMetrics,
+    LiveScrollbackPage, LiveSearchPage, LiveSnapshot, LiveSplintConfig, LiveSplintHandle,
+    LiveSplintRuntime, PreparedPtyHandoff, ProcessExit, ProcessIncarnation, ProcessPlacement,
+    RootProcessProbe, StagedLiveSplint, Subscription, SubscriptionReceive,
+    TerminalPublicationMemoryLease,
 };
 pub use splinterm_policy::{executable_identity, inspect_policy_file, policy};
 

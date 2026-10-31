@@ -18,7 +18,7 @@ use splinterm_core::{
     TopologyRevision,
 };
 
-pub const PROTOCOL_VERSION: u16 = 47;
+pub const PROTOCOL_VERSION: u16 = 48;
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_TERMINAL_TRANSACTION_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_TERMINAL_TRANSACTION_CHUNK_BYTES: usize = 8 * 1024 * 1024;
@@ -149,6 +149,13 @@ pub const MAX_HANDOFF_WINDOW_DOJOS: usize = 32;
 pub const MAX_HANDOFF_DOJO_NAME_BYTES: usize = 128;
 /// Longest a daemon waits for a [`ClientFrame::HandoffDecision`] answer.
 pub const MAX_HANDOFF_DECISION_DEADLINE_MS: u32 = 60_000;
+
+/// The most bytes one OSC 52 clipboard set or query answer carries, decoded
+/// (Plan 0074 M2).
+pub const MAX_CLIPBOARD_BYTES: usize = 1024 * 1024;
+/// The longest base64 text a clipboard set or answer may carry: the
+/// encoding of [`MAX_CLIPBOARD_BYTES`].
+pub const MAX_CLIPBOARD_BASE64_BYTES: usize = MAX_CLIPBOARD_BYTES.div_ceil(3) * 4;
 
 #[must_use]
 pub fn image_content_socket_path(control_socket: &Path) -> PathBuf {
@@ -1108,6 +1115,19 @@ pub enum Request {
     ClaimDojoPresentation {
         dojo_id: DojoId,
     },
+    /// Trusted UI only (Plan 0074 M2): answers the
+    /// [`SubscriptionEvent::ClipboardQuery`] `query_id` sent on this
+    /// connection's control subscription with the Window's clipboard text as
+    /// base64 ([`encode_clipboard_data`]), empty when its configuration
+    /// refuses or it has no text. Answered `Acknowledged` whether or not the
+    /// query was still waiting; only the asked connection's first answer
+    /// reaches the program, and only while that connection still holds the
+    /// Splint's controller lease.
+    AnswerClipboardQuery {
+        query_id: u64,
+        #[serde(deserialize_with = "deserialize_clipboard_data")]
+        data: String,
+    },
 }
 
 /// Validates one [`Request::AnswerConsentOffer`]: a nonzero generation and
@@ -1123,6 +1143,65 @@ pub fn validate_consent_answer(daemon_generation: u64, offer_id: u64) -> Result<
         ));
     }
     Ok(())
+}
+
+/// A selection a program names through OSC 52 (Plan 0074 M2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClipboardSelection {
+    Clipboard,
+    Primary,
+}
+
+/// Encodes clipboard text for [`SubscriptionEvent::ClipboardSet`] or
+/// [`Request::AnswerClipboardQuery`].
+///
+/// # Errors
+/// Returns `InvalidArgument` for more than [`MAX_CLIPBOARD_BYTES`].
+pub fn encode_clipboard_data(bytes: &[u8]) -> Result<String, ProtocolError> {
+    if bytes.len() > MAX_CLIPBOARD_BYTES {
+        return Err(ProtocolError::new(
+            ErrorCode::InvalidArgument,
+            "clipboard data exceeds its byte limit",
+        ));
+    }
+    Ok(BASE64_STANDARD.encode(bytes))
+}
+
+/// Decodes the base64 clipboard data of a set or an answer: canonical
+/// padded base64 for at most [`MAX_CLIPBOARD_BYTES`]. Empty data decodes to
+/// no bytes.
+///
+/// # Errors
+/// Returns `InvalidArgument` for malformed or oversized data.
+pub fn decode_clipboard_data(data: &str) -> Result<Vec<u8>, ProtocolError> {
+    let invalid = || {
+        ProtocolError::new(
+            ErrorCode::InvalidArgument,
+            "clipboard data is not bounded canonical base64",
+        )
+    };
+    if data.len() > MAX_CLIPBOARD_BASE64_BYTES {
+        return Err(invalid());
+    }
+    let bytes = BASE64_STANDARD.decode(data).map_err(|_| invalid())?;
+    if bytes.len() > MAX_CLIPBOARD_BYTES {
+        return Err(invalid());
+    }
+    Ok(bytes)
+}
+
+fn deserialize_clipboard_data<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let data = String::deserialize(deserializer)?;
+    if data.len() > MAX_CLIPBOARD_BASE64_BYTES {
+        return Err(serde::de::Error::custom(
+            "clipboard data exceeds its byte limit",
+        ));
+    }
+    Ok(data)
 }
 
 /// The `Unauthorized` reason the daemon gives a `Hello` claiming the
@@ -1710,6 +1789,26 @@ pub enum SubscriptionEvent {
     ConsentOfferWithdrawn {
         offer_id: u64,
         reason: ConsentOfferEnd,
+    },
+    /// Plan 0074 M2: a program in the Splint set `selection` through OSC 52;
+    /// `data` is its text as base64 ([`decode_clipboard_data`]). Sent only on
+    /// the control subscription of the Window connection, installed client
+    /// or remote Window whose relay runs outside every Splint, that holds the
+    /// Splint's controller lease; never to an automation connection. The
+    /// Window decides by its own configuration whether to publish it.
+    ClipboardSet {
+        selection: ClipboardSelection,
+        #[serde(deserialize_with = "deserialize_clipboard_data")]
+        data: String,
+    },
+    /// Plan 0074 M2: a program in the Splint asked for `selection`'s
+    /// contents through OSC 52. Sent like [`Self::ClipboardSet`]; the Window
+    /// answers with [`Request::AnswerClipboardQuery`], empty when its
+    /// configuration refuses. Without an answer in time the daemon gives the
+    /// program an empty reply.
+    ClipboardQuery {
+        query_id: u64,
+        selection: ClipboardSelection,
     },
 }
 
@@ -2669,6 +2768,13 @@ pub enum AuditOperation {
     AnswerConsentOffer,
     /// Plan 0067 M3: a Window claims an agent's new Dojo as a background tab.
     ClaimDojoPresentation,
+    /// Plan 0074 M2: a program set a selection through OSC 52. The daemon
+    /// records the byte count and outcome, never the contents or the
+    /// selection; `succeeded` means sent to the Window.
+    ClipboardSet,
+    /// Plan 0074 M2: a program asked for a selection through OSC 52, and a
+    /// Window's answer to it. Never the contents or the selection.
+    ClipboardQuery,
 }
 
 impl AuditOperation {
@@ -2728,6 +2834,8 @@ impl AuditOperation {
             Self::SubscribeConsentOffers => "subscribe_consent_offers",
             Self::AnswerConsentOffer => "answer_consent_offer",
             Self::ClaimDojoPresentation => "claim_dojo_presentation",
+            Self::ClipboardSet => "clipboard_set",
+            Self::ClipboardQuery => "clipboard_query",
         }
     }
 }
@@ -2797,6 +2905,10 @@ pub struct AuditRecord {
     pub argument_count: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub executable_basename: Option<String>,
+    /// The bytes a clipboard operation moved (Plan 0074 M2), never what
+    /// they were.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub byte_count: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -7070,7 +7182,7 @@ mod tests {
 
     #[test]
     fn first_terminal_read_requests_are_explicit_protocol_v20_shapes() {
-        assert_eq!(PROTOCOL_VERSION, 47);
+        assert_eq!(PROTOCOL_VERSION, 48);
         let splint_id = SplintId::new();
         let attach = Request::Attach {
             splint_id,
@@ -7402,6 +7514,125 @@ mod tests {
         let encoded = serde_json::to_string(&event).unwrap();
         assert!(encoded.contains("control_transfer_resolved"));
         assert!(encoded.contains("controller_id"));
+    }
+
+    /// Plan 0074 M2: OSC 52 sets and queries reach a Window as control
+    /// events with explicit shapes, and its answer is its own request.
+    #[test]
+    fn clipboard_events_and_answers_have_explicit_shapes() {
+        let set = SubscriptionEvent::ClipboardSet {
+            selection: ClipboardSelection::Clipboard,
+            data: encode_clipboard_data(b"hi").unwrap(),
+        };
+        let encoded = serde_json::to_value(&set).unwrap();
+        assert_eq!(
+            encoded,
+            serde_json::json!({"type": "clipboard_set", "selection": "clipboard", "data": "aGk="})
+        );
+        assert_eq!(
+            serde_json::from_value::<SubscriptionEvent>(encoded).unwrap(),
+            set
+        );
+        let query = SubscriptionEvent::ClipboardQuery {
+            query_id: 7,
+            selection: ClipboardSelection::Primary,
+        };
+        let encoded = serde_json::to_value(&query).unwrap();
+        assert_eq!(
+            encoded,
+            serde_json::json!({"type": "clipboard_query", "query_id": 7, "selection": "primary"})
+        );
+        assert_eq!(
+            serde_json::from_value::<SubscriptionEvent>(encoded).unwrap(),
+            query
+        );
+        let answer = Request::AnswerClipboardQuery {
+            query_id: 7,
+            data: String::new(),
+        };
+        let encoded = serde_json::to_value(&answer).unwrap();
+        assert_eq!(
+            encoded,
+            serde_json::json!({"type": "answer_clipboard_query", "query_id": 7, "data": ""})
+        );
+        assert_eq!(serde_json::from_value::<Request>(encoded).unwrap(), answer);
+        assert_eq!(AuditOperation::ClipboardSet.as_str(), "clipboard_set");
+        assert_eq!(AuditOperation::ClipboardQuery.as_str(), "clipboard_query");
+    }
+
+    #[test]
+    fn clipboard_data_is_bounded_canonical_base64() {
+        let largest = vec![b'x'; MAX_CLIPBOARD_BYTES];
+        let data = encode_clipboard_data(&largest).unwrap();
+        assert_eq!(data.len(), MAX_CLIPBOARD_BASE64_BYTES);
+        assert_eq!(decode_clipboard_data(&data).unwrap(), largest);
+        assert_eq!(decode_clipboard_data("").unwrap(), Vec::<u8>::new());
+        assert!(encode_clipboard_data(&vec![b'x'; MAX_CLIPBOARD_BYTES + 1]).is_err());
+        for malformed in ["aGk", "a", "not base64!", "aGk=="] {
+            assert_eq!(
+                decode_clipboard_data(malformed).unwrap_err().code,
+                ErrorCode::InvalidArgument,
+                "{malformed:?}"
+            );
+        }
+        // The largest set fits one frame.
+        let frame = ServerFrame::Event {
+            subscription_id: 1,
+            sequence: 1,
+            event: SubscriptionEvent::ClipboardSet {
+                selection: ClipboardSelection::Clipboard,
+                data,
+            },
+        };
+        assert!(encode_frame(&frame).is_ok());
+        // Longer data is refused while decoding the frame.
+        let oversized = "A".repeat(MAX_CLIPBOARD_BASE64_BYTES + 4);
+        let event = serde_json::json!({
+            "type": "clipboard_set",
+            "selection": "clipboard",
+            "data": oversized,
+        });
+        assert!(serde_json::from_value::<SubscriptionEvent>(event).is_err());
+        let answer = serde_json::json!({
+            "type": "answer_clipboard_query",
+            "query_id": 1,
+            "data": oversized,
+        });
+        assert!(serde_json::from_value::<Request>(answer).is_err());
+        // An audit record from before the byte count still decodes.
+        let mut record = serde_json::to_value(AuditRecord {
+            schema: "splinterm.audit.v2".to_owned(),
+            retention: "daemon_lifetime".to_owned(),
+            audit_id: 1,
+            unix_seconds: 1,
+            policy_generation: None,
+            policy_rule_id: None,
+            peer: AuditPeer {
+                uid: 1,
+                executable_path: "/usr/bin/splinterd".to_owned(),
+                executable_sha256: "a".repeat(64),
+                device: None,
+                inode: None,
+            },
+            operation: AuditOperation::ClipboardSet,
+            resource: None,
+            requested_scopes: Vec::new(),
+            decision: AuditDecision::Allowed,
+            reason: "clipboard_delivered".to_owned(),
+            outcome: Some(AuditOutcome::Succeeded),
+            argument_count: None,
+            executable_basename: None,
+            byte_count: Some(2),
+        })
+        .unwrap();
+        assert_eq!(record["byte_count"], 2);
+        record.as_object_mut().unwrap().remove("byte_count");
+        assert_eq!(
+            serde_json::from_value::<AuditRecord>(record)
+                .unwrap()
+                .byte_count,
+            None
+        );
     }
 
     /// Plan 0072: a resize reclaim is its own request, and the status that
@@ -9051,8 +9282,8 @@ mod tests {
         // An undeclared hello keeps its exact protocol 41 shape.
         let plain = serde_json::json!({
             "type": "hello",
-            "minimum_version": 47,
-            "maximum_version": 47,
+            "minimum_version": 48,
+            "maximum_version": 48,
             "role": "trusted_ui",
         });
         assert_eq!(serde_json::to_value(hello(false)).unwrap(), plain);

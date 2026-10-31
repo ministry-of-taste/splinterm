@@ -6,7 +6,7 @@ use std::{
     os::{fd::OwnedFd, unix::process::ExitStatusExt},
     path::PathBuf,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
@@ -22,10 +22,11 @@ use splinterm_pty::{
     PtyError, PtySession, PtySignal, PtySize,
 };
 use splinterm_terminal::{
-    ActiveScreen, CellAttributesSnapshot, CellSnapshotContent, CursorSnapshot, Dimensions,
-    ImageContent, ImageContentId, ImageContentMetadata, ImagePlacement, ScrollDirection,
-    ScrollRegion, ScrollbackSnapshot, SearchFrom, SearchPage, SnapshotRequest, Terminal,
-    TerminalConfig, TerminalDamage, TerminalEvent, TerminalModes, TerminalRevision, TerminalUpdate,
+    ActiveScreen, CellAttributesSnapshot, CellSnapshotContent, ClipboardSelection, CursorSnapshot,
+    Dimensions, ImageContent, ImageContentId, ImageContentMetadata, ImagePlacement,
+    OSC52_MAX_BYTES, ReplyTerminator, ScrollDirection, ScrollRegion, ScrollbackSnapshot,
+    SearchFrom, SearchPage, SnapshotRequest, Terminal, TerminalConfig, TerminalDamage,
+    TerminalEvent, TerminalModes, TerminalRevision, TerminalUpdate, osc52_reply,
 };
 use thiserror::Error;
 use tokio::{
@@ -261,6 +262,38 @@ pub struct LiveSearchPage {
     pub title: String,
     pub page: SearchPage,
 }
+
+/// Plan 0074 M2: what a Splint's program asked of the clipboard through
+/// OSC 52. The actor only reports it; the daemon routes it to a Window.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ClipboardRequest {
+    /// Set `selection` to `bytes`, decoded and bounded by the terminal.
+    Set {
+        selection: ClipboardSelection,
+        bytes: Vec<u8>,
+    },
+    /// Give `selection`'s contents. The daemon answers with
+    /// [`LiveSplintHandle::write_clipboard_reply`] and this `seq`; the actor
+    /// writes the replies in the order the program asked.
+    Query {
+        selection: ClipboardSelection,
+        seq: u64,
+    },
+}
+
+/// One [`ClipboardRequest`] and the Splint incarnation whose program made it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClipboardEvent {
+    pub splint_id: SplintId,
+    pub incarnation: u64,
+    pub request: ClipboardRequest,
+}
+
+/// Where an actor sends its program's clipboard requests: the daemon's
+/// receiver, installed once on each runtime it admits
+/// ([`LiveSplintHandle::install_clipboard_sink`]). Until then, and when the
+/// receiver is full or gone, a set is dropped and a query answered empty.
+type ClipboardOutlet = Arc<OnceLock<mpsc::Sender<ClipboardEvent>>>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LiveEvent {
@@ -2885,6 +2918,8 @@ impl Drop for PreparedPtyHandoff {
 
 enum Command {
     Input(Vec<u8>, Reply<()>),
+    /// The daemon's answer to an OSC 52 query (Plan 0074 M2).
+    ClipboardReply(u64, Vec<u8>, Reply<()>),
     Resize(PtySize, Reply<()>),
     Snapshot(usize, Reply<LiveSnapshot>),
     ImageContent(ImageContentId, u64, [u8; 32], Reply<ImageContent>),
@@ -2912,6 +2947,8 @@ pub struct LiveRuntimeMetrics {
     pub reply_write_queue_high_water_bytes: usize,
     /// Terminal-generated PTY reply bytes dropped after the bounded reply queue fills.
     pub reply_write_queue_dropped_bytes: u64,
+    /// OSC 52 queries dropped unanswered while the most a runtime owes waited.
+    pub clipboard_queries_dropped: u64,
     /// Maximum active subscribers observed while publication attribution was enabled.
     pub subscriber_count_high_water: usize,
     /// Compact events whose ownership was admitted by a reserved queue permit
@@ -2994,6 +3031,7 @@ struct RuntimeMetrics {
     user_write_queue_high_water_bytes: AtomicUsize,
     reply_write_queue_high_water_bytes: AtomicUsize,
     reply_write_queue_dropped_bytes: AtomicU64,
+    clipboard_queries_dropped: AtomicU64,
     subscriber_count_high_water: AtomicUsize,
     subscriber_queue_events_current: AtomicUsize,
     subscriber_queue_events_high_water: AtomicUsize,
@@ -3220,6 +3258,7 @@ impl RuntimeMetrics {
             reply_write_queue_dropped_bytes: self
                 .reply_write_queue_dropped_bytes
                 .load(Ordering::Relaxed),
+            clipboard_queries_dropped: self.clipboard_queries_dropped.load(Ordering::Relaxed),
             subscriber_count_high_water: self.subscriber_count_high_water.load(Ordering::Relaxed),
             subscriber_queue_events_current: self
                 .subscriber_queue_events_current
@@ -3536,6 +3575,7 @@ pub struct LiveSplintHandle {
     metrics: Arc<RuntimeMetrics>,
     exit: watch::Receiver<Option<ProcessExit>>,
     use_latch: Arc<UseLatch>,
+    clipboard: ClipboardOutlet,
 }
 
 #[allow(
@@ -3566,6 +3606,33 @@ impl LiveSplintHandle {
     /// [`LiveError::Retiring`].
     pub async fn input(&self, bytes: Vec<u8>) -> Result<(), LiveError> {
         self.write_input(bytes, true).await
+    }
+
+    /// Sends this runtime's clipboard requests to `sink` from now on
+    /// (Plan 0074 M2). Only the first sink installed is kept.
+    pub fn install_clipboard_sink(&self, sink: mpsc::Sender<ClipboardEvent>) {
+        let _ = self.clipboard.set(sink);
+    }
+
+    /// Answers the program's OSC 52 query `seq` with `text`, empty for
+    /// nothing to paste (Plan 0074 M2). The reply is terminal input that is
+    /// not the person's: it leaves the runtime unused. The actor writes it
+    /// after every earlier query's reply, and writes the empty reply instead
+    /// for text over [`OSC52_MAX_BYTES`] or text that would crowd the input
+    /// queue. An answer to a query the runtime no longer owes is ignored.
+    pub async fn write_clipboard_reply(
+        &self,
+        seq: u64,
+        mut text: Vec<u8>,
+    ) -> Result<(), LiveError> {
+        if text.len() > OSC52_MAX_BYTES {
+            text = Vec::new();
+        }
+        if !self.use_latch.record_input(false) {
+            return Err(LiveError::Retiring);
+        }
+        self.request(|reply| Command::ClipboardReply(seq, text, reply))
+            .await
     }
 
     /// Writes focus reports a graphical client generated for its own focus
@@ -4357,6 +4424,7 @@ struct ActorStart<P: ProcessPlacement> {
     publication_memory_metrics: bool,
     metrics: Arc<RuntimeMetrics>,
     use_latch: Arc<UseLatch>,
+    clipboard: ClipboardOutlet,
     exit_sender: watch::Sender<Option<ProcessExit>>,
     placement: P,
 }
@@ -4382,6 +4450,7 @@ impl<P: ProcessPlacement> ActorStart<P> {
         let (exit_sender, exit) = watch::channel(None);
         let metrics = Arc::new(RuntimeMetrics::default());
         let use_latch = Arc::new(use_latch);
+        let clipboard = ClipboardOutlet::default();
         let handle = LiveSplintHandle {
             splint_id,
             incarnation,
@@ -4394,6 +4463,7 @@ impl<P: ProcessPlacement> ActorStart<P> {
             metrics: Arc::clone(&metrics),
             exit,
             use_latch: Arc::clone(&use_latch),
+            clipboard: Arc::clone(&clipboard),
         };
         let actor = Self {
             splint_id,
@@ -4406,6 +4476,7 @@ impl<P: ProcessPlacement> ActorStart<P> {
             publication_memory_metrics,
             metrics,
             use_latch,
+            clipboard,
             exit_sender,
             placement,
         };
@@ -4424,6 +4495,7 @@ impl<P: ProcessPlacement> ActorStart<P> {
             publication_memory_metrics,
             metrics,
             use_latch,
+            clipboard,
             exit_sender,
             placement,
         } = self;
@@ -4439,6 +4511,7 @@ impl<P: ProcessPlacement> ActorStart<P> {
                 publication_memory_metrics,
                 metrics,
                 use_latch,
+                clipboard,
                 exit_sender,
             ))
             .await;
@@ -4598,6 +4671,20 @@ impl SynchronizedPublication {
     }
 }
 
+/// The queue the next PTY write takes from. Terminal replies go first, but
+/// never into the middle of a partly written chunk of input, such as a large
+/// paste or OSC 52 reply.
+fn next_write_queue<'a>(
+    user_writes: &'a mut WriteQueue,
+    reply_writes: &'a mut WriteQueue,
+) -> &'a mut WriteQueue {
+    if reply_writes.is_empty() || user_writes.offset != 0 {
+        user_writes
+    } else {
+        reply_writes
+    }
+}
+
 #[derive(Default)]
 struct WriteQueue {
     chunks: VecDeque<Vec<u8>>,
@@ -4729,6 +4816,7 @@ async fn run_actor(
     publication_memory_metrics: bool,
     metrics: Arc<RuntimeMetrics>,
     use_latch: Arc<UseLatch>,
+    clipboard: ClipboardOutlet,
     exit_sender: watch::Sender<Option<ProcessExit>>,
 ) -> Result<ActorEnd, LiveError> {
     let mut session = Some(session);
@@ -4743,6 +4831,7 @@ async fn run_actor(
         publication_memory_metrics,
         &metrics,
         &use_latch,
+        &clipboard,
     )
     .await;
     let forced_status = if result.is_err() {
@@ -4795,6 +4884,7 @@ async fn run_actor_body(
     publication_memory_metrics: bool,
     metrics: &Arc<RuntimeMetrics>,
     use_latch: &UseLatch,
+    clipboard: &ClipboardOutlet,
 ) -> Result<ActorEnd, LiveError> {
     let mut subscribers = Vec::<Subscriber>::new();
     let mut publication = SynchronizedPublication::new(terminal.revision());
@@ -4806,6 +4896,7 @@ async fn run_actor_body(
     };
     let mut user_writes = WriteQueue::default();
     let mut reply_writes = WriteQueue::default();
+    let mut clipboard = ActorClipboard::new(Arc::clone(clipboard));
     let mut interval = time::interval(config.poll_interval);
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut child_exit = None;
@@ -4844,6 +4935,7 @@ async fn run_actor_body(
                 || publication.published_revision != terminal.revision()
                 || user_writes.offset != 0
                 || reply_writes.offset != 0
+                || !clipboard.owed.is_empty()
             {
                 let _ = reply.send(Err(LiveError::HandoffStateUnsupported));
                 continue;
@@ -5072,6 +5164,10 @@ async fn run_actor_body(
             }
             command = commands.recv(), if commands_open && pending_handoff.is_none() => {
                 if let Some(Command::PreparePtyHandoff(budget, reply)) = command {
+                    // The adopted runtime owes the program nothing: every
+                    // query still waiting is answered empty first.
+                    clipboard.answer_all_empty();
+                    clipboard.flush(&mut user_writes, config.input_byte_limit, metrics);
                     pending_handoff = Some(reply);
                     pending_budget = budget;
                 } else if let Some(command) = command {
@@ -5083,7 +5179,7 @@ async fn run_actor_body(
                         &mut terminal,
                         &mut subscribers,
                         &mut publication,
-                        &mut user_writes,
+                        (&mut user_writes, &mut clipboard),
                         &mut current_size,
                         &mut shutdown,
                         &mut shutdown_replies,
@@ -5131,7 +5227,9 @@ async fn run_actor_body(
                                 &mut publication,
                                 metrics,
                                 config.reply_byte_limit,
+                                &mut clipboard,
                             );
+                            clipboard.flush(&mut user_writes, config.input_byte_limit, metrics);
                             metrics.output_parse_batches.fetch_add(
                                 output.parse_batches,
                                 Ordering::Relaxed,
@@ -5179,11 +5277,7 @@ async fn run_actor_body(
             }
             ready = io.as_ref().expect("active actor owns one PTY reader").writable(), if !reply_writes.is_empty() || !user_writes.is_empty() => {
                 let mut ready = ready?;
-                let queue = if reply_writes.is_empty() {
-                    &mut user_writes
-                } else {
-                    &mut reply_writes
-                };
+                let queue = next_write_queue(&mut user_writes, &mut reply_writes);
                 if let Some(bytes) = queue.front() {
                     let result = ready.try_io(|inner| inner.get_ref().write(bytes));
                     if let Ok(result) = result {
@@ -5231,6 +5325,8 @@ async fn run_actor_body(
                     drain_deadline = Some(Instant::now() + config.exit_drain_timeout);
                 }
                 advance_shutdown(session, &mut shutdown, &config, child_exit.is_some());
+                clipboard.expire(Instant::now());
+                clipboard.flush(&mut user_writes, config.input_byte_limit, metrics);
             }
         }
     }
@@ -5278,7 +5374,7 @@ fn handle_command(
     terminal: &mut Terminal,
     subscribers: &mut Vec<Subscriber>,
     publication: &mut SynchronizedPublication,
-    writes: &mut WriteQueue,
+    (writes, clipboard): (&mut WriteQueue, &mut ActorClipboard),
     current_size: &mut PtySize,
     shutdown: &mut Option<ShutdownStage>,
     shutdown_replies: &mut Vec<oneshot::Sender<()>>,
@@ -5293,6 +5389,16 @@ fn handle_command(
                 Err(LiveError::ProcessExited)
             } else {
                 writes.push(bytes, config.input_byte_limit)
+            };
+            let _ = reply.send(result);
+        }
+        Command::ClipboardReply(seq, text, reply) => {
+            let result = if child_exit.is_some() {
+                Err(LiveError::ProcessExited)
+            } else {
+                clipboard.answer(seq, text);
+                clipboard.flush(writes, config.input_byte_limit, metrics);
+                Ok(())
             };
             let _ = reply.send(result);
         }
@@ -5749,6 +5855,178 @@ fn publish_updates(
     (update_count, overflows)
 }
 
+/// The most OSC 52 queries one runtime waits on answers for. A program that
+/// asks more gets no reply to the extra queries, which are counted.
+const MAX_OWED_CLIPBOARD_REPLIES: usize = 16;
+
+/// The longest empty OSC 52 reply, `ESC ] 52 ; c ; ESC \`. Only these may
+/// queue past the input limit, at most one per owed reply.
+const EMPTY_CLIPBOARD_REPLY_BYTES: usize = 9;
+
+/// How long the actor waits on the daemon for an answer before it answers
+/// empty itself: past the daemon's own two-second wait, so the daemon
+/// normally answers first.
+const CLIPBOARD_ANSWER_DEADLINE: Duration = Duration::from_secs(3);
+
+/// Input queue room a non-empty reply leaves free, so the person's keys,
+/// ^C included, still fit behind it.
+const CLIPBOARD_REPLY_INPUT_HEADROOM: usize = 64 * 1024;
+
+/// A runtime's side of OSC 52 (Plan 0074 M2): where it sends its program's
+/// requests, and the replies it still owes, oldest first. Replies reach the
+/// program strictly in the order it asked, whatever order answers come in.
+#[derive(Default)]
+struct ActorClipboard {
+    outlet: ClipboardOutlet,
+    next_seq: u64,
+    owed: VecDeque<OwedReply>,
+}
+
+struct OwedReply {
+    seq: u64,
+    target: u8,
+    terminator: ReplyTerminator,
+    /// When the actor stops waiting and answers empty.
+    deadline: Instant,
+    /// The answer, once it came.
+    text: Option<Vec<u8>>,
+}
+
+impl ActorClipboard {
+    fn new(outlet: ClipboardOutlet) -> Self {
+        Self {
+            outlet,
+            ..Self::default()
+        }
+    }
+
+    /// Hands one request to the daemon. `false` when no sink is installed or
+    /// it is full or closed.
+    fn forward(
+        &self,
+        splint_id: SplintId,
+        incarnation: ProcessIncarnation,
+        request: ClipboardRequest,
+    ) -> bool {
+        self.outlet.get().is_some_and(|sink| {
+            sink.try_send(ClipboardEvent {
+                splint_id,
+                incarnation: incarnation.value(),
+                request,
+            })
+            .is_ok()
+        })
+    }
+
+    /// Hands the daemon the latest set of each selection, then forgets them.
+    /// A set the daemon cannot take is dropped.
+    fn forward_sets(
+        &self,
+        sets: &mut [Option<Vec<u8>>; 2],
+        splint_id: SplintId,
+        incarnation: ProcessIncarnation,
+    ) {
+        let selections = [ClipboardSelection::Clipboard, ClipboardSelection::Primary];
+        for (selection, bytes) in selections.into_iter().zip(sets.iter_mut()) {
+            if let Some(bytes) = bytes.take() {
+                let request = ClipboardRequest::Set { selection, bytes };
+                self.forward(splint_id, incarnation, request);
+            }
+        }
+    }
+
+    /// Owes the program a reply to a query and asks the daemon for it. With
+    /// nobody to ask, the reply is empty. Past the bound the query is
+    /// dropped and counted.
+    fn ask(
+        &mut self,
+        (splint_id, incarnation): (SplintId, ProcessIncarnation),
+        selection: ClipboardSelection,
+        target: u8,
+        terminator: ReplyTerminator,
+        metrics: &RuntimeMetrics,
+    ) {
+        if self.owed.len() >= MAX_OWED_CLIPBOARD_REPLIES {
+            RuntimeMetrics::add_saturating(&metrics.clipboard_queries_dropped, 1);
+            return;
+        }
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
+        self.owed.push_back(OwedReply {
+            seq,
+            target,
+            terminator,
+            deadline: Instant::now() + CLIPBOARD_ANSWER_DEADLINE,
+            text: None,
+        });
+        let request = ClipboardRequest::Query { selection, seq };
+        if !self.forward(splint_id, incarnation, request) {
+            self.answer(seq, Vec::new());
+        }
+    }
+
+    /// Fills the reply owed for `seq`; an unknown or answered `seq` is
+    /// ignored.
+    fn answer(&mut self, seq: u64, text: Vec<u8>) {
+        if let Some(owed) = self
+            .owed
+            .iter_mut()
+            .find(|owed| owed.seq == seq && owed.text.is_none())
+        {
+            owed.text = Some(text);
+        }
+    }
+
+    /// Answers empty every owed reply whose deadline passed, so a lost
+    /// answer never holds the replies behind it.
+    fn expire(&mut self, now: Instant) {
+        for owed in &mut self.owed {
+            if now >= owed.deadline {
+                owed.text.get_or_insert_with(Vec::new);
+            }
+        }
+    }
+
+    /// Answers every owed reply empty, so nothing is owed once they flush.
+    fn answer_all_empty(&mut self) {
+        for owed in &mut self.owed {
+            owed.text.get_or_insert_with(Vec::new);
+        }
+    }
+
+    /// Queues answered replies from the oldest until one still waits. A
+    /// reply that would leave less than [`CLIPBOARD_REPLY_INPUT_HEADROOM`] of
+    /// the input queue free goes as the empty reply.
+    fn flush(&mut self, writes: &mut WriteQueue, input_limit: usize, metrics: &RuntimeMetrics) {
+        while self.owed.front().is_some_and(|owed| owed.text.is_some()) {
+            let owed = self.owed.pop_front().expect("the front was just checked");
+            let text = owed.text.unwrap_or_default();
+            let mut reply = osc52_reply(owed.target, &text, owed.terminator);
+            let needed = reply
+                .len()
+                .saturating_add(writes.bytes)
+                .saturating_add(CLIPBOARD_REPLY_INPUT_HEADROOM);
+            if !text.is_empty() && needed > input_limit {
+                reply = osc52_reply(owed.target, b"", owed.terminator);
+            }
+            let dropped = u64::try_from(reply.len()).unwrap_or(u64::MAX);
+            let limit = input_limit
+                .saturating_add(MAX_OWED_CLIPBOARD_REPLIES * EMPTY_CLIPBOARD_REPLY_BYTES);
+            if writes.push(reply, limit).is_err() {
+                RuntimeMetrics::add_saturating(&metrics.reply_write_queue_dropped_bytes, dropped);
+            }
+        }
+    }
+}
+
+/// The slot of a selection's latest set while one output batch is drained.
+const fn set_slot(selection: ClipboardSelection) -> usize {
+    match selection {
+        ClipboardSelection::Clipboard => 0,
+        ClipboardSelection::Primary => 1,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct ProcessOutputMetrics {
     parse_batches: u64,
@@ -5793,8 +6071,11 @@ fn process_output(
     publication: &mut SynchronizedPublication,
     runtime_metrics: &Arc<RuntimeMetrics>,
     reply_limit: usize,
+    clipboard: &mut ActorClipboard,
 ) -> ProcessOutputMetrics {
     let _compact_batch = CompactProducerBatch::begin(subscribers);
+    // Only the latest set of each selection in one read reaches the daemon.
+    let mut sets: [Option<Vec<u8>>; 2] = [None, None];
     let mut metrics = ProcessOutputMetrics::default();
     let trace_enabled = perf_trace_enabled();
     let trace_base_revision = terminal.revision();
@@ -5866,17 +6147,40 @@ fn process_output(
             );
         }
         for event in terminal.drain_events() {
-            if let TerminalEvent::PtyWrite(bytes) = event {
-                let dropped_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-                if reply_writes.push(bytes, reply_limit).is_err() {
-                    RuntimeMetrics::add_saturating(
-                        &runtime_metrics.reply_write_queue_dropped_bytes,
-                        dropped_bytes,
-                    );
+            let bytes = match event {
+                TerminalEvent::PtyWrite(bytes) => bytes,
+                TerminalEvent::ClipboardSet { selection, bytes } => {
+                    sets[set_slot(selection)] = Some(bytes);
+                    continue;
                 }
+                TerminalEvent::ClipboardQuery {
+                    selection,
+                    target,
+                    terminator,
+                } => {
+                    // A query reads what the program set before it.
+                    clipboard.forward_sets(&mut sets, splint_id, incarnation);
+                    clipboard.ask(
+                        (splint_id, incarnation),
+                        selection,
+                        target,
+                        terminator,
+                        runtime_metrics,
+                    );
+                    continue;
+                }
+                _ => continue,
+            };
+            let dropped_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+            if reply_writes.push(bytes, reply_limit).is_err() {
+                RuntimeMetrics::add_saturating(
+                    &runtime_metrics.reply_write_queue_dropped_bytes,
+                    dropped_bytes,
+                );
             }
         }
     }
+    clipboard.forward_sets(&mut sets, splint_id, incarnation);
     if trace_enabled {
         let common = PerfTraceEvent {
             splint_id: Some(splint_id),
@@ -6809,6 +7113,7 @@ mod tests {
             &mut publication,
             &attribution,
             1024,
+            &mut ActorClipboard::default(),
         );
         assert!(publication.active && !publication.timed_out);
         assert_eq!(metrics.terminal_updates, 0);
@@ -6832,6 +7137,7 @@ mod tests {
             &mut publication,
             &attribution,
             1024,
+            &mut ActorClipboard::default(),
         );
         assert!(!publication.active);
         let LiveEvent::Update {
@@ -6875,6 +7181,7 @@ mod tests {
             &mut publication,
             &metrics,
             4,
+            &mut ActorClipboard::default(),
         );
 
         assert_eq!(replies.bytes, 4);
@@ -6909,6 +7216,7 @@ mod tests {
             &mut publication,
             &attribution,
             1024,
+            &mut ActorClipboard::default(),
         );
 
         assert!(terminal.synchronized_updates());
@@ -6954,6 +7262,7 @@ mod tests {
             &mut publication,
             &attribution,
             1024,
+            &mut ActorClipboard::default(),
         );
         process_output(
             b"\x1b\\",
@@ -6966,6 +7275,7 @@ mod tests {
             &mut publication,
             &attribution,
             1024,
+            &mut ActorClipboard::default(),
         );
         assert!(matches!(
             receiver.try_recv(),
@@ -6986,6 +7296,7 @@ mod tests {
             &mut publication,
             &attribution,
             1024,
+            &mut ActorClipboard::default(),
         );
 
         assert_eq!(metrics.terminal_updates, 2);
@@ -7842,6 +8153,7 @@ mod tests {
             &mut publication,
             &attribution,
             1024,
+            &mut ActorClipboard::default(),
         );
         assert_eq!(terminal.revision(), initial_revision);
         let deadline = publication.deadline.unwrap();
@@ -9895,6 +10207,302 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clipboard_requests_reach_the_installed_sink_and_replies_reach_the_program() {
+        let runtime = LiveSplintRuntime::spawn(
+            SplintId::new(),
+            backend(),
+            shell(
+                "sleep 0.3; stty -icanon -echo min 12 time 50; \
+                 printf '\\033]52;c;aGk=\\007'; sleep 0.2; printf '\\033]52;s;?\\007'; \
+                 head -c 12 | od -An -tx1; sleep 0.2",
+            ),
+            fast_config(),
+        )
+        .await
+        .unwrap();
+        let handle = runtime.handle();
+        let (sink, mut events) = mpsc::channel(4);
+        handle.install_clipboard_sink(sink);
+        let set = time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(set.splint_id, handle.splint_id);
+        assert_eq!(set.incarnation, handle.incarnation.value());
+        assert_eq!(
+            set.request,
+            ClipboardRequest::Set {
+                selection: ClipboardSelection::Clipboard,
+                bytes: b"hi".to_vec(),
+            }
+        );
+        let query = time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let ClipboardRequest::Query { selection, seq } = query.request else {
+            panic!("expected a query, got {:?}", query.request);
+        };
+        assert_eq!(selection, ClipboardSelection::Primary);
+        // The contents never show on the screen a subscriber or agent reads.
+        assert!(!snapshot_text(&handle.snapshot().await.unwrap()).contains("aGk"));
+        // An answer to a query nobody asked is ignored.
+        handle
+            .write_clipboard_reply(seq.wrapping_add(100), b"no".to_vec())
+            .await
+            .unwrap();
+        handle
+            .write_clipboard_reply(seq, b"hi".to_vec())
+            .await
+            .unwrap();
+        // ESC ] 52 ; s ; aGk= BEL: the reply names the letter asked.
+        wait_for_text(&handle, "1b 5d 35 32 3b 73 3b 61 47 6b 3d 07").await;
+        // A program's answer is not the person's input.
+        assert!(handle.claim_unused());
+        handle.release_unused_claim();
+        runtime.wait().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_oversized_clipboard_answer_gives_the_empty_reply() {
+        let runtime = LiveSplintRuntime::spawn(
+            SplintId::new(),
+            backend(),
+            shell(
+                "sleep 0.3; stty -icanon -echo min 8 time 50; printf '\\033]52;c;?\\007'; \
+                 head -c 8 | od -An -tx1; sleep 0.2",
+            ),
+            fast_config(),
+        )
+        .await
+        .unwrap();
+        let handle = runtime.handle();
+        let (sink, mut events) = mpsc::channel(4);
+        handle.install_clipboard_sink(sink);
+        let query = time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let ClipboardRequest::Query { seq, .. } = query.request else {
+            panic!("expected a query, got {:?}", query.request);
+        };
+        handle
+            .write_clipboard_reply(seq, vec![b'x'; OSC52_MAX_BYTES + 1])
+            .await
+            .unwrap();
+        wait_for_text(&handle, "1b 5d 35 32 3b 63 3b 07").await;
+        runtime.wait().await.unwrap();
+    }
+
+    /// An input limit that leaves 1024 bytes beyond the reply headroom.
+    const LIMIT: usize = CLIPBOARD_REPLY_INPUT_HEADROOM + 1024;
+
+    fn clipboard_writes(writes: &WriteQueue) -> Vec<Vec<u8>> {
+        writes.chunks.iter().cloned().collect()
+    }
+
+    /// Plan 0074 M2: a terminal reply never lands inside a partly written
+    /// chunk of input, such as a paste or a large OSC 52 reply.
+    #[test]
+    fn a_terminal_reply_waits_for_a_partly_written_input_chunk() {
+        let mut user_writes = WriteQueue::default();
+        let mut reply_writes = WriteQueue::default();
+        user_writes.push(b"paste".to_vec(), 64).unwrap();
+        reply_writes.push(b"\x1b[0n".to_vec(), 64).unwrap();
+        // Between chunks, the reply goes first.
+        assert_eq!(
+            next_write_queue(&mut user_writes, &mut reply_writes).front(),
+            Some(&b"\x1b[0n"[..])
+        );
+        user_writes.consume(2);
+        assert_eq!(
+            next_write_queue(&mut user_writes, &mut reply_writes).front(),
+            Some(&b"ste"[..])
+        );
+        user_writes.consume(3);
+        assert_eq!(
+            next_write_queue(&mut user_writes, &mut reply_writes).front(),
+            Some(&b"\x1b[0n"[..])
+        );
+    }
+
+    /// Plan 0074 M2: an answer the daemon never gives is given empty at its
+    /// deadline, so it never holds the replies behind it.
+    #[test]
+    fn an_unanswered_clipboard_query_expires_empty() {
+        let metrics = RuntimeMetrics::default();
+        let ids = (SplintId::new(), ProcessIncarnation::allocate());
+        let (sink, _events) = mpsc::channel(4);
+        let outlet = ClipboardOutlet::default();
+        let _ = outlet.set(sink);
+        let mut clipboard = ActorClipboard::new(outlet);
+        let mut writes = WriteQueue::default();
+        let bell = ReplyTerminator::Bell;
+        clipboard.ask(ids, ClipboardSelection::Clipboard, b'c', bell, &metrics);
+        clipboard.expire(Instant::now());
+        clipboard.flush(&mut writes, LIMIT, &metrics);
+        assert!(writes.is_empty());
+        clipboard.expire(Instant::now() + CLIPBOARD_ANSWER_DEADLINE);
+        clipboard.flush(&mut writes, LIMIT, &metrics);
+        assert_eq!(clipboard_writes(&writes), [b"\x1b]52;c;\x07".to_vec()]);
+        assert!(clipboard.owed.is_empty());
+    }
+
+    /// Plan 0074 M2: replies reach the program in the order it asked,
+    /// whenever their answers come, and a query nobody can take is
+    /// answered empty in its turn.
+    #[test]
+    fn clipboard_replies_keep_the_program_order() {
+        let metrics = RuntimeMetrics::default();
+        let ids = (SplintId::new(), ProcessIncarnation::allocate());
+        let (sink, mut events) = mpsc::channel(1);
+        let outlet = ClipboardOutlet::default();
+        let _ = outlet.set(sink);
+        let mut clipboard = ActorClipboard::new(outlet);
+        let mut writes = WriteQueue::default();
+        let bell = ReplyTerminator::Bell;
+        clipboard.ask(ids, ClipboardSelection::Clipboard, b'c', bell, &metrics);
+        // The sink is full, so this one is answered empty at once.
+        clipboard.ask(ids, ClipboardSelection::Primary, b's', bell, &metrics);
+        let Ok(ClipboardEvent {
+            request: ClipboardRequest::Query { seq: first, .. },
+            ..
+        }) = events.try_recv()
+        else {
+            panic!("the first query reached the sink");
+        };
+        clipboard.flush(&mut writes, LIMIT, &metrics);
+        assert!(writes.is_empty(), "the second reply waits for the first");
+        clipboard.answer(first, b"hi".to_vec());
+        clipboard.flush(&mut writes, LIMIT, &metrics);
+        assert_eq!(
+            clipboard_writes(&writes),
+            [b"\x1b]52;c;aGk=\x07".to_vec(), b"\x1b]52;s;\x07".to_vec()]
+        );
+        assert!(clipboard.owed.is_empty());
+        // A late or repeated answer changes nothing.
+        clipboard.answer(first, b"again".to_vec());
+        clipboard.flush(&mut writes, LIMIT, &metrics);
+        assert_eq!(clipboard_writes(&writes).len(), 2);
+    }
+
+    #[test]
+    fn clipboard_replies_are_bounded() {
+        let metrics = RuntimeMetrics::default();
+        let ids = (SplintId::new(), ProcessIncarnation::allocate());
+        let (sink, mut events) = mpsc::channel(64);
+        let outlet = ClipboardOutlet::default();
+        let _ = outlet.set(sink);
+        let mut clipboard = ActorClipboard::new(outlet);
+        let bell = ReplyTerminator::Bell;
+        for _ in 0..=MAX_OWED_CLIPBOARD_REPLIES {
+            clipboard.ask(ids, ClipboardSelection::Clipboard, b'c', bell, &metrics);
+        }
+        assert_eq!(clipboard.owed.len(), MAX_OWED_CLIPBOARD_REPLIES);
+        assert_eq!(metrics.snapshot().clipboard_queries_dropped, 1);
+        let mut seqs = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let ClipboardRequest::Query { seq, .. } = event.request {
+                seqs.push(seq);
+            }
+        }
+        assert_eq!(seqs.len(), MAX_OWED_CLIPBOARD_REPLIES);
+
+        // A reply that would overfill the input queue goes empty.
+        let mut writes = WriteQueue::default();
+        writes.push(vec![b'i'; 1000], LIMIT).unwrap();
+        clipboard.answer(seqs[0], vec![b'x'; 30]);
+        clipboard.flush(&mut writes, LIMIT, &metrics);
+        assert_eq!(clipboard_writes(&writes)[1], b"\x1b]52;c;\x07");
+        clipboard.answer(seqs[1], b"hi".to_vec());
+        clipboard.flush(&mut writes, LIMIT, &metrics);
+        assert_eq!(clipboard_writes(&writes)[2], b"\x1b]52;c;aGk=\x07");
+
+        // A handoff answers every query still owed, empty.
+        clipboard.answer_all_empty();
+        clipboard.flush(&mut writes, LIMIT, &metrics);
+        assert!(clipboard.owed.is_empty());
+        assert_eq!(writes.chunks.len(), 1 + MAX_OWED_CLIPBOARD_REPLIES);
+        assert!(
+            writes
+                .chunks
+                .iter()
+                .skip(3)
+                .all(|reply| reply == b"\x1b]52;c;\x07")
+        );
+        assert_eq!(metrics.snapshot().reply_write_queue_dropped_bytes, 0);
+    }
+
+    /// Plan 0074 M2: one read's sets reach the daemon as the latest of each
+    /// selection, and a query follows the sets made before it.
+    #[test]
+    fn one_reads_clipboard_sets_are_coalesced_before_a_query() {
+        let incarnation = ProcessIncarnation::allocate();
+        let mut terminal = Terminal::new(8, 2, TerminalConfig::default());
+        let mut subscribers = Vec::new();
+        let mut publication = SynchronizedPublication::new(terminal.revision());
+        let mut replies = WriteQueue::default();
+        let metrics = Arc::new(RuntimeMetrics::default());
+        let (sink, mut events) = mpsc::channel(16);
+        let outlet = ClipboardOutlet::default();
+        let _ = outlet.set(sink);
+        let mut clipboard = ActorClipboard::new(outlet);
+        // a, b, c, then p: "YQ==", "Yg==", "Yw==", "cA==".
+        process_output(
+            b"\x1b]52;c;YQ==\x07\x1b]52;c;Yg==\x07\x1b]52;p;cA==\x07\x1b]52;c;?\x07\
+              \x1b]52;c;Yw==\x07\x1b]52;c;Yw==\x07",
+            SplintId::new(),
+            incarnation,
+            None,
+            &mut terminal,
+            &mut replies,
+            &mut subscribers,
+            &mut publication,
+            &metrics,
+            1024,
+            &mut clipboard,
+        );
+        let mut requests = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            requests.push(event.request);
+        }
+        let set = |selection, bytes: &[u8]| ClipboardRequest::Set {
+            selection,
+            bytes: bytes.to_vec(),
+        };
+        assert_eq!(
+            requests,
+            [
+                set(ClipboardSelection::Clipboard, b"b"),
+                set(ClipboardSelection::Primary, b"p"),
+                ClipboardRequest::Query {
+                    selection: ClipboardSelection::Clipboard,
+                    seq: 0,
+                },
+                set(ClipboardSelection::Clipboard, b"c"),
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_clipboard_query_nobody_can_answer_gets_the_empty_reply_at_once() {
+        let runtime = LiveSplintRuntime::spawn(
+            SplintId::new(),
+            backend(),
+            shell(
+                "stty -icanon -echo min 8 time 50; printf '\\033]52;c;?\\007'; \
+                 head -c 8 | od -An -tx1; sleep 0.2",
+            ),
+            fast_config(),
+        )
+        .await
+        .unwrap();
+        let handle = runtime.handle();
+        wait_for_text(&handle, "1b 5d 35 32 3b 63 3b 07").await;
+        runtime.wait().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shared_image_budget_rejects_across_actors_and_releases_on_exit() {
         let budget = splinterm_terminal::SharedImageBudget::new(96);
         let image_script = "printf '\\033Pq#1;2;100;0;0#1~\\033\\\\'; sleep 5";
@@ -10688,6 +11296,44 @@ mod tests {
         assert!(child_is_running_unreaped(child_pid));
         assert_eq!(placement.calls(), ["retain"]);
 
+        let status = tokio::task::spawn_blocking(move || handed_off.session.kill_child_and_wait())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.signal(), Some(9));
+    }
+
+    /// Plan 0074 M2: a program that used OSC 52, and still waits on an
+    /// answer, does not stop a live upgrade. The query is answered empty
+    /// before capture, so the adopted runtime owes nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_handoff_after_osc52_answers_owed_queries_and_captures() {
+        let (runtime, placement) = spawn_recorded(
+            "sleep 0.2; printf '\\033]52;c;aGk=\\007\\033]52;c;?\\007ready'; exec sleep 30",
+            fast_config(),
+        )
+        .await;
+        let handle = runtime.handle();
+        let (sink, mut events) = mpsc::channel(4);
+        handle.install_clipboard_sink(sink);
+        wait_for_text(&handle, "ready").await;
+        let mut seq = None;
+        while let Ok(event) = events.try_recv() {
+            if let ClipboardRequest::Query { seq: asked, .. } = event.request {
+                seq = Some(asked);
+            }
+        }
+        let seq = seq.expect("the query reached the sink");
+        let (handed_off, handle) = hand_off(runtime, &placement).await;
+        assert_eq!(handed_off.evidence.user_write_bytes, 0);
+        restore_handed_off_terminal(&handed_off, fast_config().terminal);
+        // The old runtime ignores a late answer.
+        assert!(
+            handle
+                .write_clipboard_reply(seq, b"hi".to_vec())
+                .await
+                .is_err()
+        );
         let status = tokio::task::spawn_blocking(move || handed_off.session.kill_child_and_wait())
             .await
             .unwrap()

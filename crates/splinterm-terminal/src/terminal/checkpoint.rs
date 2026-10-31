@@ -328,7 +328,9 @@ impl CheckpointEvent {
             TerminalEvent::UnsupportedSequence(_)
             | TerminalEvent::ImageRejected(_)
             | TerminalEvent::StringTruncated(_)
-            | TerminalEvent::EventQueueOverflow => Err(CheckpointError::UnsupportedState),
+            | TerminalEvent::EventQueueOverflow
+            | TerminalEvent::ClipboardSet { .. }
+            | TerminalEvent::ClipboardQuery { .. } => Err(CheckpointError::UnsupportedState),
         }
     }
 
@@ -488,6 +490,7 @@ impl TerminalCheckpointV1 {
             .map(CheckpointEvent::from_terminal)
             .collect::<Result<Vec<_>, _>>()?;
         let mut composed = terminal.composed.clone();
+        let parser = terminal.parser.checkpoint_copy();
         let event_body_bytes = events.iter().try_fold(0_usize, |total, event| {
             total.checked_add(event.body_bytes())
         });
@@ -501,9 +504,7 @@ impl TerminalCheckpointV1 {
             || !terminal.attributes.checkpoint_is_valid()
             || !terminal.saved_attributes.checkpoint_is_valid()
             || !composed.validate_and_rebuild_checkpoint(terminal.config.composed_limit)
-            || !terminal
-                .parser
-                .checkpoint_is_valid(terminal.config.osc_limit, terminal.config.dcs_limit)
+            || !parser.checkpoint_is_valid(terminal.config.osc_limit, terminal.config.dcs_limit)
             || !terminal
                 .normal
                 .checkpoint_is_valid(terminal.composed.checkpoint_entry_count())
@@ -518,7 +519,7 @@ impl TerminalCheckpointV1 {
             normal: terminal.normal.clone(),
             alternate: terminal.alternate.clone(),
             active: terminal.active,
-            parser: terminal.parser.clone(),
+            parser,
             attributes: terminal.attributes,
             saved_attributes: terminal.saved_attributes,
             scroll_region: terminal.scroll_region,

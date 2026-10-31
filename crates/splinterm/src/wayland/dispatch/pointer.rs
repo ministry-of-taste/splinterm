@@ -138,6 +138,7 @@ impl PointerHandler for App {
                 }
                 PointerEventKind::Press { button, serial, .. } => {
                     self.input.last_pointer_serial = Some(serial);
+                    self.input.last_input_serial = Some(serial);
                     if button == BTN_LEFT
                         && self
                             .modal
@@ -266,6 +267,7 @@ impl PointerHandler for App {
                 }
                 PointerEventKind::Release { button, serial, .. } => {
                     self.input.last_pointer_serial = Some(serial);
+                    self.input.last_input_serial = Some(serial);
                     match take_press_owner(&mut self.input.pressed_buttons, button) {
                         PressOwner::Application {
                             code,

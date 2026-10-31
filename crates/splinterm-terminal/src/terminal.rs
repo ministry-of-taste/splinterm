@@ -20,14 +20,15 @@ use std::{
 use unicode_width::UnicodeWidthChar;
 
 use crate::{
-    ActiveScreen, Attributes, CellContent, ChangeSet, Color, ColorSource, ComposedTable,
-    Coordinate, Cursor, CursorSnapshot, Dimensions, Grid, ImageAlphaMode, ImageContent,
-    ImageContentId, ImageErasePolicy, ImageError, ImageMetrics, ImagePlacement, ImagePlacementId,
-    ImagePlane, ImageRetention, ImageSourceFormat, MouseTracking, NewImageContent,
-    NewImagePlacement, NewImagePlacementOptions, PixelRect, PixelSize, ResnapshotRequired,
-    RowSnapshot, ScrollDirection, ScrollRegion, ScrollbackSnapshot, SearchMatch, SearchPage,
-    SharedKittyUploadBudget, SnapshotRequest, TerminalConfig, TerminalDamage, TerminalEvent,
-    TerminalModes, TerminalRevision, TerminalSnapshot, TerminalUpdate, UnderlineStyle, UpdateBatch,
+    ActiveScreen, Attributes, CellContent, ChangeSet, ClipboardSelection, Color, ColorSource,
+    ComposedTable, Coordinate, Cursor, CursorSnapshot, Dimensions, Grid, ImageAlphaMode,
+    ImageContent, ImageContentId, ImageErasePolicy, ImageError, ImageMetrics, ImagePlacement,
+    ImagePlacementId, ImagePlane, ImageRetention, ImageSourceFormat, MouseTracking,
+    NewImageContent, NewImagePlacement, NewImagePlacementOptions, OSC52_MAX_BYTES, PixelRect,
+    PixelSize, ReplyTerminator, ResnapshotRequired, RowSnapshot, ScrollDirection, ScrollRegion,
+    ScrollbackSnapshot, SearchMatch, SearchPage, SharedKittyUploadBudget, SnapshotRequest,
+    TerminalConfig, TerminalDamage, TerminalEvent, TerminalModes, TerminalRevision,
+    TerminalSnapshot, TerminalUpdate, UnderlineStyle, UpdateBatch,
     image::{
         KittyUploadReservation, MAX_SIXEL_COLORS, SixelDecoder, SixelError, SixelImage, iterm,
         kitty::{self, Command as KittyCommand, Error as KittyError},
@@ -858,7 +859,13 @@ impl Terminal {
     }
 
     fn push_event(&mut self, event: TerminalEvent) {
-        if let Some(change) = &mut self.current_change {
+        // Clipboard contents stay out of terminal updates, which reach every
+        // subscriber and the update history; only the drain sees them.
+        let clipboard = matches!(
+            event,
+            TerminalEvent::ClipboardSet { .. } | TerminalEvent::ClipboardQuery { .. }
+        );
+        if !clipboard && let Some(change) = &mut self.current_change {
             change.events.push(event.clone());
         }
         if self.events.len() < self.config.event_limit {
@@ -3054,6 +3061,7 @@ impl Terminal {
                 self.push_event(TerminalEvent::TitleChanged(self.title.clone()));
             }
             "4" => self.osc_palette(data, terminator),
+            "52" => self.osc_clipboard(data, terminator),
             "10" | "11" | "12" => {
                 let slot = command.parse::<usize>().unwrap() - 10;
                 if data == "?" {
@@ -3128,6 +3136,51 @@ impl Terminal {
                     color,
                 });
             }
+        }
+    }
+
+    /// OSC 52 (Plan 0074 M2): `52;<targets>;<base64>` asks to set the named
+    /// selections, and `52;<targets>;?` asks for one's contents. The terminal
+    /// only reports either; it never touches a clipboard or answers a query.
+    /// A set whose payload is empty, not base64, or over [`OSC52_MAX_BYTES`]
+    /// decoded is ignored, as is a sequence that names no selection this
+    /// terminal knows.
+    fn osc_clipboard(&mut self, data: &str, terminator: StringTerminator) {
+        let Some((targets, payload)) = data.split_once(';') else {
+            return;
+        };
+        let selections = osc52_selections(targets);
+        let Some(&(first, target)) = selections.first() else {
+            return;
+        };
+        if payload == "?" {
+            self.push_event(TerminalEvent::ClipboardQuery {
+                selection: first,
+                target,
+                terminator: match terminator {
+                    StringTerminator::Bell => ReplyTerminator::Bell,
+                    StringTerminator::StringTerminator => ReplyTerminator::StringTerminator,
+                },
+            });
+            return;
+        }
+        let Some(bytes) = decode_osc52(payload) else {
+            return;
+        };
+        if let Some(&(second, _)) = selections.get(1) {
+            self.push_event(TerminalEvent::ClipboardSet {
+                selection: first,
+                bytes: bytes.clone(),
+            });
+            self.push_event(TerminalEvent::ClipboardSet {
+                selection: second,
+                bytes,
+            });
+        } else {
+            self.push_event(TerminalEvent::ClipboardSet {
+                selection: first,
+                bytes,
+            });
         }
     }
 
@@ -3325,6 +3378,50 @@ fn extended_color(params: &Params, index: usize) -> Option<(Color, usize)> {
         }
         _ => None,
     }
+}
+
+/// The selections an OSC 52 target list names, each with the letter that
+/// first named it, in first-named order and at most once each: `c` the
+/// clipboard, `p` and `s` the primary selection (as foot and Alacritty read
+/// `s`), and an empty list the clipboard. Cut buffers `0`-`7`, `q`, and
+/// anything else name nothing here.
+fn osc52_selections(targets: &str) -> Vec<(ClipboardSelection, u8)> {
+    if targets.is_empty() {
+        return vec![(ClipboardSelection::Clipboard, b'c')];
+    }
+    let mut selections = Vec::with_capacity(2);
+    for target in targets.bytes() {
+        let selection = match target {
+            b'c' => ClipboardSelection::Clipboard,
+            b'p' | b's' => ClipboardSelection::Primary,
+            _ => continue,
+        };
+        if !selections.iter().any(|(named, _)| *named == selection) {
+            selections.push((selection, target));
+        }
+    }
+    selections
+}
+
+/// An OSC 52 payload decoded: standard base64, padded or not. `None` for
+/// anything empty, malformed, or over [`OSC52_MAX_BYTES`] decoded.
+fn decode_osc52(payload: &str) -> Option<Vec<u8>> {
+    use base64::{
+        Engine as _,
+        alphabet::STANDARD,
+        engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig},
+    };
+    const LENIENT: GeneralPurpose = GeneralPurpose::new(
+        &STANDARD,
+        GeneralPurposeConfig::new()
+            .with_decode_padding_mode(DecodePaddingMode::Indifferent)
+            .with_decode_allow_trailing_bits(true),
+    );
+    if payload.is_empty() || payload.len() > crate::OSC52_MAX_BASE64_BYTES {
+        return None;
+    }
+    let bytes = LENIENT.decode(payload).ok()?;
+    (!bytes.is_empty() && bytes.len() <= OSC52_MAX_BYTES).then_some(bytes)
 }
 
 fn osc_color_reply(command: &str, color: u32, terminator: StringTerminator) -> Vec<u8> {
@@ -3838,6 +3935,287 @@ mod tests {
         assert_eq!(terminal.active_screen(), ActiveScreen::Normal);
         assert_eq!(row_text(&terminal, 0), "normal");
         assert_eq!(terminal.grid().cursor().position(), Coordinate::new(5, 0));
+    }
+
+    fn clipboard_events(terminal: &mut Terminal) -> Vec<TerminalEvent> {
+        terminal
+            .drain_events()
+            .filter(|event| {
+                matches!(
+                    event,
+                    TerminalEvent::ClipboardSet { .. } | TerminalEvent::ClipboardQuery { .. }
+                )
+            })
+            .collect()
+    }
+
+    fn clipboard_set(selection: ClipboardSelection, bytes: &[u8]) -> TerminalEvent {
+        TerminalEvent::ClipboardSet {
+            selection,
+            bytes: bytes.to_vec(),
+        }
+    }
+
+    #[test]
+    fn osc52_sets_each_target_and_an_empty_target_means_the_clipboard() {
+        let mut terminal = terminal(8, 2);
+        // "hi" is aGk= in base64.
+        for (targets, expected) in [
+            ("c", vec![ClipboardSelection::Clipboard]),
+            ("", vec![ClipboardSelection::Clipboard]),
+            ("p", vec![ClipboardSelection::Primary]),
+            ("s", vec![ClipboardSelection::Primary]),
+            (
+                "pc",
+                vec![ClipboardSelection::Primary, ClipboardSelection::Clipboard],
+            ),
+            (
+                "cc0s",
+                vec![ClipboardSelection::Clipboard, ClipboardSelection::Primary],
+            ),
+        ] {
+            terminal.advance(format!("\x1b]52;{targets};aGk=\x07").as_bytes());
+            let expected = expected
+                .into_iter()
+                .map(|selection| clipboard_set(selection, b"hi"))
+                .collect::<Vec<_>>();
+            assert_eq!(clipboard_events(&mut terminal), expected, "{targets:?}");
+        }
+        // Unpadded base64 is accepted too, and the ST terminator works.
+        terminal.advance(b"\x1b]52;c;aGk\x1b\\");
+        assert_eq!(
+            clipboard_events(&mut terminal),
+            vec![clipboard_set(ClipboardSelection::Clipboard, b"hi")]
+        );
+        // The terminal never writes anything back for a set.
+        assert!(
+            !terminal
+                .drain_events()
+                .any(|event| matches!(event, TerminalEvent::PtyWrite(_)))
+        );
+    }
+
+    #[test]
+    fn osc52_queries_report_the_target_and_terminator_and_are_never_answered() {
+        use ClipboardSelection::{Clipboard, Primary};
+        use ReplyTerminator::{Bell, StringTerminator};
+
+        let mut terminal = terminal(8, 2);
+        for (sequence, selection, target, terminator) in [
+            (&b"\x1b]52;c;?\x07"[..], Clipboard, b'c', Bell),
+            (b"\x1b]52;;?\x1b\\", Clipboard, b'c', StringTerminator),
+            (b"\x1b]52;p;?\x07", Primary, b'p', Bell),
+            // `s` reads the primary selection, and its reply names `s`.
+            (b"\x1b]52;s;?\x1b\\", Primary, b's', StringTerminator),
+            // A query names one selection: the first.
+            (b"\x1b]52;pc;?\x07", Primary, b'p', Bell),
+            (b"\x1b]52;0sc;?\x07", Primary, b's', Bell),
+        ] {
+            terminal.advance(sequence);
+            let events = terminal.drain_events().collect::<Vec<_>>();
+            assert_eq!(
+                events,
+                vec![TerminalEvent::ClipboardQuery {
+                    selection,
+                    target,
+                    terminator,
+                }],
+                "{sequence:?}"
+            );
+        }
+        assert_eq!(crate::osc52_reply(b'c', b"hi", Bell), b"\x1b]52;c;aGk=\x07");
+        assert_eq!(
+            crate::osc52_reply(b's', b"", StringTerminator),
+            b"\x1b]52;s;\x1b\\"
+        );
+    }
+
+    #[test]
+    fn osc52_ignores_invalid_empty_and_unknown_sequences() {
+        let mut terminal = terminal(8, 2);
+        for sequence in [
+            &b"\x1b]52;c;not base64!\x07"[..],
+            b"\x1b]52;c;\x07",
+            b"\x1b]52;c\x07",
+            b"\x1b]52;0;aGk=\x07",
+            b"\x1b]52;q;?\x07",
+            b"\x1b]52;c;a\x07",
+        ] {
+            terminal.advance(sequence);
+            assert_eq!(clipboard_events(&mut terminal), Vec::new(), "{sequence:?}");
+        }
+        terminal.advance(b"Z");
+        assert_eq!(
+            terminal.grid().row(0).unwrap()[0].content(),
+            CellContent::Scalar('Z')
+        );
+    }
+
+    #[test]
+    fn osc52_payloads_are_bounded_beyond_the_ordinary_osc_limit() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+        let mut terminal = terminal(8, 2);
+        let largest = vec![b'x'; OSC52_MAX_BYTES];
+        let mut sequence = b"\x1b]52;c;".to_vec();
+        sequence.extend_from_slice(STANDARD.encode(&largest).as_bytes());
+        sequence.push(0x07);
+        assert!(sequence.len() > TerminalConfig::default().osc_limit);
+        terminal.advance(&sequence);
+        assert_eq!(
+            clipboard_events(&mut terminal),
+            vec![clipboard_set(ClipboardSelection::Clipboard, &largest)]
+        );
+        // One byte over still fits the string, and is refused decoded.
+        let mut over = b"\x1b]52;c;".to_vec();
+        over.extend_from_slice(STANDARD.encode(vec![b'x'; OSC52_MAX_BYTES + 1]).as_bytes());
+        over.push(0x07);
+        terminal.advance(&over);
+        assert_eq!(clipboard_events(&mut terminal), Vec::new());
+        // Far over, the string itself overflows and stays synchronized.
+        let mut far = b"\x1b]52;c;".to_vec();
+        far.extend_from_slice(STANDARD.encode(vec![b'x'; 2 * OSC52_MAX_BYTES]).as_bytes());
+        far.extend_from_slice(b"\x07Z");
+        terminal.advance(&far);
+        let events = terminal.drain_events().collect::<Vec<_>>();
+        assert_eq!(events, vec![TerminalEvent::StringTruncated("OSC")]);
+        assert_eq!(
+            terminal.grid().row(0).unwrap()[0].content(),
+            CellContent::Scalar('Z')
+        );
+        // Every other OSC keeps the configured limit.
+        let mut title = b"\x1b]2;".to_vec();
+        title.extend(std::iter::repeat_n(b't', 8192));
+        title.push(0x07);
+        terminal.advance(&title);
+        assert_eq!(
+            terminal.drain_events().collect::<Vec<_>>(),
+            vec![TerminalEvent::StringTruncated("OSC")]
+        );
+    }
+
+    #[test]
+    fn osc52_contents_stay_out_of_terminal_updates() {
+        let mut terminal = terminal(8, 2);
+        let base = terminal.revision();
+        terminal.advance(b"A\x1b]52;c;aGk=\x07B\x1b]52;c;?\x07C");
+        assert_eq!(clipboard_events(&mut terminal).len(), 2);
+        let updates = terminal.updates_since(base).unwrap();
+        assert!(updates.updates().all(|update| update.events().all(|event| {
+            !matches!(
+                event,
+                TerminalEvent::ClipboardSet { .. } | TerminalEvent::ClipboardQuery { .. }
+            )
+        })));
+    }
+
+    #[test]
+    fn osc52_base64_may_be_split_across_lines() {
+        let mut terminal = terminal(8, 2);
+        terminal.advance(b"\x1b]52;c;aG\nk\r\n=\x07");
+        assert_eq!(
+            clipboard_events(&mut terminal),
+            vec![clipboard_set(ClipboardSelection::Clipboard, b"hi")]
+        );
+    }
+
+    /// A finished OSC 52 sequence, however it ended, leaves a terminal a
+    /// live upgrade can checkpoint and restore.
+    #[test]
+    fn a_checkpoint_after_osc52_succeeds() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+        let mut far = b"\x1b]52;c;".to_vec();
+        far.extend_from_slice(STANDARD.encode(vec![b'x'; 2 * OSC52_MAX_BYTES]).as_bytes());
+        far.push(0x07);
+        for sequence in [
+            &b"\x1b]52;c;aGk=\x07"[..],
+            b"\x1b]52;c;?\x1b\\",
+            far.as_slice(),
+        ] {
+            let mut terminal = terminal(8, 2);
+            terminal.advance(sequence);
+            assert_eq!(terminal.drain_events().count(), 1);
+            let checkpoint = terminal.encode_checkpoint().unwrap();
+            let mut restored =
+                Terminal::restore_checkpoint(&checkpoint, TerminalConfig::default()).unwrap();
+            restored.advance(b"\x1b]52;p;?\x07");
+            assert_eq!(
+                clipboard_events(&mut restored),
+                vec![TerminalEvent::ClipboardQuery {
+                    selection: ClipboardSelection::Primary,
+                    target: b'p',
+                    terminator: ReplyTerminator::Bell,
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn a_set_in_progress_at_a_checkpoint_may_still_grow_past_the_osc_limit() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+        let mut terminal = terminal(8, 2);
+        terminal.advance(b"\x1b]52;c;");
+        let checkpoint = terminal.encode_checkpoint().unwrap();
+        let mut restored =
+            Terminal::restore_checkpoint(&checkpoint, TerminalConfig::default()).unwrap();
+        let text = vec![b'x'; 6 * 1024];
+        let encoded = STANDARD.encode(&text);
+        assert!(encoded.len() > TerminalConfig::default().osc_limit);
+        restored.advance(encoded.as_bytes());
+        restored.advance(b"\x07");
+        assert_eq!(
+            clipboard_events(&mut restored),
+            vec![clipboard_set(ClipboardSelection::Clipboard, &text)]
+        );
+    }
+
+    #[test]
+    fn a_query_in_progress_at_a_checkpoint_is_still_asked_after_restore() {
+        let mut terminal = terminal(8, 2);
+        terminal.advance(b"\x1b]52;s;");
+        let checkpoint = terminal.encode_checkpoint().unwrap();
+        let mut restored =
+            Terminal::restore_checkpoint(&checkpoint, TerminalConfig::default()).unwrap();
+        restored.advance(b"?\x07");
+        assert_eq!(
+            clipboard_events(&mut restored),
+            vec![TerminalEvent::ClipboardQuery {
+                selection: ClipboardSelection::Primary,
+                target: b's',
+                terminator: ReplyTerminator::Bell,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_checkpoint_mid_osc52_drops_the_rest_and_stays_synchronized() {
+        let config = TerminalConfig {
+            osc_limit: 16,
+            ..TerminalConfig::default()
+        };
+        let mut terminal = Terminal::new(8, 2, config.clone());
+        terminal.advance(b"\x1b]52;c;");
+        terminal.advance(&[b'A'; 40]);
+        let mut whole = terminal.clone();
+        let checkpoint = terminal.encode_checkpoint().unwrap();
+        let mut restored = Terminal::restore_checkpoint(&checkpoint, config).unwrap();
+        restored.advance(b"QUJD\x07Z");
+        let events = restored.drain_events().collect::<Vec<_>>();
+        assert_eq!(events, vec![TerminalEvent::StringTruncated("OSC")]);
+        assert_eq!(
+            restored.grid().row(0).unwrap()[0].content(),
+            CellContent::Scalar('Z')
+        );
+        // Without the checkpoint the same bytes set the clipboard.
+        whole.advance(b"QUJD\x07");
+        let mut expected = vec![0_u8; 30];
+        expected.extend_from_slice(b"ABC");
+        assert_eq!(
+            clipboard_events(&mut whole),
+            vec![clipboard_set(ClipboardSelection::Clipboard, &expected)]
+        );
     }
 
     #[test]

@@ -177,6 +177,7 @@ fn spawn_single_pane_controller(
         resyncs: resync_sender,
         handoff: factory.handoff_status().source(),
         forces: factory.forces_in_flight().clone(),
+        osc52: factory.osc52().clone(),
     };
     let forced_control_transfer = factory.capabilities().forced_control_transfer;
     let token = cancellation.clone();
@@ -769,6 +770,7 @@ async fn run_live_multipane_window_inner(
     .map(AbortOnDropTask::new);
     let local_endpoint = factory.is_local();
     let handoff_status = factory.handoff_status().clone();
+    let osc52 = factory.osc52().clone();
     let (layout_ledger, _window_anchor) = spawn_window_anchor(&factory, app_id.clone());
     let (forced_control_transfer, follows_remote_prompts) = forced_control_offer(
         factory.capabilities().forced_control_transfer,
@@ -840,6 +842,7 @@ async fn run_live_multipane_window_inner(
                 local_endpoint,
                 clipboard_image_directory: window_config.clipboard_image_directory,
                 middle_click_paste: window_config.middle_click_paste,
+                osc52_policy: window_config.osc52,
                 initial_dojo: Some(initial_identity),
                 initial_tab_strip_visible,
                 initial_columns: window_config.initial_columns,
@@ -864,6 +867,7 @@ async fn run_live_multipane_window_inner(
                 keymap: window_config.keymap,
                 prefix_timeout_ms: window_config.prefix_timeout_ms,
                 handoff_status: Some(handoff_status),
+                osc52: Some(osc52),
                 layout_ledger,
                 ..WindowOptions::default()
             },
@@ -1001,6 +1005,7 @@ pub(super) async fn run_live_window(
     .map(AbortOnDropTask::new);
     let local_endpoint = factory.is_local();
     let handoff_status = factory.handoff_status().clone();
+    let osc52 = factory.osc52().clone();
     // Its responder keeps the opt-out it opened with, and so does Force
     // control.
     let (forced_control_transfer, _) = forced_control_offer(
@@ -1024,6 +1029,7 @@ pub(super) async fn run_live_window(
             local_endpoint,
             clipboard_image_directory: window_config.clipboard_image_directory,
             middle_click_paste: window_config.middle_click_paste,
+            osc52_policy: window_config.osc52,
             initial_columns: window_config.initial_columns,
             initial_rows: window_config.initial_rows,
             cursor_style: window_config.cursor_style,
@@ -1045,6 +1051,7 @@ pub(super) async fn run_live_window(
             keymap: window_config.keymap,
             prefix_timeout_ms: window_config.prefix_timeout_ms,
             handoff_status: Some(handoff_status),
+            osc52: Some(osc52),
             ..WindowOptions::default()
         })
     });

@@ -684,6 +684,12 @@ pub struct WindowOptions {
     /// `[clipboard] middle-click-paste`: a middle click pastes the primary
     /// selection.
     pub middle_click_paste: bool,
+    /// `[clipboard] osc52`: what programs in the Window's panes may do with
+    /// its clipboard through OSC 52 (Plan 0074 M2).
+    pub osc52_policy: crate::osc52::Osc52Policy,
+    /// Where the Window's panes hand it their programs' OSC 52 requests.
+    /// `None` for Windows that hold no daemon panes.
+    pub osc52: Option<crate::osc52::Osc52Hub>,
     /// Fixed endpoint authority, not inferred from a UI capability or terminal data.
     pub local_endpoint: bool,
     /// Multi-pane input. Empty retains the legacy one-pane fields above.
@@ -787,6 +793,8 @@ impl Default for WindowOptions {
             prefix_timeout_ms: 1_000,
             clipboard_image_directory: None,
             middle_click_paste: true,
+            osc52_policy: crate::osc52::Osc52Policy::CopyPaste,
+            osc52: None,
             local_endpoint: false,
             panes: Vec::new(),
             layout: None,
