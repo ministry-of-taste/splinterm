@@ -2368,7 +2368,7 @@ async fn a_bracketed_paste_cut_short_still_sends_its_closing_marker() {
 }
 
 /// A queue that stays full keeps the closing marker for the next input.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_closing_marker_the_full_queue_refuses_goes_ahead_of_the_next_input() {
     let id = SplintId::new();
     let limits = ServerLimits {
@@ -2405,6 +2405,55 @@ async fn a_closing_marker_the_full_queue_refuses_goes_ahead_of_the_next_input() 
     )
     .await;
     result.unwrap();
+}
+
+/// A closing marker put ahead of input the full queue refuses whole stays
+/// owed, and goes ahead of the input after that.
+#[tokio::test(start_paused = true)]
+async fn a_closing_marker_refused_with_the_next_input_stays_owed() {
+    let id = SplintId::new();
+    let limits = ServerLimits {
+        maximum_input_bytes: 8,
+        ..ServerLimits::default()
+    };
+    let mut steps = paste_cut_steps(id);
+    for _ in 0..PASTE_CLOSE_ATTEMPTS {
+        steps.push((
+            controlled_input(id, b"[201~", false),
+            Err(ErrorCode::ResourceLimit),
+            Vec::new(),
+        ));
+    }
+    steps.push((
+        controlled_input(id, b"[201~xx", false),
+        Err(ErrorCode::ResourceLimit),
+        Vec::new(),
+    ));
+    steps.push((
+        controlled_input(id, b"[201~y", false),
+        Ok(input_acknowledged(id)),
+        Vec::new(),
+    ));
+    steps.push((
+        Request::ReleaseControl { controller_id: 1 },
+        Ok(Response::Acknowledged),
+        Vec::new(),
+    ));
+    let (result, updates, _) = run_case_with(
+        id,
+        true,
+        limits,
+        vec![
+            WindowCommand::Input(b"[200~abcdefghij[201~".to_vec()),
+            // A full request's worth, so the next input is not merged in.
+            WindowCommand::Input(b"xxxxxxxx".to_vec()),
+            WindowCommand::Input(b"y".to_vec()),
+        ],
+        steps,
+    )
+    .await;
+    result.unwrap();
+    assert_eq!(input_dropped_count(&updates), 2);
 }
 
 /// Typed input cut short sends no closing marker of its own.

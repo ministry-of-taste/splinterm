@@ -1040,7 +1040,8 @@ pub(in crate::app) async fn drive_controller(
                     };
                     // Plan 0074: the closing marker of a bracketed paste cut
                     // short earlier goes ahead of the next input.
-                    let bytes = if paste_close_pending && !focus_report {
+                    let close_prepended = paste_close_pending && !focus_report;
+                    let bytes = if close_prepended {
                         paste_close_pending = false;
                         [PASTE_END, bytes.as_slice()].concat()
                     } else {
@@ -1050,6 +1051,7 @@ pub(in crate::app) async fn drive_controller(
                     let lengths = bytes.chunks(maximum_input_bytes.max(1)).map(<[u8]>::len);
                     let mut sent = 0;
                     let mut cut = false;
+                    let mut fenced = false;
                     for (request, length) in input_requests(
                         controller_id,
                         splint_id,
@@ -1079,19 +1081,35 @@ pub(in crate::app) async fn drive_controller(
                             }
                             // Fenced before this pane heard the pause: the
                             // rest of the batch is dropped, not queued.
-                            Err(error) if handoff_refused(&error) => break,
+                            Err(error) if handoff_refused(&error) => {
+                                fenced = true;
+                                break;
+                            }
                             Err(error) => return Err(error),
                         }
                     }
+                    // A closing marker put ahead of this input that did not
+                    // get through is still owed.
+                    let close_owed = close_prepended && sent < PASTE_END.len();
                     if cut {
-                        // The Window says so; a full update queue loses
-                        // only the notice.
-                        let _ = outputs.updates.try_send(WindowUpdate::InputDropped);
+                        // The Window says so, unless only a generated focus
+                        // report was refused; a full update queue loses only
+                        // the notice.
+                        if !focus_report {
+                            let _ = outputs.updates.try_send(WindowUpdate::InputDropped);
+                        }
                         if bracketed_paste_left_open(&bytes[..sent]) {
                             paste_close_pending =
                                 !close_cut_paste(&mut control, controller_id, splint_id, incarnation)
                                     .await?;
+                        } else if close_owed {
+                            paste_close_pending = true;
                         }
+                    } else if fenced {
+                        // Input stays paused through the handoff; the marker
+                        // goes ahead of the first input after it.
+                        paste_close_pending =
+                            close_owed || bracketed_paste_left_open(&bytes[..sent]);
                     }
                     continue;
                 }

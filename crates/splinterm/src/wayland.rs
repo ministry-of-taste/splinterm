@@ -6598,6 +6598,10 @@ impl App {
                 match offer.with_mime_types(|mimes| paste_offer(mimes, target)) {
                     PasteOffer::Text(mime) => offer.receive(mime).ok().map(OwnedFd::from),
                     PasteOffer::ImageKey => {
+                        if self.panes.pane.commands.is_none() {
+                            self.window_notice(PasteDrop::NoInput.notice());
+                            return;
+                        }
                         let key = image_paste_key(self.panes.input_modes());
                         self.send_command(WindowCommand::Input(key));
                         return;
