@@ -231,6 +231,8 @@ processes. Public input and resize commands therefore use an atomic same-connect
 workflow: acquire control, perform the action, and release control during cleanup.
 The machine CLI does not expose reusable controller IDs, standalone acquire/release
 commands, transfer requests or decisions, or forced takeover. Observation and control-status subscriptions never acquire control.
+Automation can never take control the way a Window does when a person resizes
+a pane: no policy scope or grant covers it.
 
 Machine mode never prompts. It requires `--yes` for killing a process, closing a
 Splint, closing a Dojo, and revoking authorization. Create, split, restore,
@@ -358,7 +360,9 @@ whole topology for changes still needs a daemon policy rule.
   or creating a new Lair. These are not consent scopes at all and stay available
   only through the policy file.
 - When an agent with Look and type or Manage takes control of a pane, your
-  Window shows the change, and you can take control back.
+  Window shows the change, and you can take control back. Resizing the pane
+  in a Window takes control without asking, from an agent or another Window;
+  the agent's next input then fails and says why.
 
 An agent that asks for anything other than exactly one level is shown as
 **Custom** access, with every requested scope listed. Splinterm grants exactly

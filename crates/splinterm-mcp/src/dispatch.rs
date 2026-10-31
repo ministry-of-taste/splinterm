@@ -362,6 +362,11 @@ pub(crate) const ALREADY_CONTROLLED: &str = "this Splint already has a controlle
 pub(crate) const NOBODY_CONTROLS: &str =
     "nobody controls this Splint; call acquire_control without takeover";
 
+/// What input, resize, or release says once a person resized the pane in a
+/// Window, which took control without asking (Plan 0072). Like a denied
+/// transfer, it respects the person.
+pub(crate) const RECLAIMED_BY_WINDOW: &str = "a person resized this pane in a Window, so that Window took control and this controller_handle no longer works; do not take the pane back unless the person tells you to. To type again, call request_control_transfer and ask them to press Ctrl+Shift+Y (the default key) in that pane within 15 seconds";
+
 /// What a transfer request says while another transfer of the Splint waits
 /// for an answer (Plan 0067 M4).
 pub(crate) const TRANSFER_ALREADY_PENDING: &str = "another control transfer of this Splint is waiting for an answer; call again once it ends (at most 15 seconds)";
@@ -433,8 +438,8 @@ fn lifecycle_refusal(error: &splinterm_protocol::ProtocolError) -> Option<Dispat
 /// daemon code, never the daemon's own text.
 fn map_protocol_error(error: &splinterm_protocol::ProtocolError) -> DispatchFailure {
     use splinterm_protocol::{
-        CONTROL_TRANSFER_PENDING, NO_CONTROLLER_TO_TRANSFER, NO_WORKSPACE_GRANT,
-        SPLINT_ALREADY_CONTROLLED,
+        CONTROL_RECLAIMED_BY_WINDOW, CONTROL_TRANSFER_PENDING, NO_CONTROLLER_TO_TRANSFER,
+        NO_WORKSPACE_GRANT, SPLINT_ALREADY_CONTROLLED,
     };
 
     if let Some(failure) = lifecycle_refusal(error) {
@@ -463,6 +468,11 @@ fn map_protocol_error(error: &splinterm_protocol::ProtocolError) -> DispatchFail
         // A Lair list or topology read no grant covers: say what to ask for.
         ErrorCode::Unauthorized if error.message == NO_WORKSPACE_GRANT => {
             ("unauthorized", NO_WORKSPACE_GRANT, false)
+        }
+        // Plan 0072: a Window took the controller when a person resized the
+        // pane; the handle is gone for good.
+        ErrorCode::Unauthorized if error.message == CONTROL_RECLAIMED_BY_WINDOW => {
+            ("controller_unavailable", RECLAIMED_BY_WINDOW, false)
         }
         ErrorCode::Unauthorized | ErrorCode::DevelopmentFeatureDisabled => {
             ("unauthorized", UNAUTHORIZED, false)

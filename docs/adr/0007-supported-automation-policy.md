@@ -192,6 +192,7 @@ checked in addition to every listed scope.
 | `RequestControlTransfer` | `controller_transfer` plus at least one of `input` or `resize` |
 | `DecideControlTransfer` | own pending transfer as current controller; no additional scope |
 | `ForceControlTransfer` | trusted graphical UI confirmation only; no persistent policy scope |
+| `ReclaimControl` (v47) | installed trusted graphical client or remote Window only, without confirmation; no persistent policy scope or grant; audited as `reclaim_control` |
 | `ReleaseControl` | own controller; no additional scope |
 | `Input` | own controller and `input` |
 | `Resize` | own controller and `resize` |
@@ -344,10 +345,34 @@ only to policy rules.
 - A Custom request that contains `control_takeover` is offered just this once
   only.
 - The trusted UI's own forced takeover with confirmation is unchanged.
+- A Window also takes control when a person resizes the pane, without
+  confirmation; see the next amendment.
 
 **Consent.** "Graphical grant-once consent remains available and
 daemon-lifetime-only" in the consent section above is amended accordingly.
 Just-this-once grants keep that behavior. The longer durations follow ADR 0014.
+
+### Amendment: a resize takes control (protocol 47)
+
+Operator decision, 2026-10-30. When a person resizes a pane in a Window that
+is not its controller, that Window takes control with `ReclaimControl`. There
+is no dialog, and it takes the pane from any holder: another Window, a remote
+Window, or an agent, with or without a grant. For resizes this replaces the
+rule that a Window does not take a pane from an agent without the person's
+answer.
+
+- Only the installed client and remote Windows may send it. No policy scope
+  names it, so no policy rule, grant, or development access lets an agent or
+  any other automation send it.
+- The lease it takes is never bound to a grant. A pending transfer of the
+  Splint is cancelled. A connection still holds one lease.
+- The connection that lost the lease gets a control status with
+  `lost_reason: reclaimed_by_window`, and its next input, resize, or release
+  is refused with the same reason. Nobody is told which Window took it.
+- Each reclaim is audited as `reclaim_control`; the reason names who took
+  control (a Window or a remote Window) and from whom (nobody, itself, a
+  Window, a remote Window, or an agent).
+- The confirmed forced takeover is unchanged.
 
 ## Threat-model conclusions
 

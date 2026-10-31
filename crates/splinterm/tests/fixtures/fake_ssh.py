@@ -171,7 +171,7 @@ while True:
                     continue
                 private_write(channel, {
                     'type': 'hello',
-                    'version': 46,
+                    'version': 47,
                     'limits': {
                         'maximum_frame_bytes': 16777216,
                         'maximum_input_bytes': 65536,

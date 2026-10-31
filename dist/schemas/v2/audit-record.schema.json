@@ -116,6 +116,7 @@
         "request_control_transfer",
         "decide_control_transfer",
         "force_control_transfer",
+        "reclaim_control",
         "release_control",
         "input",
         "resize",

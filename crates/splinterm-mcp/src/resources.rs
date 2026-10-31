@@ -1174,6 +1174,7 @@ mod tests {
                 incarnation: 2,
                 controlled: false,
                 locally_owned: false,
+                lost_reason: None,
             },
             &modes,
             1,
@@ -1193,6 +1194,7 @@ mod tests {
                 incarnation: 2,
                 controlled: true,
                 locally_owned: false,
+                lost_reason: None,
             },
             &modes,
             2,
@@ -1218,6 +1220,7 @@ mod tests {
                 incarnation: 2,
                 controlled: true,
                 locally_owned: false,
+                lost_reason: None,
             },
         };
         let state = Arc::new(Mutex::new(PublishedState {
@@ -1231,6 +1234,7 @@ mod tests {
                     incarnation: 2,
                     controlled: false,
                     locally_owned: false,
+                    lost_reason: None,
                 },
                 &[],
                 5,

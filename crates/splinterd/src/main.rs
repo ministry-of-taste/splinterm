@@ -14,7 +14,7 @@ mod presentation_offers;
 mod remote_consent;
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     env,
     ffi::OsString,
     io::{ErrorKind, IoSlice},
@@ -253,6 +253,9 @@ enum ControlNotice {
         incarnation: u64,
         owner_connection_id: Option<u64>,
         excluded_connections: Option<Arc<HashSet<u64>>>,
+        /// The connection whose lease a Window just took by resizing
+        /// (Plan 0072); only its subscriptions hear why.
+        reclaimed_from: Option<u64>,
     },
     TransferRequested(PendingControlTransfer),
     TransferResolved {
@@ -272,6 +275,26 @@ struct ControllerState {
     by_connection: HashMap<u64, u64>,
     transfers: HashMap<u64, PendingControlTransfer>,
     transfer_by_splint: HashMap<SplintId, u64>,
+    /// Leases a Window took by resizing (Plan 0072), as (controller ID,
+    /// connection ID), newest last, so the losing connection's next use of
+    /// one says why it no longer works. Controller IDs are never reused.
+    reclaimed: VecDeque<(u64, u64)>,
+}
+
+/// How many reclaimed leases are remembered for their old connections.
+const MAXIMUM_RECLAIMED_LEASES: usize = 64;
+
+/// What a resize reclaim did (Plan 0072).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ControlReclaim {
+    /// The requester's lease.
+    lease: ControllerLease,
+    /// The lease it ended, if another connection held the Splint.
+    previous: Option<ControllerLease>,
+    /// Whether the requester already held this Splint's lease.
+    already_held: bool,
+    /// The pending transfer of the Splint it cancelled.
+    cancelled: Option<PendingControlTransfer>,
 }
 
 impl Default for ControllerState {
@@ -284,6 +307,7 @@ impl Default for ControllerState {
             by_connection: HashMap::new(),
             transfers: HashMap::new(),
             transfer_by_splint: HashMap::new(),
+            reclaimed: VecDeque::new(),
         }
     }
 }
@@ -340,11 +364,18 @@ impl ControllerState {
             {
                 Ok(())
             }
+            None if self.reclaimed_from(connection_id, controller_id) => Err(reclaimed_by_window()),
             _ => Err(ProtocolError::new(
                 ErrorCode::Unauthorized,
                 "controller lease is not owned by this connection",
             )),
         }
+    }
+
+    /// Whether a Window took `controller_id` from `connection_id` by
+    /// resizing.
+    fn reclaimed_from(&self, connection_id: u64, controller_id: u64) -> bool {
+        self.reclaimed.contains(&(controller_id, connection_id))
     }
 
     fn status(&self, connection_id: u64, splint_id: SplintId, incarnation: u64) -> ControlStatus {
@@ -358,6 +389,7 @@ impl ControllerState {
             incarnation,
             controlled: lease.is_some(),
             locally_owned: lease.is_some_and(|lease| lease.connection_id == connection_id),
+            lost_reason: None,
         }
     }
 
@@ -528,6 +560,64 @@ impl ControllerState {
         })?;
         self.release(current.id);
         self.acquire(requester_connection_id, splint_id, incarnation, grant_id)
+    }
+
+    /// Gives `requester_connection_id` the Splint's controller without
+    /// asking (Plan 0072): a lease another connection holds ends, whoever
+    /// holds it, and a pending transfer of the Splint is cancelled. The
+    /// requester's own lease of this Splint is kept as it is. Like an
+    /// acquire, a connection holds one lease, and the lease is never
+    /// grant-bound: only a Window reclaims.
+    fn reclaim(
+        &mut self,
+        requester_connection_id: u64,
+        splint_id: SplintId,
+        incarnation: u64,
+    ) -> Result<ControlReclaim, ProtocolError> {
+        let current = self
+            .by_splint
+            .get(&splint_id)
+            .and_then(|id| self.by_id.get(id))
+            .copied();
+        if let Some(lease) = current.filter(|lease| {
+            lease.connection_id == requester_connection_id && lease.incarnation == incarnation
+        }) {
+            return Ok(ControlReclaim {
+                lease,
+                previous: None,
+                already_held: true,
+                cancelled: None,
+            });
+        }
+        if self.by_connection.contains_key(&requester_connection_id) {
+            return Err(ProtocolError::new(
+                ErrorCode::ControllerUnavailable,
+                "connection already owns a controller lease",
+            ));
+        }
+        self.next_id.checked_add(1).ok_or_else(|| {
+            ProtocolError::new(ErrorCode::ResourceLimit, "controller ID space exhausted")
+        })?;
+        let previous = current.and_then(|lease| self.release(lease.id));
+        if let Some(previous) = previous {
+            if self.reclaimed.len() == MAXIMUM_RECLAIMED_LEASES {
+                self.reclaimed.pop_front();
+            }
+            self.reclaimed
+                .push_back((previous.id, previous.connection_id));
+        }
+        let cancelled = self
+            .transfer_by_splint
+            .get(&splint_id)
+            .copied()
+            .and_then(|id| self.expire_transfer(id));
+        let lease = self.acquire(requester_connection_id, splint_id, incarnation, None)?;
+        Ok(ControlReclaim {
+            lease,
+            previous,
+            already_held: false,
+            cancelled,
+        })
     }
 
     fn cancel_connection_transfers(&mut self, connection_id: u64) -> Vec<PendingControlTransfer> {
@@ -5048,8 +5138,10 @@ async fn serve_authenticated(
 struct Handled {
     response: Response,
     subscription: Option<PendingSubscription>,
-    /// The route of an accepted consent answer, for its audit (ADR 0015).
-    answered_by: Option<remote_consent::AnswerRoute>,
+    /// The request audit's reason when the handler knows it better: the
+    /// route of an accepted consent answer (ADR 0015), or what a resize
+    /// reclaim took control from (Plan 0072).
+    audit_reason: Option<&'static str>,
 }
 
 #[derive(Debug)]
@@ -5121,6 +5213,27 @@ async fn publish_control_status_excluding(
     incarnation: u64,
     excluded_connections: Option<Arc<HashSet<u64>>>,
 ) {
+    publish_control_change(state, splint_id, incarnation, excluded_connections, None).await;
+}
+
+/// Publishes the status after a resize reclaim (Plan 0072): the connection
+/// whose lease a Window took hears why, and nobody hears who took it.
+async fn publish_control_reclaim(
+    state: &DaemonState,
+    splint_id: SplintId,
+    incarnation: u64,
+    reclaimed_from: Option<u64>,
+) {
+    publish_control_change(state, splint_id, incarnation, None, reclaimed_from).await;
+}
+
+async fn publish_control_change(
+    state: &DaemonState,
+    splint_id: SplintId,
+    incarnation: u64,
+    excluded_connections: Option<Arc<HashSet<u64>>>,
+    reclaimed_from: Option<u64>,
+) {
     let owner_connection_id = {
         let controllers = state.controller.lock().await;
         controllers
@@ -5137,6 +5250,7 @@ async fn publish_control_status_excluding(
             incarnation,
             owner_connection_id,
             excluded_connections,
+            reclaimed_from,
         },
     );
 }
@@ -5207,6 +5321,25 @@ async fn revoke_grant_controllers(state: &DaemonState, grant_id: u64) {
             },
         );
     }
+}
+
+/// What a control subscription of `connection_id` hears about a lost lease:
+/// only the connection a Window took it from learns why (Plan 0072).
+fn control_loss_reason(
+    reclaimed_from: Option<u64>,
+    connection_id: u64,
+    locally_owned: bool,
+) -> Option<splinterm_protocol::ControlLossReason> {
+    (reclaimed_from == Some(connection_id) && !locally_owned)
+        .then_some(splinterm_protocol::ControlLossReason::ReclaimedByWindow)
+}
+
+/// The refusal for a controller a Window took by resizing (Plan 0072).
+fn reclaimed_by_window() -> ProtocolError {
+    ProtocolError::new(
+        ErrorCode::Unauthorized,
+        splinterm_protocol::CONTROL_RECLAIMED_BY_WINDOW,
+    )
 }
 
 async fn controlled_handle(
@@ -6715,6 +6848,7 @@ fn trusted_ui_request(request: &Request) -> bool {
             | Request::RequestControlTransfer { .. }
             | Request::DecideControlTransfer { .. }
             | Request::ForceControlTransfer { .. }
+            | Request::ReclaimControl { .. }
             | Request::ReleaseControl { .. }
             | Request::Input { .. }
             | Request::Resize { .. }
@@ -6754,6 +6888,8 @@ fn interactive_bypass(
             request,
             Request::PublishGraphicalFocus { .. }
                 | Request::RequestImageContent { .. }
+                // Its confirmation is shown on the daemon host. A remote Window
+                // still takes control by resizing (`ReclaimControl`, Plan 0072).
                 | Request::ForceControlTransfer { .. }
                 | Request::MaterializePreset { .. }
                 | Request::PrepareDaemonHandoff { .. }
@@ -8280,6 +8416,11 @@ async fn request_policy_resources(
             splint_id,
             incarnation,
         }
+        | Request::ReclaimControl {
+            splint_id,
+            incarnation,
+            ..
+        }
         | Request::SubscribeControl {
             splint_id,
             incarnation,
@@ -9077,15 +9218,18 @@ async fn append_request_result_audit(
     } else {
         splinterm_protocol::AuditDecision::Allowed
     };
-    // Which route answered a consent offer (ADR 0015); never the nonce or
-    // the decision.
-    let answered_by = result.as_ref().ok().and_then(|handled| handled.answered_by);
+    // Which route answered a consent offer (ADR 0015), never the nonce or
+    // the decision; or what a resize reclaim took control from (Plan 0072).
+    let handled_reason = result
+        .as_ref()
+        .ok()
+        .and_then(|handled| handled.audit_reason);
     let reason = if denied {
         "authorization_denied"
     } else if revoked {
         "grant_revoked"
-    } else if let Some(route) = answered_by {
-        route.audit_reason()
+    } else if let Some(reason) = handled_reason {
+        reason
     } else if authorization.policy_authorized() {
         "policy_match"
     } else if authorization.granted_lairs.is_some() {
@@ -9484,7 +9628,7 @@ async fn handle_request(
         return result.map(|response| Handled {
             response,
             subscription: None,
-            answered_by: None,
+            audit_reason: None,
         });
     }
     let audit_resource = request_policy_resources(&request, state)
@@ -9699,7 +9843,7 @@ async fn handle_authorized_request(
                     stream,
                     maximum_returned_bytes: authorization.maximum_returned_bytes(),
                 }),
-                answered_by: None,
+                audit_reason: None,
             });
         }
         Request::InspectSplint { splint_id } => {
@@ -11255,7 +11399,7 @@ async fn handle_authorized_request(
                         visible_rows,
                     },
                 }),
-                answered_by: None,
+                audit_reason: None,
             });
         }
         Request::StartScrollbackPage {
@@ -11333,7 +11477,7 @@ async fn handle_authorized_request(
                     response: scrollback_resync_response(state, splint_id, incarnation, page)
                         .await?,
                     subscription: None,
-                    answered_by: None,
+                    audit_reason: None,
                 });
             }
             scrollback_response(state, splint_id, incarnation, page).await?
@@ -11424,7 +11568,7 @@ async fn handle_authorized_request(
                 return Ok(Handled {
                     response: search_resync_response(state, splint_id, incarnation, search).await?,
                     subscription: None,
-                    answered_by: None,
+                    audit_reason: None,
                 });
             }
             search_response(state, splint_id, incarnation, search).await?
@@ -11540,7 +11684,7 @@ async fn handle_authorized_request(
                     grant_id,
                     revocations,
                 }),
-                answered_by: None,
+                audit_reason: None,
             });
         }
         Request::RequestControlTransfer {
@@ -11670,18 +11814,47 @@ async fn handle_authorized_request(
                 dojo_id,
             }
         }
+        Request::ReclaimControl {
+            splint_id,
+            incarnation,
+            modes,
+        } => {
+            let trusted_local = trusted_ui_client && peer.connection_matches_splinterm();
+            let requester = if trusted_local {
+                ReclaimRequester::Window
+            } else if remote_interactive_client {
+                ReclaimRequester::RemoteWindow
+            } else {
+                return Err(ProtocolError::new(
+                    ErrorCode::Unauthorized,
+                    "only a Window takes control by resizing",
+                ));
+            };
+            return reclaim_control(
+                state,
+                connection_id,
+                requester,
+                splint_id,
+                incarnation,
+                &modes,
+            )
+            .await;
+        }
         Request::ReleaseControl { controller_id } => {
-            let lease = state
-                .controller
-                .lock()
-                .await
-                .release_owned(connection_id, controller_id)
-                .ok_or_else(|| {
-                    ProtocolError::new(
-                        ErrorCode::Unauthorized,
-                        "controller lease is not owned by this connection",
-                    )
-                })?;
+            let lease = {
+                let mut controllers = state.controller.lock().await;
+                let released = controllers.release_owned(connection_id, controller_id);
+                released.ok_or_else(|| {
+                    if controllers.reclaimed_from(connection_id, controller_id) {
+                        reclaimed_by_window()
+                    } else {
+                        ProtocolError::new(
+                            ErrorCode::Unauthorized,
+                            "controller lease is not owned by this connection",
+                        )
+                    }
+                })?
+            };
             publish_control_status(state, lease.splint_id, lease.incarnation).await;
             Response::Acknowledged
         }
@@ -11948,7 +12121,7 @@ async fn handle_authorized_request(
                     subscription_id: stream.subscription_id(),
                 },
                 subscription: Some(PendingSubscription::ConsentOffers { stream }),
-                answered_by: None,
+                audit_reason: None,
             });
         }
         request @ Request::AnswerConsentOffer {
@@ -11975,14 +12148,154 @@ async fn handle_authorized_request(
             return Ok(Handled {
                 response: Response::ConsentOfferAnswered,
                 subscription: None,
-                answered_by: Some(route),
+                audit_reason: Some(route.audit_reason()),
             });
         }
     };
     Ok(Handled {
         response,
         subscription: None,
-        answered_by: None,
+        audit_reason: None,
+    })
+}
+
+/// Who held, or takes, a Splint's controller, for a resize reclaim's audit
+/// (Plan 0072).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ControlHolder {
+    /// The installed graphical client.
+    Window,
+    /// A remote Window through the graphical relay.
+    RemoteWindow,
+    /// An automation connection: an MCP agent or another tool.
+    Agent,
+}
+
+/// Which Window takes control by resizing (Plan 0072).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReclaimRequester {
+    /// The installed graphical client.
+    Window,
+    /// A remote Window through the graphical relay.
+    RemoteWindow,
+}
+
+/// What a resize reclaim took control from (Plan 0072).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReclaimedFrom {
+    /// Nobody held the Splint.
+    Nobody,
+    /// The requester already held it.
+    Itself,
+    Holder(ControlHolder),
+}
+
+/// The request audit's reason for a resize reclaim: who took control, and
+/// from whom (Plan 0072).
+const fn reclaim_audit_reason(requester: ReclaimRequester, from: ReclaimedFrom) -> &'static str {
+    use ControlHolder::{Agent, RemoteWindow, Window};
+    use ReclaimedFrom::{Holder, Itself, Nobody};
+
+    match (requester, from) {
+        (ReclaimRequester::Window, Nobody) => "resize_reclaim_by_window_from_nobody",
+        (ReclaimRequester::Window, Itself) => "resize_reclaim_by_window_already_held",
+        (ReclaimRequester::Window, Holder(Window)) => "resize_reclaim_by_window_from_window",
+        (ReclaimRequester::Window, Holder(RemoteWindow)) => {
+            "resize_reclaim_by_window_from_remote_window"
+        }
+        (ReclaimRequester::Window, Holder(Agent)) => "resize_reclaim_by_window_from_agent",
+        (ReclaimRequester::RemoteWindow, Nobody) => "resize_reclaim_by_remote_window_from_nobody",
+        (ReclaimRequester::RemoteWindow, Itself) => "resize_reclaim_by_remote_window_already_held",
+        (ReclaimRequester::RemoteWindow, Holder(Window)) => {
+            "resize_reclaim_by_remote_window_from_window"
+        }
+        (ReclaimRequester::RemoteWindow, Holder(RemoteWindow)) => {
+            "resize_reclaim_by_remote_window_from_remote_window"
+        }
+        (ReclaimRequester::RemoteWindow, Holder(Agent)) => {
+            "resize_reclaim_by_remote_window_from_agent"
+        }
+    }
+}
+
+/// Which kind of connection held `lease`. A grant-bound lease and an
+/// automation connection's are an agent's; a trusted-UI connection is a
+/// Window; the only other role is a remote Window. A holder whose
+/// connection closed meanwhile is counted as a remote Window; only the
+/// audit reason reads this.
+async fn control_holder(state: &DaemonState, lease: ControllerLease) -> ControlHolder {
+    if lease.grant_id.is_some()
+        || state
+            .automation_connections
+            .lock()
+            .await
+            .contains_key(&lease.connection_id)
+    {
+        ControlHolder::Agent
+    } else if state
+        .handoff_windows
+        .lock()
+        .unwrap()
+        .is_trusted_ui_connection(lease.connection_id)
+    {
+        ControlHolder::Window
+    } else {
+        ControlHolder::RemoteWindow
+    }
+}
+
+/// Takes a Splint's controller for a Window whose pane a person resized
+/// (Plan 0072; operator decision 2026-10-30): without a dialog, from
+/// whoever holds it, a local Window, a remote Window, or an agent. The
+/// caller admitted only the installed client and remote Windows; no policy
+/// or grant reaches it. The connection that lost its lease hears why on
+/// its control subscriptions, and its next use of the lease is refused
+/// with the same reason. A pending transfer of the Splint is cancelled.
+async fn reclaim_control(
+    state: &Arc<DaemonState>,
+    connection_id: u64,
+    requester: ReclaimRequester,
+    splint_id: SplintId,
+    incarnation: u64,
+    modes: &[splinterm_protocol::ControlMode],
+) -> Result<Handled, ProtocolError> {
+    splinterm_protocol::validate_control_modes(modes)?;
+    let _ = current_handle(state, splint_id, incarnation).await?;
+    let reclaim = state
+        .controller
+        .lock()
+        .await
+        .reclaim(connection_id, splint_id, incarnation)?;
+    let from = match reclaim.previous {
+        _ if reclaim.already_held => ReclaimedFrom::Itself,
+        None => ReclaimedFrom::Nobody,
+        Some(previous) => ReclaimedFrom::Holder(control_holder(state, previous).await),
+    };
+    if let Some(transfer) = reclaim.cancelled {
+        publish_control_notice(
+            state,
+            ControlNotice::TransferResolved {
+                transfer,
+                outcome: ControlTransferOutcome::Cancelled,
+                controller_id: None,
+                excluded_connections: None,
+            },
+        );
+    }
+    if !reclaim.already_held {
+        let reclaimed_from = reclaim.previous.map(|previous| previous.connection_id);
+        publish_control_reclaim(state, splint_id, incarnation, reclaimed_from).await;
+    }
+    let (lair_id, dojo_id, _) =
+        splint_containment(&*state.topology.read().await, splint_id).ok_or_else(not_found)?;
+    Ok(Handled {
+        response: Response::ControlGranted {
+            controller_id: reclaim.lease.id,
+            lair_id,
+            dojo_id,
+        },
+        subscription: None,
+        audit_reason: Some(reclaim_audit_reason(requester, from)),
     })
 }
 
@@ -12260,7 +12573,7 @@ async fn window_acknowledgement(
             .map(|()| Handled {
                 response: Response::Acknowledged,
                 subscription: None,
-                answered_by: None,
+                audit_reason: None,
             });
     append_request_result_audit(
         state,
@@ -12665,6 +12978,7 @@ const fn handoff_fenced(request: &Request) -> bool {
         | Request::RequestControlTransfer { .. }
         | Request::DecideControlTransfer { .. }
         | Request::ForceControlTransfer { .. }
+        | Request::ReclaimControl { .. }
         | Request::RequestAccess { .. }
         | Request::RequestLairAccess { .. }
         | Request::SubscribeTopology
@@ -14529,11 +14843,11 @@ struct ManifestWindowInputs<'a> {
 /// with the fence up. That one snapshot is what the manifests record, and
 /// it is sound for this reason: every request that acquires or moves a
 /// lease (`AcquireControl`, `RequestControlTransfer`,
-/// `DecideControlTransfer`, `ForceControlTransfer`, and consent's forced
-/// lease, which re-checks the fence before committing) is fenced, and the
-/// fence drained any such handler already in flight before it went up
-/// (`HandoffAdmission`, #164). So no lease can be acquired after the
-/// snapshot. What can still change `ControllerState` while the attempt runs
+/// `DecideControlTransfer`, `ForceControlTransfer`, `ReclaimControl`, and
+/// consent's forced lease, which re-checks the fence before committing) is
+/// fenced, and the fence drained any such handler already in flight before
+/// it went up (`HandoffAdmission`, #164). So no lease can be acquired after
+/// the snapshot. What can still change `ControllerState` while the attempt runs
 /// only removes authority: `ReleaseControl` (admitted while fenced), a
 /// transfer timeout (`expire_transfer` ends a pending request and leaves
 /// the lease where it is), grant expiry or revocation (`release_grant`),
@@ -15118,18 +15432,23 @@ fn spawn_control_subscription(
                         incarnation: event_incarnation,
                         owner_connection_id,
                         excluded_connections,
+                        reclaimed_from,
                     }) if event_splint == splint_id
                         && event_incarnation == incarnation
                         && excluded_connections
                             .as_ref()
                             .is_none_or(|excluded| !excluded.contains(&connection_id)) =>
                     {
+                        let locally_owned = owner_connection_id == Some(connection_id);
+                        let lost_reason =
+                            control_loss_reason(reclaimed_from, connection_id, locally_owned);
                         Some(SubscriptionEvent::ControlStatusChanged {
                             status: ControlStatus {
                                 splint_id,
                                 incarnation,
                                 controlled: owner_connection_id.is_some(),
-                                locally_owned: owner_connection_id == Some(connection_id),
+                                locally_owned,
+                                lost_reason,
                             },
                         })
                     }
@@ -21040,6 +21359,11 @@ mod tests {
                 splint_id,
                 incarnation: 1,
             },
+            Request::ReclaimControl {
+                splint_id,
+                incarnation: 1,
+                modes: vec![splinterm_protocol::ControlMode::Resize],
+            },
             Request::RequestAccess {
                 splint_id,
                 incarnation: 1,
@@ -21815,6 +22139,7 @@ mod tests {
                     incarnation: 1,
                     owner_connection_id: None,
                     excluded_connections: None,
+                    reclaimed_from: None,
                 },
             );
         }
@@ -25122,6 +25447,8 @@ mod tests {
                     splinterm_protocol::ControlMode::Resize,
                 ],
             },
+            // Plan 0072: a remote Window takes control by resizing.
+            reclaim_request(splint_id, 1),
         ] {
             let authorization = authorize_request(&request, &state, &peer, 0, false, true)
                 .await
@@ -25458,6 +25785,12 @@ mod tests {
                 splinterm_protocol::AutomationScope::ControllerAcquire,
                 splinterm_protocol::AutomationScope::ControllerTransfer,
             ])
+        );
+        // Plan 0072: no scope names a resize reclaim, so no policy rule or
+        // grant admits one.
+        assert_eq!(
+            requested_operation_scopes(&reclaim_request(splint_id, 1)),
+            Some(Vec::new())
         );
         assert!(
             requested_operation_scopes(&Request::AcquireControl {
@@ -26222,6 +26555,54 @@ mod tests {
             reason(c.request_transfer(10, other, 2, None).unwrap_err()),
             unavailable(splinterm_protocol::TRANSFER_REQUESTER_CONTROLS)
         );
+    }
+
+    /// Plan 0072: a reclaim takes the Splint from whoever holds it, keeps the
+    /// requester's own lease, refuses a second lease on one connection,
+    /// cancels a pending transfer, and remembers the lease it ended for that
+    /// lease's connection only.
+    #[test]
+    fn a_resize_reclaim_takes_any_lease_once_per_connection() {
+        let id = SplintId::new();
+        let mut c = ControllerState::default();
+        let first = c.reclaim(10, id, 4).unwrap();
+        assert_eq!((first.previous, first.cancelled), (None, None));
+        assert!(!first.already_held);
+        assert!(c.authorize(10, first.lease.id, id, 4).is_ok());
+        let again = c.reclaim(10, id, 4).unwrap();
+        assert!(again.already_held);
+        assert_eq!(again.lease, first.lease);
+        assert_eq!(
+            c.reclaim(10, SplintId::new(), 2).unwrap_err().code,
+            ErrorCode::ControllerUnavailable
+        );
+
+        // An agent's grant-bound lease, with a transfer pending.
+        c.release_connection(10);
+        let agent = c.acquire(20, id, 4, Some(77)).unwrap();
+        let pending = c.request_transfer(30, id, 4, None).unwrap();
+        let taken = c.reclaim(40, id, 4).unwrap();
+        assert_eq!(
+            (taken.previous, taken.cancelled),
+            (Some(agent), Some(pending))
+        );
+        assert_eq!(taken.lease.grant_id, None);
+        assert!(c.transfers.is_empty() && c.transfer_by_splint.is_empty());
+        let refused = c.authorize(20, agent.id, id, 4).unwrap_err();
+        assert_eq!(
+            (refused.code, refused.message.as_str()),
+            (
+                ErrorCode::Unauthorized,
+                splinterm_protocol::CONTROL_RECLAIMED_BY_WINDOW
+            )
+        );
+        assert_ne!(
+            c.authorize(21, agent.id, id, 4).unwrap_err().message,
+            splinterm_protocol::CONTROL_RECLAIMED_BY_WINDOW
+        );
+        // Revoking the agent's grant leaves the Window's lease.
+        assert_eq!(c.release_grant(77), (Vec::new(), Vec::new()));
+        assert!(c.authorize(40, taken.lease.id, id, 4).is_ok());
     }
 
     #[test]
@@ -30318,6 +30699,298 @@ mod tests {
             Some(&owner),
             "the owner keeps its controller"
         );
+    }
+
+    /// A remote Window's relay connection, with the stable identity the
+    /// request audit records.
+    fn remote_window_peer() -> PeerIdentity {
+        let mut peer = PeerIdentity::for_test();
+        peer.install_persistent_executable(
+            executable_identity::ExecutableIdentity::from_pid(std::process::id())
+                .expect("test executable"),
+        );
+        peer
+    }
+
+    fn reclaim_request(splint_id: SplintId, incarnation: u64) -> Request {
+        Request::ReclaimControl {
+            splint_id,
+            incarnation,
+            modes: vec![
+                splinterm_protocol::ControlMode::Input,
+                splinterm_protocol::ControlMode::Resize,
+            ],
+        }
+    }
+
+    fn granted_controller(handled: Result<Handled, ProtocolError>) -> u64 {
+        match handled.unwrap().response {
+            Response::ControlGranted { controller_id, .. } => controller_id,
+            response => panic!("not a controller grant: {response:?}"),
+        }
+    }
+
+    fn input_request(controller_id: u64, splint_id: SplintId, incarnation: u64) -> Request {
+        Request::Input {
+            controller_id,
+            splint_id,
+            incarnation,
+            bytes: b"x".to_vec(),
+            focus_report: false,
+        }
+    }
+
+    /// A control subscription of `connection_id` to one Splint.
+    fn watch_control(
+        state: &Arc<DaemonState>,
+        connection_id: u64,
+        splint_id: SplintId,
+        incarnation: u64,
+    ) -> (AbortOnDrop, mpsc::Receiver<QueuedServerFrame>) {
+        let (outbound, frames) = mpsc::channel(8);
+        let task = AbortOnDrop::new(spawn_control_subscription(
+            connection_id,
+            state.handoff_gate.subscribe_control(&state.control_events),
+            outbound,
+            ControlSubscriptionContext {
+                state: Arc::clone(state),
+                connection_id,
+                splint_id,
+                incarnation,
+                maximum_returned_bytes: None,
+                grant_id: None,
+                revocations: state.revocations.subscribe(),
+            },
+        ));
+        (task, frames)
+    }
+
+    async fn next_control_event(
+        frames: &mut mpsc::Receiver<QueuedServerFrame>,
+    ) -> SubscriptionEvent {
+        let frame = time::timeout(Duration::from_secs(5), frames.recv())
+            .await
+            .expect("a control event")
+            .expect("the control subscription stays open")
+            .frame;
+        let ServerFrame::Event { event, .. } = frame else {
+            panic!("expected a control event: {frame:?}");
+        };
+        event
+    }
+
+    /// The request audit's reasons for every resize reclaim, oldest first.
+    async fn reclaim_audit_reasons(state: &DaemonState) -> Vec<String> {
+        let page = state.audit.lock().await.page(None, 64);
+        page.records
+            .into_iter()
+            .filter(|record| record.operation == splinterm_protocol::AuditOperation::ReclaimControl)
+            .map(|record| record.reason)
+            .collect()
+    }
+
+    /// Plan 0072: Windows take a pane by resizing it, without a dialog, from
+    /// nobody, a local Window, and a remote Window. The Window that lost it
+    /// hears that a Window took it, not which, and its next input says so.
+    /// Each reclaim is audited with who took control from whom.
+    #[tokio::test]
+    async fn windows_reclaim_a_pane_from_nobody_and_from_each_other() {
+        let state = test_state_with_backend(false, test_pty_backend());
+        let handle = live_cat_splints(&state, 1).await.remove(0);
+        let (splint_id, incarnation) = (handle.splint_id, handle.incarnation.value());
+        let pinned = Arc::new(consent::PinnedClientSnapshot::own_executable_for_test());
+        let window = pinned_window_peer(&pinned);
+        let remote = remote_window_peer();
+        state.handoff_windows.lock().unwrap().register_connection(
+            501,
+            window.pid,
+            window.start_time(),
+        );
+        let reclaim = reclaim_request(splint_id, incarnation);
+
+        let local = granted_controller(
+            handle_request(reclaim.clone(), &state, &window, 501, 0, true, false).await,
+        );
+        let (_watch, mut frames) = watch_control(&state, 501, splint_id, incarnation);
+        let taken = granted_controller(
+            handle_request(reclaim.clone(), &state, &remote, 601, 0, false, true).await,
+        );
+        assert_ne!(taken, local);
+        assert_eq!(
+            next_control_event(&mut frames).await,
+            SubscriptionEvent::ControlStatusChanged {
+                status: ControlStatus {
+                    splint_id,
+                    incarnation,
+                    controlled: true,
+                    locally_owned: false,
+                    lost_reason: Some(splinterm_protocol::ControlLossReason::ReclaimedByWindow),
+                },
+            }
+        );
+        let refused = handle_request(
+            input_request(local, splint_id, incarnation),
+            &state,
+            &window,
+            501,
+            0,
+            true,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            refused.message,
+            splinterm_protocol::CONTROL_RECLAIMED_BY_WINDOW
+        );
+        // The remote Window keeps its own lease when it resizes again.
+        let again = handle_request(reclaim.clone(), &state, &remote, 601, 0, false, true).await;
+        assert_eq!(granted_controller(again), taken);
+        granted_controller(handle_request(reclaim, &state, &window, 501, 0, true, false).await);
+        assert_eq!(
+            reclaim_audit_reasons(&state).await,
+            [
+                "resize_reclaim_by_window_from_nobody",
+                "resize_reclaim_by_remote_window_from_window",
+                "resize_reclaim_by_remote_window_already_held",
+                "resize_reclaim_by_window_from_remote_window",
+            ]
+        );
+    }
+
+    /// Plan 0072: a Window takes a pane from an agent's grant-bound lease
+    /// without a dialog, ending a pending transfer, and the agent's next
+    /// input says a Window took it. No grant lets the agent reclaim, and the
+    /// Window's connection still holds one lease, at the live incarnation.
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one agent lease walks every reclaim refusal and the takeover together"
+    )]
+    async fn a_window_reclaims_an_agents_pane_and_no_grant_lets_an_agent_reclaim() {
+        use agent_access::{AccessLevel, GrantDuration};
+
+        let mut fixture = agent_fixture().await;
+        Arc::get_mut(&mut fixture.state).unwrap().pty_backend = test_pty_backend();
+        let state = &fixture.state;
+        let agent = &fixture.peer;
+        let handles = live_cat_splints(state, 2).await;
+        let (splint_id, incarnation) = (handles[0].splint_id, handles[0].incarnation.value());
+        let lair_id = splint_containment(&*state.topology.read().await, splint_id)
+            .unwrap()
+            .0;
+        commit_for(
+            state,
+            agent,
+            lair_id,
+            level(AccessLevel::LookAndType),
+            GrantDuration::WorkspaceSession,
+        )
+        .await;
+        let acquire = Request::AcquireControl {
+            splint_id,
+            incarnation,
+            modes: vec![splinterm_protocol::ControlMode::Input],
+        };
+        let acquired = handle_request(acquire.clone(), state, agent, 9, 0, false, false).await;
+        let agent_lease = granted_controller(acquired);
+        let reclaim = reclaim_request(splint_id, incarnation);
+
+        // Neither the grant nor the handler admits an agent.
+        let refused = handle_request(reclaim.clone(), state, agent, 9, 0, false, false)
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code, ErrorCode::Unauthorized);
+        let granted = authorize_request(&acquire, state, agent, 0, false, false)
+            .await
+            .unwrap();
+        assert!(granted.authorized_grant_id().is_some());
+        let refused = handle_authorized_request(
+            reclaim.clone(),
+            state,
+            agent,
+            9,
+            false,
+            false,
+            &granted,
+            &mut HandoffAdmission::unfenced(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(refused.code, ErrorCode::Unauthorized);
+
+        // A remote Window's transfer request waits on the agent.
+        let remote = remote_window_peer();
+        let (_watch, mut frames) = watch_control(state, 601, splint_id, incarnation);
+        let transfer = Request::RequestControlTransfer {
+            splint_id,
+            incarnation,
+            modes: vec![splinterm_protocol::ControlMode::Input],
+        };
+        let pending = handle_request(transfer, state, &remote, 601, 0, false, true).await;
+        let Response::ControlTransferPending { transfer_id, .. } = pending.unwrap().response else {
+            panic!("no pending transfer");
+        };
+
+        let pinned = Arc::new(consent::PinnedClientSnapshot::own_executable_for_test());
+        let window = pinned_window_peer(&pinned);
+        granted_controller(handle_request(reclaim, state, &window, 501, 0, true, false).await);
+        assert_eq!(
+            next_control_event(&mut frames).await,
+            SubscriptionEvent::ControlTransferResolved {
+                transfer_id,
+                outcome: ControlTransferOutcome::Cancelled,
+                controller_id: None,
+            }
+        );
+        assert!(state.controller.lock().await.transfers.is_empty());
+        let refused = handle_request(
+            input_request(agent_lease, splint_id, incarnation),
+            state,
+            agent,
+            9,
+            0,
+            false,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            refused.message,
+            splinterm_protocol::CONTROL_RECLAIMED_BY_WINDOW
+        );
+        // The agent's refused attempt is audited too.
+        assert_eq!(
+            reclaim_audit_reasons(state).await,
+            ["policy_rejected", "resize_reclaim_by_window_from_agent"]
+        );
+
+        // One lease per connection, and the live incarnation only, as for an
+        // acquire.
+        let second = &handles[1];
+        let refused = handle_request(
+            reclaim_request(second.splint_id, second.incarnation.value()),
+            state,
+            &window,
+            501,
+            0,
+            true,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(refused.code, ErrorCode::ControllerUnavailable);
+        let from_window = |request| handle_request(request, state, &window, 502, 0, true, false);
+        let acquire_stale = Request::AcquireControl {
+            splint_id,
+            incarnation: incarnation + 1,
+            modes: vec![splinterm_protocol::ControlMode::Input],
+        };
+        let acquire_error = from_window(acquire_stale).await.unwrap_err();
+        let reclaim_error = from_window(reclaim_request(splint_id, incarnation + 1))
+            .await
+            .unwrap_err();
+        assert_eq!(reclaim_error.code, acquire_error.code);
     }
 
     /// Every scrollback read and search, first page and continuation, as

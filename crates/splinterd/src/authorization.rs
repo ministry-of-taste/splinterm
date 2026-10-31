@@ -135,7 +135,11 @@ pub const fn for_request(request: &Request) -> RequestAuthorization {
         | Request::SubscribeConsentOffers { .. }
         | Request::AnswerConsentOffer { .. }
         // Plan 0067 M3: only a Window opens an agent's Dojo as its tab.
-        | Request::ClaimDojoPresentation { .. } => RequestAuthorization::TrustedUi,
+        | Request::ClaimDojoPresentation { .. }
+        // Plan 0072: a Window takes control by resizing, without a dialog
+        // and from any holder; only the installed client and remote Windows
+        // send it, and no policy rule or grant admits anyone else.
+        | Request::ReclaimControl { .. } => RequestAuthorization::TrustedUi,
         Request::ListLairs | Request::InspectTopology | Request::InspectSplint { .. } => {
             RequestAuthorization::policy(&[Scope::TopologyMetadataRead])
         }
@@ -536,6 +540,16 @@ mod tests {
                 ],
                 requirement: ConditionalRequirement::RequestedControlTakeover,
             }
+        );
+        // Plan 0072: no scope names a resize reclaim, so no policy rule or
+        // grant can admit an agent to it.
+        assert_eq!(
+            for_request(&Request::ReclaimControl {
+                splint_id,
+                incarnation: 1,
+                modes: vec![splinterm_protocol::ControlMode::Resize],
+            }),
+            RequestAuthorization::TrustedUi
         );
     }
 }

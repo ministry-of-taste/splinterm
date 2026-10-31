@@ -62,6 +62,10 @@ input bodies. Per-Splint controller leases bind daemon-owned connection IDs.
 Control observers receive subscriber-specific status without peer identity;
 transfer requests are bounded, owner-decided, timeout-denied, and cancelled on
 either disconnect. Forced transfer uses a separate trusted consent prompt.
+A Window that is not a pane's controller takes it when a person resizes the
+pane (`ReclaimControl`): no prompt, from any holder, an agent included. Only
+the installed client and remote Windows may; the connection that lost the
+lease is told a Window took it, not which.
 Literal search runs inside the owning terminal actor with fixed query/result/
 preview/deadline bounds and opaque cursors tied to incarnation, terminal
 revision, and history generation. See

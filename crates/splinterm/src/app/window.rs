@@ -1544,6 +1544,7 @@ mod tests {
                         incarnation: 7,
                         controlled: false,
                         locally_owned: false,
+                        lost_reason: None,
                     },
                 },
             };
