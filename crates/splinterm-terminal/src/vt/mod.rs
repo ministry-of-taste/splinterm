@@ -203,15 +203,28 @@ impl Parser {
         }
     }
 
-    /// This parser as a checkpoint carries it. An OSC 52 string collected past
-    /// the configured OSC limit is carried as an overflowed OSC: after a
-    /// restore the rest of it is consumed and dropped, so a checkpoint keeps
-    /// ordinary OSC bounds and an older daemon still accepts it.
+    /// This parser as a checkpoint carries it. Only an OSC 52 string may hold
+    /// more than the configured OSC limit. One still within it, such as a
+    /// query, is carried whole; a longer one is carried as an overflowed OSC,
+    /// so after a restore the rest of it is consumed and dropped. A
+    /// checkpoint thus keeps ordinary OSC bounds and an older daemon still
+    /// accepts it.
     pub(crate) fn checkpoint_copy(&self) -> Self {
-        let extended = matches!(self.state, State::OscString | State::OscEscape)
-            && self.string_limit > self.osc_limit;
-        if !extended {
+        if !matches!(self.state, State::OscString | State::OscEscape) {
+            // A finished string's limit never outlives it; this is a guard.
+            return Self {
+                string_limit: self.string_limit.min(self.normal_string_limit()),
+                ..self.clone()
+            };
+        }
+        if self.string_limit <= self.osc_limit {
             return self.clone();
+        }
+        if self.string.len() <= self.osc_limit {
+            return Self {
+                string_limit: self.osc_limit,
+                ..self.clone()
+            };
         }
         Self {
             string_limit: self.osc_limit,
@@ -219,6 +232,11 @@ impl Parser {
             string_utf8_remaining: 0,
             ..self.clone_without_string()
         }
+    }
+
+    /// The largest string limit a checkpoint accepts.
+    fn normal_string_limit(&self) -> usize {
+        self.osc_limit.max(self.dcs_limit).max(1024)
     }
 
     fn clone_without_string(&self) -> Self {
@@ -311,7 +329,7 @@ impl Parser {
             };
             self.state = State::Ground;
             self.sixel_streaming = false;
-            self.string.clear();
+            self.end_string();
             self.clear_sequence();
             return (Some(action), false);
         }
@@ -797,7 +815,7 @@ impl Parser {
 
     fn start_string(&mut self, state: State, limit: usize) {
         self.state = state;
-        self.string.clear();
+        self.free_string();
         self.string_limit = limit;
         self.string_truncated = false;
         self.string_utf8_remaining = 0;
@@ -811,16 +829,33 @@ impl Parser {
         }
     }
 
+    /// Empties the string buffer. One grown past the configured limits, as
+    /// by an OSC 52 set, is freed rather than kept for the next string.
+    fn free_string(&mut self) {
+        if self.string.capacity() > self.osc_limit.max(self.dcs_limit) {
+            self.string = Vec::new();
+        } else {
+            self.string.clear();
+        }
+    }
+
+    /// Ends a string: frees its buffer, and drops an OSC 52 limit, which a
+    /// checkpoint outside that string would refuse.
+    fn end_string(&mut self) {
+        self.free_string();
+        self.string_limit = self.string_limit.min(self.normal_string_limit());
+    }
+
     fn finish_string(&mut self, osc: bool, terminator: StringTerminator) -> (Option<Action>, bool) {
         self.state = State::Ground;
+        let payload = std::mem::take(&mut self.string);
+        self.end_string();
         if self.string_truncated {
-            self.string.clear();
             return (
                 Some(Action::StringTruncated(if osc { "OSC" } else { "DCS" })),
                 false,
             );
         }
-        let payload = std::mem::take(&mut self.string);
         (Some(Action::Osc(payload, terminator)), false)
     }
 
@@ -832,7 +867,7 @@ impl Parser {
             return (Some(Action::SixelEnd), false);
         }
         if self.string_truncated {
-            self.string.clear();
+            self.end_string();
             (Some(Action::StringTruncated("DCS")), false)
         } else {
             (Some(Action::Dcs(std::mem::take(&mut self.string))), false)
@@ -1132,5 +1167,36 @@ mod tests {
             ]
         );
         assert_eq!(parser.state, State::Ground);
+    }
+
+    #[test]
+    fn an_osc52_string_leaves_no_large_buffer_or_limit_behind() {
+        let feed = |parser: &mut Parser, bytes: &[u8]| {
+            for byte in bytes {
+                let _ = parser.feed(*byte);
+            }
+        };
+        let large = vec![b'A'; 64 * 1024];
+        // Ended by BEL or ST, or cancelled by CAN.
+        for end in [&b"\x07"[..], b"\x1b\\", b"\x18"] {
+            let mut parser = Parser::new(16, 16);
+            feed(&mut parser, b"\x1b]52;c;");
+            feed(&mut parser, &large);
+            assert!(parser.string.capacity() > 16);
+            feed(&mut parser, end);
+            assert_eq!(parser.state, State::Ground, "{end:?}");
+            assert_eq!(parser.string.capacity(), 0, "{end:?}");
+            assert!(parser.checkpoint_is_valid(16, 16), "{end:?}");
+            assert!(parser.checkpoint_copy().checkpoint_is_valid(16, 16));
+        }
+        let mut parser = Parser::new(16, 16);
+        feed(&mut parser, b"\x1b]52;c;?\x07");
+        assert!(parser.checkpoint_is_valid(16, 16));
+        // A short OSC 52 string in progress is carried whole.
+        feed(&mut parser, b"\x1b]52;c;");
+        let copy = parser.checkpoint_copy();
+        assert!(copy.checkpoint_is_valid(16, 16));
+        assert_eq!(copy.string, b"52;c;");
+        assert!(!copy.string_truncated);
     }
 }

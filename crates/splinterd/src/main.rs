@@ -1141,7 +1141,7 @@ struct QueuedServerFrame {
     terminal_publication: Option<TerminalPublicationReservation>,
     /// The routed clipboard memory an OSC 52 set holds until its frame is
     /// written (Plan 0074 M2).
-    clipboard_memory: Option<tokio::sync::OwnedSemaphorePermit>,
+    clipboard_memory: Option<clipboard::SetMemory>,
 }
 
 impl From<ServerFrame> for QueuedServerFrame {
@@ -11776,6 +11776,26 @@ async fn handle_authorized_request(
             if !access_inventory::grant_live(state, grant_id).await {
                 return Err(access_inventory::revoked_grant());
             }
+            // Plan 0074 M2: only a Window's subscription carries OSC 52
+            // requests. A remote Window qualifies only from outside every
+            // Splint, as for a resize reclaim, so an agent running the relay
+            // itself inside one is never handed the clipboard.
+            let window = if trusted_ui_client && peer.connection_matches_splinterm() {
+                true
+            } else if remote_interactive_client {
+                let context = remote_consent::TreeContext {
+                    splint_leaders: splint_leaders(state).await,
+                    workload_slices: workload_slices(state),
+                    requester: None,
+                };
+                state
+                    .consent_responders
+                    .check_remote_window(connection_id, peer, context)
+                    .await
+                    .is_ok()
+            } else {
+                false
+            };
             let status =
                 state
                     .controller
@@ -11797,8 +11817,7 @@ async fn handle_authorized_request(
                     maximum_returned_bytes: authorization.maximum_returned_bytes(),
                     grant_id,
                     revocations,
-                    window: (trusted_ui_client && peer.connection_matches_splinterm())
-                        || remote_interactive_client,
+                    window,
                 }),
                 audit_reason: None,
             });
@@ -31423,7 +31442,8 @@ mod tests {
     /// Plan 0074 M2: the controlling Window answers a program's query, and
     /// the reply reaches the program as input; another connection's answer
     /// and an automation peer's are ignored. A second query while one waits
-    /// is answered empty at once, and every reply keeps the program's order.
+    /// is answered empty, and its reply still follows the first: replies
+    /// reach the program in the order it asked.
     #[tokio::test]
     async fn osc52_queries_are_answered_by_the_controlling_window() {
         use splinterm_protocol::AuditOperation;
@@ -31484,7 +31504,7 @@ mod tests {
             ("clipboard_query_window_answered".into(), Some(2))
         );
         handle.input(b"\n".to_vec()).await.unwrap();
-        wait_for_screen(&handle, "reply:E]52;p;BE]52;c;aGk=B", 1).await;
+        wait_for_screen(&handle, "reply:E]52;c;aGk=BE]52;p;B", 1).await;
     }
 
     /// Plan 0074 M2: with no controlling Window, or a Window that never
@@ -31523,6 +31543,236 @@ mod tests {
         assert!(started.elapsed() >= clipboard::QUERY_TIMEOUT - Duration::from_millis(100));
         handle.input(b"\n".to_vec()).await.unwrap();
         wait_for_screen(&handle, "reply:E]52;c;B", 2).await;
+    }
+
+    /// Plan 0074 M2: a query whose Window subscription ends is answered
+    /// empty at once, not when the wait times out.
+    #[tokio::test]
+    async fn osc52_a_query_whose_window_leaves_is_answered_empty_at_once() {
+        use splinterm_protocol::AuditOperation;
+
+        let (state, handle) = osc52_state().await;
+        let (splint_id, incarnation) = (handle.splint_id, handle.incarnation.value());
+        state
+            .controller
+            .lock()
+            .await
+            .acquire(501, splint_id, incarnation, None)
+            .unwrap();
+        let (controlling, mut frames) = watch_osc52_control(&state, 501, &handle, true);
+        handle.input(b"query\n".to_vec()).await.unwrap();
+        assert!(matches!(
+            next_control_event(&mut frames).await,
+            SubscriptionEvent::ClipboardQuery { .. }
+        ));
+        let started = time::Instant::now();
+        drop(controlling);
+        assert_eq!(
+            wait_for_clipboard_audit(&state, AuditOperation::ClipboardQuery, 1).await,
+            [("clipboard_query_window_gone".into(), Some(0))]
+        );
+        assert!(started.elapsed() < clipboard::QUERY_TIMEOUT / 2);
+        handle.input(b"\n".to_vec()).await.unwrap();
+        wait_for_screen(&handle, "reply:E]52;c;B", 1).await;
+    }
+
+    /// Plan 0074 M2: a Window that lost the Splint's lease while its answer
+    /// was on the way gives the program nothing.
+    #[tokio::test]
+    async fn osc52_an_answer_after_the_lease_moved_is_not_given() {
+        use splinterm_protocol::AuditOperation;
+
+        let (state, handle) = osc52_state().await;
+        let (splint_id, incarnation) = (handle.splint_id, handle.incarnation.value());
+        let lease = state
+            .controller
+            .lock()
+            .await
+            .acquire(501, splint_id, incarnation, None)
+            .unwrap();
+        let (_controlling, mut frames) = watch_osc52_control(&state, 501, &handle, true);
+        handle.input(b"query\n".to_vec()).await.unwrap();
+        let SubscriptionEvent::ClipboardQuery { query_id, .. } =
+            next_control_event(&mut frames).await
+        else {
+            panic!("expected a clipboard query");
+        };
+        state.controller.lock().await.release(lease.id).unwrap();
+        state
+            .controller
+            .lock()
+            .await
+            .acquire(503, splint_id, incarnation, None)
+            .unwrap();
+        let pinned = Arc::new(consent::PinnedClientSnapshot::own_executable_for_test());
+        let window = pinned_window_peer(&pinned);
+        let answer = Request::AnswerClipboardQuery {
+            query_id,
+            data: "c2VjcmV0".into(),
+        };
+        let accepted = handle_request(answer, &state, &window, 501, 0, true, false)
+            .await
+            .unwrap();
+        assert_eq!(accepted.audit_reason, Some("clipboard_answer_accepted"));
+        assert_eq!(
+            wait_for_clipboard_audit(&state, AuditOperation::ClipboardQuery, 1).await,
+            [("clipboard_query_lease_moved".into(), Some(0))]
+        );
+        handle.input(b"\n".to_vec()).await.unwrap();
+        wait_for_screen(&handle, "reply:E]52;c;B", 1).await;
+    }
+
+    /// Plan 0074 M2: a query belongs to its program's incarnation. After a
+    /// relaunch the new program asks on its own while the old query still
+    /// waits, and an answer to the old one never reaches the new program.
+    #[tokio::test]
+    async fn osc52_queries_do_not_cross_a_relaunch() {
+        use splinterm_protocol::AuditOperation;
+
+        let (state, handle) = osc52_state().await;
+        let (splint_id, old) = (handle.splint_id, handle.incarnation.value());
+        state
+            .controller
+            .lock()
+            .await
+            .acquire(501, splint_id, old, None)
+            .unwrap();
+        let (_old_route, mut old_frames) = watch_osc52_control(&state, 501, &handle, true);
+        handle.input(b"query\n".to_vec()).await.unwrap();
+        let SubscriptionEvent::ClipboardQuery {
+            query_id: old_query,
+            ..
+        } = next_control_event(&mut old_frames).await
+        else {
+            panic!("expected a clipboard query");
+        };
+        let killed = handle_authorized_request(
+            Request::KillSplint {
+                splint_id,
+                incarnation: old,
+            },
+            &state,
+            &PeerIdentity::for_test(),
+            81,
+            false,
+            true,
+            &RequestAuthorizationContext {
+                interactive_bypass: true,
+                ..RequestAuthorizationContext::default()
+            },
+            &mut HandoffAdmission::unfenced(),
+        )
+        .await
+        .unwrap()
+        .response;
+        assert!(
+            matches!(killed, Response::SplintKilled { .. }),
+            "{killed:?}"
+        );
+        let revision = state.topology.read().await.revision();
+        let relaunch = Request::RelaunchSplint {
+            expected_topology_revision: revision,
+            splint_id,
+            launch: test_launch(&["/bin/sh", "-c", OSC52_PROGRAM]),
+        };
+        trusted_request(&state, 81, relaunch).await.unwrap();
+        let handle = state.runtimes.lock().await.handle(splint_id).unwrap();
+        let new = handle.incarnation.value();
+        assert_ne!(new, old);
+        state
+            .controller
+            .lock()
+            .await
+            .acquire(502, splint_id, new, None)
+            .unwrap();
+        let (_new_route, mut new_frames) = watch_osc52_control(&state, 502, &handle, true);
+        handle.input(b"query\n".to_vec()).await.unwrap();
+        let SubscriptionEvent::ClipboardQuery {
+            query_id: new_query,
+            ..
+        } = next_control_event(&mut new_frames).await
+        else {
+            panic!("the new program's query is not refused as pending");
+        };
+        let pinned = Arc::new(consent::PinnedClientSnapshot::own_executable_for_test());
+        let window = pinned_window_peer(&pinned);
+        let answer = |query_id, data: &str| Request::AnswerClipboardQuery {
+            query_id,
+            data: data.into(),
+        };
+        let old_answer = answer(old_query, "c2VjcmV0");
+        handle_request(old_answer, &state, &window, 501, 0, true, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            wait_for_clipboard_audit(&state, AuditOperation::ClipboardQuery, 1).await[0].0,
+            "clipboard_query_reply_not_written"
+        );
+        let new_answer = answer(new_query, "aGk=");
+        handle_request(new_answer, &state, &window, 502, 0, true, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            wait_for_clipboard_audit(&state, AuditOperation::ClipboardQuery, 2).await[1],
+            ("clipboard_query_window_answered".into(), Some(2))
+        );
+        handle.input(b"\n".to_vec()).await.unwrap();
+        wait_for_screen(&handle, "reply:E]52;c;aGk=B", 1).await;
+    }
+
+    /// Plan 0074 M2, ADR 0015: the relay role needs no SSH, so an agent can
+    /// run the relay itself inside a Splint. Such a relay may watch control
+    /// status, but its subscription carries no OSC 52 requests, even while it
+    /// holds the lease; a relay outside every Splint's carries them.
+    #[tokio::test]
+    async fn a_relay_inside_a_splint_gets_no_clipboard_requests() {
+        use splinterm_protocol::AuditOperation;
+
+        let (state, handle) = osc52_state().await;
+        let (splint_id, incarnation) = (handle.splint_id, handle.incarnation.value());
+        state
+            .consent_responders
+            .set_probe(Arc::new(|connection_id, _context| {
+                if connection_id == 602 {
+                    Err(remote_consent::Ineligible::InsideSplint)
+                } else {
+                    Ok(())
+                }
+            }));
+        let remote = remote_window_peer();
+        state.remote_window_connections.lock().unwrap().insert(601);
+        state.remote_window_connections.lock().unwrap().insert(602);
+        let subscribe = Request::SubscribeControl {
+            splint_id,
+            incarnation,
+        };
+        let window_subscription = |handled: Handled| match handled.subscription {
+            Some(PendingSubscription::Control { window, .. }) => window,
+            _ => panic!("expected a control subscription"),
+        };
+        let outside = handle_request(subscribe.clone(), &state, &remote, 601, 0, false, true)
+            .await
+            .unwrap();
+        assert!(window_subscription(outside));
+        let inside = handle_request(subscribe, &state, &remote, 602, 0, false, true)
+            .await
+            .unwrap();
+        let inside = window_subscription(inside);
+        assert!(!inside);
+
+        state
+            .controller
+            .lock()
+            .await
+            .acquire(602, splint_id, incarnation, None)
+            .unwrap();
+        let (_inside, mut frames) = watch_osc52_control(&state, 602, &handle, inside);
+        handle.input(b"set\n".to_vec()).await.unwrap();
+        assert_eq!(
+            wait_for_clipboard_audit(&state, AuditOperation::ClipboardSet, 1).await,
+            [("clipboard_set_no_controlling_window".into(), Some(2))]
+        );
+        no_control_event(&mut frames).await;
     }
 
     /// The request audit's reasons for every resize reclaim, oldest first.

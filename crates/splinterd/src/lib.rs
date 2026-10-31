@@ -49,9 +49,9 @@ pub use live::{
     CompactSubscription, HandedOffSplint, HandoffCheckpointBudget, LiveAdoptionFailure,
     LiveAdoptionInputs, LiveCell, LiveError, LiveEvent, LiveRow, LiveRuntimeMetrics,
     LiveScrollbackPage, LiveSearchPage, LiveSnapshot, LiveSplintConfig, LiveSplintHandle,
-    LiveSplintRuntime, MAX_CLIPBOARD_REPLY_BYTES, PreparedPtyHandoff, ProcessExit,
-    ProcessIncarnation, ProcessPlacement, RootProcessProbe, StagedLiveSplint, Subscription,
-    SubscriptionReceive, TerminalPublicationMemoryLease,
+    LiveSplintRuntime, PreparedPtyHandoff, ProcessExit, ProcessIncarnation, ProcessPlacement,
+    RootProcessProbe, StagedLiveSplint, Subscription, SubscriptionReceive,
+    TerminalPublicationMemoryLease,
 };
 pub use splinterm_policy::{executable_identity, inspect_policy_file, policy};
 

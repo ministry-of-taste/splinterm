@@ -21,17 +21,6 @@ pub enum ClipboardSelection {
     Primary,
 }
 
-impl ClipboardSelection {
-    /// The target letter an OSC 52 reply names.
-    #[must_use]
-    pub const fn letter(self) -> u8 {
-        match self {
-            Self::Clipboard => b'c',
-            Self::Primary => b'p',
-        }
-    }
-}
-
 /// How an OSC query ended; its reply ends the same way.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ReplyTerminator {
@@ -53,18 +42,15 @@ impl ReplyTerminator {
 }
 
 /// The reply to an OSC 52 query: `ESC ] 52 ; <target> ; <base64> <ST>`,
-/// ending as the query did. Empty `bytes` give the empty reply, which a
-/// program reads as "nothing to paste" rather than waiting.
+/// naming the target letter the query named and ending as it did. Empty
+/// `bytes` give the empty reply, which a program reads as "nothing to
+/// paste" rather than waiting.
 #[must_use]
-pub fn osc52_reply(
-    selection: ClipboardSelection,
-    bytes: &[u8],
-    terminator: ReplyTerminator,
-) -> Vec<u8> {
+pub fn osc52_reply(target: u8, bytes: &[u8], terminator: ReplyTerminator) -> Vec<u8> {
     let encoded = STANDARD.encode(bytes);
     let mut reply = Vec::with_capacity(encoded.len() + 9);
     reply.extend_from_slice(b"\x1b]52;");
-    reply.push(selection.letter());
+    reply.push(target);
     reply.push(b';');
     reply.extend_from_slice(encoded.as_bytes());
     reply.extend_from_slice(terminator.bytes());
@@ -108,6 +94,9 @@ pub enum TerminalEvent {
     /// to give, so the program never waits for an answer that never comes.
     ClipboardQuery {
         selection: ClipboardSelection,
+        /// The target letter the query named, which its reply names too:
+        /// `c`, `p`, or `s`, and `c` for an empty target.
+        target: u8,
         terminator: ReplyTerminator,
     },
 }
