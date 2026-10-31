@@ -1,9 +1,10 @@
 //! Explicit local-versus-remote daemon endpoint capabilities.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use anyhow::Result;
 use splinterm_automation_client::Connection;
+use splinterm_core::SplintId;
 
 use crate::{
     handoff_control::HandoffControlRestore, handoff_status::HandoffStatusHub,
@@ -63,7 +64,9 @@ pub enum LaunchSemantics {
     RemoteInteractive,
 }
 
-/// Whether trusted graphical force-transfer authority is available.
+/// Whether this Window may force control of a pane (Ctrl+Shift+U). A local
+/// Window confirms in the daemon's own dialog; a remote one in its own
+/// dialog, through its consent responder (Plan 0072 M3).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ForcedControlTransfer {
     Enabled,
@@ -112,6 +115,54 @@ pub struct ConnectionFactory {
     /// (Plan 0061 M3.16); never armed for any other Window or a remote
     /// endpoint.
     handoff_control: HandoffControlRestore,
+    /// The forced takeovers this Window's panes wait on (Plan 0072 M3).
+    forces: ForcesInFlight,
+}
+
+/// The forced takeovers a Window's panes wait on now (Plan 0072 M3), shared
+/// by its factory's clones. A remote Window shows a forced-control
+/// confirmation only for a Splint one of its own panes is forcing, so its
+/// daemon cannot make it show one nobody asked for.
+#[derive(Clone, Debug, Default)]
+pub struct ForcesInFlight(Arc<Mutex<Vec<(SplintId, u64)>>>);
+
+impl ForcesInFlight {
+    /// Records a force of `splint_id` at `incarnation` until the returned
+    /// guard drops.
+    #[must_use]
+    pub fn begin(&self, splint_id: SplintId, incarnation: u64) -> ForceInFlight {
+        self.entries().push((splint_id, incarnation));
+        ForceInFlight {
+            forces: self.clone(),
+            key: (splint_id, incarnation),
+        }
+    }
+
+    /// Whether a pane forces `splint_id` at `incarnation` now.
+    #[must_use]
+    pub fn contains(&self, splint_id: SplintId, incarnation: u64) -> bool {
+        self.entries().contains(&(splint_id, incarnation))
+    }
+
+    fn entries(&self) -> MutexGuard<'_, Vec<(SplintId, u64)>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// One pane's force in flight; dropping it ends it.
+#[derive(Debug)]
+pub struct ForceInFlight {
+    forces: ForcesInFlight,
+    key: (SplintId, u64),
+}
+
+impl Drop for ForceInFlight {
+    fn drop(&mut self) {
+        let mut entries = self.forces.entries();
+        if let Some(index) = entries.iter().position(|entry| *entry == self.key) {
+            entries.swap_remove(index);
+        }
+    }
 }
 
 impl ConnectionFactory {
@@ -130,6 +181,7 @@ impl ConnectionFactory {
             }),
             handoff_status: HandoffStatusHub::default(),
             handoff_control: HandoffControlRestore::default(),
+            forces: ForcesInFlight::default(),
         }
     }
 
@@ -166,7 +218,9 @@ impl ConnectionFactory {
                 image_transport: ImageTransport::Unavailable,
                 graphical_focus_publication: GraphicalFocusPublication::Disabled,
                 launch_semantics: LaunchSemantics::RemoteInteractive,
-                forced_control_transfer: ForcedControlTransfer::Disabled,
+                // Plan 0072 M3: confirmed in this Window's own dialog, through
+                // its consent responder (ADR 0015).
+                forced_control_transfer: ForcedControlTransfer::Enabled,
                 recency_namespace: format!("remote-{profile_name}"),
                 remote_consent: RemoteConsent::Enabled {
                     profile: profile_name.to_owned(),
@@ -174,6 +228,7 @@ impl ConnectionFactory {
             }),
             handoff_status: HandoffStatusHub::default(),
             handoff_control: HandoffControlRestore::default(),
+            forces: ForcesInFlight::default(),
         }
     }
 
@@ -216,6 +271,12 @@ impl ConnectionFactory {
     #[must_use]
     pub fn handoff_control(&self) -> &HandoffControlRestore {
         &self.handoff_control
+    }
+
+    /// The forced takeovers this Window's panes wait on now.
+    #[must_use]
+    pub fn forces_in_flight(&self) -> &ForcesInFlight {
+        &self.forces
     }
 
     /// Returns the explicit endpoint behavior contract.
@@ -313,5 +374,20 @@ mod tests {
             local.capabilities().image_transport,
             ImageTransport::Unavailable
         );
+    }
+
+    #[test]
+    fn a_force_is_in_flight_until_its_guard_drops() {
+        let forces = ForcesInFlight::default();
+        let (splint, other) = (SplintId::new(), SplintId::new());
+        let first = forces.begin(splint, 3);
+        let second = forces.begin(splint, 3);
+        assert!(forces.contains(splint, 3));
+        assert!(!forces.contains(splint, 4), "only that incarnation");
+        assert!(!forces.contains(other, 3));
+        drop(first);
+        assert!(forces.contains(splint, 3), "the other pane still forces it");
+        drop(second);
+        assert!(!forces.contains(splint, 3));
     }
 }

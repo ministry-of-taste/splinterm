@@ -464,6 +464,9 @@ fn consent_text(
     selected: usize,
     local_hostname: Option<&str>,
 ) -> DialogText {
+    if remote_takeover(prompt) {
+        return takeover_text(prompt, local_hostname);
+    }
     let workspace = workspace_label(&prompt.target);
     let mut lines = consent_request_lines(prompt, local_hostname);
     lines.push(DialogLine::blank());
@@ -509,6 +512,45 @@ fn consent_text(
             .get(selected)
             .map_or(GrantDuration::Once, |offer| offer.duration),
     )));
+    DialogText {
+        lines,
+        minimum_rows: 0,
+    }
+}
+
+/// Whether `prompt` confirms a remote Window's own forced takeover (Plan
+/// 0072 M3, Ctrl+Shift+U). No agent's request can take its wording: the
+/// remote daemon may offer the Window no other Splint prompt
+/// (`OfferedConsentPrompt::validate`), the Window shows this one only while
+/// one of its panes forces that Splint, and the origin is the Window's own.
+/// The daemon's own dialog for a local Window's force keeps the agent
+/// request's wording for now.
+fn remote_takeover(prompt: &ConsentPrompt) -> bool {
+    matches!(prompt.origin, ConsentOrigin::Remote { .. }) && prompt.is_forced_takeover()
+}
+
+/// A remote Window's forced-takeover confirmation: what it does, on which
+/// host and Splint, and its two buttons. It offers no duration to choose,
+/// and says nothing of an agent or access.
+fn takeover_text(prompt: &ConsentPrompt, local_hostname: Option<&str>) -> DialogText {
+    let host = PromptHost::of(prompt, local_hostname);
+    let mut lines = vec![
+        DialogLine::title("Force control"),
+        prompt_line("Take control of this pane from whoever holds it now?", 4)
+            .with_style(DialogStyle::Strong),
+        DialogLine::blank(),
+        host.line(),
+        consent_target_line(&prompt.target),
+        DialogLine::blank(),
+    ];
+    lines.push(
+        DialogLine::hint(
+            "G or the green Take control button (right) takes it. Enter, Escape, D, or the red Cancel button (left) cancel.",
+        )
+        .with_wrap_at(PROMPT_LINE_CHARS),
+    );
+    lines.push(DialogLine::deny("Cancel"));
+    lines.push(DialogLine::allow("Take control"));
     DialogText {
         lines,
         minimum_rows: 0,
@@ -1024,6 +1066,65 @@ mod tests {
         prompt
     }
 
+    /// The confirmation a remote Window shows for its own forced takeover
+    /// (Plan 0072 M3), from the daemon behind SSH profile `work`.
+    fn takeover_prompt() -> ConsentPrompt {
+        let prompt = ConsentPrompt {
+            capability: vec![1; splinterm_protocol::CONSENT_CAPABILITY_BYTES],
+            requester: "/usr/bin/splinterm-relay".to_owned(),
+            requester_pid: 42,
+            requester_uid: 1000,
+            agent_name: None,
+            target: ConsentTarget::Splint {
+                splint_id: splinterm_core::SplintId::new(),
+                incarnation: 3,
+            },
+            scopes: vec![AccessScope::ControlTakeover],
+            level: None,
+            durations: vec![offer(GrantDuration::Once, None)],
+            respond_within_seconds: 20,
+            origin: ConsentOrigin::Remote {
+                profile: "work".to_owned(),
+                daemon_hostname: Some("neuromancer".to_owned()),
+            },
+        };
+        assert_eq!(prompt.validate(), Ok(()));
+        prompt
+    }
+
+    /// Plan 0072 M3: a remote Window's forced-takeover confirmation says
+    /// what it does, with Take control and Cancel, and no duration. Nothing
+    /// in it reads as an agent's access request. The daemon's own dialog for
+    /// a local Window keeps its wording, and any other remote prompt keeps
+    /// the agent request's.
+    #[test]
+    fn a_remote_force_confirmation_says_what_it_does_and_offers_no_duration() {
+        let prompt = takeover_prompt();
+        let shown = variants(&prompt);
+        assert_eq!(shown.len(), 1);
+        assert_eq!(shown[0].title(), "Force control");
+        assert_eq!(shown[0].allow_label(), "Take control");
+        assert_eq!(shown[0].deny_label(), "Cancel");
+        let text = words(&prompt, 0);
+        assert!(
+            text.starts_with("Take control of this pane from whoever holds it now?"),
+            "{text}"
+        );
+        assert!(text.contains("host neuromancer · remote, SSH profile 'work'"));
+        assert!(text.contains("incarnation 3"));
+        for agent_words in ["agent", "access", "Allow", "once", "how long", "minutes"] {
+            assert!(!text.contains(agent_words), "{agent_words:?}: {text}");
+        }
+        assert!(laid_out(&prompt, 0).duration_rows.is_empty());
+
+        let mut local = prompt.clone();
+        local.origin = ConsentOrigin::Local;
+        assert_eq!(variants(&local)[0].title(), "agent access request");
+        let mut agent = prompt;
+        agent.agent_name = Some("Force control".to_owned());
+        assert_eq!(variants(&agent)[0].title(), "remote agent access request");
+    }
+
     /// A Splint prompt as the daemon sends it: "Just this once" only.
     fn splint_prompt() -> ConsentPrompt {
         let prompt = ConsentPrompt {
@@ -1061,6 +1162,7 @@ mod tests {
             splint_prompt(),
             longest_prompt(),
             longest_remote_prompt(),
+            takeover_prompt(),
         ] {
             for shortcut in [shortcut(), None] {
                 let (decision, _receiver) = std::sync::mpsc::channel();

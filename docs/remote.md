@@ -130,8 +130,9 @@ OpenSSH authenticates the human user and starts the installed graphical relay
 under that remote Unix account; native remote Windows do not use automation
 policy. The daemon accepts this role only from the adjacent
 `splinterm-relay --graphical-stdio` process. It grants ordinary human terminal
-and topology authority while withholding trusted-local compositor focus, image
-content, and forced-control privileges. Closing SSH or the local session
+and topology authority while withholding trusted-local compositor focus and
+image content. A remote Window may force control (Ctrl+Shift+U) with a
+confirmation shown in that same Window (see below), never on the daemon host. Closing SSH or the local session
 releases connection-owned subscriptions and controllers but sends no Splint
 termination request. Raw `relay --stdio` automation remains byte-compatible and
 continues to negotiate `ClientRole::Automation` under persistent policy.
@@ -151,8 +152,26 @@ Dojo picker. Dojo discovery, tabs, pane snapshots and ordered updates,
 resynchronization, scrollback/search, ordinary requested control/input/resize,
 and ordinary lifecycle actions all use logical channels on the same SSH child.
 New Lairs, Dojos, and Splints may be created, attached, controlled, and rendered
-immediately without policy publication or Window restart. Trusted forced control
-transfer remains visibly unavailable and is rejected before request construction.
+immediately without policy publication or Window restart.
+
+Force control (Ctrl+Shift+U, or **Force control transfer** in the action menu) works
+in a remote Window too. The remote daemon asks for the confirmation in that
+Window only, through its agent-prompt responder: a **Force control** dialog,
+"Take control of this pane from whoever holds it now?", with **Take control**
+and **Cancel** and the usual 20-second countdown. It is never shown on the
+daemon host, nor in another Window, and the Window shows it only while one of
+its own panes is forcing that pane; any other is denied unseen. Cancel or
+letting it expire leaves the pane a viewer, and the Window title says why.
+With `[integration] remote-agent-prompts = no` the Window cannot show the
+dialog, so Force control is unavailable there; Reload configuration follows
+the setting. While an agent's access prompt is open in the Window, the force
+fails at once and the title says that prompt is not the confirmation: deny or
+answer it first. Nothing waits. The relay must run outside every Splint, so an
+agent cannot force a takeover by running the relay itself. The audit records
+the takeover as `forced_transfer_confirmed_in_remote_window`, and a refusal as
+`forced_transfer_refused_inside_splint`, `forced_transfer_denied_in_remote_window`,
+or `forced_transfer_unroutable`.
+
 A Window remains bound to exactly one endpoint: it binds when its terminal
 opens and never changes, and the profile list, status screen, and Dojo list
 that may come first in the same Window hold no endpoint. Local and remote

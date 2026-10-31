@@ -61,7 +61,11 @@ and subscriptions; bounded audit metadata excludes terminal, clipboard, and
 input bodies. Per-Splint controller leases bind daemon-owned connection IDs.
 Control observers receive subscriber-specific status without peer identity;
 transfer requests are bounded, owner-decided, timeout-denied, and cancelled on
-either disconnect. Forced transfer uses a separate trusted consent prompt.
+either disconnect. Forced transfer uses a separate trusted consent prompt,
+"Just this once" only: the daemon's own dialog for the installed client, and
+for a remote Window, whose relay must run outside every Splint, an offer to
+that Window's own consent responder alone (ADR 0015), failing at once without
+one and never falling back to this host's display.
 A Window that is not a pane's controller takes it when a person resizes the
 pane (`ReclaimControl`): no prompt, from any holder, an agent included. The
 daemon accepts it only from the installed client and from remote Windows'
@@ -156,8 +160,9 @@ non-reallocating buffers that carry the answer to OpenSSH.
 local uses `TrustedUi`, trusted local image content, focus publication, local
 launch semantics, trusted force-transfer authority, and the `local` recency
 namespace; remote uses `RemoteInteractive`, unavailable image transport,
-disabled focus publication, unavailable forced transfer, remote-daemon launch
-defaults, and `remote-PROFILE` recency. OpenSSH authenticates the human remote
+disabled focus publication, forced transfer confirmed in the Window itself
+through its consent responder (Plan 0072 M3), remote-daemon launch defaults,
+and `remote-PROFILE` recency. OpenSSH authenticates the human remote
 account; persistent automation policy is not part of this path. The daemon
 accepts the role only from the adjacent relay running `--graphical-stdio`, while
 raw `--stdio` remains `Automation`. Phase 2 routes CLI selection, session
@@ -337,8 +342,8 @@ Wayland client's lifetime.
 6. Headless automation uses the dedicated, exact-policy raw relay over
    authenticated SSH. Native human remote transport uses one authenticated SSH
    child with bounded logical channels negotiating `RemoteInteractive`; it does
-   not consult automation policy or receive trusted image, forced-transfer, or
-   graphical-focus authority. `splinterd` exposes no network listener.
+   not consult automation policy or receive trusted image or graphical-focus
+   authority; its forced transfer is confirmed in the remote Window itself. `splinterd` exposes no network listener.
 7. Shutdown owns and drains connection tasks before runtime shutdown and final
    metadata persistence; one pinned signal future prevents lost SIGINT events.
 8. Dojo mutation never claims native Window mapping or focus; Window-local tab

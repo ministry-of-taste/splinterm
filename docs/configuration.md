@@ -146,7 +146,7 @@ substitution, but do not sandbox hostile processes running as your own user.
 | `explorer.status-colors` | colour agent status glyphs in the Explorer and on Dojo tabs by state, and the access "Asking" marker; see [Status colours](#status-colours). `no` draws them in the colour of the text around them; the remote host tag is not a status and keeps its colour. Configuration reload applies it | strict boolean; yes |
 | `explorer.status-glyphs` | `icons` draws two-cell icons; `dots` draws one-cell shapes: ◆ needs input, ▲ error, ■ done, □ idle, the Braille spinner for working, and `~` after a stale status. Every state keeps its own shape in both, so colour is never the only signal; configuration reload applies it | icons |
 | `integration.dialog-shortcut` | the chord that engages a waiting trusted dialog's keyboard, as a click inside does, without answering it: `ctrl+alt+` and one letter or digit (modifiers in any order; no `shift`, and no Super chords), or `none` to turn it off. When Hyprland maps dialogs without focus (the Omarchy integration), Splinterm also binds it while a dialog waits, so it reaches the dialog from any Window ([Trusted dialogs](usage.md#trusted-dialogs)); read when a dialog starts | ctrl+alt+g |
-| `integration.remote-agent-prompts` | a remote Window (`splinterm --remote`) shows the agent access prompts of the computer it is connected to and can answer them ([Agent access prompts](remote.md#agent-access-prompts)); `no` leaves them to that computer's own dialog. Configuration reload applies it, closing a prompt the Window shows when it turns it off; a Window attached to one Splint (`splinterm launch --splint-id`) keeps the value it opened with. It changes nothing in a local Window | strict boolean; yes |
+| `integration.remote-agent-prompts` | a remote Window (`splinterm --remote`) shows the agent access prompts of the computer it is connected to and can answer them ([Agent access prompts](remote.md#agent-access-prompts)); `no` leaves them to that computer's own dialog and makes **Force control** unavailable in that Window, which confirms a force in the same dialog. Configuration reload applies it, closing a prompt the Window shows when it turns it off; a Window attached to one Splint (`splinterm launch --splint-id`) keeps the value it opened with. It changes nothing in a local Window | strict boolean; yes |
 
 `multiplexer.pane-gap` puts empty space between neighbouring Splints, outside
 their chrome. With `divider-style=frame` each Splint keeps its whole frame and
@@ -321,7 +321,9 @@ configuration reload, copy mode, focused-pane zoom, Dojo and Lair choosers,
 Dojo reordering, Lair rename/navigation/termination, and clean Window detach in
 addition to recent Dojos, tab navigation, splits, pane focus/closing/resizing,
 tab-strip and font zoom, history/search, and bounded control actions. Force
-control is trusted-local only and remains visibly disabled in remote Windows.
+control transfer works in local and remote Windows; a remote Window confirms
+it in its own dialog, so it offers it only with
+`integration.remote-agent-prompts = yes` (see [Remote access](remote.md)).
 Typing filters
 titles, categories, and keywords; arrows skip unavailable commands, Enter runs,
 and Escape closes. Actions without an available captured target remain visible

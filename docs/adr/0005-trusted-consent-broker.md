@@ -102,5 +102,6 @@ valid answer wins and the others are withdrawn. A remote Window launches its
 own `splinterm consent` dialog for an offer, on the viewer's computer, with the
 same private descriptor, one-use capability, and input rules, and marks it
 remote. With no local dialog and no responder, the request still fails at
-once. Splint access requests and forced takeover stay local and
-daemon-launched only.
+once. Splint access requests stay local and daemon-launched only, and so
+does a local Window's forced takeover; a remote Window's forced takeover
+confirms in that Window alone (ADR 0015's protocol 47 amendment).

@@ -553,6 +553,13 @@ impl Approver {
                 "Ignored an access request from another splinterd generation.".to_owned(),
             )];
         }
+        // Plan 0072 M3: only the remote Window that forced control confirms
+        // it, never a terminal approver.
+        if offer.prompt.is_forced_takeover() {
+            return vec![Effect::Print(
+                "Ignored a forced-control confirmation: only its own Window shows it.".to_owned(),
+            )];
+        }
         // The same offer again changes nothing: no reprint, no re-arm.
         if self
             .open
@@ -2148,6 +2155,28 @@ mod tests {
             approver.offered(invalid, GENERATION, now).as_slice(),
             [Effect::Print(_)]
         ));
+        assert!(!approver.prompting());
+        // Nor is a forced-takeover confirmation (Plan 0072 M3), which only
+        // the Window that forces control shows.
+        let mut takeover = offer(1);
+        takeover.request_id = 0;
+        takeover.prompt = OfferedConsentPrompt {
+            agent_name: None,
+            target: ConsentTarget::Splint {
+                splint_id: splinterm_core::SplintId::new(),
+                incarnation: 2,
+            },
+            scopes: vec![splinterm_protocol::AccessScope::ControlTakeover],
+            level: None,
+            durations: vec![duration(GrantDuration::Once, None)],
+            ..offered_prompt()
+        };
+        assert_eq!(takeover.validate(), Ok(()));
+        let ignored = approver.offered(takeover, GENERATION, now);
+        let [Effect::Print(line)] = ignored.as_slice() else {
+            panic!("expected one line, got {ignored:?}");
+        };
+        assert!(line.contains("forced-control confirmation"), "{line}");
         assert!(!approver.prompting());
     }
 

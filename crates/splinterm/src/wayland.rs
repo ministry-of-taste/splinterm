@@ -1135,6 +1135,7 @@ fn assemble_app(
             keyboard_focused: false,
             graphical_focus: options.graphical_focus,
             forced_control_transfer: options.forced_control_transfer,
+            forced_control_follows_remote_prompts: options.forced_control_follows_remote_prompts,
             optimistic_remote_splits: options.optimistic_remote_splits,
             input_generation: 0,
             pending_terminal_input: VecDeque::new(),
@@ -2325,6 +2326,11 @@ impl PaneView {
                 self.display_lost = Some(display_lost_notice(reconnecting));
                 Ok(BackgroundUpdateImpact::VISUAL)
             }
+            // The person moved on to another pane; the log still says why.
+            WindowUpdate::ForceRefused(notice) => {
+                eprintln!("splinterm: {notice}");
+                Ok(BackgroundUpdateImpact::NONE)
+            }
         }
     }
 }
@@ -2619,6 +2625,7 @@ struct InputState {
     keyboard_focused: bool,
     graphical_focus: Option<tokio::sync::watch::Sender<Option<SplintId>>>,
     forced_control_transfer: bool,
+    forced_control_follows_remote_prompts: bool,
     optimistic_remote_splits: bool,
     input_generation: u64,
     pending_terminal_input: VecDeque<PendingTerminalInput>,
@@ -7014,6 +7021,10 @@ impl App {
                     .reload(loaded.config.theme_colors());
                 self.clipboard.image_directory = loaded.config.clipboard_image_directory;
                 self.clipboard.middle_click_paste = loaded.config.middle_click_paste;
+                if self.input.forced_control_follows_remote_prompts {
+                    // Plan 0072 M3: only while this Window can confirm one.
+                    self.input.forced_control_transfer = loaded.config.remote_agent_prompts;
+                }
                 self.input.keymap = loaded.config.keymap;
                 self.input.prefix_timeout =
                     std::time::Duration::from_millis(loaded.config.prefix_timeout_ms);
@@ -11742,6 +11753,7 @@ impl App {
         let mut effect_desired_changed = false;
         let mut font_reconciled = false;
         let mut strip_relayout = false;
+        let mut force_notice = None;
         let mut impact = ThemeUpdateImpact::default();
         if let Some(update) = next_theme {
             if inline_picker_open {
@@ -12180,6 +12192,8 @@ impl App {
                 WindowUpdate::InputDropped => {
                     self.window_notice(INPUT_DROPPED_NOTICE);
                 }
+                // Plan 0072 M3: shown in the title once it is set below.
+                WindowUpdate::ForceRefused(notice) => force_notice = Some(notice),
                 WindowUpdate::Exited { splint_id } => {
                     anyhow::ensure!(
                         self.panes.focused_splint() == Some(splint_id),
@@ -12474,6 +12488,9 @@ impl App {
                 .terminal_window_title()
                 .context("updated snapshot exists")?;
             self.surface.window.set_title(title);
+        }
+        if let Some(notice) = force_notice {
+            self.window_notice(notice);
         }
         if picker_reconcile_pending {
             self.modal.session_picker_reconcile_pending = false;
