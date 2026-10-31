@@ -679,6 +679,22 @@ remote-agent-prompts = no` Force control is unavailable in a remote Window. A
 denied, expired, or refused force leaves the pane a viewer and says why in the
 Window title.
 
+Resizing the Window you are using takes control of the panes it shows. When
+you resize a Window that has keyboard focus, each visible pane it only views
+takes control from whoever holds it, another local or remote Window or an
+agent, with no prompt. One drag takes control once, after the size settles.
+Changes the Window makes itself do not take control: opening it, splitting,
+closing, or adding panes, switching tabs, showing or hiding the Explorer or tab
+strip, changing the font or scale, and resuming after a daemon upgrade. A
+Window without keyboard focus that the compositor resizes, such as a tiled
+neighbour, does not take control either. The compositor does not say why it
+resized a Window, so a scripted resize of the focused Window, such as
+`hyprctl dispatch resizeactive`, counts as yours. The Window that lost control
+keeps showing the pane as a viewer, and its title says **Viewing — another
+Window took control** until the title next changes. An agent that lost control
+is told a person took the pane, and is asked not to take it back unless you
+say so. Neither side's view moves if it is scrolled back into history.
+
 When an agent asks to control a pane (MCP `splinterm.request_control_transfer`),
 that pane shows a notice at its bottom centre until you answer or the request
 ends: **An agent asks to control this pane**, framed in the theme's warning
@@ -698,8 +714,9 @@ it. A remote Window gets the request over the same pane connection as a local
 one, so it shows the notice too.
 
 Closing a controlling Window releases its connection-owned lease. A later client
-must acquire control explicitly; observation never silently becomes input
-authority.
+takes control only by an action of yours, such as typing into a pane nobody
+controls, requesting control, or resizing its Window as above; observation
+alone never becomes input authority.
 
 ## Trusted dialogs
 

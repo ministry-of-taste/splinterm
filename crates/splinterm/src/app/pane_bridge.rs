@@ -26,7 +26,7 @@ use splinterm::{
 };
 use splinterm_core::{LayoutNode, SplintId};
 use splinterm_protocol::{
-    AccessGrant, AccessScope, ControlMode, ControlTransferOutcome, ErrorCode,
+    AccessGrant, AccessScope, ControlLossReason, ControlMode, ControlTransferOutcome, ErrorCode,
     FORCED_TAKEOVER_AGENT_PROMPT_OPEN, FORCED_TAKEOVER_ALREADY_CONFIRMING, HandoffStatusPhase,
     LairAccessGrant, Request, Response, ServerFrame, ServerLimits, SubscriptionEvent,
     TerminalSnapshot, TerminalUpdate,
@@ -340,6 +340,10 @@ type PaneResize = (u16, u16, u16, u16);
 pub(in crate::app) struct PendingPaneResize {
     pub(in crate::app) size: PaneResize,
     pub(in crate::app) claim_control: bool,
+    /// Plan 0072 M2b: the person resized the focused Window, so the pane
+    /// takes control from any holder. One drag debounced into one resize
+    /// takes it once.
+    pub(in crate::app) reclaim: bool,
 }
 
 impl PendingPaneResize {
@@ -353,6 +357,7 @@ impl PendingPaneResize {
             } => Ok(Self {
                 size: (columns, rows, pixel_width, pixel_height),
                 claim_control: true,
+                reclaim: false,
             }),
             WindowCommand::PrepareResize {
                 columns,
@@ -362,6 +367,17 @@ impl PendingPaneResize {
             } => Ok(Self {
                 size: (columns, rows, pixel_width, pixel_height),
                 claim_control: false,
+                reclaim: false,
+            }),
+            WindowCommand::ReclaimResize {
+                columns,
+                rows,
+                pixel_width,
+                pixel_height,
+            } => Ok(Self {
+                size: (columns, rows, pixel_width, pixel_height),
+                claim_control: true,
+                reclaim: true,
             }),
             command => Err(command),
         }
@@ -370,11 +386,19 @@ impl PendingPaneResize {
     fn merge(&mut self, next: Self) {
         self.size = next.size;
         self.claim_control |= next.claim_control;
+        self.reclaim |= next.reclaim;
     }
 
     fn into_command(self) -> WindowCommand {
         let (columns, rows, pixel_width, pixel_height) = self.size;
-        if self.claim_control {
+        if self.reclaim {
+            WindowCommand::ReclaimResize {
+                columns,
+                rows,
+                pixel_width,
+                pixel_height,
+            }
+        } else if self.claim_control {
             WindowCommand::Resize {
                 columns,
                 rows,
@@ -570,6 +594,7 @@ pub(in crate::app) const fn paused_during_handoff(command: &WindowCommand) -> bo
         | WindowCommand::FocusReport(_)
         | WindowCommand::Resize { .. }
         | WindowCommand::PrepareResize { .. }
+        | WindowCommand::ReclaimResize { .. }
         | WindowCommand::RequestControlTransfer
         | WindowCommand::DecideControlTransfer { .. }
         | WindowCommand::ForceControlTransfer => true,
@@ -783,6 +808,52 @@ pub(in crate::app) async fn active_resize_request(
     ))
 }
 
+/// Plan 0072 M2b: takes control of a pane the person resized in this
+/// Window, from whoever holds it, unless the pane already has it. Returns
+/// whether the resize goes on as a `Resize` does.
+///
+/// A refusal is logged, never fatal, and leaves the pane a viewer. When the
+/// daemon refused the request itself, as for a client it does not trust to
+/// reclaim, the resize goes on and still takes control nobody holds, as
+/// before Plan 0072. Otherwise, as for a Splint that is gone, the pane only
+/// keeps the size for its next acquisition. A handoff fence is returned, so
+/// the resize is dropped as any other is.
+pub(in crate::app) async fn reclaim_pane_control(
+    control: &mut Connection,
+    active_controller: &mut Option<u64>,
+    updates: &mpsc::Sender<WindowUpdate>,
+    splint_id: SplintId,
+    incarnation: u64,
+) -> Result<bool> {
+    if active_controller.is_some() {
+        return Ok(true);
+    }
+    match control
+        .reclaim_control(
+            splint_id,
+            incarnation,
+            vec![ControlMode::Input, ControlMode::Resize],
+        )
+        .await
+    {
+        Ok(controller_id) => {
+            *active_controller = Some(controller_id);
+            let _ = updates.send(WindowUpdate::Control(true)).await;
+            Ok(true)
+        }
+        Err(error) if handoff_refused(&error) => Err(error),
+        Err(error) => {
+            eprintln!("splinterm could not take control of the resized pane: {error:#}");
+            Ok(protocol_error(&error).is_some_and(|error| {
+                matches!(
+                    error.code,
+                    ErrorCode::Unauthorized | ErrorCode::UnsupportedOperation
+                )
+            }))
+        }
+    }
+}
+
 pub(in crate::app) async fn handle_control_event(
     frame: ServerFrame,
     subscription_id: u64,
@@ -809,6 +880,10 @@ pub(in crate::app) async fn handle_control_event(
             let _ = updates
                 .send(WindowUpdate::Control(status.locally_owned))
                 .await;
+            // Plan 0072 M2b: only the connection that lost the lease hears why.
+            if status.lost_reason == Some(ControlLossReason::ReclaimedByWindow) {
+                let _ = updates.send(WindowUpdate::ControlReclaimed).await;
+            }
         }
         SubscriptionEvent::ControlTransferRequested { transfer_id } => {
             let _ = updates
@@ -1146,6 +1221,52 @@ pub(in crate::app) async fn drive_controller(
                         &outputs.updates,
                         (splint_id, incarnation),
                         (columns, rows, pixel_width, pixel_height),
+                    )
+                    .await
+                    {
+                        Ok(request) => request,
+                        Err(error) if handoff_refused(&error) => continue,
+                        Err(error) => return Err(error),
+                    };
+                    let Some(request) = request else {
+                        continue;
+                    };
+                    request
+                }
+                // Plan 0072 M2b: the person resized this Window, so the pane
+                // takes control first, then resizes as its controller.
+                WindowCommand::ReclaimResize {
+                    columns,
+                    rows,
+                    pixel_width,
+                    pixel_height,
+                } => {
+                    let resize = (columns, rows, pixel_width, pixel_height);
+                    match reclaim_pane_control(
+                        &mut control,
+                        &mut active_controller,
+                        &outputs.updates,
+                        splint_id,
+                        incarnation,
+                    )
+                    .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            // Kept for the pane's next acquisition.
+                            requested_resize = Some(resize);
+                            continue;
+                        }
+                        Err(error) if handoff_refused(&error) => continue,
+                        Err(error) => return Err(error),
+                    }
+                    let request = match active_resize_request(
+                        &mut control,
+                        &mut active_controller,
+                        &mut requested_resize,
+                        &outputs.updates,
+                        (splint_id, incarnation),
+                        resize,
                     )
                     .await
                     {

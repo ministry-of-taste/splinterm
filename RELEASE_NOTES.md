@@ -103,6 +103,12 @@ running daemon by themselves.
   `Ctrl+Shift+1`–`9` and, in the `omarchy-tmux` profile, `Prefix Shift+S`,
   `Prefix Shift+F`, `Prefix Shift+V`, and `Prefix Shift+O`.
 - The tab strip is shorter on a stock Omarchy desktop.
+- Resizing the Window you are using takes control of the panes it shows, from
+  another Window or an agent, without asking. The Window that lost control
+  keeps showing them and says **Viewing — another Window took control** in its
+  title. Layout changes, such as a split or a new tab, and Windows without
+  keyboard focus do not take control (see "Control ownership" in the usage
+  guide).
 - In pickers, typing filters at once: `j` and `k` type rather than move, and
   there is no `/`.
 - The repository moved to `ministry-of-taste/splinterm`; old URLs redirect.

@@ -153,6 +153,10 @@ resynchronization, scrollback/search, ordinary requested control/input/resize,
 and ordinary lifecycle actions all use logical channels on the same SSH child.
 New Lairs, Dojos, and Splints may be created, attached, controlled, and rendered
 immediately without policy publication or Window restart.
+Resizing a focused remote Window takes control of its panes without a prompt,
+as a local Window does (see [Control ownership](usage.md#control-ownership)).
+The remote daemon allows it only when its graphical relay runs outside every
+Splint on that host; otherwise the resize takes only control nobody holds.
 
 Force control (Ctrl+Shift+U, or **Force control transfer** in the action menu) works
 in a remote Window too. The remote daemon asks for the confirmation in that

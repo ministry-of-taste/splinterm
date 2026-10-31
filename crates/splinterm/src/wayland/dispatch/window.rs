@@ -5,8 +5,8 @@ use splinterm_protocol::perf_trace::{
 use super::super::{
     App, CompositorHandler, Connection, ExitClass, QueueHandle, SCALE_DENOMINATOR,
     TerminalResizeCause, WaylandSurface, Window, WindowConfigure, WindowHandler,
-    WindowTopologyCommand, note_output_enter, note_output_leave, terminal_resize_allowed,
-    viewport_destination, wl_output, wl_surface,
+    WindowTopologyCommand, configure_resize_cause, note_output_enter, note_output_leave,
+    terminal_resize_allowed, viewport_destination, wl_output, wl_surface,
 };
 use crate::wayland::chrome::bounded_fixed_size;
 
@@ -219,11 +219,15 @@ impl WindowHandler for App {
                 TerminalResizeCause::SurfaceConfigure,
                 self.panes.pane.last_resize.is_some(),
             ));
+            // Plan 0072 M2b: a person's resize of the focused Window takes
+            // control of its panes. One the inline picker defers does not.
+            let cause =
+                configure_resize_cause(initial_configure, resized, self.input.keyboard_focused);
             let resize = if self.modal.inline_picker_open() {
                 self.panes.restored_frontend_needs_resize = true;
                 Ok(())
             } else {
-                self.emit_resize()
+                self.emit_resize_for(cause)
             };
             if let Err(error) = self
                 .queue_background_effect_geometry_for_draw()

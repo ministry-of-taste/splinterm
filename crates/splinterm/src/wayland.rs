@@ -271,6 +271,9 @@ const MAX_SCALE_120: u32 = 960;
 const MAX_PREEDIT_BYTES: usize = 4 * 1024;
 /// Plan 0074: shown when the daemon's full input queue cut input short.
 const INPUT_DROPPED_NOTICE: &str = "Input cut short: the program is not reading it";
+/// Plan 0072 M2b: shown when a person resized one of this Window's panes in
+/// another Window, which took control of it.
+const CONTROL_RECLAIMED_NOTICE: &str = "Viewing — another Window took control";
 const MAX_PENDING_TERMINAL_INPUT_BYTES: usize =
     clipboard::MAX_CLIPBOARD_BYTES + clipboard::BRACKETED_PASTE_OVERHEAD;
 const PENDING_INPUT_RETRY_INTERVAL: Duration = Duration::from_millis(5);
@@ -2315,9 +2318,12 @@ impl PaneView {
             } else {
                 BackgroundUpdateImpact::NONE
             }),
-            WindowUpdate::Theme(_) | WindowUpdate::Font(_) | WindowUpdate::InputDropped => {
-                Ok(BackgroundUpdateImpact::NONE)
-            }
+            // A pane in a hidden tab says nothing; a visible inactive pane's
+            // notice is taken by `apply_inactive_updates` before this.
+            WindowUpdate::Theme(_)
+            | WindowUpdate::Font(_)
+            | WindowUpdate::InputDropped
+            | WindowUpdate::ControlReclaimed => Ok(BackgroundUpdateImpact::NONE),
             WindowUpdate::Exited { .. } | WindowUpdate::Shutdown => {
                 self.end_stream();
                 Ok(BackgroundUpdateImpact::VISUAL)
@@ -2342,6 +2348,8 @@ struct InactiveUpdateDrain {
     dirty_frames: HashSet<SplintId>,
     repaint_panes: HashSet<SplintId>,
     exited: Vec<SplintId>,
+    /// Plan 0072 M2b: another Window took control of a visible pane.
+    control_reclaimed: bool,
 }
 
 impl InactiveUpdateDrain {
@@ -3651,6 +3659,35 @@ enum TerminalResizeCause {
     SurfaceConfigure,
     OutputDpiChanged,
     CompositorScaleChanged,
+}
+
+/// Plan 0072 M2b: who caused a pane resize. Only a size the person gave the
+/// Window they are using takes control of its panes from whoever holds them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PaneResizeCause {
+    /// Anything this client did: the first configure, a handoff resume, a
+    /// split, close, or tab switch, the Explorer or tab strip, a font, DPI,
+    /// or scale change, or a size the compositor gave an unfocused Window.
+    Layout,
+    /// The person resized the focused Window.
+    User,
+}
+
+/// Plan 0072 M2b: the cause of the pane resizes a toplevel configure makes.
+/// A configure after the first that changed the Window's size while it has
+/// keyboard focus is the person's, so of two tiled Windows laid out again
+/// together only the focused one takes control. The compositor does not say
+/// why it resized, so a scripted resize of the focused Window counts too.
+const fn configure_resize_cause(
+    initial_configure: bool,
+    resized: bool,
+    keyboard_focused: bool,
+) -> PaneResizeCause {
+    if !initial_configure && resized && keyboard_focused {
+        PaneResizeCause::User
+    } else {
+        PaneResizeCause::Layout
+    }
 }
 
 const fn terminal_resize_allowed(cause: TerminalResizeCause, resize_known: bool) -> bool {
@@ -10643,6 +10680,12 @@ impl App {
     }
 
     fn emit_resize(&mut self) -> Result<()> {
+        self.emit_resize_for(PaneResizeCause::Layout)
+    }
+
+    /// Resizes every visible pane to the layout; a `cause` of
+    /// [`PaneResizeCause::User`] takes control of each (Plan 0072 M2b).
+    fn emit_resize_for(&mut self, cause: PaneResizeCause) -> Result<()> {
         let layout = self.computed_pane_layout();
         let active_rect = self
             .panes
@@ -10658,6 +10701,7 @@ impl App {
             active_width,
             active_height,
             self.surface.scale_120,
+            cause,
         )?;
         for pane in &mut self.panes.inactive_panes {
             let Some(splint_id) = pane.snapshot.as_ref().map(|snapshot| snapshot.splint_id) else {
@@ -10666,7 +10710,13 @@ impl App {
             let Some(rect) = layout.as_ref().and_then(|layout| layout.rect(splint_id)) else {
                 continue;
             };
-            Self::emit_inactive_pane_resize(pane, rect.width, rect.height, self.surface.scale_120)?;
+            Self::emit_inactive_pane_resize(
+                pane,
+                rect.width,
+                rect.height,
+                self.surface.scale_120,
+                cause,
+            )?;
         }
         Ok(())
     }
@@ -10714,8 +10764,9 @@ impl App {
         logical_width: u32,
         logical_height: u32,
         scale_120: u32,
+        cause: PaneResizeCause,
     ) -> Result<()> {
-        Self::emit_pane_resize(pane, logical_width, logical_height, scale_120, true)
+        Self::emit_pane_resize_for(pane, logical_width, logical_height, scale_120, true, cause)
     }
 
     fn emit_inactive_pane_resize(
@@ -10723,10 +10774,11 @@ impl App {
         logical_width: u32,
         logical_height: u32,
         scale_120: u32,
+        cause: PaneResizeCause,
     ) -> Result<()> {
         // Every visible pane must resize immediately. Deferring an uncontrolled
         // pane leaves its reflowed history stale until later input claims control.
-        Self::emit_pane_resize(pane, logical_width, logical_height, scale_120, true)
+        Self::emit_pane_resize_for(pane, logical_width, logical_height, scale_120, true, cause)
     }
 
     fn emit_pane_resize(
@@ -10735,6 +10787,24 @@ impl App {
         logical_height: u32,
         scale_120: u32,
         activate: bool,
+    ) -> Result<()> {
+        Self::emit_pane_resize_for(
+            pane,
+            logical_width,
+            logical_height,
+            scale_120,
+            activate,
+            PaneResizeCause::Layout,
+        )
+    }
+
+    fn emit_pane_resize_for(
+        pane: &mut PaneView,
+        logical_width: u32,
+        logical_height: u32,
+        scale_120: u32,
+        activate: bool,
+        cause: PaneResizeCause,
     ) -> Result<()> {
         let Some(frame) = &pane.snapshot_frame else {
             return Ok(());
@@ -10778,7 +10848,21 @@ impl App {
             pane.pending_resize = None;
             return Ok(());
         }
-        let resize_command = if activate {
+        // A person's resize still waiting for room in the queue keeps taking
+        // control when a layout change replaces its size.
+        let reclaim_pending = matches!(
+            pane.pending_resize.as_ref().map(|pending| &pending.command),
+            Some(WindowCommand::ReclaimResize { .. })
+        );
+        let reclaim = activate && (cause == PaneResizeCause::User || reclaim_pending);
+        let resize_command = if reclaim {
+            WindowCommand::ReclaimResize {
+                columns: resize.0,
+                rows: resize.1,
+                pixel_width: resize.2,
+                pixel_height: resize.3,
+            }
+        } else if activate {
             WindowCommand::Resize {
                 columns: resize.0,
                 rows: resize.1,
@@ -11609,6 +11693,7 @@ impl App {
                         drain.exited.push(splint_id);
                         drain.changed = true;
                     }
+                    WindowUpdate::ControlReclaimed => drain.control_reclaimed = true,
                     update => terminal_updates.push(update),
                 }
             }
@@ -11747,6 +11832,9 @@ impl App {
         let mut visual_changed = topology_changed | inactive.changed;
         let mut focused_visual_changed = topology_changed;
         let mut title_changed = false;
+        // Plan 0072 M2b: shown once the title below is set, so it is not
+        // replaced by the title of the `Control` change that came with it.
+        let mut control_reclaimed = inactive.control_reclaimed;
         let mut full_frame_reload = false;
         let mut history_content_changed = false;
         let mut rebuild_all_inactive = false;
@@ -12194,6 +12282,7 @@ impl App {
                 }
                 // Plan 0072 M3: shown in the title once it is set below.
                 WindowUpdate::ForceRefused(notice) => force_notice = Some(notice),
+                WindowUpdate::ControlReclaimed => control_reclaimed = true,
                 WindowUpdate::Exited { splint_id } => {
                     anyhow::ensure!(
                         self.panes.focused_splint() == Some(splint_id),
@@ -12518,6 +12607,9 @@ impl App {
             if self.surface.configured {
                 self.schedule_draw(queue_handle)?;
             }
+        }
+        if control_reclaimed {
+            self.window_notice(CONTROL_RECLAIMED_NOTICE);
         }
         Ok(())
     }
@@ -18577,13 +18669,27 @@ mod tests {
         .unwrap();
         let mut pane = view.pane;
 
-        App::emit_active_pane_resize(&mut pane, 320, 240, SCALE_DENOMINATOR).unwrap();
+        App::emit_active_pane_resize(
+            &mut pane,
+            320,
+            240,
+            SCALE_DENOMINATOR,
+            PaneResizeCause::Layout,
+        )
+        .unwrap();
         assert!(matches!(
             command_receiver.try_recv().unwrap(),
             WindowCommand::Resize { .. }
         ));
 
-        App::emit_active_pane_resize(&mut pane, 640, 480, SCALE_DENOMINATOR).unwrap();
+        App::emit_active_pane_resize(
+            &mut pane,
+            640,
+            480,
+            SCALE_DENOMINATOR,
+            PaneResizeCause::Layout,
+        )
+        .unwrap();
         assert!(matches!(
             command_receiver.try_recv().unwrap(),
             WindowCommand::Resize { .. }
@@ -18609,7 +18715,14 @@ mod tests {
         )
         .unwrap();
 
-        App::emit_inactive_pane_resize(&mut pane, 320, 240, SCALE_DENOMINATOR).unwrap();
+        App::emit_inactive_pane_resize(
+            &mut pane,
+            320,
+            240,
+            SCALE_DENOMINATOR,
+            PaneResizeCause::Layout,
+        )
+        .unwrap();
         assert!(matches!(
             command_receiver.try_recv().unwrap(),
             WindowCommand::Resize { .. }
@@ -18635,17 +18748,236 @@ mod tests {
         )
         .unwrap();
 
-        App::emit_inactive_pane_resize(&mut pane, 320, 240, SCALE_DENOMINATOR).unwrap();
+        App::emit_inactive_pane_resize(
+            &mut pane,
+            320,
+            240,
+            SCALE_DENOMINATOR,
+            PaneResizeCause::Layout,
+        )
+        .unwrap();
         assert!(matches!(
             command_receiver.try_recv().unwrap(),
             WindowCommand::Resize { .. }
         ));
 
-        App::emit_inactive_pane_resize(&mut pane, 640, 480, SCALE_DENOMINATOR).unwrap();
+        App::emit_inactive_pane_resize(
+            &mut pane,
+            640,
+            480,
+            SCALE_DENOMINATOR,
+            PaneResizeCause::Layout,
+        )
+        .unwrap();
         assert!(matches!(
             command_receiver.try_recv().unwrap(),
             WindowCommand::Resize { .. }
         ));
+    }
+
+    fn reclaim_test_pane(controlled: bool, queue: usize) -> (PaneView, Receiver<WindowCommand>) {
+        let (_updates, update_receiver) = tokio::sync::mpsc::channel(1);
+        let (commands, command_receiver) = tokio::sync::mpsc::channel(queue);
+        let pane = PaneView::from_options(
+            WindowPaneOptions {
+                snapshot: valid_snapshot(SplintId::new()),
+                terminal_grid_limits: TerminalGridLimits::default(),
+                updates: update_receiver,
+                commands,
+                authority: AuthorityStatus::default(),
+                controlled,
+                image_sources: ImageContentLeaseSet::default(),
+            },
+            SCALE_DENOMINATOR,
+        )
+        .unwrap();
+        (pane, command_receiver)
+    }
+
+    /// Plan 0072 M2b: only a configure after the first that changed the
+    /// size of the Window with keyboard focus is the person's resize.
+    #[test]
+    fn only_a_later_resize_of_the_focused_window_is_the_persons() {
+        // (initial configure, resized, keyboard focused)
+        for (initial, resized, focused) in [
+            (true, true, true),
+            (true, false, true),
+            (true, true, false),
+            (false, false, true),
+            (false, true, false),
+            (false, false, false),
+        ] {
+            assert_eq!(
+                configure_resize_cause(initial, resized, focused),
+                PaneResizeCause::Layout,
+                "initial {initial}, resized {resized}, focused {focused}"
+            );
+        }
+        assert_eq!(
+            configure_resize_cause(false, true, true),
+            PaneResizeCause::User
+        );
+    }
+
+    /// Plan 0072 M2b: a person's resize asks each visible pane to take
+    /// control; a layout resize keeps asking only for control nobody holds.
+    #[test]
+    fn a_persons_resize_reclaims_and_a_layout_resize_does_not() {
+        for controlled in [false, true] {
+            let (mut pane, mut commands) = reclaim_test_pane(controlled, 4);
+            App::emit_active_pane_resize(
+                &mut pane,
+                320,
+                240,
+                SCALE_DENOMINATOR,
+                PaneResizeCause::User,
+            )
+            .unwrap();
+            assert!(matches!(
+                commands.try_recv().unwrap(),
+                WindowCommand::ReclaimResize { .. }
+            ));
+            App::emit_inactive_pane_resize(
+                &mut pane,
+                640,
+                480,
+                SCALE_DENOMINATOR,
+                PaneResizeCause::User,
+            )
+            .unwrap();
+            assert!(matches!(
+                commands.try_recv().unwrap(),
+                WindowCommand::ReclaimResize { .. }
+            ));
+            App::emit_active_pane_resize(
+                &mut pane,
+                320,
+                240,
+                SCALE_DENOMINATOR,
+                PaneResizeCause::Layout,
+            )
+            .unwrap();
+            assert!(matches!(
+                commands.try_recv().unwrap(),
+                WindowCommand::Resize { .. }
+            ));
+            // A person's resize that leaves the grid as it is sends nothing.
+            App::emit_active_pane_resize(
+                &mut pane,
+                320,
+                240,
+                SCALE_DENOMINATOR,
+                PaneResizeCause::User,
+            )
+            .unwrap();
+            assert!(commands.try_recv().is_err());
+            // A font or scale change that only prepares a size never reclaims.
+            App::emit_pane_resize_for(
+                &mut pane,
+                640,
+                480,
+                SCALE_DENOMINATOR,
+                false,
+                PaneResizeCause::User,
+            )
+            .unwrap();
+            assert!(matches!(
+                commands.try_recv().unwrap(),
+                WindowCommand::PrepareResize { .. }
+            ));
+        }
+    }
+
+    /// Plan 0072 M2b: the geometry a handoff resume sends again is the
+    /// client's own, so it does not take control.
+    #[test]
+    fn a_handoff_resume_resends_geometry_without_reclaiming() {
+        let (mut pane, mut commands) = reclaim_test_pane(false, 4);
+        App::emit_active_pane_resize(
+            &mut pane,
+            320,
+            240,
+            SCALE_DENOMINATOR,
+            PaneResizeCause::User,
+        )
+        .unwrap();
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            WindowCommand::ReclaimResize { .. }
+        ));
+        App::ready_pane_for_handoff_resume(&mut pane, false, &VecDeque::new());
+        App::emit_active_pane_resize(
+            &mut pane,
+            320,
+            240,
+            SCALE_DENOMINATOR,
+            PaneResizeCause::Layout,
+        )
+        .unwrap();
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            WindowCommand::Resize { .. }
+        ));
+    }
+
+    /// Plan 0072 M2b: a person's resize held back by a full queue still
+    /// takes control when a layout change replaces its size before it goes.
+    #[test]
+    fn a_queued_persons_resize_keeps_reclaiming_when_a_layout_resize_replaces_it() {
+        let (mut pane, mut commands) = reclaim_test_pane(false, 1);
+        pane.commands
+            .as_ref()
+            .unwrap()
+            .try_send(WindowCommand::Resynchronize)
+            .unwrap();
+        App::emit_active_pane_resize(
+            &mut pane,
+            320,
+            240,
+            SCALE_DENOMINATOR,
+            PaneResizeCause::User,
+        )
+        .unwrap();
+        App::emit_active_pane_resize(
+            &mut pane,
+            640,
+            480,
+            SCALE_DENOMINATOR,
+            PaneResizeCause::Layout,
+        )
+        .unwrap();
+        assert_eq!(commands.try_recv().unwrap(), WindowCommand::Resynchronize);
+        App::retry_pending_pane_resize(&mut pane).unwrap();
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            WindowCommand::ReclaimResize { .. }
+        ));
+        assert!(pane.pending_resize.is_none());
+    }
+
+    /// Plan 0072 M2b: neither taking control nor losing it to another
+    /// Window moves a view scrolled back into history.
+    #[test]
+    fn gaining_or_losing_control_keeps_a_scrolled_back_view() {
+        let (mut pane, _commands) = viewer_pane(10, 6);
+        let snapshot = pane.snapshot.clone().unwrap();
+        pane.scrollback_viewport
+            .set_local_rows(Some(4), Some(&snapshot));
+        pane.scroll_viewport(MouseAction::WheelUp, 3).unwrap();
+        let shown = |pane: &PaneView| display_row_ids(&pane.display_snapshot().unwrap());
+        let before = shown(&pane);
+        assert_eq!(before, [Some(10), Some(11), Some(12), Some(13)]);
+        for update in [
+            WindowUpdate::Control(true),
+            WindowUpdate::Control(false),
+            WindowUpdate::ControlReclaimed,
+        ] {
+            pane.apply_background_update(update, ResolvedTheme::default(), "visible-inactive")
+                .unwrap();
+            assert!(!pane.scrollback_viewport.is_live());
+            assert_eq!(shown(&pane), before);
+        }
+        assert!(!pane.controller_active);
     }
 
     fn reduce_history_merge_case(

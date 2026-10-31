@@ -114,6 +114,19 @@ async fn run_case_in_window(
     steps: Vec<(Request, Reply, Vec<ServerFrame>)>,
     hub: &HandoffStatusHub,
 ) -> (Result<()>, Vec<WindowUpdate>, usize) {
+    run_case_debounced(splint_id, owned, limits, commands, steps, hub, 0).await
+}
+
+/// Like `run_case_in_window`, with the Window's resize debounce.
+async fn run_case_debounced(
+    splint_id: SplintId,
+    owned: bool,
+    limits: ServerLimits,
+    commands: Vec<WindowCommand>,
+    steps: Vec<(Request, Reply, Vec<ServerFrame>)>,
+    hub: &HandoffStatusHub,
+    resize_delay_ms: u64,
+) -> (Result<()>, Vec<WindowUpdate>, usize) {
     tokio::time::timeout(Duration::from_secs(5), async {
         let (client, server) = tokio::io::duplex(65536);
         let (finished, finish) = tokio::sync::oneshot::channel();
@@ -189,7 +202,7 @@ async fn run_case_in_window(
             7,
             // A remote Window forces control too (Plan 0072 M3).
             ForcedControlTransfer::Enabled,
-            0,
+            resize_delay_ms,
             tokio_util::sync::CancellationToken::new(),
         )
         .await;
@@ -2573,5 +2586,253 @@ async fn a_failed_force_of_another_kind_still_ends_the_pane() {
             .iter()
             .any(|update| matches!(update, WindowUpdate::ForceRefused(_)));
         assert!(!refused, "{code:?}");
+    }
+}
+
+fn reclaim(splint_id: SplintId) -> Request {
+    Request::ReclaimControl {
+        splint_id,
+        incarnation: 7,
+        modes: vec![ControlMode::Input, ControlMode::Resize],
+    }
+}
+
+const fn reclaim_resize(columns: u16, rows: u16) -> WindowCommand {
+    WindowCommand::ReclaimResize {
+        columns,
+        rows,
+        pixel_width: columns * 10,
+        pixel_height: rows * 20,
+    }
+}
+
+const fn sized(controller_id: u64, splint_id: SplintId, columns: u16, rows: u16) -> Request {
+    Request::Resize {
+        controller_id,
+        splint_id,
+        incarnation: 7,
+        columns,
+        rows,
+        pixel_width: columns * 10,
+        pixel_height: rows * 20,
+    }
+}
+
+fn control_updates(updates: &[WindowUpdate]) -> Vec<bool> {
+    updates
+        .iter()
+        .filter_map(|update| match update {
+            WindowUpdate::Control(active) => Some(*active),
+            _ => None,
+        })
+        .collect()
+}
+
+fn reclaimed_notices(updates: &[WindowUpdate]) -> usize {
+    updates
+        .iter()
+        .filter(|update| matches!(update, WindowUpdate::ControlReclaimed))
+        .count()
+}
+
+/// Plan 0072 M2b: a viewer pane the person resized takes control without
+/// asking, then resizes as the new controller.
+#[tokio::test]
+async fn a_persons_resize_of_a_viewer_reclaims_then_resizes() {
+    let id = SplintId::new();
+    let (result, updates, _) = run_case(
+        id,
+        false,
+        vec![reclaim_resize(100, 40)],
+        vec![
+            (reclaim(id), Ok(granted())),
+            (sized(2, id, 100, 40), Ok(input_acknowledged(id))),
+            (
+                Request::ReleaseControl { controller_id: 2 },
+                Ok(Response::Acknowledged),
+            ),
+        ],
+    )
+    .await;
+    result.unwrap();
+    assert_eq!(control_updates(&updates), vec![false, true]);
+}
+
+/// Plan 0072 M2b: a pane that controls its Splint just resizes.
+#[tokio::test]
+async fn a_persons_resize_of_a_controlling_pane_does_not_reclaim() {
+    let id = SplintId::new();
+    let (result, _, _) = run_case(
+        id,
+        true,
+        vec![reclaim_resize(100, 40)],
+        vec![
+            (sized(1, id, 100, 40), Ok(input_acknowledged(id))),
+            (
+                Request::ReleaseControl { controller_id: 1 },
+                Ok(Response::Acknowledged),
+            ),
+        ],
+    )
+    .await;
+    result.unwrap();
+}
+
+/// Plan 0072 M2b: a layout resize of a viewer still only asks for control
+/// nobody holds.
+#[tokio::test]
+async fn a_layout_resize_of_a_viewer_acquires_and_does_not_reclaim() {
+    let id = SplintId::new();
+    let (result, updates, _) = run_case(
+        id,
+        false,
+        vec![WindowCommand::Resize {
+            columns: 100,
+            rows: 40,
+            pixel_width: 1_000,
+            pixel_height: 800,
+        }],
+        vec![(acquire(id), Err(ErrorCode::ControllerUnavailable))],
+    )
+    .await;
+    result.unwrap();
+    assert_eq!(control_updates(&updates), vec![false, false]);
+}
+
+/// Plan 0072 M2b: a refused reclaim is not fatal. Refused as unauthorized,
+/// the resize still asks for control nobody holds; refused because the
+/// Splint is gone, the pane keeps the size and goes on serving.
+#[tokio::test]
+async fn a_refused_reclaim_leaves_the_pane_a_working_viewer() {
+    let id = SplintId::new();
+    let (result, updates, resyncs) = run_case(
+        id,
+        false,
+        vec![reclaim_resize(100, 40), WindowCommand::Resynchronize],
+        vec![
+            (reclaim(id), Err(ErrorCode::Unauthorized)),
+            (acquire(id), Err(ErrorCode::ControllerUnavailable)),
+        ],
+    )
+    .await;
+    result.unwrap();
+    assert_eq!(resyncs, 1);
+    assert_eq!(control_updates(&updates), vec![false, false]);
+
+    for code in [ErrorCode::NotFound, ErrorCode::StaleIncarnation] {
+        let (result, updates, resyncs) = run_case(
+            id,
+            false,
+            vec![reclaim_resize(100, 40), WindowCommand::Resynchronize],
+            vec![(reclaim(id), Err(code))],
+        )
+        .await;
+        result.unwrap();
+        assert_eq!(resyncs, 1);
+        assert_eq!(control_updates(&updates), vec![false]);
+    }
+}
+
+/// Plan 0072 M2b: a reclaim a handoff fenced is dropped, as any resize is,
+/// and the size is sent again when the pause ends.
+#[tokio::test]
+async fn a_reclaim_fenced_by_a_handoff_is_dropped() {
+    let id = SplintId::new();
+    let (result, _, resyncs) = run_case(
+        id,
+        false,
+        vec![reclaim_resize(100, 40), WindowCommand::Resynchronize],
+        vec![(reclaim(id), Err(ErrorCode::HandoffInProgress))],
+    )
+    .await;
+    result.unwrap();
+    assert_eq!(resyncs, 1);
+}
+
+/// Plan 0072 M2b: one drag is debounced into one resize, which takes
+/// control once, at the drag's last size, even when a layout resize ends it.
+#[tokio::test]
+async fn one_drag_reclaims_once_at_its_last_size() {
+    let id = SplintId::new();
+    let hub = HandoffStatusHub::default();
+    let (result, _, _) = run_case_debounced(
+        id,
+        false,
+        ServerLimits::default(),
+        vec![
+            reclaim_resize(80, 24),
+            reclaim_resize(90, 30),
+            WindowCommand::Resize {
+                columns: 100,
+                rows: 40,
+                pixel_width: 1_000,
+                pixel_height: 800,
+            },
+        ],
+        vec![
+            (reclaim(id), Ok(granted()), Vec::new()),
+            (
+                sized(2, id, 100, 40),
+                Ok(input_acknowledged(id)),
+                Vec::new(),
+            ),
+            (
+                Request::ReleaseControl { controller_id: 2 },
+                Ok(Response::Acknowledged),
+                Vec::new(),
+            ),
+        ],
+        &hub,
+        100,
+    )
+    .await;
+    result.unwrap();
+}
+
+/// Plan 0072 M2b: a pane whose control another Window took by resizing it
+/// says so after it becomes a viewer; a loss for any other reason does not.
+#[tokio::test]
+async fn control_reclaimed_by_another_window_is_announced() {
+    let id = SplintId::new();
+    let lost = |lost_reason| ServerFrame::Event {
+        subscription_id: 9,
+        sequence: 1,
+        event: SubscriptionEvent::ControlStatusChanged {
+            status: ControlStatus {
+                splint_id: id,
+                incarnation: 7,
+                controlled: true,
+                locally_owned: false,
+                lost_reason,
+            },
+        },
+    };
+    for (reason, notices) in [(Some(ControlLossReason::ReclaimedByWindow), 1), (None, 0)] {
+        let (result, updates, _) = run_case_with(
+            id,
+            true,
+            ServerLimits::default(),
+            vec![WindowCommand::Resize {
+                columns: 100,
+                rows: 40,
+                pixel_width: 1_000,
+                pixel_height: 800,
+            }],
+            vec![(
+                sized(1, id, 100, 40),
+                Ok(input_acknowledged(id)),
+                vec![lost(reason)],
+            )],
+        )
+        .await;
+        result.unwrap();
+        assert_eq!(control_updates(&updates), vec![true, false]);
+        assert_eq!(reclaimed_notices(&updates), notices);
+        if notices == 1 {
+            assert!(matches!(
+                updates.last(),
+                Some(WindowUpdate::ControlReclaimed)
+            ));
+        }
     }
 }
