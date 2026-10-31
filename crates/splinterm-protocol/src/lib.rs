@@ -18,7 +18,7 @@ use splinterm_core::{
     TopologyRevision,
 };
 
-pub const PROTOCOL_VERSION: u16 = 47;
+pub const PROTOCOL_VERSION: u16 = 48;
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_TERMINAL_TRANSACTION_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_TERMINAL_TRANSACTION_CHUNK_BYTES: usize = 8 * 1024 * 1024;
@@ -1121,7 +1121,8 @@ pub enum Request {
     /// base64 ([`encode_clipboard_data`]), empty when its configuration
     /// refuses or it has no text. Answered `Acknowledged` whether or not the
     /// query was still waiting; only the asked connection's first answer
-    /// reaches the program.
+    /// reaches the program, and only while that connection still holds the
+    /// Splint's controller lease.
     AnswerClipboardQuery {
         query_id: u64,
         #[serde(deserialize_with = "deserialize_clipboard_data")]
@@ -1792,9 +1793,9 @@ pub enum SubscriptionEvent {
     /// Plan 0074 M2: a program in the Splint set `selection` through OSC 52;
     /// `data` is its text as base64 ([`decode_clipboard_data`]). Sent only on
     /// the control subscription of the Window connection, installed client
-    /// or remote Window, that holds the Splint's controller lease; never to
-    /// an automation connection. The Window decides by its own
-    /// configuration whether to publish it.
+    /// or remote Window whose relay runs outside every Splint, that holds the
+    /// Splint's controller lease; never to an automation connection. The
+    /// Window decides by its own configuration whether to publish it.
     ClipboardSet {
         selection: ClipboardSelection,
         #[serde(deserialize_with = "deserialize_clipboard_data")]
@@ -2768,10 +2769,11 @@ pub enum AuditOperation {
     /// Plan 0067 M3: a Window claims an agent's new Dojo as a background tab.
     ClaimDojoPresentation,
     /// Plan 0074 M2: a program set a selection through OSC 52. The daemon
-    /// records the selection, byte count, and outcome, never the contents.
+    /// records the byte count and outcome, never the contents or the
+    /// selection; `succeeded` means sent to the Window.
     ClipboardSet,
     /// Plan 0074 M2: a program asked for a selection through OSC 52, and a
-    /// Window's answer to it. Never the contents.
+    /// Window's answer to it. Never the contents or the selection.
     ClipboardQuery,
 }
 
@@ -7180,7 +7182,7 @@ mod tests {
 
     #[test]
     fn first_terminal_read_requests_are_explicit_protocol_v20_shapes() {
-        assert_eq!(PROTOCOL_VERSION, 47);
+        assert_eq!(PROTOCOL_VERSION, 48);
         let splint_id = SplintId::new();
         let attach = Request::Attach {
             splint_id,
@@ -9280,8 +9282,8 @@ mod tests {
         // An undeclared hello keeps its exact protocol 41 shape.
         let plain = serde_json::json!({
             "type": "hello",
-            "minimum_version": 47,
-            "maximum_version": 47,
+            "minimum_version": 48,
+            "maximum_version": 48,
             "role": "trusted_ui",
         });
         assert_eq!(serde_json::to_value(hello(false)).unwrap(), plain);

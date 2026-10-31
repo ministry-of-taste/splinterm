@@ -113,17 +113,35 @@ osc52=copy
 
 Configuration reload applies a change. The target letters `c` (clipboard), `p`
 and `s` (primary selection) are understood; an empty target means the
-clipboard. A set carries at most 1 MiB of UTF-8 text; anything larger, not
-valid base64, or not text is ignored. A read answers with text only, at most
-1 MiB, and with an empty answer when the clipboard holds no text or does not
-answer within about a second.
+clipboard, and a reply names the letter the program asked for. A set carries
+at most 1 MiB of UTF-8 text; anything larger, not valid base64, or not text is
+ignored. A read answers with text only. It answers empty when the clipboard
+holds no text, does not answer within about a second, or holds more than the
+program's input queue takes at once: about 768 KiB, less while input is still
+queued. Replies reach the program in the order it asked; a program already
+waiting on 16 reads gets no reply to another.
 
 Only the Window that controls the pane, by typing in it or resizing it, sets
-or reads its clipboard; a Window that only shows the pane does nothing, and an
-agent connected through MCP or the automation socket never receives a set or a
-read. With no controlling Window, a read gets an empty answer at once. Every
-set and read is recorded in the daemon audit with its target, byte count, and
-outcome, never the text.
+or reads its clipboard. That holds for a pane in a background tab or in a
+Window without focus, too. A Window that only shows the pane does nothing.
+With no controlling Window, a read gets an empty answer at once.
+
+**Remote Windows.** A remote Window sets and reads the clipboard of the
+machine it runs on, under that machine's `clipboard.osc52`, not the daemon
+host's. With its default, programs on the daemon host can read the clipboard
+of the person viewing them from another machine.
+
+**Agents.** An agent connected only through MCP or the automation socket never
+receives a set or answers a read, and neither does a relay running inside a
+pane, as an agent could start one. OSC 52 never gives such an agent a
+clipboard of its own: clipboard scopes stay invalid there.
+
+**Audit.** The daemon audit records sets and reads with their byte count and
+outcome, never the text and not the selection. A set that succeeded was
+delivered to the Window, which may still drop it, as under `off`. A pane
+records at most 16 requests a minute, then one record that the rest were
+suppressed. A set dropped while the daemon is busy may not be recorded at
+all.
 
 **What the default allows.** With `copy-paste`, any program running in a pane
 your Window controls can read your clipboard without asking, and replace it,
@@ -133,9 +151,18 @@ a password from a password manager, is readable that way. An agent you gave
 **Look and type** access through MCP can start such a program in the pane; it
 reads the clipboard once your Window controls the pane again, and the agent
 can then read the result from the screen. Set `osc52=copy` to let programs
-copy without reading, or `osc52=off` to refuse both. OSC 52 never gives an
-agent connected only through MCP a clipboard of its own: clipboard scopes stay
-invalid there.
+copy without reading, or `osc52=off` to refuse both.
+
+Known limits:
+
+- A program can replace the clipboard with a command and wait for you to paste
+  it into a shell. Bracketed paste, which most shells turn on, keeps such a
+  paste from running by itself.
+- The answer to a read comes later than the terminal's own replies. A program
+  that sends a read and then a device attributes query (DA1) to see whether
+  the read is answered gets the DA1 reply first.
+- A read's reply can arrive between the pieces of a large paste you are
+  making into the same program.
 
 ## Supported keys
 

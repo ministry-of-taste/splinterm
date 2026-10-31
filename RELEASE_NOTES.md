@@ -66,7 +66,7 @@ running daemon by themselves.
 
 ## Behaviour changes
 
-- Private protocol 47 (0.1.1 used 36). Old and new clients, daemons, and relays
+- Private protocol 48 (0.1.1 used 36). Old and new clients, daemons, and relays
   do not interoperate. Upgrade both ends of a remote connection, and keep
   `splinterm-mcp` at the same version.
 - The agent access prompt no longer grants on Enter: Enter denies, and only `G`
@@ -835,10 +835,13 @@ a hostile program running as your account.
   - `[clipboard] middle-click-paste=no` turns off middle-click paste.
 - Programs can copy to the clipboard and read it with OSC 52, as in Alacritty,
   so Neovim, tmux, and programs over SSH reach your desktop clipboard. Only
-  the Window that controls the pane answers; agents connected through MCP
-  never do. With the default `[clipboard] osc52=copy-paste`, any program in
-  such a pane, agents in it included, can read the clipboard without asking;
-  `osc52=copy` allows copying only and `osc52=off` neither.
+  the Window that controls the pane answers, even for a pane in a background
+  tab; agents connected through MCP never do. With the default
+  `[clipboard] osc52=copy-paste`, any program in such a pane, agents in it
+  included, can read the clipboard without asking; `osc52=copy` allows copying
+  only and `osc52=off` neither. A remote Window answers from its own machine's
+  clipboard, under that machine's setting. The audit records byte counts,
+  never the text.
 - Resizing a pane whose text does not fill it, for example by splitting it,
   keeps the text at the top, as in Foot. Before, the text and the cursor
   moved to the bottom with blank rows above them, and growing the pane again
