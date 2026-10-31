@@ -4,7 +4,8 @@
   contract (protocol 45), the daemon's routing, the countdown and host row in
   the dialog, the remote Window responder, and `splinterm approvals`. Amended
   for protocol 47 (Plan 0072 M3): a remote Window's forced-takeover
-  confirmation.
+  confirmation. Amended for protocol 48 (Plan 0074 M2): which remote Windows
+  receive a program's OSC 52 clipboard requests.
 - **Date:** 2026-10-27
 - **Amends:** [ADR 0005](0005-trusted-consent-broker.md) (where the trusted
   prompt is shown), [ADR 0010](0010-one-authentication-graphical-relay.md)
@@ -274,3 +275,17 @@ user's SSH key, can force and answer its own confirmation, with no more
 reach than a resize reclaim. A process that inherits a relay connection's
 descriptor, or takes it with `ptrace`, uses it unidentified, as ADR 0007's
 general residual says.
+
+## Amendment: OSC 52 goes only to a remote Window outside every Splint (protocol 48)
+
+Plan 0074 M2; operator decision 2026-10-30 ("Copy and read").
+
+A program's OSC 52 set or query goes only to the Window connection that holds
+its pane's controller lease, on that connection's control subscription. A
+remote Window qualifies only if its relay passes the same Window checks as a
+forced takeover or a resize reclaim (installed relay, outside every Splint's
+tree), checked when it subscribes. The relay role needs no SSH, so an agent
+could run the relay itself inside a Splint; such a relay may still watch
+control status, but its subscription carries no clipboard requests, and it
+can answer no query. Automation connections, MCP agents included, never
+receive a set or answer a query.
