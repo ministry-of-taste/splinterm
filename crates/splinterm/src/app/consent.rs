@@ -137,16 +137,14 @@ fn table_line(key: &str, value: impl AsRef<str>) -> DialogLine {
 }
 
 /// The target's row of the table. A workspace's name is user data any
-/// agent with Manage can change, so its short ID always comes first.
+/// agent with Manage can change, so its short ID always comes first. A
+/// Splint has no name in the prompt, so its row shows its plain ID.
 fn consent_target_line(target: &ConsentTarget) -> DialogLine {
     match target {
         ConsentTarget::Splint {
             splint_id,
             incarnation,
-        } => table_line(
-            "splint",
-            format!("{splint_id:?} · incarnation {incarnation}"),
-        ),
+        } => table_line("splint", format!("{splint_id} · incarnation {incarnation}")),
         ConsentTarget::Lair { lair_id, lair_name } => {
             let short_id: String = lair_id.to_string().chars().take(8).collect();
             table_line(
@@ -1123,6 +1121,23 @@ mod tests {
         let mut agent = prompt;
         agent.agent_name = Some("Force control".to_owned());
         assert_eq!(variants(&agent)[0].title(), "remote agent access request");
+    }
+
+    /// A Splint's row shows its plain ID, never the debug form, in a remote
+    /// Window's force confirmation and in the daemon's own Splint prompt.
+    #[test]
+    fn a_splint_row_shows_the_plain_splint_id() {
+        for prompt in [takeover_prompt(), splint_prompt()] {
+            let ConsentTarget::Splint { splint_id, .. } = &prompt.target else {
+                panic!("a Splint prompt");
+            };
+            let text = words(&prompt, 0);
+            assert!(!text.contains("SplintId("), "{text}");
+            assert!(
+                text.contains(&format!("splint {splint_id} · incarnation 3")),
+                "{text}"
+            );
+        }
     }
 
     /// A Splint prompt as the daemon sends it: "Just this once" only.
