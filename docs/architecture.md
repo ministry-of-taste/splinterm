@@ -66,12 +66,16 @@ either disconnect. Forced transfer uses a separate trusted consent prompt,
 for a remote Window, whose relay must run outside every Splint, an offer to
 that Window's own consent responder alone (ADR 0015), failing at once without
 one and never falling back to this host's display.
-A Window that is not a pane's controller takes it when a person resizes the
-pane (`ReclaimControl`): no prompt, from any holder, an agent included. The
-daemon accepts it only from the installed client and from remote Windows'
-relays running outside every Splint, and no policy grants it; the connection
-that lost the lease is told a Window took it, not which. ADR 0007 and ADR 0010
-list the residual risks.
+A Window that is not a pane's controller takes it when a person resizes the pane
+(`ReclaimControl`): no prompt, from any holder, an agent included. The Window
+sends it only for a debounced toplevel configure that changed its size while it
+had keyboard focus and kept it through the debounce, at least a second after the
+Window first mapped, never for its own layout, font, scale, or resume resizes. A
+stale lease the daemon then refuses makes the losing pane a viewer; it never
+ends the pane. The daemon accepts it only from the installed client and from
+remote Windows' relays running outside every Splint, and no policy grants it;
+the connection that lost the lease is told a Window took it, not which. ADR 0007
+and ADR 0010 list the residual risks.
 Literal search runs inside the owning terminal actor with fixed query/result/
 preview/deadline bounds and opaque cursors tied to incarnation, terminal
 revision, and history generation. See

@@ -1920,6 +1920,7 @@ mod tests {
                 PendingPaneResize {
                     size: (80, 24, 800, 480),
                     claim_control: false,
+                    reclaim: false,
                 },
                 delay,
                 started,
@@ -1936,6 +1937,7 @@ mod tests {
                 PendingPaneResize {
                     size: (100, 40, 1_000, 800),
                     claim_control: true,
+                    reclaim: false,
                 },
                 delay,
                 latest_at,
@@ -1948,6 +1950,7 @@ mod tests {
             Some(PendingPaneResize {
                 size: (100, 40, 1_000, 800),
                 claim_control: true,
+                reclaim: false,
             })
         );
     }
@@ -1962,6 +1965,7 @@ mod tests {
             PendingPaneResize {
                 size: (80, 24, 800, 480),
                 claim_control: true,
+                reclaim: false,
             },
             Duration::ZERO,
             tokio::time::Instant::now(),

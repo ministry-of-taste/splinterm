@@ -679,6 +679,30 @@ remote-agent-prompts = no` Force control is unavailable in a remote Window. A
 denied, expired, or refused force leaves the pane a viewer and says why in the
 Window title.
 
+Resizing the Window you are using takes control of the panes it shows. When you
+resize a Window that has keyboard focus, each visible pane it only views takes
+control from whoever holds it, another local or remote Window or an agent, with
+no prompt. A drag takes control once its size has held still for about 100 ms
+(`main.resize-delay-ms`), so a longer pause mid-drag takes control at the pause.
+Changes the Window makes itself do not take control: opening it, splitting,
+closing, or adding panes, switching tabs, showing or hiding the Explorer or tab
+strip, a font change or zoom, a scale change that keeps the Window's size, and
+resuming after a daemon upgrade. A Window that just opened does not take control
+while it settles, for about a second, so a window rule or the first re-tile that
+moves or resizes it is not counted. A Window without keyboard focus that the
+compositor resizes, such as a tiled neighbour, does not take control either, and
+neither does a Window that loses keyboard focus before the size settles, as when
+a new window opens beside it. The compositor does not say why it resized a
+Window, so any other size change of the focused Window counts as yours: moving
+it to a monitor where its size changes, toggling fullscreen or floating, and a
+scripted resize such as `hyprctl dispatch resizeactive`. The Window that lost
+control keeps showing the pane as a viewer and says **Viewing — another Window
+took control** over it for about 5 seconds, or until you type in it or it takes
+control back. A pending control request or a lost display is shown instead,
+since it matters more. An agent that lost control is told a person took the
+pane, and is asked not to take it back unless you say so. Neither side's view
+moves if it is scrolled back into history.
+
 When an agent asks to control a pane (MCP `splinterm.request_control_transfer`),
 that pane shows a notice at its bottom centre until you answer or the request
 ends: **An agent asks to control this pane**, framed in the theme's warning
@@ -698,8 +722,9 @@ it. A remote Window gets the request over the same pane connection as a local
 one, so it shows the notice too.
 
 Closing a controlling Window releases its connection-owned lease. A later client
-must acquire control explicitly; observation never silently becomes input
-authority.
+takes control only by an action of yours, such as typing into a pane nobody
+controls, requesting control, or resizing its Window as above; observation
+alone never becomes input authority.
 
 ## Trusted dialogs
 

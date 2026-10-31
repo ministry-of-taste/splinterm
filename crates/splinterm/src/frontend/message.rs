@@ -73,6 +73,10 @@ pub enum WindowUpdate {
     /// confirmed; the pane stays a viewer and the Window shows this short
     /// notice.
     ForceRefused(&'static str),
+    /// Plan 0072 M2b: a person resized this pane in another Window, which
+    /// took control of it without asking; the pane is a viewer now. Sent
+    /// after the [`WindowUpdate::Control`] that says so.
+    ControlReclaimed,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -179,6 +183,15 @@ pub enum WindowCommand {
         pixel_width: u16,
         pixel_height: u16,
     },
+    /// Plan 0072 M2b: a size the person gave the focused Window. A pane that
+    /// does not control its Splint takes control from whoever holds it,
+    /// without asking, then resizes; one that controls it just resizes.
+    ReclaimResize {
+        columns: u16,
+        rows: u16,
+        pixel_width: u16,
+        pixel_height: u16,
+    },
     FetchScrollback {
         splint_id: SplintId,
         incarnation: u64,
@@ -196,6 +209,10 @@ pub enum WindowCommand {
         decision: ControlTransferDecision,
     },
     ForceControlTransfer,
+    /// Plan 0072 M2b: the Window lost keyboard focus, so a
+    /// [`WindowCommand::ReclaimResize`] still waiting in the pane's resize
+    /// debounce resizes without taking control.
+    CancelReclaim,
     Search {
         terminal_revision: u64,
         history_generation: u64,
