@@ -103,6 +103,10 @@ pub struct AppConfig {
     /// Explicit absolute private directory for user-requested clipboard PNG saves.
     /// Filesystem checks happen in the save worker, not during configuration parsing.
     pub clipboard_image_directory: Option<PathBuf>,
+    /// Whether a middle click pastes the primary selection into the
+    /// terminal (`[clipboard] middle-click-paste`, default on). Off, a
+    /// middle click reaches a program that tracks the mouse instead.
+    pub middle_click_paste: bool,
     pub pane_divider_style: PaneDividerStyle,
     /// `[multiplexer] pane-gap`: empty logical px between adjacent Splint
     /// panes' outer edges, outside any frame or around a divider line. Zero
@@ -368,6 +372,7 @@ impl Default for AppConfig {
             role_colors: None,
             theme_path: None,
             clipboard_image_directory: None,
+            middle_click_paste: true,
             pane_divider_style: PaneDividerStyle::Line,
             pane_gap: 0,
             frame_title_mode: FrameTitleMode::Splint,
@@ -1266,6 +1271,10 @@ fn parse_with_base(text: &str, config_dir: &Path) -> Result<ConfigLoad> {
                 if config.clipboard_image_directory.replace(path).is_some() {
                     bail!("line {}: duplicate clipboard.image-directory", index + 1);
                 }
+                false
+            }
+            "clipboard.middle-click-paste" => {
+                config.middle_click_paste = parse_bool(value, index)?;
                 false
             }
             "main.font" | "font" => {
@@ -3776,6 +3785,25 @@ pub(crate) mod tests {
         let shipped = parse(include_str!("../../../config/splinterm/config.ini")).unwrap();
         assert!(shipped.diagnostics.is_empty(), "{:?}", shipped.diagnostics);
         assert!(shipped.config.tab_strip_border);
+    }
+
+    #[test]
+    fn middle_click_paste_defaults_on_and_can_be_turned_off() {
+        assert!(AppConfig::default().middle_click_paste);
+        assert!(parse("[clipboard]\n").unwrap().config.middle_click_paste);
+        for (value, expected) in [("yes", true), ("on", true), ("no", false), ("off", false)] {
+            let loaded = parse(&format!("[clipboard]\nmiddle-click-paste={value}\n")).unwrap();
+            assert_eq!(loaded.config.middle_click_paste, expected, "{value}");
+            assert!(loaded.diagnostics.is_empty());
+        }
+        for invalid in ["", "primary", "2"] {
+            assert!(
+                parse(&format!("[clipboard]\nmiddle-click-paste={invalid}\n")).is_err(),
+                "{invalid:?}"
+            );
+        }
+        let shipped = parse(include_str!("../../../config/splinterm/config.ini")).unwrap();
+        assert!(shipped.config.middle_click_paste);
     }
 
     #[test]

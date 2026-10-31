@@ -133,14 +133,19 @@ fn mouse_button_code(button: u32) -> Option<u8> {
     }
 }
 
+/// What a pointer button press in the terminal does. A middle click pastes
+/// the primary selection unless `middle_click_paste` (`[clipboard]
+/// middle-click-paste`) is off; then it is a button like the others, reported
+/// to a program that tracks the mouse.
 pub(in crate::wayland) fn classify_press(
     button: u32,
     has_position: bool,
     modifiers: Modifiers,
     modes: TerminalInputModes,
     has_hovered_url: bool,
+    middle_click_paste: bool,
 ) -> PressOwner {
-    if button == BTN_MIDDLE {
+    if button == BTN_MIDDLE && middle_click_paste {
         return PressOwner::PrimaryPaste;
     }
     if button == BTN_LEFT && modifiers.ctrl && has_hovered_url {
@@ -196,14 +201,6 @@ pub(in crate::wayland) fn picker_release_activation(
     released: Option<PickerHitTarget>,
 ) -> Option<PickerHitTarget> {
     pressed.filter(|target| Some(*target) == released)
-}
-
-pub(in crate::wayland) const fn clipboard_read_is_current(
-    input_blocked: bool,
-    current_generation: u64,
-    read_generation: u64,
-) -> bool {
-    !input_blocked && current_generation == read_generation
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -482,6 +479,25 @@ mod tests {
         ));
     }
 
+    /// Plan 0074: `[clipboard] middle-click-paste=no` makes a middle click
+    /// a button like the others: reported to a program tracking the mouse,
+    /// ignored otherwise.
+    #[test]
+    fn middle_click_pastes_only_while_middle_click_paste_is_on() {
+        let mut modes = normal_modes();
+        let press = |modes, paste| {
+            classify_press(BTN_MIDDLE, true, Modifiers::default(), modes, false, paste)
+        };
+        assert!(matches!(press(modes, true), PressOwner::PrimaryPaste));
+        assert!(matches!(press(modes, false), PressOwner::Ignored));
+        modes.mouse_tracking = MouseTracking::Normal;
+        assert!(matches!(press(modes, true), PressOwner::PrimaryPaste));
+        assert!(matches!(
+            press(modes, false),
+            PressOwner::Application { code: 1, .. }
+        ));
+    }
+
     #[test]
     fn press_ownership_pairs_application_and_local_releases() {
         let position_present = true;
@@ -493,6 +509,7 @@ mod tests {
             Modifiers::default(),
             modes,
             false,
+            true,
         );
         assert!(matches!(
             app,
@@ -510,6 +527,7 @@ mod tests {
             Modifiers::default(),
             modes,
             false,
+            true,
         );
         assert!(application_motion(&button_motion).is_some());
         let primary = classify_press(
@@ -518,6 +536,7 @@ mod tests {
             Modifiers::default(),
             modes,
             false,
+            true,
         );
         assert!(matches!(primary, PressOwner::PrimaryPaste));
         let url = classify_press(
@@ -528,6 +547,7 @@ mod tests {
                 ..Modifiers::default()
             },
             modes,
+            true,
             true,
         );
         assert!(matches!(url, PressOwner::Url));

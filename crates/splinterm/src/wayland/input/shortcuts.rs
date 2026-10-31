@@ -118,6 +118,40 @@ pub(in crate::wayland) fn owned_field_clipboard_action(
         .filter(|action| matches!(action, ActionId::ClipboardCopy | ActionId::ClipboardPaste))
 }
 
+/// An edit a chord makes in a Splinterm text field.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::wayland) enum FieldEdit {
+    Copy,
+    Paste,
+    Cut,
+    Undo,
+    SelectAll,
+}
+
+/// Plan 0074: the edit a chord makes in a Splinterm text field (the command
+/// palette, key binding help, search, and rename prompts): `Super+C/V/X/A/Z`,
+/// and `Ctrl+C/V/X/A`, which Omarchy's `Super+C/V/X/A` send to a window
+/// without its `terminal` tag. Only those fields use this; in the terminal,
+/// `Ctrl+C` and the rest stay the program's keys.
+pub(in crate::wayland) fn owned_field_edit(
+    keysym: Keysym,
+    modifiers: Modifiers,
+) -> Option<FieldEdit> {
+    let desktop = modifiers.logo && !modifiers.ctrl && !modifiers.alt && !modifiers.shift;
+    let ctrl = modifiers.ctrl && !modifiers.logo && !modifiers.alt && !modifiers.shift;
+    if !desktop && !ctrl {
+        return None;
+    }
+    match keysym {
+        Keysym::c | Keysym::C => Some(FieldEdit::Copy),
+        Keysym::v | Keysym::V => Some(FieldEdit::Paste),
+        Keysym::x | Keysym::X => Some(FieldEdit::Cut),
+        Keysym::a | Keysym::A => Some(FieldEdit::SelectAll),
+        Keysym::z | Keysym::Z if desktop => Some(FieldEdit::Undo),
+        _ => None,
+    }
+}
+
 pub(in crate::wayland) fn keymap_press_for(
     keymap: &ResolvedKeymap,
     prefix_state: &mut PrefixState,
@@ -234,6 +268,17 @@ pub(in crate::wayland) fn tab_shortcut_action(
     } else {
         action
     })
+}
+
+/// Plan 0074: whether `action` is a clipboard chord. Its key is the
+/// Window's from press to release, so a held copy or paste chord, or a
+/// synthetic one left stuck down, never repeats into the program as
+/// `Ctrl+C` (SIGINT), `Ctrl+V` or `Shift+Insert`.
+pub(in crate::wayland) const fn clipboard_chord(action: Option<ActionId>) -> bool {
+    matches!(
+        action,
+        Some(ActionId::ClipboardCopy | ActionId::ClipboardPaste | ActionId::ClipboardSaveImage)
+    )
 }
 
 /// Whether a resolved keymap press owns its raw key until release, so the
@@ -581,6 +626,126 @@ mod tests {
             shift: true,
             ..Modifiers::default()
         }
+    }
+
+    /// Plan 0074: every built-in copy and paste chord owns its key from
+    /// press to release in both profiles and in every Window, so its
+    /// repeats, even after a modifier is let go, never reach the terminal.
+    #[test]
+    fn clipboard_chords_consume_their_key_until_release() {
+        let logo = Modifiers {
+            logo: true,
+            ..Modifiers::default()
+        };
+        let ctrl = Modifiers {
+            ctrl: true,
+            ..Modifiers::default()
+        };
+        let shift = Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        };
+        let chords = [
+            (Keysym::C, 46, ctrl_shift(), ActionId::ClipboardCopy),
+            (Keysym::V, 47, ctrl_shift(), ActionId::ClipboardPaste),
+            (Keysym::c, 46, logo, ActionId::ClipboardCopy),
+            (Keysym::v, 47, logo, ActionId::ClipboardPaste),
+            (Keysym::Insert, 110, ctrl, ActionId::ClipboardCopy),
+            (Keysym::Insert, 110, shift, ActionId::ClipboardPaste),
+        ];
+        for profile in [
+            crate::keymap::KeymapProfile::Splinterm,
+            crate::keymap::KeymapProfile::OmarchyTmux,
+        ] {
+            let keymap = crate::keymap::built_in_keymap(profile);
+            for (keysym, raw_code, modifiers, expected) in chords {
+                let mut state = PrefixState::Idle;
+                let KeymapPress::Consumed(Some(action)) = keymap_press_for(
+                    &keymap,
+                    &mut state,
+                    keysym,
+                    modifiers,
+                    raw_code,
+                    Instant::now(),
+                    Duration::from_secs(1),
+                ) else {
+                    panic!("{keysym:?} {modifiers:?} is a clipboard chord");
+                };
+                assert_eq!(action, expected);
+                assert!(clipboard_chord(Some(action)));
+                for managed_tabs in [true, false] {
+                    assert!(keymap_press_consumes_key(action, managed_tabs));
+                }
+                // A repeat resolves the chord again: still the Window's.
+                assert!(clipboard_chord(action_for_key(
+                    &keymap, keysym, raw_code, modifiers
+                )));
+            }
+        }
+        // Ctrl+C, Ctrl+V and plain Insert remain the program's keys.
+        assert!(!clipboard_chord(shortcut_action(Keysym::c, ctrl)));
+        assert!(!clipboard_chord(shortcut_action(Keysym::v, ctrl)));
+        assert!(!clipboard_chord(shortcut_action(
+            Keysym::Insert,
+            Modifiers::default()
+        )));
+        assert!(!clipboard_chord(Some(ActionId::ZoomIn)));
+    }
+
+    /// Plan 0074: text fields take Omarchy's `Ctrl+A/X/C/V` (what its
+    /// `Super+A/X/C/V` send) as well as the Super chords.
+    #[test]
+    fn text_fields_take_ctrl_and_super_edit_chords() {
+        let with = |ctrl, shift, alt, logo| Modifiers {
+            ctrl,
+            shift,
+            alt,
+            logo,
+            ..Modifiers::default()
+        };
+        let ctrl = with(true, false, false, false);
+        let logo = with(false, false, false, true);
+        for modifiers in [ctrl, logo] {
+            assert_eq!(
+                owned_field_edit(Keysym::a, modifiers),
+                Some(FieldEdit::SelectAll)
+            );
+            assert_eq!(owned_field_edit(Keysym::x, modifiers), Some(FieldEdit::Cut));
+            assert_eq!(
+                owned_field_edit(Keysym::c, modifiers),
+                Some(FieldEdit::Copy)
+            );
+            assert_eq!(
+                owned_field_edit(Keysym::V, modifiers),
+                Some(FieldEdit::Paste)
+            );
+            assert_eq!(owned_field_edit(Keysym::b, modifiers), None);
+        }
+        assert_eq!(owned_field_edit(Keysym::z, logo), Some(FieldEdit::Undo));
+        assert_eq!(owned_field_edit(Keysym::z, ctrl), None);
+        // Other chords are not field edits; Ctrl+Shift+C/V arrive as the
+        // keymap's clipboard bindings instead.
+        for modifiers in [
+            Modifiers::default(),
+            with(true, true, false, false),
+            with(true, false, true, false),
+            with(true, false, false, true),
+            with(false, true, false, true),
+        ] {
+            assert_eq!(
+                owned_field_edit(Keysym::c, modifiers),
+                None,
+                "{modifiers:?}"
+            );
+        }
+        assert_eq!(
+            owned_field_clipboard_action(&ResolvedKeymap::default(), Keysym::C, ctrl_shift()),
+            Some(ActionId::ClipboardCopy)
+        );
+        assert_eq!(
+            owned_field_clipboard_action(&ResolvedKeymap::default(), Keysym::V, ctrl_shift()),
+            Some(ActionId::ClipboardPaste)
+        );
     }
 
     #[test]

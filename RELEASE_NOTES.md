@@ -802,6 +802,19 @@ a hostile program running as your account.
   thousand lines and then showed no matches. Paging through matches in
   history also keeps working while the terminal prints.
 - `Shift+End` at the bottom of a shell no longer types `F`.
+- Copy and paste are more dependable in terminal programs and agents:
+  - A held copy or paste chord no longer repeats into the program as
+    `Ctrl+C` (interrupt) or `Ctrl+V`.
+  - Pasted text with control characters is pasted without them instead of
+    being ignored. A paste that still cannot be delivered, such as one over
+    1 MiB, says why in the Window title; the read waits up to five seconds.
+  - Without bracketed paste, line ends are sent as carriage returns, as in
+    foot. A bracketed paste cut short still ends its paste mode.
+  - Copying a wrapped line gives one line.
+  - With an image and no text on the clipboard, `Ctrl+Shift+V` sends `Ctrl+V`
+    so agents can read the image.
+  - Text fields take Omarchy's `Ctrl+A/X/C/V` as well as `Super+A/X/C/V`.
+  - `[clipboard] middle-click-paste=no` turns off middle-click paste.
 - Resizing a pane whose text does not fill it, for example by splitting it,
   keeps the text at the top, as in Foot. Before, the text and the cursor
   moved to the bottom with blank rows above them, and growing the pane again

@@ -681,6 +681,9 @@ pub struct WindowOptions {
     pub prefix_timeout_ms: u64,
     /// Explicit opt-in destination; saves also require a local endpoint.
     pub clipboard_image_directory: Option<PathBuf>,
+    /// `[clipboard] middle-click-paste`: a middle click pastes the primary
+    /// selection.
+    pub middle_click_paste: bool,
     /// Fixed endpoint authority, not inferred from a UI capability or terminal data.
     pub local_endpoint: bool,
     /// Multi-pane input. Empty retains the legacy one-pane fields above.
@@ -779,6 +782,7 @@ impl Default for WindowOptions {
             keymap: ResolvedKeymap::default(),
             prefix_timeout_ms: 1_000,
             clipboard_image_directory: None,
+            middle_click_paste: true,
             local_endpoint: false,
             panes: Vec::new(),
             layout: None,
