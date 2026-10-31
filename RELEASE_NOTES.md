@@ -833,6 +833,12 @@ a hostile program running as your account.
     so agents can read the image.
   - Text fields take Omarchy's `Ctrl+A/X/C/V` as well as `Super+A/X/C/V`.
   - `[clipboard] middle-click-paste=no` turns off middle-click paste.
+- Programs can copy to the clipboard and read it with OSC 52, as in Alacritty,
+  so Neovim, tmux, and programs over SSH reach your desktop clipboard. Only
+  the Window that controls the pane answers; agents connected through MCP
+  never do. With the default `[clipboard] osc52=copy-paste`, any program in
+  such a pane, agents in it included, can read the clipboard without asking;
+  `osc52=copy` allows copying only and `osc52=off` neither.
 - Resizing a pane whose text does not fill it, for example by splitting it,
   keeps the text at the top, as in Foot. Before, the text and the cursor
   moved to the bottom with blank rows above them, and growing the pane again

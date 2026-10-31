@@ -131,6 +131,7 @@ pub const fn operation_for_request(request: &Request) -> AuditOperation {
         Request::AcknowledgeHandoffPrepare { .. } => AuditOperation::AcknowledgeHandoffPrepare,
         Request::SubscribeConsentOffers { .. } => AuditOperation::SubscribeConsentOffers,
         Request::AnswerConsentOffer { .. } => AuditOperation::AnswerConsentOffer,
+        Request::AnswerClipboardQuery { .. } => AuditOperation::ClipboardQuery,
     }
 }
 
@@ -148,6 +149,8 @@ pub struct AuditDraft {
     pub outcome: Option<AuditOutcome>,
     pub argument_count: Option<usize>,
     pub executable_basename: Option<String>,
+    /// How many clipboard bytes an OSC 52 request carried, never the bytes.
+    pub byte_count: Option<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -178,6 +181,7 @@ impl AuditStore {
             executable_basename: draft
                 .executable_basename
                 .map(|basename| basename.chars().take(255).collect()),
+            byte_count: draft.byte_count,
         };
         self.records.push_back(record);
         while self.records.len() > MAX_AUDIT_RECORDS {
@@ -321,6 +325,7 @@ mod tests {
             outcome: Some(AuditOutcome::Succeeded),
             argument_count: None,
             executable_basename: None,
+            byte_count: None,
         }
     }
 

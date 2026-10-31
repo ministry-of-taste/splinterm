@@ -6,7 +6,7 @@ use std::{
     os::{fd::OwnedFd, unix::process::ExitStatusExt},
     path::PathBuf,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
@@ -22,10 +22,11 @@ use splinterm_pty::{
     PtyError, PtySession, PtySignal, PtySize,
 };
 use splinterm_terminal::{
-    ActiveScreen, CellAttributesSnapshot, CellSnapshotContent, CursorSnapshot, Dimensions,
-    ImageContent, ImageContentId, ImageContentMetadata, ImagePlacement, ScrollDirection,
-    ScrollRegion, ScrollbackSnapshot, SearchFrom, SearchPage, SnapshotRequest, Terminal,
-    TerminalConfig, TerminalDamage, TerminalEvent, TerminalModes, TerminalRevision, TerminalUpdate,
+    ActiveScreen, CellAttributesSnapshot, CellSnapshotContent, ClipboardSelection, CursorSnapshot,
+    Dimensions, ImageContent, ImageContentId, ImageContentMetadata, ImagePlacement,
+    OSC52_MAX_BASE64_BYTES, ReplyTerminator, ScrollDirection, ScrollRegion, ScrollbackSnapshot,
+    SearchFrom, SearchPage, SnapshotRequest, Terminal, TerminalConfig, TerminalDamage,
+    TerminalEvent, TerminalModes, TerminalRevision, TerminalUpdate, osc52_reply,
 };
 use thiserror::Error;
 use tokio::{
@@ -261,6 +262,40 @@ pub struct LiveSearchPage {
     pub title: String,
     pub page: SearchPage,
 }
+
+/// Plan 0074 M2: what a Splint's program asked of the clipboard through
+/// OSC 52. The actor only reports it; the daemon routes it to a Window.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ClipboardRequest {
+    /// Set `selection` to `bytes`, decoded and bounded by the terminal.
+    Set {
+        selection: ClipboardSelection,
+        bytes: Vec<u8>,
+    },
+    /// Give `selection`'s contents; the reply ends with `terminator`.
+    Query {
+        selection: ClipboardSelection,
+        terminator: ReplyTerminator,
+    },
+}
+
+/// One [`ClipboardRequest`] and the Splint incarnation whose program made it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClipboardEvent {
+    pub splint_id: SplintId,
+    pub incarnation: u64,
+    pub request: ClipboardRequest,
+}
+
+/// The most bytes one OSC 52 reply written to a program takes: base64 for
+/// the largest clipboard, its prefix, and a terminator.
+pub const MAX_CLIPBOARD_REPLY_BYTES: usize = OSC52_MAX_BASE64_BYTES + 16;
+
+/// Where an actor sends its program's clipboard requests: the daemon's
+/// receiver, installed once on each runtime it admits
+/// ([`LiveSplintHandle::install_clipboard_sink`]). Until then, and when the
+/// receiver is full or gone, a set is dropped and a query answered empty.
+type ClipboardOutlet = Arc<OnceLock<mpsc::Sender<ClipboardEvent>>>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LiveEvent {
@@ -2885,6 +2920,8 @@ impl Drop for PreparedPtyHandoff {
 
 enum Command {
     Input(Vec<u8>, Reply<()>),
+    /// An OSC 52 reply the daemon writes for the program (Plan 0074 M2).
+    ClipboardReply(Vec<u8>, Reply<()>),
     Resize(PtySize, Reply<()>),
     Snapshot(usize, Reply<LiveSnapshot>),
     ImageContent(ImageContentId, u64, [u8; 32], Reply<ImageContent>),
@@ -3536,6 +3573,7 @@ pub struct LiveSplintHandle {
     metrics: Arc<RuntimeMetrics>,
     exit: watch::Receiver<Option<ProcessExit>>,
     use_latch: Arc<UseLatch>,
+    clipboard: ClipboardOutlet,
 }
 
 #[allow(
@@ -3566,6 +3604,26 @@ impl LiveSplintHandle {
     /// [`LiveError::Retiring`].
     pub async fn input(&self, bytes: Vec<u8>) -> Result<(), LiveError> {
         self.write_input(bytes, true).await
+    }
+
+    /// Sends this runtime's clipboard requests to `sink` from now on
+    /// (Plan 0074 M2). Only the first sink installed is kept.
+    pub fn install_clipboard_sink(&self, sink: mpsc::Sender<ClipboardEvent>) {
+        let _ = self.clipboard.set(sink);
+    }
+
+    /// Writes an OSC 52 reply for the program, as terminal input that is
+    /// not the person's (Plan 0074 M2): it leaves the runtime unused. At
+    /// most [`MAX_CLIPBOARD_REPLY_BYTES`], queued beyond the input limit.
+    pub async fn write_clipboard_reply(&self, bytes: Vec<u8>) -> Result<(), LiveError> {
+        if bytes.len() > MAX_CLIPBOARD_REPLY_BYTES {
+            return Err(LiveError::InputQueueFull);
+        }
+        if !self.use_latch.record_input(false) {
+            return Err(LiveError::Retiring);
+        }
+        self.request(|reply| Command::ClipboardReply(bytes, reply))
+            .await
     }
 
     /// Writes focus reports a graphical client generated for its own focus
@@ -4357,6 +4415,7 @@ struct ActorStart<P: ProcessPlacement> {
     publication_memory_metrics: bool,
     metrics: Arc<RuntimeMetrics>,
     use_latch: Arc<UseLatch>,
+    clipboard: ClipboardOutlet,
     exit_sender: watch::Sender<Option<ProcessExit>>,
     placement: P,
 }
@@ -4382,6 +4441,7 @@ impl<P: ProcessPlacement> ActorStart<P> {
         let (exit_sender, exit) = watch::channel(None);
         let metrics = Arc::new(RuntimeMetrics::default());
         let use_latch = Arc::new(use_latch);
+        let clipboard = ClipboardOutlet::default();
         let handle = LiveSplintHandle {
             splint_id,
             incarnation,
@@ -4394,6 +4454,7 @@ impl<P: ProcessPlacement> ActorStart<P> {
             metrics: Arc::clone(&metrics),
             exit,
             use_latch: Arc::clone(&use_latch),
+            clipboard: Arc::clone(&clipboard),
         };
         let actor = Self {
             splint_id,
@@ -4406,6 +4467,7 @@ impl<P: ProcessPlacement> ActorStart<P> {
             publication_memory_metrics,
             metrics,
             use_latch,
+            clipboard,
             exit_sender,
             placement,
         };
@@ -4424,6 +4486,7 @@ impl<P: ProcessPlacement> ActorStart<P> {
             publication_memory_metrics,
             metrics,
             use_latch,
+            clipboard,
             exit_sender,
             placement,
         } = self;
@@ -4439,6 +4502,7 @@ impl<P: ProcessPlacement> ActorStart<P> {
                 publication_memory_metrics,
                 metrics,
                 use_latch,
+                clipboard,
                 exit_sender,
             ))
             .await;
@@ -4729,6 +4793,7 @@ async fn run_actor(
     publication_memory_metrics: bool,
     metrics: Arc<RuntimeMetrics>,
     use_latch: Arc<UseLatch>,
+    clipboard: ClipboardOutlet,
     exit_sender: watch::Sender<Option<ProcessExit>>,
 ) -> Result<ActorEnd, LiveError> {
     let mut session = Some(session);
@@ -4743,6 +4808,7 @@ async fn run_actor(
         publication_memory_metrics,
         &metrics,
         &use_latch,
+        &clipboard,
     )
     .await;
     let forced_status = if result.is_err() {
@@ -4795,6 +4861,7 @@ async fn run_actor_body(
     publication_memory_metrics: bool,
     metrics: &Arc<RuntimeMetrics>,
     use_latch: &UseLatch,
+    clipboard: &ClipboardOutlet,
 ) -> Result<ActorEnd, LiveError> {
     let mut subscribers = Vec::<Subscriber>::new();
     let mut publication = SynchronizedPublication::new(terminal.revision());
@@ -5131,6 +5198,7 @@ async fn run_actor_body(
                                 &mut publication,
                                 metrics,
                                 config.reply_byte_limit,
+                                clipboard.get(),
                             );
                             metrics.output_parse_batches.fetch_add(
                                 output.parse_batches,
@@ -5293,6 +5361,22 @@ fn handle_command(
                 Err(LiveError::ProcessExited)
             } else {
                 writes.push(bytes, config.input_byte_limit)
+            };
+            let _ = reply.send(result);
+        }
+        // One reply may queue past the input limit, so a full input queue
+        // never loses the program its answer; the daemon keeps one query per
+        // Splint outstanding, which bounds what this adds.
+        Command::ClipboardReply(bytes, reply) => {
+            let result = if child_exit.is_some() {
+                Err(LiveError::ProcessExited)
+            } else {
+                writes.push(
+                    bytes,
+                    config
+                        .input_byte_limit
+                        .saturating_add(MAX_CLIPBOARD_REPLY_BYTES),
+                )
             };
             let _ = reply.send(result);
         }
@@ -5749,6 +5833,25 @@ fn publish_updates(
     (update_count, overflows)
 }
 
+/// Hands one clipboard request to the daemon (Plan 0074 M2). `false` when no
+/// sink is installed or it is full or closed: a set is then dropped, and the
+/// caller answers a query empty itself.
+fn forward_clipboard(
+    sink: Option<&mpsc::Sender<ClipboardEvent>>,
+    splint_id: SplintId,
+    incarnation: ProcessIncarnation,
+    request: ClipboardRequest,
+) -> bool {
+    sink.is_some_and(|sink| {
+        sink.try_send(ClipboardEvent {
+            splint_id,
+            incarnation: incarnation.value(),
+            request,
+        })
+        .is_ok()
+    })
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct ProcessOutputMetrics {
     parse_batches: u64,
@@ -5793,6 +5896,7 @@ fn process_output(
     publication: &mut SynchronizedPublication,
     runtime_metrics: &Arc<RuntimeMetrics>,
     reply_limit: usize,
+    clipboard: Option<&mpsc::Sender<ClipboardEvent>>,
 ) -> ProcessOutputMetrics {
     let _compact_batch = CompactProducerBatch::begin(subscribers);
     let mut metrics = ProcessOutputMetrics::default();
@@ -5866,14 +5970,36 @@ fn process_output(
             );
         }
         for event in terminal.drain_events() {
-            if let TerminalEvent::PtyWrite(bytes) = event {
-                let dropped_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-                if reply_writes.push(bytes, reply_limit).is_err() {
-                    RuntimeMetrics::add_saturating(
-                        &runtime_metrics.reply_write_queue_dropped_bytes,
-                        dropped_bytes,
-                    );
+            let bytes = match event {
+                TerminalEvent::PtyWrite(bytes) => bytes,
+                TerminalEvent::ClipboardSet { selection, bytes } => {
+                    let request = ClipboardRequest::Set { selection, bytes };
+                    forward_clipboard(clipboard, splint_id, incarnation, request);
+                    continue;
                 }
+                TerminalEvent::ClipboardQuery {
+                    selection,
+                    terminator,
+                } => {
+                    let request = ClipboardRequest::Query {
+                        selection,
+                        terminator,
+                    };
+                    if forward_clipboard(clipboard, splint_id, incarnation, request) {
+                        continue;
+                    }
+                    // Nobody will answer: the program gets the empty reply
+                    // now rather than waiting for one.
+                    osc52_reply(selection, b"", terminator)
+                }
+                _ => continue,
+            };
+            let dropped_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+            if reply_writes.push(bytes, reply_limit).is_err() {
+                RuntimeMetrics::add_saturating(
+                    &runtime_metrics.reply_write_queue_dropped_bytes,
+                    dropped_bytes,
+                );
             }
         }
     }
@@ -6809,6 +6935,7 @@ mod tests {
             &mut publication,
             &attribution,
             1024,
+            None,
         );
         assert!(publication.active && !publication.timed_out);
         assert_eq!(metrics.terminal_updates, 0);
@@ -6832,6 +6959,7 @@ mod tests {
             &mut publication,
             &attribution,
             1024,
+            None,
         );
         assert!(!publication.active);
         let LiveEvent::Update {
@@ -6875,6 +7003,7 @@ mod tests {
             &mut publication,
             &metrics,
             4,
+            None,
         );
 
         assert_eq!(replies.bytes, 4);
@@ -6909,6 +7038,7 @@ mod tests {
             &mut publication,
             &attribution,
             1024,
+            None,
         );
 
         assert!(terminal.synchronized_updates());
@@ -6954,6 +7084,7 @@ mod tests {
             &mut publication,
             &attribution,
             1024,
+            None,
         );
         process_output(
             b"\x1b\\",
@@ -6966,6 +7097,7 @@ mod tests {
             &mut publication,
             &attribution,
             1024,
+            None,
         );
         assert!(matches!(
             receiver.try_recv(),
@@ -6986,6 +7118,7 @@ mod tests {
             &mut publication,
             &attribution,
             1024,
+            None,
         );
 
         assert_eq!(metrics.terminal_updates, 2);
@@ -7842,6 +7975,7 @@ mod tests {
             &mut publication,
             &attribution,
             1024,
+            None,
         );
         assert_eq!(terminal.revision(), initial_revision);
         let deadline = publication.deadline.unwrap();
@@ -9891,6 +10025,84 @@ mod tests {
                 .await,
             Err(LiveError::ImageContentNotFound)
         ));
+        runtime.wait().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clipboard_requests_reach_the_installed_sink_and_replies_reach_the_program() {
+        let runtime = LiveSplintRuntime::spawn(
+            SplintId::new(),
+            backend(),
+            shell(
+                "sleep 0.3; stty -echo; printf '\\033]52;c;aGk=\\007'; sleep 0.2; \
+                 printf '\\033]52;p;?\\033\\\\'; read -r line; printf 'got:%s\\n' \"$line\"; \
+                 sleep 0.2",
+            ),
+            fast_config(),
+        )
+        .await
+        .unwrap();
+        let handle = runtime.handle();
+        let (sink, mut events) = mpsc::channel(4);
+        handle.install_clipboard_sink(sink);
+        let set = time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(set.splint_id, handle.splint_id);
+        assert_eq!(set.incarnation, handle.incarnation.value());
+        assert_eq!(
+            set.request,
+            ClipboardRequest::Set {
+                selection: ClipboardSelection::Clipboard,
+                bytes: b"hi".to_vec(),
+            }
+        );
+        let query = time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            query.request,
+            ClipboardRequest::Query {
+                selection: ClipboardSelection::Primary,
+                terminator: ReplyTerminator::StringTerminator,
+            }
+        );
+        // The contents never show on the screen a subscriber or agent reads.
+        assert!(!snapshot_text(&handle.snapshot().await.unwrap()).contains("aGk"));
+        assert!(matches!(
+            handle
+                .write_clipboard_reply(vec![b'x'; MAX_CLIPBOARD_REPLY_BYTES + 1])
+                .await,
+            Err(LiveError::InputQueueFull)
+        ));
+        handle
+            .write_clipboard_reply(b"reply\n".to_vec())
+            .await
+            .unwrap();
+        wait_for_text(&handle, "got:reply").await;
+        // A program's answer is not the person's input.
+        assert!(handle.claim_unused());
+        handle.release_unused_claim();
+        runtime.wait().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_clipboard_query_nobody_can_answer_gets_the_empty_reply_at_once() {
+        let runtime = LiveSplintRuntime::spawn(
+            SplintId::new(),
+            backend(),
+            shell(
+                "stty -icanon -echo min 8 time 50; printf '\\033]52;c;?\\007'; \
+                 head -c 8 | od -An -tx1; sleep 0.2",
+            ),
+            fast_config(),
+        )
+        .await
+        .unwrap();
+        let handle = runtime.handle();
+        wait_for_text(&handle, "1b 5d 35 32 3b 63 3b 07").await;
         runtime.wait().await.unwrap();
     }
 

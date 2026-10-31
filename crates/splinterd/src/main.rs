@@ -3,6 +3,7 @@ mod agent_access;
 mod agent_status;
 mod audit;
 mod candidate_acquire;
+mod clipboard;
 mod consent;
 mod foreground_app;
 mod handoff_requests;
@@ -813,6 +814,10 @@ struct RuntimeRegistry {
     entries: HashMap<SplintId, LiveSplintRuntime>,
     retiring: RetiringRuntimes,
     reserved: Arc<AtomicUsize>,
+    /// Where each admitted runtime sends its program's OSC 52 requests
+    /// (Plan 0074 M2); without it, sets are dropped and queries answered
+    /// empty.
+    clipboard_sink: Option<mpsc::Sender<splinterd::ClipboardEvent>>,
 }
 
 /// A live-registry slot held from before a process is spawned until the
@@ -838,6 +843,7 @@ impl RuntimeRegistry {
             entries: HashMap::new(),
             retiring,
             reserved: Arc::new(AtomicUsize::new(0)),
+            clipboard_sink: None,
         }
     }
 
@@ -859,6 +865,10 @@ impl RuntimeRegistry {
     }
 
     /// Admits a runtime into the slot reserved for it.
+    #[allow(
+        clippy::result_large_err,
+        reason = "a refused runtime returns by value with its slot, to be retired before the slot drops"
+    )]
     fn insert(
         &mut self,
         runtime: LiveSplintRuntime,
@@ -867,6 +877,9 @@ impl RuntimeRegistry {
         let id = runtime.handle().splint_id;
         if self.entries.contains_key(&id) {
             return Err((runtime, slot));
+        }
+        if let Some(sink) = &self.clipboard_sink {
+            runtime.handle().install_clipboard_sink(sink.clone());
         }
         self.entries.insert(id, runtime);
         drop(slot);
@@ -1126,6 +1139,9 @@ struct TerminalPublicationReservation {
 struct QueuedServerFrame {
     frame: ServerFrame,
     terminal_publication: Option<TerminalPublicationReservation>,
+    /// The routed clipboard memory an OSC 52 set holds until its frame is
+    /// written (Plan 0074 M2).
+    clipboard_memory: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl From<ServerFrame> for QueuedServerFrame {
@@ -1133,6 +1149,7 @@ impl From<ServerFrame> for QueuedServerFrame {
         Self {
             frame,
             terminal_publication: None,
+            clipboard_memory: None,
         }
     }
 }
@@ -1228,6 +1245,9 @@ struct DaemonState {
     remote_window_connections: StdMutex<HashSet<u64>>,
     controller: Mutex<ControllerState>,
     control_events: broadcast::Sender<ControlNotice>,
+    /// Plan 0074 M2: the Window control subscriptions that carry OSC 52
+    /// requests, and the queries waiting for an answer.
+    clipboard: Arc<clipboard::ClipboardRoutes>,
     connection_revocations: broadcast::Sender<u64>,
     grants: Mutex<GrantStore>,
     /// "While this workspace is open" and remembered grant definitions and
@@ -2520,6 +2540,7 @@ async fn record_handoff_adoption_audit(state: &DaemonState, rollback: bool) {
         outcome: Some(splinterm_protocol::AuditOutcome::Succeeded),
         argument_count: None,
         executable_basename: None,
+        byte_count: None,
     });
 }
 
@@ -3583,9 +3604,14 @@ fn build_daemon_state(inputs: DaemonStateInputs) -> Arc<DaemonState> {
     let (connection_revocations, _) = broadcast::channel(CONNECTION_LIMIT);
     let retiring = RetiringRuntimes::default();
     let (policy_reloads, _) = broadcast::channel(1);
-    Arc::new(DaemonState {
+    // Plan 0074 M2: every admitted runtime sends its program's OSC 52
+    // requests to one broker, which routes them to the controlling Window.
+    let (clipboard_sink, clipboard_events) = mpsc::channel(clipboard::BROKER_QUEUE);
+    let mut runtimes = RuntimeRegistry::new(retiring.clone());
+    runtimes.clipboard_sink = Some(clipboard_sink);
+    let state = Arc::new(DaemonState {
         topology: RwLock::new(topology),
-        runtimes: Mutex::new(RuntimeRegistry::new(retiring.clone())),
+        runtimes: Mutex::new(runtimes),
         retiring,
         plain_dojos: StdMutex::default(),
         generated_lairs: StdMutex::default(),
@@ -3615,6 +3641,7 @@ fn build_daemon_state(inputs: DaemonStateInputs) -> Arc<DaemonState> {
         automation_connections: Mutex::new(HashMap::new()),
         remote_window_connections: StdMutex::default(),
         controller: Mutex::new(ControllerState::default()),
+        clipboard: Arc::default(),
         control_events,
         connection_revocations,
         grants: Mutex::new(GrantStore::with_ids(Arc::clone(&grant_ids))),
@@ -3659,7 +3686,16 @@ fn build_daemon_state(inputs: DaemonStateInputs) -> Arc<DaemonState> {
             == Some(std::ffi::OsStr::new("1")),
         agent_status: Arc::default(),
         foreground_apps: Arc::default(),
-    })
+    });
+    // Unit tests that build state outside a runtime run without a broker:
+    // their programs' sets are dropped and queries answered empty.
+    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        runtime.spawn(clipboard::run_broker(
+            Arc::downgrade(&state),
+            clipboard_events,
+        ));
+    }
+    state
 }
 
 /// Re-reads the persistent policy, publishes it under the topology
@@ -4327,7 +4363,29 @@ async fn record_policy_reload(state: &DaemonState, generation: &policy::PolicyGe
         outcome: Some(splinterm_protocol::AuditOutcome::Succeeded),
         argument_count: None,
         executable_basename: None,
+        byte_count: None,
     });
+}
+
+/// The audit resource naming a Splint incarnation, while it is in the topology.
+async fn daemon_splint_audit_resource(
+    state: &DaemonState,
+    splint_id: SplintId,
+    incarnation: u64,
+) -> Option<splinterm_protocol::AuditResource> {
+    let lair = state.topology.read().await;
+    lair.lairs().find_map(|named_lair| {
+        named_lair.dojos.iter().find_map(|dojo| {
+            dojo.root
+                .find_splint(splint_id)
+                .map(|_| splinterm_protocol::AuditResource {
+                    lair_id: Some(named_lair.id),
+                    dojo_id: Some(dojo.id),
+                    splint_id: Some(splint_id),
+                    incarnation: Some(incarnation),
+                })
+        })
+    })
 }
 
 async fn append_daemon_splint_audit(
@@ -4339,21 +4397,7 @@ async fn append_daemon_splint_audit(
     reason: &'static str,
     outcome: splinterm_protocol::AuditOutcome,
 ) {
-    let resource = {
-        let lair = state.topology.read().await;
-        lair.lairs().find_map(|named_lair| {
-            named_lair.dojos.iter().find_map(|dojo| {
-                dojo.root
-                    .find_splint(splint_id)
-                    .map(|_| splinterm_protocol::AuditResource {
-                        lair_id: Some(named_lair.id),
-                        dojo_id: Some(dojo.id),
-                        splint_id: Some(splint_id),
-                        incarnation: Some(incarnation),
-                    })
-            })
-        })
-    };
+    let resource = daemon_splint_audit_resource(state, splint_id, incarnation).await;
     state.audit.lock().await.record(audit::AuditDraft {
         unix_seconds: SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -4370,6 +4414,7 @@ async fn append_daemon_splint_audit(
         outcome: Some(outcome),
         argument_count: None,
         executable_basename: None,
+        byte_count: None,
     });
 }
 
@@ -4413,6 +4458,7 @@ async fn append_preset_leaf_audit(state: &DaemonState, splint_id: SplintId, succ
         }),
         argument_count: None,
         executable_basename: None,
+        byte_count: None,
     });
 }
 
@@ -5106,6 +5152,7 @@ async fn serve_authenticated(
                                     maximum_returned_bytes,
                                     grant_id,
                                     revocations,
+                                    window,
                                 } => (
                                     id,
                                     spawn_control_subscription(
@@ -5120,6 +5167,7 @@ async fn serve_authenticated(
                                             maximum_returned_bytes,
                                             grant_id,
                                             revocations,
+                                            window,
                                         },
                                     ),
                                 ),
@@ -5193,6 +5241,9 @@ enum PendingSubscription {
         /// The grant that authorized the subscription, whose revoke ends it.
         grant_id: Option<u64>,
         revocations: broadcast::Receiver<Revocation>,
+        /// Whether a Window, installed client or remote Window, subscribed;
+        /// only its subscription carries OSC 52 requests (Plan 0074 M2).
+        window: bool,
     },
     /// A consent responder (ADR 0015): its offers and their withdrawals.
     /// Dropped before it starts, its responder ends.
@@ -6883,6 +6934,7 @@ fn trusted_ui_request(request: &Request) -> bool {
             | Request::AcknowledgeHandoffPrepare { .. }
             | Request::SubscribeConsentOffers { .. }
             | Request::AnswerConsentOffer { .. }
+            | Request::AnswerClipboardQuery { .. }
     )
 }
 
@@ -8354,6 +8406,7 @@ async fn request_policy_resources(
         | Request::AcknowledgeHandoffPrepare { .. }
         | Request::SubscribeConsentOffers { .. }
         | Request::AnswerConsentOffer { .. }
+        | Request::AnswerClipboardQuery { .. }
         | Request::ClaimDojoPresentation { .. } => Vec::new(),
         Request::ListLairs
         | Request::InspectTopology
@@ -9205,6 +9258,7 @@ async fn append_request_audit(
         outcome: Some(disposition.outcome),
         argument_count,
         executable_basename,
+        byte_count: None,
     });
 }
 
@@ -11743,6 +11797,8 @@ async fn handle_authorized_request(
                     maximum_returned_bytes: authorization.maximum_returned_bytes(),
                     grant_id,
                     revocations,
+                    window: (trusted_ui_client && peer.connection_matches_splinterm())
+                        || remote_interactive_client,
                 }),
                 audit_reason: None,
             });
@@ -12247,6 +12303,34 @@ async fn handle_authorized_request(
                 },
                 subscription: Some(PendingSubscription::ConsentOffers { stream }),
                 audit_reason: None,
+            });
+        }
+        // Plan 0074 M2: the Window a Splint's OSC 52 query was sent to answers
+        // it with its clipboard text, empty when its configuration refuses.
+        // Only that connection's first answer counts; anything else is
+        // acknowledged and ignored, so an answer reveals nothing.
+        Request::AnswerClipboardQuery { query_id, data } => {
+            if !((trusted_ui_client && peer.connection_matches_splinterm())
+                || remote_interactive_client)
+            {
+                return Err(ProtocolError::new(
+                    ErrorCode::Unauthorized,
+                    "only a Window answers a clipboard query",
+                ));
+            }
+            let mut text = splinterm_protocol::decode_clipboard_data(&data)?;
+            if std::str::from_utf8(&text).is_err() {
+                text.clear();
+            }
+            let audit_reason = if state.clipboard.answer(connection_id, query_id, text) {
+                "clipboard_answer_accepted"
+            } else {
+                "clipboard_answer_not_pending"
+            };
+            return Ok(Handled {
+                response: Response::Acknowledged,
+                subscription: None,
+                audit_reason: Some(audit_reason),
             });
         }
         request @ Request::AnswerConsentOffer {
@@ -13197,6 +13281,7 @@ const fn handoff_fenced(request: &Request) -> bool {
         | Request::RevokeAccessEntry { .. }
         | Request::RevokeAllAccess { .. }
         | Request::PrepareDaemonHandoff { .. }
+        | Request::AnswerClipboardQuery { .. }
         | Request::AcknowledgeHandoffPrepare { .. } => false,
         Request::CreateLair { .. }
         | Request::ClaimHandoffControl { .. }
@@ -15603,6 +15688,9 @@ struct ControlSubscriptionContext {
     maximum_returned_bytes: Option<usize>,
     grant_id: Option<u64>,
     revocations: broadcast::Receiver<Revocation>,
+    /// Whether a Window subscribed, so its subscription carries the Splint's
+    /// OSC 52 requests while the connection holds the controller lease.
+    window: bool,
 }
 
 #[allow(
@@ -15624,6 +15712,7 @@ fn spawn_control_subscription(
             maximum_returned_bytes,
             grant_id,
             mut revocations,
+            window,
         } = context;
         let ControlStream {
             notices: mut stream,
@@ -15644,14 +15733,65 @@ fn spawn_control_subscription(
         // as when older notices retained across a lag follow its replay.
         let mut handoff_floor = handoff_seed.serial;
         let mut sequence = 1_u64;
+        // Plan 0074 M2: a Window's subscription carries the Splint's OSC 52
+        // requests while its connection holds the controller lease.
+        let (_clipboard_route, mut clipboard_deliveries) = if window {
+            let routes = &state.clipboard;
+            let (route, deliveries) = routes.register(connection_id, splint_id, incarnation);
+            (Some(route), Some(deliveries))
+        } else {
+            (None, None)
+        };
+        let mut clipboard_open = clipboard_deliveries.is_some();
+        let mut clipboard_pacer = clipboard::SetPacer::default();
         loop {
             let event = if let Some(event) = pending_handoff.take() {
                 Some(event)
             } else {
+                let clipboard_deadline = clipboard_pacer.deadline();
                 // A subscription a grant authorized ends when that grant is
                 // revoked, like a terminal subscription.
                 let received = tokio::select! {
                     received = stream.recv() => received,
+                    delivery = next_clipboard_delivery(clipboard_deliveries.as_mut()), if clipboard_open => {
+                        let Some(delivery) = delivery else {
+                            clipboard_open = false;
+                            continue;
+                        };
+                        let Some(delivery) = clipboard_pacer.offer(delivery, time::Instant::now())
+                        else {
+                            continue;
+                        };
+                        if !send_clipboard_delivery(
+                            &outbound,
+                            (id, &mut sequence),
+                            delivery,
+                            maximum_returned_bytes,
+                        )
+                        .await
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+                    () = time::sleep_until(clipboard_deadline.unwrap_or_else(time::Instant::now)),
+                        if clipboard_deadline.is_some() =>
+                    {
+                        let Some(delivery) = clipboard_pacer.take_due(time::Instant::now()) else {
+                            continue;
+                        };
+                        if !send_clipboard_delivery(
+                            &outbound,
+                            (id, &mut sequence),
+                            delivery,
+                            maximum_returned_bytes,
+                        )
+                        .await
+                        {
+                            break;
+                        }
+                        continue;
+                    }
                     revoked = revocations.recv(), if grant_id.is_some() => {
                         match classify_revocation(&revoked, grant_id) {
                             RevocationDecision::Continue => continue,
@@ -15769,6 +15909,47 @@ fn spawn_control_subscription(
             sequence = sequence.saturating_add(1);
         }
     })
+}
+
+/// The next OSC 52 delivery for a Window control subscription; never ready
+/// for a subscription without a route (Plan 0074 M2).
+async fn next_clipboard_delivery(
+    deliveries: Option<&mut mpsc::Receiver<clipboard::Delivery>>,
+) -> Option<clipboard::Delivery> {
+    match deliveries {
+        Some(deliveries) => deliveries.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Sends one OSC 52 delivery as the subscription's next event. A frame over
+/// the policy limit is skipped rather than ending the subscription: the
+/// program's query then times out empty. `false` when the connection is gone.
+async fn send_clipboard_delivery(
+    outbound: &mpsc::Sender<QueuedServerFrame>,
+    (subscription_id, sequence): (u64, &mut u64),
+    delivery: clipboard::Delivery,
+    maximum_returned_bytes: Option<usize>,
+) -> bool {
+    let (event, clipboard_memory) = clipboard::delivery_event(delivery);
+    let frame = ServerFrame::Event {
+        subscription_id,
+        sequence: *sequence,
+        event,
+    };
+    if !frame_within_policy_limit(&frame, maximum_returned_bytes) {
+        return true;
+    }
+    let queued = QueuedServerFrame {
+        frame,
+        terminal_publication: None,
+        clipboard_memory,
+    };
+    if outbound.send(queued).await.is_err() {
+        return false;
+    }
+    *sequence = sequence.saturating_add(1);
+    true
 }
 
 fn spawn_topology_subscription(
@@ -15920,6 +16101,7 @@ async fn record_subscription_expiry(audit: &SubscriptionAudit, handle: &LiveSpli
         outcome: Some(splinterm_protocol::AuditOutcome::Cancelled),
         argument_count: None,
         executable_basename: None,
+        byte_count: None,
     });
 }
 
@@ -16240,6 +16422,7 @@ fn spawn_subscription(
                         let queued = QueuedServerFrame {
                             frame,
                             terminal_publication: Some(reservation),
+                            clipboard_memory: None,
                         };
                         if let Some(status) = trailing_exit {
                             let _ = send_final_subscription_frames(
@@ -16470,7 +16653,7 @@ async fn write_frames(
     connection_id: u64,
 ) {
     loop {
-        let (frame, _publication_reservation, written) = tokio::select! {
+        let (frame, _held_memory, written) = tokio::select! {
             biased;
             frame = control.recv() => {
                 match frame {
@@ -16495,7 +16678,11 @@ async fn write_frames(
             }
             queued = normal.recv() => {
                 let Some(queued) = queued else { break };
-                (queued.frame, queued.terminal_publication, None)
+                (
+                    queued.frame,
+                    Some((queued.terminal_publication, queued.clipboard_memory)),
+                    None,
+                )
             }
         };
         let identity = frame_trace_identity(&frame);
@@ -16705,6 +16892,7 @@ async fn send_response(
         .send(QueuedServerFrame {
             frame,
             terminal_publication,
+            clipboard_memory: None,
         })
         .await
         .context("writer closed")
@@ -18486,6 +18674,7 @@ mod tests {
             automation_connections: Mutex::new(HashMap::new()),
             remote_window_connections: StdMutex::default(),
             controller: Mutex::new(ControllerState::default()),
+            clipboard: Arc::default(),
             control_events,
             connection_revocations: broadcast::channel(CONNECTION_LIMIT).0,
             grants: Mutex::new(GrantStore::with_ids(Arc::clone(&grant_ids))),
@@ -22321,6 +22510,7 @@ mod tests {
             maximum_returned_bytes: None,
             grant_id: None,
             revocations: state.revocations.subscribe(),
+            window: false,
         };
         let spawn = |id| {
             let (outbound, frames) = mpsc::channel(8);
@@ -22414,6 +22604,7 @@ mod tests {
                 maximum_returned_bytes: None,
                 grant_id: None,
                 revocations: state.revocations.subscribe(),
+                window: false,
             },
         ));
         let first = time::timeout(Duration::from_secs(5), frames.recv())
@@ -22491,6 +22682,7 @@ mod tests {
                 maximum_returned_bytes: None,
                 grant_id: None,
                 revocations: state.revocations.subscribe(),
+                window: false,
             },
         ));
         assert!(
@@ -31022,6 +31214,7 @@ mod tests {
                 maximum_returned_bytes: None,
                 grant_id: None,
                 revocations: state.revocations.subscribe(),
+                window: false,
             },
         ));
         (task, frames)
@@ -31039,6 +31232,297 @@ mod tests {
             panic!("expected a control event: {frame:?}");
         };
         event
+    }
+
+    /// Plan 0074 M2: a program that sets or reads the clipboard on request.
+    /// Each `query` line prints its queries, then the reply line it reads
+    /// with ESC as `E` and BEL as `B`.
+    const OSC52_PROGRAM: &str = "stty -echo; while read -r cmd; do case \"$cmd\" in \
+        set) printf '\\033]52;c;aGk=\\007' ;; \
+        query) printf '\\033]52;c;?\\007'; read -r reply; \
+            printf 'reply:%s\\n' \"$reply\" | tr '\\033\\007' EB ;; \
+        twice) printf '\\033]52;c;?\\007\\033]52;p;?\\007'; read -r reply; \
+            printf 'reply:%s\\n' \"$reply\" | tr '\\033\\007' EB ;; \
+        esac; done";
+
+    /// A state whose admitted runtimes send OSC 52 requests to a broker, as
+    /// the daemon's do, and one live Splint running [`OSC52_PROGRAM`].
+    async fn osc52_state() -> (Arc<DaemonState>, LiveSplintHandle) {
+        let state = test_state_with_backend(false, test_pty_backend());
+        let (sink, events) = mpsc::channel(clipboard::BROKER_QUEUE);
+        state.runtimes.lock().await.clipboard_sink = Some(sink);
+        tokio::spawn(clipboard::run_broker(Arc::downgrade(&state), events));
+        let revision = state.topology.read().await.revision();
+        let response = trusted_request(
+            &state,
+            81,
+            Request::CreateLair {
+                expected_topology_revision: revision,
+                name: "osc52".into(),
+                launch: test_launch(&["/bin/sh", "-c", OSC52_PROGRAM]),
+                generated_name: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(response, Response::LairCreated { .. }));
+        let handle = state
+            .runtimes
+            .lock()
+            .await
+            .handles()
+            .into_values()
+            .next()
+            .unwrap();
+        (state, handle)
+    }
+
+    /// A control subscription of `connection_id`, a Window's when `window`.
+    fn watch_osc52_control(
+        state: &Arc<DaemonState>,
+        connection_id: u64,
+        handle: &LiveSplintHandle,
+        window: bool,
+    ) -> (AbortOnDrop, mpsc::Receiver<QueuedServerFrame>) {
+        let (outbound, frames) = mpsc::channel(8);
+        let task = AbortOnDrop::new(spawn_control_subscription(
+            connection_id,
+            state.handoff_gate.subscribe_control(&state.control_events),
+            outbound,
+            ControlSubscriptionContext {
+                state: Arc::clone(state),
+                connection_id,
+                splint_id: handle.splint_id,
+                incarnation: handle.incarnation.value(),
+                maximum_returned_bytes: None,
+                grant_id: None,
+                revocations: state.revocations.subscribe(),
+                window,
+            },
+        ));
+        (task, frames)
+    }
+
+    async fn wait_for_screen(handle: &LiveSplintHandle, needle: &str, count: usize) {
+        time::timeout(Duration::from_secs(5), async {
+            loop {
+                let snapshot = handle.snapshot().await.unwrap();
+                let text = snapshot
+                    .visible_rows
+                    .iter()
+                    .flat_map(|row| row.cells.iter())
+                    .map(|cell| cell.content.as_str())
+                    .collect::<String>();
+                if text.matches(needle).count() >= count {
+                    return;
+                }
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("the screen never showed {needle:?}"));
+    }
+
+    /// The reasons of every clipboard audit record of `operation`, oldest
+    /// first, after checking none carries the test's clipboard text.
+    async fn clipboard_audit(
+        state: &DaemonState,
+        operation: splinterm_protocol::AuditOperation,
+    ) -> Vec<(String, Option<u64>)> {
+        let page = state.audit.lock().await.page(None, 64);
+        let encoded = serde_json::to_string(&page.records).unwrap();
+        assert!(!encoded.contains("aGk") && !encoded.contains("secret"));
+        page.records
+            .into_iter()
+            .filter(|record| {
+                record.operation == operation && record.peer == state.daemon_audit_peer
+            })
+            .map(|record| (record.reason, record.byte_count))
+            .collect()
+    }
+
+    async fn wait_for_clipboard_audit(
+        state: &DaemonState,
+        operation: splinterm_protocol::AuditOperation,
+        count: usize,
+    ) -> Vec<(String, Option<u64>)> {
+        time::timeout(Duration::from_secs(5), async {
+            loop {
+                let records = clipboard_audit(state, operation).await;
+                if records.len() >= count {
+                    return records;
+                }
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the clipboard request is audited")
+    }
+
+    async fn no_control_event(frames: &mut mpsc::Receiver<QueuedServerFrame>) {
+        assert!(
+            time::timeout(Duration::from_millis(200), frames.recv())
+                .await
+                .is_err(),
+            "the subscription heard nothing"
+        );
+    }
+
+    /// Plan 0074 M2: a program's OSC 52 set reaches the Window holding the
+    /// Splint's controller lease, and nobody else: not a Window that only
+    /// views it, and never automation, even holding the lease itself. The
+    /// audit records the byte count, never the text.
+    #[tokio::test]
+    async fn osc52_sets_reach_only_the_controlling_window() {
+        use splinterm_protocol::AuditOperation;
+
+        let (state, handle) = osc52_state().await;
+        let (splint_id, incarnation) = (handle.splint_id, handle.incarnation.value());
+        let lease = state
+            .controller
+            .lock()
+            .await
+            .acquire(501, splint_id, incarnation, None)
+            .unwrap();
+        let (_controlling, mut controlling) = watch_osc52_control(&state, 501, &handle, true);
+        let (_viewing, mut viewing) = watch_osc52_control(&state, 502, &handle, true);
+        let (_agent, mut agent) = watch_osc52_control(&state, 503, &handle, false);
+        handle.input(b"set\n".to_vec()).await.unwrap();
+        assert_eq!(
+            next_control_event(&mut controlling).await,
+            SubscriptionEvent::ClipboardSet {
+                selection: splinterm_protocol::ClipboardSelection::Clipboard,
+                data: "aGk=".into(),
+            }
+        );
+        no_control_event(&mut viewing).await;
+        no_control_event(&mut agent).await;
+        assert_eq!(
+            wait_for_clipboard_audit(&state, AuditOperation::ClipboardSet, 1).await,
+            [("clipboard_set_sent_to_window".into(), Some(2))]
+        );
+
+        // An agent holding the lease gets nothing, and neither does a Window.
+        state.controller.lock().await.release(lease.id).unwrap();
+        state
+            .controller
+            .lock()
+            .await
+            .acquire(503, splint_id, incarnation, None)
+            .unwrap();
+        handle.input(b"set\n".to_vec()).await.unwrap();
+        assert_eq!(
+            wait_for_clipboard_audit(&state, AuditOperation::ClipboardSet, 2).await[1],
+            ("clipboard_set_no_controlling_window".into(), Some(2))
+        );
+        no_control_event(&mut controlling).await;
+        no_control_event(&mut viewing).await;
+        no_control_event(&mut agent).await;
+    }
+
+    /// Plan 0074 M2: the controlling Window answers a program's query, and
+    /// the reply reaches the program as input; another connection's answer
+    /// and an automation peer's are ignored. A second query while one waits
+    /// is answered empty at once, and every reply keeps the program's order.
+    #[tokio::test]
+    async fn osc52_queries_are_answered_by_the_controlling_window() {
+        use splinterm_protocol::AuditOperation;
+
+        let (state, handle) = osc52_state().await;
+        let (splint_id, incarnation) = (handle.splint_id, handle.incarnation.value());
+        state
+            .controller
+            .lock()
+            .await
+            .acquire(501, splint_id, incarnation, None)
+            .unwrap();
+        let pinned = Arc::new(consent::PinnedClientSnapshot::own_executable_for_test());
+        let window = pinned_window_peer(&pinned);
+        let (_controlling, mut controlling) = watch_osc52_control(&state, 501, &handle, true);
+        handle.input(b"twice\n".to_vec()).await.unwrap();
+        let SubscriptionEvent::ClipboardQuery {
+            query_id,
+            selection,
+        } = next_control_event(&mut controlling).await
+        else {
+            panic!("expected a clipboard query");
+        };
+        assert_eq!(selection, splinterm_protocol::ClipboardSelection::Clipboard);
+        assert_eq!(
+            wait_for_clipboard_audit(&state, AuditOperation::ClipboardQuery, 1).await,
+            [("clipboard_query_already_pending".into(), Some(0))]
+        );
+        let answer = |data: &str| Request::AnswerClipboardQuery {
+            query_id,
+            data: data.into(),
+        };
+        // An automation peer may not answer at all.
+        let refused = handle_request(
+            answer("c2VjcmV0"),
+            &state,
+            &PeerIdentity::for_test(),
+            503,
+            0,
+            false,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(refused.code, ErrorCode::Unauthorized);
+        // Another Window's answer is acknowledged and ignored.
+        let ignored = handle_request(answer("c2VjcmV0"), &state, &window, 502, 0, true, false)
+            .await
+            .unwrap();
+        assert!(matches!(ignored.response, Response::Acknowledged));
+        assert_eq!(ignored.audit_reason, Some("clipboard_answer_not_pending"));
+        let accepted = handle_request(answer("aGk="), &state, &window, 501, 0, true, false)
+            .await
+            .unwrap();
+        assert_eq!(accepted.audit_reason, Some("clipboard_answer_accepted"));
+        assert_eq!(
+            wait_for_clipboard_audit(&state, AuditOperation::ClipboardQuery, 2).await[1],
+            ("clipboard_query_window_answered".into(), Some(2))
+        );
+        handle.input(b"\n".to_vec()).await.unwrap();
+        wait_for_screen(&handle, "reply:E]52;p;BE]52;c;aGk=B", 1).await;
+    }
+
+    /// Plan 0074 M2: with no controlling Window, or a Window that never
+    /// answers, the program gets the empty reply instead of waiting forever.
+    #[tokio::test]
+    async fn osc52_queries_nobody_answers_get_the_empty_reply() {
+        use splinterm_protocol::AuditOperation;
+
+        let (state, handle) = osc52_state().await;
+        let (splint_id, incarnation) = (handle.splint_id, handle.incarnation.value());
+        handle.input(b"query\n".to_vec()).await.unwrap();
+        assert_eq!(
+            wait_for_clipboard_audit(&state, AuditOperation::ClipboardQuery, 1).await,
+            [("clipboard_query_no_controlling_window".into(), Some(0))]
+        );
+        handle.input(b"\n".to_vec()).await.unwrap();
+        wait_for_screen(&handle, "reply:E]52;c;B", 1).await;
+
+        state
+            .controller
+            .lock()
+            .await
+            .acquire(501, splint_id, incarnation, None)
+            .unwrap();
+        let (_controlling, mut controlling) = watch_osc52_control(&state, 501, &handle, true);
+        handle.input(b"query\n".to_vec()).await.unwrap();
+        assert!(matches!(
+            next_control_event(&mut controlling).await,
+            SubscriptionEvent::ClipboardQuery { .. }
+        ));
+        let started = time::Instant::now();
+        assert_eq!(
+            wait_for_clipboard_audit(&state, AuditOperation::ClipboardQuery, 2).await[1],
+            ("clipboard_query_timed_out".into(), Some(0))
+        );
+        assert!(started.elapsed() >= clipboard::QUERY_TIMEOUT - Duration::from_millis(100));
+        handle.input(b"\n".to_vec()).await.unwrap();
+        wait_for_screen(&handle, "reply:E]52;c;B", 2).await;
     }
 
     /// The request audit's reasons for every resize reclaim, oldest first.
@@ -31965,6 +32449,7 @@ mod tests {
                 maximum_returned_bytes: None,
                 grant_id: Some(77),
                 revocations: state.revocations.subscribe(),
+                window: false,
             },
         ));
         // Another grant's revoke is not this one.

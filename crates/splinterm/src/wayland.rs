@@ -177,6 +177,7 @@ use crate::renderer::{
 use crate::renderer::{lair_explorer_layout, paint_box_drawing_cell};
 use crate::{
     keymap::{ActionId, KeymapPress, PrefixState, ResolvedKeymap},
+    osc52::{Osc52Hub, Osc52Policy},
     tab::{DojoTab, WindowTabSet, sanitized_tab_label},
     viewport::ScrollbackViewport,
 };
@@ -191,6 +192,7 @@ mod dispatch;
 mod file_drop;
 mod handoff;
 mod input;
+mod osc52;
 mod selection;
 mod staged;
 mod tabs;
@@ -972,6 +974,7 @@ impl WaylandSession {
             app.draw_if_pending(queue_handle)?;
             app.tick_signoff(queue_handle)?;
             app.apply_clipboard_reads()?;
+            app.apply_osc52_requests(queue_handle);
             app.apply_clipboard_image_events();
             app.tick_cursor_blink(queue_handle)?;
             app.tick_agent_spinner(queue_handle)?;
@@ -1084,6 +1087,9 @@ fn assemble_app(
     }
     let initial_lair_id = initial_identity.lair_id;
     let initial_dojo_id = initial_identity.dojo_id;
+    if let Some(hub) = &options.osc52 {
+        hub.set_waker(update_waker.clone());
+    }
     let mut app = App {
         platform,
         surface,
@@ -1157,6 +1163,7 @@ fn assemble_app(
             pointer: None,
             pointer_seat: None,
             last_pointer_serial: None,
+            last_input_serial: None,
             pressed_buttons: HashMap::new(),
             divider_drag: None,
             vertical_wheel: WheelAccumulator::default(),
@@ -1176,6 +1183,8 @@ fn assemble_app(
             primary_sources: Vec::new(),
             image_directory: options.clipboard_image_directory,
             middle_click_paste: options.middle_click_paste,
+            osc52_policy: options.osc52_policy,
+            osc52: options.osc52.take(),
             local_endpoint: options.local_endpoint,
             image_request: None,
             palette_image_target: None,
@@ -2714,6 +2723,9 @@ struct InputState {
     pointer: Option<wl_pointer::WlPointer>,
     pointer_seat: Option<wl_seat::WlSeat>,
     last_pointer_serial: Option<u32>,
+    /// The newest key, keyboard focus, or button serial, which an OSC 52 set
+    /// from a program publishes its selection with (Plan 0074 M2).
+    last_input_serial: Option<u32>,
     pressed_buttons: HashMap<u32, PressOwner>,
     divider_drag: Option<DividerDrag>,
     vertical_wheel: WheelAccumulator,
@@ -2732,6 +2744,11 @@ struct ClipboardState {
     image_directory: Option<PathBuf>,
     /// `[clipboard] middle-click-paste`; configuration reload applies it.
     middle_click_paste: bool,
+    /// `[clipboard] osc52`; configuration reload applies it (Plan 0074 M2).
+    osc52_policy: Osc52Policy,
+    /// The OSC 52 requests of this Window's panes, when its client routes
+    /// them here.
+    osc52: Option<Osc52Hub>,
     local_endpoint: bool,
     image_request: Option<clipboard_image::ImageRequest>,
     palette_image_target: Option<FileDropTarget>,
@@ -7152,6 +7169,7 @@ impl App {
                     .reload(loaded.config.theme_colors());
                 self.clipboard.image_directory = loaded.config.clipboard_image_directory;
                 self.clipboard.middle_click_paste = loaded.config.middle_click_paste;
+                self.clipboard.osc52_policy = loaded.config.osc52;
                 if self.input.forced_control_follows_remote_prompts {
                     // Plan 0072 M3: only while this Window can confirm one.
                     self.input.forced_control_transfer = loaded.config.remote_agent_prompts;

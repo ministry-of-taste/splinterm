@@ -28,7 +28,10 @@ pub(crate) use composed::ComposedTable;
 pub use config::{DEFAULT_SIXEL_PALETTE, SixelConfig, TerminalConfig};
 pub use coord::{Coordinate, CoordinateRange, ScrollRegion};
 pub use cursor::Cursor;
-pub use event::TerminalEvent;
+pub use event::{
+    ClipboardSelection, OSC52_MAX_BASE64_BYTES, OSC52_MAX_BYTES, ReplyTerminator, TerminalEvent,
+    osc52_reply,
+};
 pub use grid::{Grid, ScrollDirection, ScrollResult};
 pub use image::{
     CellExtent, DEFAULT_KITTY_UPLOAD_BYTES_PER_DAEMON, ImageAlphaMode, ImageContent,

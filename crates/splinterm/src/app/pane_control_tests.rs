@@ -212,6 +212,7 @@ async fn run_case_debounced(
                 resyncs,
                 handoff: hub.source(),
                 forces: ForcesInFlight::default(),
+                osc52: Osc52Hub::default(),
             },
             owned.then_some(1),
             splint_id,
@@ -954,6 +955,7 @@ async fn cancellation_stops_a_chain_of_coalescing_barriers() {
                 resyncs,
                 handoff: HandoffStatusHub::default().source(),
                 forces: ForcesInFlight::default(),
+                osc52: Osc52Hub::default(),
             },
             Some(1),
             id,
@@ -1207,6 +1209,7 @@ async fn handoff_phase_after_connection_loss(
                 resyncs,
                 handoff: hub.source(),
                 forces: ForcesInFlight::default(),
+                osc52: Osc52Hub::default(),
             },
             None,
             id,
@@ -1631,6 +1634,7 @@ async fn a_resynchronization_during_an_outage_never_ends_the_controller() {
         resyncs: resync_sender,
         handoff: hub.source(),
         forces: ForcesInFlight::default(),
+        osc52: Osc52Hub::default(),
     };
     let token = cancellation.clone();
     let controller = tokio::spawn(async move {
@@ -3021,4 +3025,162 @@ async fn a_reclaim_answered_with_anything_but_a_grant_or_a_refusal_is_fatal() {
     )
     .await;
     assert!(result.is_err());
+}
+
+/// Reads the client's next request, checks it, and answers `result`.
+async fn expect_request(
+    reader: &mut (impl AsyncRead + Unpin),
+    writer: &mut (impl AsyncWrite + Unpin),
+    expected: Request,
+    result: Response,
+) {
+    let ClientFrame::Request {
+        request_id,
+        request,
+        ..
+    } = read_client(reader).await
+    else {
+        panic!("expected a request");
+    };
+    assert_eq!(request, expected);
+    send_frame(writer, ServerFrame::Response { request_id, result }).await;
+}
+
+/// The Window's next OSC 52 request, keeping later ones already taken from
+/// the hub in `taken`.
+async fn next_osc52_request(
+    hub: &splinterm::osc52::Osc52Hub,
+    taken: &mut std::collections::VecDeque<splinterm::osc52::Osc52Request>,
+) -> splinterm::osc52::Osc52Request {
+    for _ in 0..10_000 {
+        taken.extend(hub.drain());
+        if let Some(request) = taken.pop_front() {
+            return request;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    panic!("the pane handed the Window no OSC 52 request");
+}
+
+/// A daemon for [`a_pane_hands_osc52_requests_to_its_window_and_answers_every_query`]:
+/// one set, then three queries, each answered before the next; `answered`
+/// reports the last answer.
+async fn osc52_daemon(
+    server: tokio::io::DuplexStream,
+    id: SplintId,
+    answered: tokio::sync::oneshot::Sender<()>,
+) {
+    use splinterm_protocol::ClipboardSelection;
+
+    let (mut reader, mut writer) = tokio::io::split(server);
+    let _hello = read_client(&mut reader).await;
+    send_frame(&mut writer, server_hello(ServerLimits::default())).await;
+    expect_request(
+        &mut reader,
+        &mut writer,
+        Request::SubscribeControl {
+            splint_id: id,
+            incarnation: 7,
+        },
+        control_subscribed(id, true),
+    )
+    .await;
+    let event = |sequence, event| ServerFrame::Event {
+        subscription_id: 9,
+        sequence,
+        event,
+    };
+    let set = SubscriptionEvent::ClipboardSet {
+        selection: ClipboardSelection::Clipboard,
+        data: "aGk=".into(),
+    };
+    send_frame(&mut writer, event(1, set)).await;
+    for (sequence, query_id, data) in [(2, 21, "eW8="), (3, 22, ""), (4, 23, "")] {
+        let query = SubscriptionEvent::ClipboardQuery {
+            query_id,
+            selection: ClipboardSelection::Primary,
+        };
+        send_frame(&mut writer, event(sequence, query)).await;
+        expect_request(
+            &mut reader,
+            &mut writer,
+            Request::AnswerClipboardQuery {
+                query_id,
+                data: data.into(),
+            },
+            Response::Acknowledged,
+        )
+        .await;
+    }
+    answered.send(()).unwrap();
+    let mut rest = Vec::new();
+    let _ = reader.read_to_end(&mut rest).await;
+    assert!(rest.is_empty(), "nothing else was sent");
+}
+
+/// Plan 0074 M2: a pane hands its control subscription's OSC 52 sets and
+/// queries to the Window, and answers each query with the Window's text,
+/// or empty when the Window drops it or does not answer in time.
+#[tokio::test(start_paused = true)]
+async fn a_pane_hands_osc52_requests_to_its_window_and_answers_every_query() {
+    use splinterm::osc52::{Osc52Hub, Osc52Request, QUERY_ANSWER_TIMEOUT};
+    use splinterm_protocol::ClipboardSelection;
+
+    let id = SplintId::new();
+    let (client, server) = tokio::io::duplex(65536);
+    let (answered, all_answered) = tokio::sync::oneshot::channel();
+    let daemon = tokio::spawn(osc52_daemon(server, id, answered));
+    let (reader, writer) = tokio::io::split(client);
+    let control = Connection::connect_remote_interactive_transport(reader, writer)
+        .await
+        .unwrap();
+    let hub = Osc52Hub::default();
+    hub.set_waker(std::task::Waker::noop().clone());
+    let mut taken = std::collections::VecDeque::new();
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let (updates, _window) = mpsc::channel(WINDOW_UPDATE_QUEUE);
+    let (resyncs, _resyncs) = mpsc::channel(1);
+    let (_commands, commands) = mpsc::channel(WINDOW_COMMAND_QUEUE);
+    let controller = tokio::spawn(run_controller(
+        control,
+        commands,
+        ControllerOutputs {
+            updates,
+            resyncs,
+            handoff: HandoffStatusHub::default().source(),
+            forces: ForcesInFlight::default(),
+            osc52: hub.clone(),
+        },
+        None,
+        id,
+        7,
+        ForcedControlTransfer::Disabled,
+        0,
+        cancellation.clone(),
+    ));
+    let request = next_osc52_request(&hub, &mut taken).await;
+    let Osc52Request::Set { selection, text } = request else {
+        panic!("the set comes first");
+    };
+    assert_eq!(selection, ClipboardSelection::Clipboard);
+    assert_eq!(text, "hi");
+    // The Window answers one query, drops the next, and never answers the
+    // third.
+    let request = next_osc52_request(&hub, &mut taken).await;
+    let Osc52Request::Query { selection, answer } = request else {
+        panic!("a query follows");
+    };
+    assert_eq!(selection, ClipboardSelection::Primary);
+    answer.send(b"yo".to_vec()).unwrap();
+    drop(next_osc52_request(&hub, &mut taken).await);
+    let request = next_osc52_request(&hub, &mut taken).await;
+    let Osc52Request::Query { answer: _held, .. } = request else {
+        panic!("a third query follows");
+    };
+    let started = tokio::time::Instant::now();
+    all_answered.await.unwrap();
+    assert!(started.elapsed() >= QUERY_ANSWER_TIMEOUT - Duration::from_millis(100));
+    cancellation.cancel();
+    controller.await.unwrap().unwrap();
+    daemon.await.unwrap();
 }

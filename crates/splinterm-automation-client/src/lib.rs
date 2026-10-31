@@ -5121,6 +5121,7 @@ mod tests {
                 outcome: Some(AuditOutcome::Succeeded),
                 argument_count: None,
                 executable_basename: None,
+                byte_count: None,
             }],
             retention_gap: false,
             oldest_available_audit_id: Some(1),

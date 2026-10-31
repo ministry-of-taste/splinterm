@@ -93,6 +93,50 @@ notice. Successful saves also persist until manually deleted.
 Descriptor-relative access and identity rechecks detect ordinary
 substitution, but do not sandbox hostile processes running as your own user.
 
+## Programs and the clipboard (OSC 52)
+
+Programs in a pane can set and read the clipboard through the OSC 52 escape
+sequence, as in Alacritty with `osc52 = "CopyPaste"`. That is how Neovim, tmux,
+and programs over SSH copy to your desktop clipboard, and how some of them
+paste from it. `[clipboard] osc52` sets what they may do:
+
+| Value | A program may |
+| --- | --- |
+| `copy-paste` (default) | set the clipboard and the primary selection, and read them |
+| `copy` | set them; a read gets an empty answer |
+| `off` | do neither; a read gets an empty answer |
+
+```ini
+[clipboard]
+osc52=copy
+```
+
+Configuration reload applies a change. The target letters `c` (clipboard), `p`
+and `s` (primary selection) are understood; an empty target means the
+clipboard. A set carries at most 1 MiB of UTF-8 text; anything larger, not
+valid base64, or not text is ignored. A read answers with text only, at most
+1 MiB, and with an empty answer when the clipboard holds no text or does not
+answer within about a second.
+
+Only the Window that controls the pane, by typing in it or resizing it, sets
+or reads its clipboard; a Window that only shows the pane does nothing, and an
+agent connected through MCP or the automation socket never receives a set or a
+read. With no controlling Window, a read gets an empty answer at once. Every
+set and read is recorded in the daemon audit with its target, byte count, and
+outcome, never the text.
+
+**What the default allows.** With `copy-paste`, any program running in a pane
+your Window controls can read your clipboard without asking, and replace it,
+including a program on a remote host you reached over SSH, and an agent such
+as Claude Code or Codex running in the pane. Whatever you copied last, such as
+a password from a password manager, is readable that way. An agent you gave
+**Look and type** access through MCP can start such a program in the pane; it
+reads the clipboard once your Window controls the pane again, and the agent
+can then read the result from the screen. Set `osc52=copy` to let programs
+copy without reading, or `osc52=off` to refuse both. OSC 52 never gives an
+agent connected only through MCP a clipboard of its own: clipboard scopes stay
+invalid there.
+
 ## Supported keys
 
 | Section/key | Meaning | Range/default |
@@ -127,6 +171,7 @@ substitution, but do not sandbox hostile processes running as your own user.
 | `scrollback.lines` | daemon terminal history budget | 0–1,000,000; 1000 |
 | `clipboard.image-directory` | explicit absolute private directory for user-requested local clipboard PNG saves | unset; no temporary fallback |
 | `clipboard.middle-click-paste` | a middle click pastes the primary selection into the terminal; `no` makes it an ordinary button, reported to a program that tracks the mouse ([Pointer, selection, clipboard, and URLs](usage.md#pointer-selection-clipboard-and-urls)); configuration reload applies it | strict boolean; yes |
+| `clipboard.osc52` | what programs in a pane may do with the clipboard and primary selection through OSC 52: `copy-paste` sets and reads them, `copy` only sets them, `off` neither; a refused read gets an empty answer ([Programs and the clipboard](#programs-and-the-clipboard-osc-52)); configuration reload applies it | `copy-paste`, `copy`, or `off`; copy-paste |
 | `cursor.style` | `block`, `beam`, or `underline` | block |
 | `cursor.blink` | permit cursor blink | yes |
 | `multiplexer.persistent-by-default` | ordinary unnamed local graphical terminals create persistent (`yes`) or Window-owned transient (`no`) Lairs | yes |

@@ -25,6 +25,7 @@ pub mod handoff_status;
 pub mod keymap;
 mod native_atspi;
 pub mod navigation_projection;
+pub mod osc52;
 pub mod pane;
 pub mod preset;
 pub mod remote;

@@ -19,11 +19,12 @@ impl KeyboardHandler for App {
         queue_handle: &QueueHandle<Self>,
         _keyboard: &wl_keyboard::WlKeyboard,
         surface: &wl_surface::WlSurface,
-        _serial: u32,
+        serial: u32,
         _raw: &[u32],
         _keysyms: &[Keysym],
     ) {
         if surface == self.surface.window.wl_surface() {
+            self.input.last_input_serial = Some(serial);
             // A trusted dialog arms its delayed actions from focus: the
             // access consent dialog again on every focus gain.
             if let Some(consent) = self.modal.trusted_consent.as_mut() {
@@ -79,6 +80,7 @@ impl KeyboardHandler for App {
         event: KeyEvent,
     ) {
         self.input.pressed_keys.insert(event.raw_code);
+        self.input.last_input_serial = Some(serial);
         if self.scheduling.parked.is_some() {
             // A parked Window takes no input: its phase has ended.
             self.input.carried_keys.insert(event.raw_code);

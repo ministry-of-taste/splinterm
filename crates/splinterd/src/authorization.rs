@@ -139,7 +139,10 @@ pub const fn for_request(request: &Request) -> RequestAuthorization {
         // Plan 0072: a Window takes control by resizing, without a dialog
         // and from any holder; only the installed client and remote Windows
         // send it, and no policy rule or grant admits anyone else.
-        | Request::ReclaimControl { .. } => RequestAuthorization::TrustedUi,
+        | Request::ReclaimControl { .. }
+        // Plan 0074 M2: only the Window asked for a Splint's clipboard answers;
+        // automation never sees a query to answer.
+        | Request::AnswerClipboardQuery { .. } => RequestAuthorization::TrustedUi,
         Request::ListLairs | Request::InspectTopology | Request::InspectSplint { .. } => {
             RequestAuthorization::policy(&[Scope::TopologyMetadataRead])
         }

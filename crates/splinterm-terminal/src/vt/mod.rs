@@ -18,6 +18,10 @@ const PARAM_LIMIT: usize = 16;
 const SUBPARAM_LIMIT: usize = 16;
 const INTERMEDIATE_LIMIT: usize = 4;
 const MAX_CHECKPOINT_PARSER_STRING_BYTES: usize = 1024 * 1024;
+/// How much one OSC 52 string may collect (Plan 0074 M2): `52;`, its targets,
+/// and base64 for [`crate::OSC52_MAX_BYTES`]. Only a string that begins `52;`
+/// is given it, so every other OSC keeps the configured limit.
+const OSC52_STRING_LIMIT: usize = 64 + crate::OSC52_MAX_BASE64_BYTES;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -196,6 +200,47 @@ impl Parser {
             utf8_minimum: 0,
             utf8_remaining: 0,
             string_utf8_remaining: 0,
+        }
+    }
+
+    /// This parser as a checkpoint carries it. An OSC 52 string collected past
+    /// the configured OSC limit is carried as an overflowed OSC: after a
+    /// restore the rest of it is consumed and dropped, so a checkpoint keeps
+    /// ordinary OSC bounds and an older daemon still accepts it.
+    pub(crate) fn checkpoint_copy(&self) -> Self {
+        let extended = matches!(self.state, State::OscString | State::OscEscape)
+            && self.string_limit > self.osc_limit;
+        if !extended {
+            return self.clone();
+        }
+        Self {
+            string_limit: self.osc_limit,
+            string_truncated: true,
+            string_utf8_remaining: 0,
+            ..self.clone_without_string()
+        }
+    }
+
+    fn clone_without_string(&self) -> Self {
+        Self {
+            state: self.state,
+            private: self.private,
+            intermediates: self.intermediates,
+            intermediate_count: self.intermediate_count,
+            params: self.params,
+            current_param: self.current_param,
+            current_subparam: self.current_subparam,
+            parameter_overflow: self.parameter_overflow,
+            string: Vec::new(),
+            string_limit: self.string_limit,
+            string_truncated: self.string_truncated,
+            osc_limit: self.osc_limit,
+            dcs_limit: self.dcs_limit,
+            sixel_streaming: self.sixel_streaming,
+            utf8_value: self.utf8_value,
+            utf8_minimum: self.utf8_minimum,
+            utf8_remaining: self.utf8_remaining,
+            string_utf8_remaining: self.string_utf8_remaining,
         }
     }
 
@@ -490,6 +535,8 @@ impl Parser {
                     self.push_string(byte);
                     if self.string == b"1337;File=" {
                         self.start_string(State::ItermControl, 1024);
+                    } else if self.string == b"52;" {
+                        self.string_limit = self.string_limit.max(OSC52_STRING_LIMIT);
                     }
                     (None, false)
                 }

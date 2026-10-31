@@ -601,6 +601,12 @@ explicit collision-safe workflow. See [Presets](presets.md) for exact behavior.
 - A middle click pastes the primary selection. Set
   `[clipboard] middle-click-paste=no` to make it an ordinary button, reported
   to programs that track the mouse.
+- Programs in a pane can copy to the clipboard and read it through OSC 52, as
+  Neovim and tmux do, including over SSH. Only the Window that controls the
+  pane answers. With the default `[clipboard] osc52=copy-paste`, any program
+  there can read the clipboard without asking; set `osc52=copy` to let
+  programs copy but not read, or `osc52=off` to refuse both
+  ([Programs and the clipboard](configuration.md#programs-and-the-clipboard-osc-52)).
 - URL recognition/activation and pointer reporting follow the implemented
   Foot-derived terminal behavior and current control ownership.
 - Right-clicking trusted tab chrome opens the tab menu; terminal-controlled

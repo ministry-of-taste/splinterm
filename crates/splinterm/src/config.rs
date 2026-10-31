@@ -28,6 +28,7 @@ use crate::{
     font_shaping::{FeatureSettings, FontLigatures},
     geometry::{FontSize, FontSizingPolicy, TerminalPadding},
     keymap::{KeymapProfile, ResolvedKeymap, resolve_keymap},
+    osc52::Osc52Policy,
     preset::PresetCatalog,
     theme::{
         Appearance, BuiltinThemeProvider, ChromeRoles, Role, RoleHints, RoleOverrideLayers,
@@ -107,6 +108,9 @@ pub struct AppConfig {
     /// terminal (`[clipboard] middle-click-paste`, default on). Off, a
     /// middle click reaches a program that tracks the mouse instead.
     pub middle_click_paste: bool,
+    /// What programs in a pane may do with the clipboard through OSC 52
+    /// (`[clipboard] osc52`, default `copy-paste`; Plan 0074 M2).
+    pub osc52: Osc52Policy,
     pub pane_divider_style: PaneDividerStyle,
     /// `[multiplexer] pane-gap`: empty logical px between adjacent Splint
     /// panes' outer edges, outside any frame or around a divider line. Zero
@@ -373,6 +377,7 @@ impl Default for AppConfig {
             theme_path: None,
             clipboard_image_directory: None,
             middle_click_paste: true,
+            osc52: Osc52Policy::CopyPaste,
             pane_divider_style: PaneDividerStyle::Line,
             pane_gap: 0,
             frame_title_mode: FrameTitleMode::Splint,
@@ -1275,6 +1280,16 @@ fn parse_with_base(text: &str, config_dir: &Path) -> Result<ConfigLoad> {
             }
             "clipboard.middle-click-paste" => {
                 config.middle_click_paste = parse_bool(value, index)?;
+                false
+            }
+            "clipboard.osc52" => {
+                let Some(policy) = Osc52Policy::parse(&value.to_ascii_lowercase()) else {
+                    bail!(
+                        "line {}: clipboard.osc52 must be copy-paste, copy, or off",
+                        index + 1
+                    );
+                };
+                config.osc52 = policy;
                 false
             }
             "main.font" | "font" => {
@@ -3804,6 +3819,33 @@ pub(crate) mod tests {
         }
         let shipped = parse(include_str!("../../../config/splinterm/config.ini")).unwrap();
         assert!(shipped.config.middle_click_paste);
+    }
+
+    #[test]
+    fn osc52_defaults_to_copy_paste_and_can_be_narrowed() {
+        assert_eq!(AppConfig::default().osc52, Osc52Policy::CopyPaste);
+        assert_eq!(
+            parse("[clipboard]\n").unwrap().config.osc52,
+            Osc52Policy::CopyPaste
+        );
+        for (value, expected) in [
+            ("copy-paste", Osc52Policy::CopyPaste),
+            ("copy", Osc52Policy::Copy),
+            ("off", Osc52Policy::Off),
+            ("OFF", Osc52Policy::Off),
+        ] {
+            let loaded = parse(&format!("[clipboard]\nosc52={value}\n")).unwrap();
+            assert_eq!(loaded.config.osc52, expected, "{value}");
+            assert!(loaded.diagnostics.is_empty());
+        }
+        for invalid in ["", "yes", "paste", "copy paste"] {
+            assert!(
+                parse(&format!("[clipboard]\nosc52={invalid}\n")).is_err(),
+                "{invalid:?}"
+            );
+        }
+        let shipped = parse(include_str!("../../../config/splinterm/config.ini")).unwrap();
+        assert_eq!(shipped.config.osc52, Osc52Policy::CopyPaste);
     }
 
     #[test]
