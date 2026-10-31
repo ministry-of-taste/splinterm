@@ -2088,6 +2088,28 @@ impl PaneView {
         Ok(true)
     }
 
+    /// The pane's process exited or its update stream ended: it has no
+    /// controller or stream any more, and (Plan 0073) is not reconnecting.
+    fn end_stream(&mut self) {
+        self.controller_active = false;
+        self.commands = None;
+        self.pending_control_transfer = None;
+        self.updates = None;
+        self.display_lost = None;
+    }
+
+    /// An inactive pane's process exited (`splint_id`).
+    fn apply_inactive_exit(&mut self, splint_id: SplintId) -> Result<()> {
+        anyhow::ensure!(
+            self.snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.splint_id == splint_id),
+            "inactive pane exit identity does not match its snapshot"
+        );
+        self.end_stream();
+        Ok(())
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "the bounded pane reducer keeps every protocol update transition explicit"
@@ -2290,11 +2312,7 @@ impl PaneView {
             }),
             WindowUpdate::Theme(_) | WindowUpdate::Font(_) => Ok(BackgroundUpdateImpact::NONE),
             WindowUpdate::Exited { .. } | WindowUpdate::Shutdown => {
-                self.controller_active = false;
-                self.commands = None;
-                self.pending_control_transfer = None;
-                self.updates = None;
-                self.display_lost = None;
+                self.end_stream();
                 Ok(BackgroundUpdateImpact::VISUAL)
             }
             WindowUpdate::StreamLost { reconnecting } => {
@@ -3703,6 +3721,17 @@ fn display_lost_notice_rects<'a>(
             .map(|(_, notice)| (content, notice))
             .collect(),
     }
+}
+
+/// Plan 0073: the display-lost notices of `lost` but for panes that show a
+/// control transfer notice (`control`): an agent's request asks for an
+/// answer, and stays visible however long the display is lost.
+fn without_control_transfer_panes(
+    mut lost: Vec<(Rect, &'static str)>,
+    control: &[(Rect, bool)],
+) -> Vec<(Rect, &'static str)> {
+    lost.retain(|(pane, _)| !control.iter().any(|(asking, _)| asking == pane));
+    lost
 }
 
 /// Where `first` and `second` overlap, if they do.
@@ -11488,10 +11517,7 @@ impl App {
                 disconnected = drained.disconnected;
             }
             if disconnected {
-                pane.controller_active = false;
-                pane.commands = None;
-                pane.pending_control_transfer = None;
-                pane.updates = None;
+                pane.end_stream();
                 drain.changed = true;
             }
             let mut terminal_updates = Vec::with_capacity(pending.len());
@@ -11501,16 +11527,7 @@ impl App {
                         retain_newest_theme(&mut drain.theme, update);
                     }
                     WindowUpdate::Exited { splint_id } => {
-                        anyhow::ensure!(
-                            pane.snapshot
-                                .as_ref()
-                                .is_some_and(|snapshot| snapshot.splint_id == splint_id),
-                            "inactive pane exit identity does not match its snapshot"
-                        );
-                        pane.controller_active = false;
-                        pane.commands = None;
-                        pane.pending_control_transfer = None;
-                        pane.updates = None;
+                        pane.apply_inactive_exit(splint_id)?;
                         drain.exited.push(splint_id);
                         drain.changed = true;
                     }
@@ -12100,11 +12117,7 @@ impl App {
                     );
                     if self.tab_state.topology_commands.is_some() {
                         self.panes.pending_exited_splints.insert(splint_id);
-                        self.panes.pane.controller_active = false;
-                        self.panes.pane.commands = None;
-                        self.panes.pane.pending_control_transfer = None;
-                        self.panes.pane.updates = None;
-                        self.panes.pane.display_lost = None;
+                        self.panes.pane.end_stream();
                         title_changed = true;
                         visual_changed = true;
                         focused_visual_changed = true;
@@ -12117,11 +12130,7 @@ impl App {
                 }
                 WindowUpdate::Shutdown => {
                     if self.panes.layout.is_some() {
-                        self.panes.pane.controller_active = false;
-                        self.panes.pane.commands = None;
-                        self.panes.pane.pending_control_transfer = None;
-                        self.panes.pane.updates = None;
-                        self.panes.pane.display_lost = None;
+                        self.panes.pane.end_stream();
                         title_changed = true;
                         visual_changed = true;
                         focused_visual_changed = true;
@@ -12808,10 +12817,12 @@ impl App {
             .clone_from(&explorer_layout);
         let pane_layout = self.computed_pane_layout();
         // Plan 0067 M4: where this draw puts control transfer notices, and
-        // Plan 0073 its display-lost notices, which take their place.
-        let lost_panes = self.display_lost_notice_panes(pane_layout.as_ref());
-        let mut notice_panes = self.control_transfer_notice_panes(pane_layout.as_ref());
-        notice_panes.retain(|(pane, _)| !lost_panes.iter().any(|(lost, _)| lost == pane));
+        // Plan 0073 its display-lost notices.
+        let notice_panes = self.control_transfer_notice_panes(pane_layout.as_ref());
+        let lost_panes = without_control_transfer_panes(
+            self.display_lost_notice_panes(pane_layout.as_ref()),
+            &notice_panes,
+        );
         let (pane_cell_width, pane_cell_height) = self
             .panes
             .pane
@@ -19764,6 +19775,34 @@ mod tests {
         lost.apply_background_update(WindowUpdate::Shutdown, theme, "visible-inactive")
             .unwrap();
         assert!(notices(&lost).is_empty());
+        // Nor is a visible inactive pane whose process exited meanwhile,
+        // which the Window's inactive drain handles itself.
+        lost.apply_background_update(stream_lost(true), theme, "visible-inactive")
+            .unwrap();
+        assert!(lost.apply_inactive_exit(first_id).is_err());
+        lost.apply_inactive_exit(second_id).unwrap();
+        assert!(notices(&lost).is_empty());
+        assert!(!lost.controller_active && lost.updates.is_none());
+    }
+
+    /// Plan 0073: an agent's control request stays visible in a pane whose
+    /// display is lost; the display notice gives way to it.
+    #[test]
+    fn a_control_request_shows_over_a_lost_display() {
+        let rect = |x| Rect {
+            x,
+            y: 0,
+            width: 100,
+            height: 100,
+        };
+        let lost = vec![
+            (rect(0), "Display disconnected"),
+            (rect(100), "Display disconnected"),
+        ];
+        assert_eq!(
+            without_control_transfer_panes(lost, &[(rect(0), true)]),
+            [(rect(100), "Display disconnected")]
+        );
     }
 
     /// The current match is outlined only while the strip is open and

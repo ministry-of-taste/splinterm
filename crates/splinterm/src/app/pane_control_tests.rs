@@ -1482,6 +1482,8 @@ fn stream_pane(
         cancellation: cancellation.clone(),
         detach_on_cancel: Arc::new(AtomicBool::new(false)),
         lagged: false,
+        control_lost_owed: false,
+        retry: StreamRetry::default(),
     }
 }
 
@@ -1958,6 +1960,10 @@ async fn reattachment_follows_the_first_attachment_and_stops_when_the_splint_cha
     let (outcome, answered) = reattach_against(Vec::new(), daemon_at(5), id).await;
     assert!(matches!(outcome, Ok(StreamReconnect::Stop(_))));
     assert_eq!(answered, 0);
+    // Nor is an upgraded one: the handoff's coordinator replaces the pane.
+    let (outcome, answered) = reattach_against(Vec::new(), daemon_at(0), id).await;
+    assert!(matches!(outcome, Ok(StreamReconnect::Handoff)));
+    assert_eq!(answered, 0);
     // Refused access stops too; another failure is retried.
     let access = Request::RequestAccess {
         splint_id: id,
@@ -2084,15 +2090,14 @@ async fn a_window_that_stops_draining_never_stalls_the_daemon_and_gets_a_snapsho
     let (updates, mut window) = mpsc::channel(WINDOW_UPDATE_QUEUE);
     let (_resync_sender, resyncs) = mpsc::channel(1);
     let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (end_controller, controller_ends) = tokio::sync::oneshot::channel::<()>();
+    let controller = tokio::spawn(async move {
+        let _ = controller_ends.await;
+        Ok(())
+    });
     let task = tokio::spawn(run_pane_subscription(
         attached_stream(connection, id, 1, 5),
-        stream_pane(
-            id,
-            idle_controller(&cancellation),
-            resyncs,
-            updates,
-            &cancellation,
-        ),
+        stream_pane(id, controller, resyncs, updates, &cancellation),
         HandoffStatusHub::default(),
         scripted_reconnect(Vec::new(), &attempts),
     ));
@@ -2100,7 +2105,11 @@ async fn a_window_that_stops_draining_never_stalls_the_daemon_and_gets_a_snapsho
         .await
         .expect("every frame was read while the Window was away")
         .unwrap();
-    // The Window comes back: what it had queued, then the snapshot it is owed.
+    // The controller ends while the Window is still away.
+    end_controller.send(()).unwrap();
+    tokio::time::sleep(PANE_UPDATE_SEND_GRACE * 3).await;
+    // The Window comes back: what it had queued, then the snapshot it is
+    // owed, then the controller's end.
     for revision in 6..=9 {
         let WindowUpdate::Update { update, .. } = next_update(&mut window).await else {
             panic!("the queued updates come first");
@@ -2116,8 +2125,175 @@ async fn a_window_that_stops_draining_never_stalls_the_daemon_and_gets_a_snapsho
         panic!("an authoritative snapshot replaces what was dropped");
     };
     assert_eq!(snapshot.revision, 300);
+    assert!(matches!(
+        next_update(&mut window).await,
+        WindowUpdate::Control(false)
+    ));
     assert_eq!(attempts.load(Ordering::SeqCst), 0);
     cancellation.cancel();
     task.await.unwrap().unwrap();
     server.await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_controller_that_ends_during_an_outage_is_reported_once_the_window_has_room() {
+    let id = SplintId::new();
+    let (first, first_reader, first_writer) = daemon_end(65536).await;
+    drop((first_reader, first_writer));
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let (updates, mut window) = mpsc::channel(1);
+    // The Window's queue is full.
+    updates.try_send(WindowUpdate::Control(true)).unwrap();
+    let (_resync_sender, resyncs) = mpsc::channel(1);
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (end_controller, controller_ends) = tokio::sync::oneshot::channel::<()>();
+    let controller = tokio::spawn(async move {
+        let _ = controller_ends.await;
+        Ok(())
+    });
+    let task = tokio::spawn(run_pane_subscription(
+        attached_stream(first, id, 1, 5),
+        stream_pane(id, controller, resyncs, updates, &cancellation),
+        HandoffStatusHub::default(),
+        scripted_reconnect(Vec::new(), &attempts),
+    ));
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    end_controller.send(()).unwrap();
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert!(matches!(window.try_recv(), Ok(WindowUpdate::Control(true))));
+    let mut seen = Vec::new();
+    for _ in 0..2 {
+        seen.push(next_update(&mut window).await);
+    }
+    assert!(
+        seen.iter()
+            .any(|update| matches!(update, WindowUpdate::Control(false))),
+        "{seen:?}"
+    );
+    cancellation.cancel();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_upgraded_daemon_leaves_the_pane_to_its_handoff_without_a_notice() {
+    let id = SplintId::new();
+    let (first, first_reader, first_writer) = daemon_end(65536).await;
+    drop((first_reader, first_writer));
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let (updates, mut window) = mpsc::channel(WINDOW_UPDATE_QUEUE);
+    let (_resync_sender, resyncs) = mpsc::channel(1);
+    let task = tokio::spawn(run_pane_subscription(
+        attached_stream(first, id, 1, 5),
+        stream_pane(
+            id,
+            idle_controller(&cancellation),
+            resyncs,
+            updates,
+            &cancellation,
+        ),
+        HandoffStatusHub::default(),
+        scripted_reconnect(vec![Ok(StreamReconnect::Handoff)], &attempts),
+    ));
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        window.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    assert!(!task.is_finished());
+    cancellation.cancel();
+    task.await.unwrap().unwrap();
+}
+
+/// Reattaches with a stream whose daemon end is already closed, so each
+/// reattachment fails again at once; records when each attempt came.
+fn failing_reattachments(
+    splint_id: SplintId,
+    attempted_at: &Arc<std::sync::Mutex<Vec<tokio::time::Instant>>>,
+) -> impl FnMut() -> std::pin::Pin<Box<dyn Future<Output = Result<StreamReconnect>> + Send>>
++ Send
++ 'static {
+    let attempted_at = Arc::clone(attempted_at);
+    move || {
+        let attempted_at = Arc::clone(&attempted_at);
+        Box::pin(async move {
+            let subscription_id = {
+                let mut attempted_at = attempted_at.lock().unwrap();
+                attempted_at.push(tokio::time::Instant::now());
+                u64::try_from(attempted_at.len()).unwrap() + 1
+            };
+            let (connection, reader, writer) = daemon_end(65536).await;
+            drop((reader, writer));
+            Ok(StreamReconnect::Attached(Box::new(attached_stream(
+                connection,
+                splint_id,
+                subscription_id,
+                9,
+            ))))
+        })
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stream_that_fails_right_after_each_reattachment_backs_off_and_says_so() {
+    let id = SplintId::new();
+    let (first, first_reader, first_writer) = daemon_end(65536).await;
+    drop((first_reader, first_writer));
+    let attempted_at = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let (updates, mut window) = mpsc::channel(WINDOW_UPDATE_QUEUE);
+    let (_resync_sender, resyncs) = mpsc::channel(1);
+    let started = tokio::time::Instant::now();
+    let task = tokio::spawn(run_pane_subscription(
+        attached_stream(first, id, 1, 5),
+        stream_pane(
+            id,
+            idle_controller(&cancellation),
+            resyncs,
+            updates,
+            &cancellation,
+        ),
+        HandoffStatusHub::default(),
+        failing_reattachments(id, &attempted_at),
+    ));
+    let mut first_notice = None;
+    while attempted_at.lock().unwrap().len() < 7 {
+        if let WindowUpdate::StreamLost { reconnecting: true } = next_update(&mut window).await {
+            first_notice.get_or_insert(started.elapsed());
+        }
+    }
+    let gaps: Vec<Duration> = std::iter::once(started)
+        .chain(attempted_at.lock().unwrap().iter().copied())
+        .collect::<Vec<_>>()
+        .windows(2)
+        .map(|pair| pair[1] - pair[0])
+        .collect();
+    assert_eq!(
+        gaps,
+        [250, 500, 1000, 2000, 4000, 5000, 5000].map(Duration::from_millis)
+    );
+    // The short-lived reattachments count toward the notice.
+    assert_eq!(first_notice, Some(PANE_STREAM_NOTICE_DELAY));
+    cancellation.cancel();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_reattachment_that_stays_up_starts_the_next_outage_afresh() {
+    let mut retry = StreamRetry::default();
+    let start = tokio::time::Instant::now();
+    assert_eq!(retry.lost(start), start + PANE_STREAM_NOTICE_DELAY);
+    assert_eq!(retry.delay, PANE_STREAM_RETRY_INITIAL);
+    retry.backed_off();
+    retry.reattached_at = Some(start + Duration::from_secs(1));
+    // Lost again soon: the outage goes on, and so does its backoff.
+    let soon = start + Duration::from_secs(3);
+    assert_eq!(retry.lost(soon), soon);
+    assert_eq!(retry.delay, PANE_STREAM_RETRY_INITIAL * 4);
+    retry.reattached_at = Some(soon);
+    // Lost after it stayed up: a new outage.
+    let later = soon + PANE_STREAM_STABLE;
+    assert_eq!(retry.lost(later), later + PANE_STREAM_NOTICE_DELAY);
+    assert_eq!(retry.delay, PANE_STREAM_RETRY_INITIAL);
 }

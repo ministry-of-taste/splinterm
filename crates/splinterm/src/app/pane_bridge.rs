@@ -1509,6 +1509,8 @@ pub(in crate::app) async fn prepare_live_pane_at_incarnation(
             cancellation: cancellation.clone(),
             detach_on_cancel: Arc::clone(&detach_on_cancel),
             lagged: false,
+            control_lost_owed: false,
+            retry: StreamRetry::default(),
         },
     );
     Ok(PreparedPane {
@@ -1669,6 +1671,10 @@ const PANE_STREAM_RETRY_MAX: Duration = Duration::from_secs(5);
 const PANE_STREAM_ATTEMPT_DEADLINE: Duration = Duration::from_secs(15);
 /// Plan 0073: how long a pane's display may stay lost before the pane says so.
 const PANE_STREAM_NOTICE_DELAY: Duration = Duration::from_secs(2);
+/// Plan 0073: how long a reattached display stream must stay up before its
+/// next loss starts a new outage. One lost sooner continues the outage
+/// before it, so a stream that fails again at once backs off.
+const PANE_STREAM_STABLE: Duration = Duration::from_secs(30);
 /// Plan 0073: how long the subscription waits for room in its pane's update
 /// queue. A Window that leaves it full longer (a stalled Window, or a pane
 /// held back while the Dojo picker is open) would stop this task reading its
@@ -1693,6 +1699,55 @@ pub(in crate::app) enum StreamReconnect {
     /// splinterd restarted, or it refuses this client. The Window's topology
     /// and lifecycle paths handle the pane from here.
     Stop(&'static str),
+    /// splinterd was upgraded: the handoff's coordinator replaces the pane,
+    /// so it stops trying without a word.
+    Handoff,
+}
+
+/// Plan 0073: a pane's reconnection backoff, which outlives each outage.
+#[derive(Debug)]
+pub(in crate::app) struct StreamRetry {
+    /// The pause before the next reconnection attempt.
+    delay: Duration,
+    /// When the current outage began, counting reattachments it outlived.
+    outage_since: Option<tokio::time::Instant>,
+    /// When the stream was last reattached.
+    reattached_at: Option<tokio::time::Instant>,
+}
+
+impl Default for StreamRetry {
+    fn default() -> Self {
+        Self {
+            delay: PANE_STREAM_RETRY_INITIAL,
+            outage_since: None,
+            reattached_at: None,
+        }
+    }
+}
+
+impl StreamRetry {
+    /// The stream was lost at `now`; returns when the Window is to be told.
+    /// A stream lost within [`PANE_STREAM_STABLE`] of its reattachment
+    /// continues the outage before it: the pause grows, and the notice
+    /// counts from that outage's start.
+    fn lost(&mut self, now: tokio::time::Instant) -> tokio::time::Instant {
+        let continued = self
+            .reattached_at
+            .take()
+            .is_some_and(|at| now.duration_since(at) < PANE_STREAM_STABLE);
+        if continued {
+            self.backed_off();
+        } else {
+            self.delay = PANE_STREAM_RETRY_INITIAL;
+            self.outage_since = None;
+        }
+        let since = *self.outage_since.get_or_insert(now);
+        (since + PANE_STREAM_NOTICE_DELAY).max(now)
+    }
+
+    fn backed_off(&mut self) {
+        self.delay = self.delay.saturating_mul(2).min(PANE_STREAM_RETRY_MAX);
+    }
 }
 
 /// What became of one update given to the Window.
@@ -1722,6 +1777,10 @@ pub(in crate::app) struct PaneSubscription {
     /// An update was dropped while the Window's queue stayed full: the
     /// Window is owed an authoritative snapshot once the queue has room.
     pub(in crate::app) lagged: bool,
+    /// The controller ended while the Window's queue was full: the Window
+    /// is owed `Control(false)` once the queue has room.
+    pub(in crate::app) control_lost_owed: bool,
+    pub(in crate::app) retry: StreamRetry,
 }
 
 impl PaneSubscription {
@@ -1762,13 +1821,29 @@ impl PaneSubscription {
     async fn deliver_snapshot(&mut self, snapshot: &TerminalSnapshot) -> Result<bool> {
         let image_sources = lease_snapshot_images(&self.image_cache, snapshot)?;
         self.lagged = false;
-        Ok(self
-            .deliver_or_lag(WindowUpdate::Snapshot {
-                snapshot: snapshot.clone(),
-                image_sources,
-                authoritative: true,
-            })
-            .await)
+        let snapshot = WindowUpdate::Snapshot {
+            snapshot: snapshot.clone(),
+            image_sources,
+            authoritative: true,
+        };
+        if !self.deliver_or_lag(snapshot).await {
+            return Ok(false);
+        }
+        if self.control_lost_owed && !self.lagged {
+            return Ok(self.deliver_control_lost().await);
+        }
+        Ok(true)
+    }
+
+    /// Tells the Window its pane's controller ended, or owes it that once
+    /// the queue has room; returns whether the pane goes on.
+    async fn deliver_control_lost(&mut self) -> bool {
+        match self.deliver(WindowUpdate::Control(false)).await {
+            Delivery::Sent => self.control_lost_owed = false,
+            Delivery::Lagged => self.control_lost_owed = true,
+            Delivery::Closed => return false,
+        }
+        true
     }
 
     /// Attaches again on `stream`'s connection and gives the Window that
@@ -1828,7 +1903,7 @@ impl PaneSubscription {
                 result = &mut self.controller, if !self.controller_completed => {
                     report_pane_controller_result(result);
                     self.controller_completed = true;
-                    if !self.deliver_or_lag(WindowUpdate::Control(false)).await {
+                    if !self.deliver_control_lost().await {
                         return Ok(());
                     }
                 }
@@ -1984,7 +2059,12 @@ impl PaneSubscription {
     /// coordinator replaces the pane. A process that ended meanwhile is
     /// delivered as an exit, so the Window takes its usual exit path. A
     /// reconnection that cannot succeed stops the attempts; the pane then
-    /// waits to be closed.
+    /// waits to be closed. The backoff outlives the outage (see
+    /// [`StreamRetry`]).
+    #[allow(
+        clippy::too_many_lines,
+        reason = "an outage's notice, attempts and pane lifetime form one loop"
+    )]
     async fn recover<R, F>(
         &mut self,
         error: &anyhow::Error,
@@ -1996,21 +2076,13 @@ impl PaneSubscription {
         F: Future<Output = Result<StreamReconnect>>,
     {
         let splint_id = self.splint_id;
-        // A loss during a handoff is expected: its coordinator replaces the pane.
-        if !hub.input_paused() {
-            eprintln!("splinterm pane {splint_id}: display stream lost: {error:#}; reconnecting");
-            if let Some(diagnostics) = splinterm::diagnostics::global() {
-                diagnostics.emit(
-                    DiagnosticLevel::Warn,
-                    DiagnosticEventCode::PaneStreamFailure,
-                    Some(DiagnosticErrorCode::PaneStream),
-                );
-            }
-        }
         let lost_at = tokio::time::Instant::now();
-        let mut notice_at = Some(lost_at + PANE_STREAM_NOTICE_DELAY);
-        let mut delay = PANE_STREAM_RETRY_INITIAL;
-        let mut next_attempt = Some(lost_at + delay);
+        let mut notice_at = Some(self.retry.lost(lost_at));
+        let mut next_attempt = Some(lost_at + self.retry.delay);
+        // Reported with the first attempt's outcome, not now: a loss during
+        // a handoff is expected (its coordinator replaces the pane), and the
+        // connection can end just before the Window learns of the handoff.
+        let mut loss = Some(error);
         let mut attempts = 0_u32;
         let mut reconnecting = true;
         loop {
@@ -2021,7 +2093,16 @@ impl PaneSubscription {
                 result = &mut self.controller, if !self.controller_completed => {
                     report_pane_controller_result(result);
                     self.controller_completed = true;
-                    let _ = self.updates.try_send(WindowUpdate::Control(false));
+                    self.control_lost_owed = true;
+                }
+                // Room again: the Window learns its controller ended.
+                open = async { self.updates.reserve().await.is_ok() }, if self.control_lost_owed => {
+                    if !open {
+                        return None;
+                    }
+                    if self.updates.try_send(WindowUpdate::Control(false)).is_ok() {
+                        self.control_lost_owed = false;
+                    }
                 }
                 // The reattachment's snapshot answers it.
                 Some(()) = self.resyncs.recv() => {}
@@ -2039,7 +2120,7 @@ impl PaneSubscription {
                 }
                 () = sleep_until_some(next_attempt) => {
                     if hub.input_paused() {
-                        next_attempt = Some(tokio::time::Instant::now() + delay);
+                        next_attempt = Some(tokio::time::Instant::now() + self.retry.delay);
                         continue;
                     }
                     attempts += 1;
@@ -2052,11 +2133,17 @@ impl PaneSubscription {
                             })
                         }
                     };
+                    if !hub.input_paused() && !matches!(attempt, Ok(StreamReconnect::Handoff)) {
+                        if let Some(error) = loss.take() {
+                            report_pane_stream_loss(splint_id, error);
+                        }
+                    }
                     match attempt {
                         Ok(StreamReconnect::Attached(stream)) => {
                             eprintln!(
                                 "splinterm pane {splint_id}: display stream reconnected after {attempts} attempt(s)"
                             );
+                            self.retry.reattached_at = Some(tokio::time::Instant::now());
                             return Some(*stream);
                         }
                         Ok(StreamReconnect::Exited) => {
@@ -2073,19 +2160,36 @@ impl PaneSubscription {
                             reconnecting = false;
                             notice_at = Some(tokio::time::Instant::now());
                         }
+                        // The handoff's coordinator replaces the pane.
+                        Ok(StreamReconnect::Handoff) => {
+                            next_attempt = None;
+                            notice_at = None;
+                        }
                         Err(error) => {
                             if attempts.is_power_of_two() {
                                 eprintln!(
                                     "splinterm pane {splint_id}: display reconnection attempt {attempts} failed: {error:#}"
                                 );
                             }
-                            delay = delay.saturating_mul(2).min(PANE_STREAM_RETRY_MAX);
-                            next_attempt = Some(tokio::time::Instant::now() + delay);
+                            self.retry.backed_off();
+                            next_attempt = Some(tokio::time::Instant::now() + self.retry.delay);
                         }
                     }
                 }
             }
         }
+    }
+}
+
+/// Plan 0073: says that a pane's display stream was lost and is reconnecting.
+fn report_pane_stream_loss(splint_id: SplintId, error: &anyhow::Error) {
+    eprintln!("splinterm pane {splint_id}: display stream lost: {error:#}; reconnecting");
+    if let Some(diagnostics) = splinterm::diagnostics::global() {
+        diagnostics.emit(
+            DiagnosticLevel::Warn,
+            DiagnosticEventCode::PaneStreamFailure,
+            Some(DiagnosticErrorCode::PaneStream),
+        );
     }
 }
 
@@ -2137,7 +2241,8 @@ where
 /// [`prepare_live_pane_at_incarnation`] first did: access, attachment and
 /// images. A process that ended or was replaced is reported as exited; a
 /// Splint that is gone, a restarted daemon, and refused access or trust stop
-/// the reconnection; any other failure is retried.
+/// the reconnection, and an upgraded daemon leaves the pane to its handoff;
+/// any other failure is retried.
 pub(in crate::app) async fn reattach_pane_stream(
     connected: Result<Connection>,
     before: DaemonIdentity,
@@ -2154,8 +2259,10 @@ pub(in crate::app) async fn reattach_pane_stream(
         }
         connected => connected?,
     };
-    if before.change_to(DaemonIdentity::of(&connection)) == DaemonChange::Restarted {
-        return Ok(StreamReconnect::Stop("splinterd restarted"));
+    match before.change_to(DaemonIdentity::of(&connection)) {
+        DaemonChange::Same => {}
+        DaemonChange::Upgraded { .. } => return Ok(StreamReconnect::Handoff),
+        DaemonChange::Restarted => return Ok(StreamReconnect::Stop("splinterd restarted")),
     }
     let Some(inspected) = unless_splint_gone(
         connection
