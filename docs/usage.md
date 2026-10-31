@@ -696,10 +696,12 @@ a new window opens beside it. The compositor does not say why it resized a
 Window, so any other size change of the focused Window counts as yours: moving
 it to a monitor where its size changes, toggling fullscreen or floating, and a
 scripted resize such as `hyprctl dispatch resizeactive`. The Window that lost
-control keeps showing the pane as a viewer, and its title says **Viewing —
-another Window took control** until the title next changes. An agent that lost
-control is told a person took the pane, and is asked not to take it back unless
-you say so. Neither side's view moves if it is scrolled back into history.
+control keeps showing the pane as a viewer and says **Viewing — another Window
+took control** over it for about 5 seconds, or until you type in it or it takes
+control back. A pending control request or a lost display is shown instead,
+since it matters more. An agent that lost control is told a person took the
+pane, and is asked not to take it back unless you say so. Neither side's view
+moves if it is scrolled back into history.
 
 When an agent asks to control a pane (MCP `splinterm.request_control_transfer`),
 that pane shows a notice at its bottom centre until you answer or the request

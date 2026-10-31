@@ -271,9 +271,12 @@ const MAX_SCALE_120: u32 = 960;
 const MAX_PREEDIT_BYTES: usize = 4 * 1024;
 /// Plan 0074: shown when the daemon's full input queue cut input short.
 const INPUT_DROPPED_NOTICE: &str = "Input cut short: the program is not reading it";
-/// Plan 0072 M2b: shown when a person resized one of this Window's panes in
-/// another Window, which took control of it.
+/// Plan 0072 M2b: shown in a pane a person resized in another Window, which
+/// took control of it.
 const CONTROL_RECLAIMED_NOTICE: &str = "Viewing — another Window took control";
+/// Plan 0072 M2b: how long [`CONTROL_RECLAIMED_NOTICE`] stays, unless the
+/// pane gets input or control first.
+const CONTROL_RECLAIMED_NOTICE_TIME: Duration = Duration::from_secs(5);
 const MAX_PENDING_TERMINAL_INPUT_BYTES: usize =
     clipboard::MAX_CLIPBOARD_BYTES + clipboard::BRACKETED_PASTE_OVERHEAD;
 const PENDING_INPUT_RETRY_INTERVAL: Duration = Duration::from_millis(5);
@@ -973,6 +976,7 @@ impl WaylandSession {
             app.tick_cursor_blink(queue_handle)?;
             app.tick_agent_spinner(queue_handle)?;
             app.tick_trusted_countdown(queue_handle);
+            app.tick_reclaimed_notices(queue_handle)?;
             let Some(dispatch_timeout) = app.event_loop_dispatch_timeout() else {
                 break;
             };
@@ -1191,6 +1195,7 @@ fn assemble_app(
                 history_page_pending: false,
                 resync_pending: false,
                 display_lost: None,
+                reclaimed_notice_until: None,
                 history_page_top: None,
                 history_selection_pin_blocked: false,
                 scroll_started_at: None,
@@ -1551,6 +1556,8 @@ struct PaneView {
     /// Plan 0073: the notice a pane whose display stream has been lost for
     /// a while shows until an authoritative snapshot.
     display_lost: Option<&'static str>,
+    /// Plan 0072 M2b: until when the pane says another Window took control.
+    reclaimed_notice_until: Option<Instant>,
     history_page_pending: bool,
     /// The oldest cached history row when older history was last requested.
     /// Pages join the cache only while that row is still its first.
@@ -1735,6 +1742,45 @@ impl BackgroundUpdateImpact {
 }
 
 impl PaneView {
+    /// Plan 0072 M2b: says another Window took control, for
+    /// [`CONTROL_RECLAIMED_NOTICE_TIME`] from `now`. The log says so too.
+    fn show_reclaimed_notice(&mut self, now: Instant) {
+        eprintln!("splinterm: {CONTROL_RECLAIMED_NOTICE}");
+        self.reclaimed_notice_until = Some(now + CONTROL_RECLAIMED_NOTICE_TIME);
+    }
+
+    /// Plan 0072 M2b: ends the pane's notice that another Window took
+    /// control, on input or control; whether it had one.
+    fn clear_reclaimed_notice(&mut self) -> bool {
+        self.reclaimed_notice_until.take().is_some()
+    }
+
+    /// Plan 0072 M2b: ends the notice once its time is up at `now`; whether
+    /// it did.
+    fn expire_reclaimed_notice(&mut self, now: Instant) -> bool {
+        if self
+            .reclaimed_notice_until
+            .is_some_and(|until| until <= now)
+        {
+            self.reclaimed_notice_until = None;
+            return true;
+        }
+        false
+    }
+
+    /// What the pane says over its content, if anything: a lost display
+    /// (Plan 0073) before another Window taking control (Plan 0072 M2b),
+    /// which only tells, while the lost display says why nothing changes. A
+    /// control transfer request outranks both; see
+    /// [`without_control_transfer_panes`].
+    fn status_notice(&self, now: Instant) -> Option<&'static str> {
+        self.display_lost.or_else(|| {
+            self.reclaimed_notice_until
+                .is_some_and(|until| now < until)
+                .then_some(CONTROL_RECLAIMED_NOTICE)
+        })
+    }
+
     fn retain_trace_correlation(
         &mut self,
         trace: Option<PerfTraceCorrelation>,
@@ -1844,6 +1890,7 @@ impl PaneView {
             history_page_pending: false,
             resync_pending: false,
             display_lost: None,
+            reclaimed_notice_until: None,
             history_page_top: None,
             history_selection_pin_blocked: false,
             scroll_started_at: None,
@@ -2298,7 +2345,8 @@ impl PaneView {
             WindowUpdate::Control(active) => {
                 let changed = self.controller_active != active;
                 self.controller_active = active;
-                Ok(if changed {
+                let notice_cleared = active && self.clear_reclaimed_notice();
+                Ok(if changed || notice_cleared {
                     BackgroundUpdateImpact::VISUAL
                 } else {
                     BackgroundUpdateImpact::NONE
@@ -2335,12 +2383,13 @@ impl PaneView {
             } else {
                 BackgroundUpdateImpact::NONE
             }),
-            // A pane in a hidden tab says nothing; a visible inactive pane's
-            // notice is taken by `apply_inactive_updates` before this.
-            WindowUpdate::Theme(_)
-            | WindowUpdate::Font(_)
-            | WindowUpdate::InputDropped
-            | WindowUpdate::ControlReclaimed => Ok(BackgroundUpdateImpact::NONE),
+            WindowUpdate::Theme(_) | WindowUpdate::Font(_) | WindowUpdate::InputDropped => {
+                Ok(BackgroundUpdateImpact::NONE)
+            }
+            WindowUpdate::ControlReclaimed => {
+                self.show_reclaimed_notice(Instant::now());
+                Ok(BackgroundUpdateImpact::VISUAL)
+            }
             WindowUpdate::Exited { .. } | WindowUpdate::Shutdown => {
                 self.end_stream();
                 Ok(BackgroundUpdateImpact::VISUAL)
@@ -2365,8 +2414,6 @@ struct InactiveUpdateDrain {
     dirty_frames: HashSet<SplintId>,
     repaint_panes: HashSet<SplintId>,
     exited: Vec<SplintId>,
-    /// Plan 0072 M2b: another Window took control of a visible pane.
-    control_reclaimed: bool,
 }
 
 impl InactiveUpdateDrain {
@@ -3787,9 +3834,10 @@ fn display_lost_notice_rects<'a>(
     layout: Option<&PaneLayout>,
     focused: Option<SplintId>,
     content: Rect,
+    now: Instant,
 ) -> Vec<(Rect, &'static str)> {
     let lost = panes.into_iter().filter_map(|pane| {
-        let notice = pane.display_lost?;
+        let notice = pane.status_notice(now)?;
         Some((pane.snapshot.as_ref()?.splint_id, notice))
     });
     match layout {
@@ -3801,6 +3849,24 @@ fn display_lost_notice_rects<'a>(
             .map(|(_, notice)| (content, notice))
             .collect(),
     }
+}
+
+/// Plan 0072 M2b: input to a pane ends its notice that another Window took
+/// control; whether a notice of one of `panes` that `commands` feeds ended.
+fn clear_reclaimed_notice_for_input<'a>(
+    panes: impl IntoIterator<Item = &'a mut PaneView>,
+    commands: &Sender<WindowCommand>,
+) -> bool {
+    panes
+        .into_iter()
+        .filter(|pane| {
+            pane.commands
+                .as_ref()
+                .is_some_and(|own| own.same_channel(commands))
+        })
+        .fold(false, |cleared, pane| {
+            pane.clear_reclaimed_notice() | cleared
+        })
 }
 
 /// Plan 0073: the display-lost notices of `lost` but for panes that show a
@@ -8306,6 +8372,14 @@ impl App {
         commands: Option<&Sender<WindowCommand>>,
         bytes: Vec<u8>,
     ) -> Result<()> {
+        if let Some(commands) = commands
+            && clear_reclaimed_notice_for_input(
+                std::iter::once(&mut self.panes.pane).chain(self.panes.inactive_panes.iter_mut()),
+                commands,
+            )
+        {
+            self.presentation.full_redraw = true;
+        }
         let outcome =
             queue_terminal_input(commands, &mut self.input.pending_terminal_input, bytes)?;
         if outcome == TerminalInputQueueOutcome::Saturated && !self.input.terminal_input_saturated {
@@ -10044,14 +10118,45 @@ impl App {
     }
 
     /// Plan 0073: the visible panes, logical px, whose display stream is
-    /// lost, and what each says; see [`display_lost_notice_rects`].
+    /// lost, or that another Window took control of (Plan 0072 M2b), and
+    /// what each says; see [`display_lost_notice_rects`].
     fn display_lost_notice_panes(&self, layout: Option<&PaneLayout>) -> Vec<(Rect, &'static str)> {
         display_lost_notice_rects(
             std::iter::once(&self.panes.pane).chain(self.panes.inactive_panes.iter()),
             layout,
             self.panes.focused_splint(),
             self.content_rect(),
+            Instant::now(),
         )
+    }
+
+    /// Plan 0072 M2b: how long until a visible pane's notice that another
+    /// Window took control is due to clear.
+    fn reclaimed_notice_timeout(&self) -> Option<Duration> {
+        let now = Instant::now();
+        std::iter::once(&self.panes.pane)
+            .chain(self.panes.inactive_panes.iter())
+            .filter_map(|pane| pane.reclaimed_notice_until)
+            .min()
+            .map(|until| until.saturating_duration_since(now))
+    }
+
+    /// Plan 0072 M2b: clears the notices whose time is up, and draws again.
+    fn tick_reclaimed_notices(&mut self, queue_handle: &QueueHandle<Self>) -> Result<()> {
+        let now = Instant::now();
+        let mut expired = false;
+        for pane in
+            std::iter::once(&mut self.panes.pane).chain(self.panes.inactive_panes.iter_mut())
+        {
+            expired |= pane.expire_reclaimed_notice(now);
+        }
+        if expired {
+            self.presentation.full_redraw = true;
+            if self.surface.configured {
+                self.schedule_draw(queue_handle)?;
+            }
+        }
+        Ok(())
     }
 
     /// The focused pane's terminal title, or `None` before it has a snapshot.
@@ -11781,7 +11886,6 @@ impl App {
                         drain.exited.push(splint_id);
                         drain.changed = true;
                     }
-                    WindowUpdate::ControlReclaimed => drain.control_reclaimed = true,
                     update => terminal_updates.push(update),
                 }
             }
@@ -11925,9 +12029,6 @@ impl App {
         let mut visual_changed = topology_changed | inactive.changed;
         let mut focused_visual_changed = topology_changed;
         let mut title_changed = false;
-        // Plan 0072 M2b: shown once the title below is set, so it is not
-        // replaced by the title of the `Control` change that came with it.
-        let mut control_reclaimed = inactive.control_reclaimed;
         let mut full_frame_reload = false;
         let mut history_content_changed = false;
         let mut rebuild_all_inactive = false;
@@ -12312,6 +12413,10 @@ impl App {
                     // Plan 0072 M2b: a repeated status, as each refused
                     // acquisition sends, leaves the title, and a notice in
                     // it, alone.
+                    if active && self.panes.pane.clear_reclaimed_notice() {
+                        visual_changed = true;
+                        self.presentation.full_redraw = true;
+                    }
                     if self.panes.pane.controller_active != active {
                         self.panes.pane.controller_active = active;
                         title_changed = true;
@@ -12380,7 +12485,11 @@ impl App {
                 }
                 // Plan 0072 M3: shown in the title once it is set below.
                 WindowUpdate::ForceRefused(notice) => force_notice = Some(notice),
-                WindowUpdate::ControlReclaimed => control_reclaimed = true,
+                WindowUpdate::ControlReclaimed => {
+                    self.panes.pane.show_reclaimed_notice(Instant::now());
+                    visual_changed = true;
+                    self.presentation.full_redraw = true;
+                }
                 WindowUpdate::Exited { splint_id } => {
                     anyhow::ensure!(
                         self.panes.focused_splint() == Some(splint_id),
@@ -12706,9 +12815,6 @@ impl App {
                 self.schedule_draw(queue_handle)?;
             }
         }
-        if control_reclaimed {
-            self.window_notice(CONTROL_RECLAIMED_NOTICE);
-        }
         Ok(())
     }
 
@@ -12895,6 +13001,11 @@ impl App {
         };
         // Wake to clear an expired upgrade outcome notice.
         let timeout = match (timeout, self.handoff.timeout(Instant::now())) {
+            (Some(timeout), Some(notice)) => Some(timeout.min(notice)),
+            (timeout, _) => timeout,
+        };
+        // Wake to clear a pane's notice that another Window took control.
+        let timeout = match (timeout, self.reclaimed_notice_timeout()) {
             (Some(timeout), Some(notice)) => Some(timeout.min(notice)),
             (timeout, _) => timeout,
         };
@@ -13749,7 +13860,11 @@ impl App {
                         legend,
                     },
                     None => crate::renderer::ControlTransferStrip {
-                        title: "display",
+                        title: if label == CONTROL_RECLAIMED_NOTICE {
+                            "control"
+                        } else {
+                            "display"
+                        },
                         label,
                         legend: &[],
                     },
@@ -19175,6 +19290,112 @@ mod tests {
         assert!(impact.visual_changed);
     }
 
+    /// Plan 0072 M2b: a pane another Window took control of says so over
+    /// its content until its time is up.
+    #[test]
+    fn a_pane_another_window_took_says_so_until_its_time_is_up() {
+        let (mut pane, _commands) = reclaim_test_pane(true, 1);
+        let splint_id = pane.snapshot.as_ref().unwrap().splint_id;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 400,
+        };
+        let notices = |pane: &PaneView, now| {
+            display_lost_notice_rects([pane], None, Some(splint_id), area, now)
+        };
+        let impact = pane
+            .apply_background_update(
+                WindowUpdate::ControlReclaimed,
+                ResolvedTheme::default(),
+                "visible-inactive",
+            )
+            .unwrap();
+        assert_eq!(impact, BackgroundUpdateImpact::VISUAL);
+        assert!(pane.reclaimed_notice_until.is_some());
+
+        let shown = Instant::now();
+        pane.show_reclaimed_notice(shown);
+        assert_eq!(notices(&pane, shown), [(area, CONTROL_RECLAIMED_NOTICE)]);
+        let almost = shown + CONTROL_RECLAIMED_NOTICE_TIME / 2;
+        assert!(!pane.expire_reclaimed_notice(almost));
+        assert_eq!(notices(&pane, almost), [(area, CONTROL_RECLAIMED_NOTICE)]);
+        let due = shown + CONTROL_RECLAIMED_NOTICE_TIME;
+        assert!(notices(&pane, due).is_empty());
+        assert!(pane.expire_reclaimed_notice(due));
+        assert!(pane.reclaimed_notice_until.is_none());
+        assert!(!pane.expire_reclaimed_notice(due), "cleared once");
+    }
+
+    /// Plan 0072 M2b: a control transfer request and a lost display both
+    /// outrank the notice that another Window took control: the request
+    /// asks for an answer, and the lost display says why nothing changes.
+    #[test]
+    fn a_control_request_and_a_lost_display_outrank_the_taken_notice() {
+        let (mut pane, _commands) = reclaim_test_pane(false, 1);
+        let splint_id = pane.snapshot.as_ref().unwrap().splint_id;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 400,
+        };
+        let now = Instant::now();
+        pane.show_reclaimed_notice(now);
+        pane.display_lost = Some(display_lost_notice(true));
+        assert_eq!(
+            display_lost_notice_rects([&pane], None, Some(splint_id), area, now),
+            [(area, display_lost_notice(true))]
+        );
+        pane.display_lost = None;
+        pane.pending_control_transfer = Some(7);
+        let asking = control_transfer_notice_rects([&pane], false, None, Some(splint_id), area);
+        assert_eq!(asking, [(area, true)]);
+        let shown = without_control_transfer_panes(
+            display_lost_notice_rects([&pane], None, Some(splint_id), area, now),
+            &asking,
+        );
+        assert!(shown.is_empty());
+    }
+
+    /// Plan 0072 M2b: the notice ends when the pane gets control again, or
+    /// input, whichever comes first; losing control again keeps it.
+    #[test]
+    fn the_taken_notice_ends_on_control_or_input() {
+        let theme = ResolvedTheme::default();
+        let (mut viewer, _viewer_commands) = reclaim_test_pane(false, 1);
+        viewer.show_reclaimed_notice(Instant::now());
+        viewer
+            .apply_background_update(WindowUpdate::Control(false), theme, "visible-inactive")
+            .unwrap();
+        assert!(viewer.reclaimed_notice_until.is_some());
+        // Control that comes back is drawn for the notice alone.
+        let (mut pane, _commands) = reclaim_test_pane(true, 1);
+        pane.show_reclaimed_notice(Instant::now());
+        let impact = pane
+            .apply_background_update(WindowUpdate::Control(true), theme, "visible-inactive")
+            .unwrap();
+        assert_eq!(impact, BackgroundUpdateImpact::VISUAL);
+        assert!(pane.reclaimed_notice_until.is_none());
+
+        let (mut typed, _typed_commands) = reclaim_test_pane(false, 1);
+        let (mut other, _other_commands) = reclaim_test_pane(false, 1);
+        typed.show_reclaimed_notice(Instant::now());
+        other.show_reclaimed_notice(Instant::now());
+        let sender = typed.commands.clone().unwrap();
+        assert!(clear_reclaimed_notice_for_input(
+            [&mut other, &mut typed],
+            &sender
+        ));
+        assert!(typed.reclaimed_notice_until.is_none());
+        assert!(
+            other.reclaimed_notice_until.is_some(),
+            "only the pane typed in"
+        );
+        assert!(!clear_reclaimed_notice_for_input([&mut typed], &sender));
+    }
+
     fn reduce_history_merge_case(
         cached: &[u64],
         previous_newest: u64,
@@ -20341,7 +20562,13 @@ mod tests {
         let focused = PaneView::from_options(pane_options(first_id), SCALE_DENOMINATOR).unwrap();
         let mut lost = PaneView::from_options(pane_options(second_id), SCALE_DENOMINATOR).unwrap();
         let notices = |lost: &PaneView| {
-            display_lost_notice_rects([&focused, lost], Some(&layout), Some(first_id), area)
+            display_lost_notice_rects(
+                [&focused, lost],
+                Some(&layout),
+                Some(first_id),
+                area,
+                Instant::now(),
+            )
         };
         assert!(notices(&lost).is_empty());
         let stream_lost = |reconnecting| WindowUpdate::StreamLost { reconnecting };
@@ -20356,7 +20583,7 @@ mod tests {
         assert_eq!(notices(&lost), [reconnecting]);
         // A Window showing its one pane puts the notice over its content.
         assert_eq!(
-            display_lost_notice_rects([&lost], None, Some(second_id), area),
+            display_lost_notice_rects([&lost], None, Some(second_id), area, Instant::now()),
             [(area, reconnecting.1)]
         );
         let snapshot = |revision, authoritative| WindowUpdate::Snapshot {
