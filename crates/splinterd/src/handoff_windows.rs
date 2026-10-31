@@ -325,6 +325,11 @@ impl HandoffWindows {
         self.anchors.contains_key(&connection_id)
     }
 
+    /// Whether `connection_id` is an open trusted-UI connection.
+    pub(crate) fn is_trusted_ui_connection(&self, connection_id: u64) -> bool {
+        self.connections.contains_key(&connection_id)
+    }
+
     #[cfg(test)]
     pub(crate) fn anchor_count(&self) -> usize {
         self.anchors.len()

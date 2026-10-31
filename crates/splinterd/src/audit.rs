@@ -118,6 +118,7 @@ pub const fn operation_for_request(request: &Request) -> AuditOperation {
         Request::RequestControlTransfer { .. } => AuditOperation::RequestControlTransfer,
         Request::DecideControlTransfer { .. } => AuditOperation::DecideControlTransfer,
         Request::ForceControlTransfer { .. } => AuditOperation::ForceControlTransfer,
+        Request::ReclaimControl { .. } => AuditOperation::ReclaimControl,
         Request::ReleaseControl { .. } => AuditOperation::ReleaseControl,
         Request::Input { .. } => AuditOperation::Input,
         Request::Resize { .. } => AuditOperation::Resize,
@@ -250,6 +251,18 @@ mod tests {
         assert_eq!(
             AuditOperation::ClaimDojoPresentation.as_str(),
             "claim_dojo_presentation"
+        );
+    }
+
+    #[test]
+    fn a_resize_reclaim_has_its_own_operation() {
+        assert_eq!(
+            operation_for_request(&Request::ReclaimControl {
+                splint_id: splinterm_core::SplintId::new(),
+                incarnation: 1,
+                modes: vec![splinterm_protocol::ControlMode::Resize],
+            }),
+            AuditOperation::ReclaimControl
         );
     }
 

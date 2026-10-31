@@ -64,6 +64,7 @@ const fn control_subscribed(splint_id: SplintId, owned: bool) -> Response {
             incarnation: 7,
             controlled: owned,
             locally_owned: owned,
+            lost_reason: None,
         },
     }
 }
@@ -343,6 +344,7 @@ async fn reacquire_after_control_loss_reapplies_the_latest_size_before_input() {
                 incarnation: 7,
                 controlled: true,
                 locally_owned: false,
+                lost_reason: None,
             },
         },
     };
@@ -795,6 +797,7 @@ async fn control_loss_between_coalesced_input_batches_is_observed_before_the_nex
                 incarnation: 7,
                 controlled: true,
                 locally_owned: false,
+                lost_reason: None,
             },
         },
     };
@@ -1010,6 +1013,7 @@ fn handoff_status_is_read_only_from_this_control_subscription() {
                 incarnation: 7,
                 controlled: true,
                 locally_owned: true,
+                lost_reason: None,
             },
         },
     };

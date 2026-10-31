@@ -114,6 +114,9 @@ struct State {
     /// Handles whose daemon connection ended, as when splinterd is upgraded:
     /// the daemon released their authority, so they stay invalid. Newest last.
     expired: VecDeque<String>,
+    /// Handles whose controller a Window took when a person resized the
+    /// pane (Plan 0072), so a later use says why. Newest last.
+    reclaimed: VecDeque<String>,
     next_token: u64,
     next_revision: u64,
     hashers: [RandomState; 2],
@@ -125,6 +128,7 @@ impl Default for State {
             controllers: HashMap::new(),
             transfers: HashMap::new(),
             expired: VecDeque::new(),
+            reclaimed: VecDeque::new(),
             next_token: 1,
             next_revision: 1,
             hashers: [RandomState::new(), RandomState::new()],
@@ -159,10 +163,23 @@ impl State {
         self.expired.push_back(token.to_owned());
     }
 
-    /// The failure for a handle this registry does not hold: expired with its
-    /// daemon connection, or never valid.
+    /// Remembers that a Window took `token`'s controller by resizing.
+    fn reclaim(&mut self, token: &str) {
+        if self.reclaimed.iter().any(|reclaimed| reclaimed == token) {
+            return;
+        }
+        if self.reclaimed.len() == MAXIMUM_EXPIRED_HANDLES {
+            self.reclaimed.pop_front();
+        }
+        self.reclaimed.push_back(token.to_owned());
+    }
+
+    /// The failure for a handle this registry does not hold: taken by a
+    /// Window, expired with its daemon connection, or never valid.
     fn missing_handle(&self, handle: &str) -> dispatch::DispatchFailure {
-        if self.expired.iter().any(|expired| expired == handle) {
+        if self.reclaimed.iter().any(|reclaimed| reclaimed == handle) {
+            reclaimed_handle()
+        } else if self.expired.iter().any(|expired| expired == handle) {
             expired_handle()
         } else {
             invalid_handle()
@@ -960,27 +977,23 @@ impl ControlRegistry {
 
     /// A controller actor that ended between a handle's lookup and its
     /// request leaves only the generic unavailable failure; when it ended
-    /// because its daemon connection did, the handle expired instead. The
-    /// actor records the expiry before its queue closes.
+    /// because a Window took its controller or its daemon connection ended,
+    /// the failure says so instead. The actor records either before its
+    /// queue closes.
     async fn expired_or(
         &self,
         handle: &str,
         failure: dispatch::DispatchFailure,
     ) -> dispatch::DispatchFailure {
-        if failure.message == stale_handle().message
-            && self
-                .0
-                .state
-                .lock()
-                .await
-                .expired
-                .iter()
-                .any(|expired| expired == handle)
-        {
-            expired_handle()
-        } else {
-            failure
+        if failure.message == stale_handle().message {
+            let state = self.0.state.lock().await;
+            if state.reclaimed.iter().any(|reclaimed| reclaimed == handle)
+                || state.expired.iter().any(|expired| expired == handle)
+            {
+                return state.missing_handle(handle);
+            }
         }
+        failure
     }
 
     async fn insert_controller(
@@ -1143,6 +1156,15 @@ async fn controller_actor(
                         }
                         result => result.map_err(|error| dispatch::map_client_error(&error)),
                     };
+                    // A Window took the controller (Plan 0072): recorded
+                    // before replying, like an expiry, so a call straight
+                    // after says so too.
+                    let reclaimed = result
+                        .as_ref()
+                        .is_err_and(|failure| failure.message == dispatch::RECLAIMED_BY_WINDOW);
+                    if reclaimed && let Some(inner) = inner.upgrade() {
+                        inner.state.lock().await.reclaim(&token);
+                    }
                     let failed = result.is_err();
                     let delivered = reply.send(result).is_ok();
                     if failed || terminate || !delivered { break; }
@@ -1459,6 +1481,16 @@ fn expired_during_call() -> dispatch::DispatchFailure {
     )
 }
 
+/// A handle whose controller a Window took when a person resized the pane
+/// (Plan 0072).
+const fn reclaimed_handle() -> dispatch::DispatchFailure {
+    dispatch::DispatchFailure::new(
+        "controller_unavailable",
+        dispatch::RECLAIMED_BY_WINDOW,
+        false,
+    )
+}
+
 fn stale_handle() -> dispatch::DispatchFailure {
     dispatch::DispatchFailure::new(
         "controller_unavailable",
@@ -1742,6 +1774,86 @@ mod tests {
         let new_handle = second["data"]["controller_handle"].as_str().unwrap();
         assert_ne!(new_handle, old_handle);
         assert_eq!(second["resource"]["splint_id"], splint_id.to_string());
+        registry.shutdown().await;
+        resources.shutdown().await;
+        join(daemon).await;
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Plan 0072: once a person resized the pane in a Window, which took the
+    /// controller, the agent's next input says so and what to do next, and
+    /// so does every later use of the handle.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_controller_a_window_reclaimed_says_so_on_the_next_input() {
+        let (directory, socket) = socket("reclaimed");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (lair_id, dojo_id, splint_id) = ids();
+        let daemon = thread::spawn(move || {
+            let mut stream = accept(&listener);
+            let ClientFrame::Request { request_id, .. } = read_frame(&mut stream) else {
+                panic!("expected the acquisition")
+            };
+            write_frame(
+                &mut stream,
+                &ServerFrame::Response {
+                    request_id,
+                    result: Response::ControlGranted {
+                        controller_id: 5,
+                        lair_id,
+                        dojo_id,
+                    },
+                },
+            );
+            // A Window reclaimed the lease; the daemon refuses its input.
+            let ClientFrame::Request {
+                request_id,
+                request: Request::Input { controller_id, .. },
+                ..
+            } = read_frame(&mut stream)
+            else {
+                panic!("expected the agent's input")
+            };
+            assert_eq!(controller_id, 5);
+            let error = ProtocolError::new(
+                ErrorCode::Unauthorized,
+                splinterm_protocol::CONTROL_RECLAIMED_BY_WINDOW,
+            );
+            let request_id = Some(request_id);
+            write_frame(&mut stream, &ServerFrame::Error { request_id, error });
+        });
+
+        let resources = Arc::new(ResourceRegistry::default());
+        let registry = ControlRegistry::new_at(Arc::clone(&resources), &socket);
+        let acquire = json!({
+            "splint_id": splint_id.to_string(),
+            "incarnation": 2,
+            "modes": ["input"]
+        });
+        let token = CancellationToken::new();
+        let acquired = registry
+            .dispatch("splinterm.acquire_control", &acquire, &token)
+            .await
+            .unwrap();
+        let input = json!({
+            "splint_id": splint_id.to_string(),
+            "incarnation": 2,
+            "text": "ls\n",
+            "controller_handle": acquired["data"]["controller_handle"],
+        });
+        for _ in 0..2 {
+            let failure = registry
+                .dispatch("splinterm.input", &input, &token)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                (failure.code, failure.message, failure.retryable),
+                (
+                    "controller_unavailable",
+                    dispatch::RECLAIMED_BY_WINDOW,
+                    false
+                )
+            );
+        }
         registry.shutdown().await;
         resources.shutdown().await;
         join(daemon).await;
@@ -2170,6 +2282,7 @@ mod tests {
                             incarnation: 2,
                             controlled: true,
                             locally_owned: false,
+                            lost_reason: None,
                         },
                     },
                 },
@@ -2415,6 +2528,7 @@ mod tests {
                             incarnation: 2,
                             controlled: true,
                             locally_owned: false,
+                            lost_reason: None,
                         },
                     },
                 },
@@ -2519,6 +2633,7 @@ mod tests {
                                 incarnation: 2,
                                 controlled: true,
                                 locally_owned: false,
+                                lost_reason: None,
                             },
                         },
                     },

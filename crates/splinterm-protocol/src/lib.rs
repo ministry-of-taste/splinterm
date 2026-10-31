@@ -18,7 +18,7 @@ use splinterm_core::{
     TopologyRevision,
 };
 
-pub const PROTOCOL_VERSION: u16 = 46;
+pub const PROTOCOL_VERSION: u16 = 47;
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_TERMINAL_TRANSACTION_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_TERMINAL_TRANSACTION_CHUNK_BYTES: usize = 8 * 1024 * 1024;
@@ -975,6 +975,15 @@ pub enum Request {
         splint_id: SplintId,
         incarnation: u64,
     },
+    /// Takes the Splint's controller for this connection without asking,
+    /// as when a person resizes a viewer Window (Plan 0072). Only the
+    /// installed client and remote Windows may send it. It succeeds like
+    /// `AcquireControl`, ending any other lease first.
+    ReclaimControl {
+        splint_id: SplintId,
+        incarnation: u64,
+        modes: Vec<ControlMode>,
+    },
     ReleaseControl {
         controller_id: u64,
     },
@@ -1144,6 +1153,12 @@ pub const SPLINT_ALREADY_CONTROLLED: &str = "live Splint already has a controlle
 /// gets when nobody controls the live Splint, so there is nothing to
 /// transfer. The MCP adapter tells it apart by it.
 pub const NO_CONTROLLER_TO_TRANSFER: &str = "live Splint has no matching controller";
+
+/// The `Unauthorized` reason input, resize, or release gets on a controller
+/// a Window took by resizing its pane (Plan 0072). The MCP adapter tells it
+/// apart by it.
+pub const CONTROL_RECLAIMED_BY_WINDOW: &str =
+    "a Window took this controller when a person resized the pane";
 
 /// The `ControlTransferUnavailable` reason a transfer request gets while
 /// another transfer of the same Splint waits for an answer.
@@ -1751,6 +1766,20 @@ pub struct ControlStatus {
     pub incarnation: u64,
     pub controlled: bool,
     pub locally_owned: bool,
+    /// Why this connection just lost the controller, sent only to it and
+    /// only with the status that ended its lease. It never names who took
+    /// it (Plan 0072).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lost_reason: Option<ControlLossReason>,
+}
+
+/// Why a connection lost its controller lease (Plan 0072).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlLossReason {
+    /// A person resized the pane in a Window that was not its controller,
+    /// and that Window took control.
+    ReclaimedByWindow,
 }
 
 impl ControlStatus {
@@ -1759,7 +1788,10 @@ impl ControlStatus {
     /// # Errors
     /// Returns `InvalidArgument` for malformed identity or ownership state.
     pub fn validate(self) -> Result<(), ProtocolError> {
-        if self.incarnation == 0 || (self.locally_owned && !self.controlled) {
+        if self.incarnation == 0
+            || (self.locally_owned && !self.controlled)
+            || (self.locally_owned && self.lost_reason.is_some())
+        {
             return Err(ProtocolError::new(
                 ErrorCode::InvalidArgument,
                 "invalid control status",
@@ -2603,6 +2635,8 @@ pub enum AuditOperation {
     RequestControlTransfer,
     DecideControlTransfer,
     ForceControlTransfer,
+    /// Plan 0072: a Window took a Splint's controller by resizing it.
+    ReclaimControl,
     ReleaseControl,
     Input,
     Resize,
@@ -2662,6 +2696,7 @@ impl AuditOperation {
             Self::RequestControlTransfer => "request_control_transfer",
             Self::DecideControlTransfer => "decide_control_transfer",
             Self::ForceControlTransfer => "force_control_transfer",
+            Self::ReclaimControl => "reclaim_control",
             Self::ReleaseControl => "release_control",
             Self::Input => "input",
             Self::Resize => "resize",
@@ -5716,6 +5751,7 @@ mod tests {
             AuditOperation::RequestControlTransfer,
             AuditOperation::DecideControlTransfer,
             AuditOperation::ForceControlTransfer,
+            AuditOperation::ReclaimControl,
             AuditOperation::ReleaseControl,
             AuditOperation::Input,
             AuditOperation::Resize,
@@ -6982,7 +7018,7 @@ mod tests {
 
     #[test]
     fn first_terminal_read_requests_are_explicit_protocol_v20_shapes() {
-        assert_eq!(PROTOCOL_VERSION, 46);
+        assert_eq!(PROTOCOL_VERSION, 47);
         let splint_id = SplintId::new();
         let attach = Request::Attach {
             splint_id,
@@ -7282,6 +7318,7 @@ mod tests {
             incarnation: 7,
             controlled: true,
             locally_owned: false,
+            lost_reason: None,
         };
         assert!(status.validate().is_ok());
         assert!(
@@ -7313,6 +7350,72 @@ mod tests {
         let encoded = serde_json::to_string(&event).unwrap();
         assert!(encoded.contains("control_transfer_resolved"));
         assert!(encoded.contains("controller_id"));
+    }
+
+    /// Plan 0072: a resize reclaim is its own request, and the status that
+    /// ends a lease may say why, without saying who took it.
+    #[test]
+    fn reclaim_control_and_the_loss_reason_have_explicit_additive_shapes() {
+        let splint_id = SplintId::new();
+        let reclaim = Request::ReclaimControl {
+            splint_id,
+            incarnation: 7,
+            modes: vec![ControlMode::Input, ControlMode::Resize],
+        };
+        let encoded = serde_json::to_value(&reclaim).unwrap();
+        assert_eq!(
+            encoded,
+            serde_json::json!({
+                "type": "reclaim_control",
+                "splint_id": splint_id,
+                "incarnation": 7,
+                "modes": ["input", "resize"],
+            })
+        );
+        assert_eq!(serde_json::from_value::<Request>(encoded).unwrap(), reclaim);
+        assert_eq!(AuditOperation::ReclaimControl.as_str(), "reclaim_control");
+
+        // Without a reason the status keeps its protocol 46 shape.
+        let kept = ControlStatus {
+            splint_id,
+            incarnation: 7,
+            controlled: true,
+            locally_owned: true,
+            lost_reason: None,
+        };
+        let plain = serde_json::json!({
+            "splint_id": splint_id,
+            "incarnation": 7,
+            "controlled": true,
+            "locally_owned": true,
+        });
+        assert_eq!(serde_json::to_value(kept).unwrap(), plain);
+        assert_eq!(
+            serde_json::from_value::<ControlStatus>(plain).unwrap(),
+            kept
+        );
+
+        let lost = ControlStatus {
+            locally_owned: false,
+            lost_reason: Some(ControlLossReason::ReclaimedByWindow),
+            ..kept
+        };
+        assert!(lost.validate().is_ok());
+        let encoded = serde_json::to_value(lost).unwrap();
+        assert_eq!(encoded["lost_reason"], "reclaimed_by_window");
+        assert_eq!(
+            serde_json::from_value::<ControlStatus>(encoded).unwrap(),
+            lost
+        );
+        // A connection that still holds the lease has lost nothing.
+        assert!(
+            ControlStatus {
+                locally_owned: true,
+                ..lost
+            }
+            .validate()
+            .is_err()
+        );
     }
 
     #[test]
@@ -8896,8 +8999,8 @@ mod tests {
         // An undeclared hello keeps its exact protocol 41 shape.
         let plain = serde_json::json!({
             "type": "hello",
-            "minimum_version": 46,
-            "maximum_version": 46,
+            "minimum_version": 47,
+            "maximum_version": 47,
             "role": "trusted_ui",
         });
         assert_eq!(serde_json::to_value(hello(false)).unwrap(), plain);

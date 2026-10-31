@@ -478,6 +478,7 @@ fn serve_subscription(stream_kind: ExpectedSubscription) -> (PathBuf, thread::Jo
                     incarnation: 2,
                     controlled: false,
                     locally_owned: false,
+                    lost_reason: None,
                 };
                 send_response(
                     &mut stream,

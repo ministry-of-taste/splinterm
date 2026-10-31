@@ -3899,6 +3899,31 @@ impl Connection {
         }
     }
 
+    /// Takes the Splint's controller for this Window's connection without
+    /// asking, as when a person resizes a pane it only views (Plan 0072).
+    /// Another holder's lease ends; this connection's own lease of the
+    /// Splint is kept. Only the installed client and remote Windows may.
+    pub async fn reclaim_control(
+        &mut self,
+        splint_id: SplintId,
+        incarnation: u64,
+        modes: Vec<splinterm_protocol::ControlMode>,
+    ) -> Result<u64> {
+        match self
+            .request(Request::ReclaimControl {
+                splint_id,
+                incarnation,
+                modes,
+            })
+            .await?
+        {
+            Response::ControlGranted { controller_id, .. } if controller_id != 0 => {
+                Ok(controller_id)
+            }
+            _ => bail!("splinterd did not grant a controller lease"),
+        }
+    }
+
     /// Restores this connection's controller for one Splint from a
     /// relaunched Window's resume ticket (Plan 0061 M3.16). `Ok(None)` means
     /// the daemon accepted the ticket but restored nothing for this Splint;

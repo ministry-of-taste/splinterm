@@ -553,6 +553,35 @@ impl ConsentResponders {
         check_responder(kind, peer, context)
     }
 
+    /// Checks, from `/proc`, that a remote Window's relay connection runs
+    /// where a Window responder may: the installed relay it ran at `Hello`,
+    /// outside every Splint's process tree, scope, and Dojo slice. A resize
+    /// reclaim from a remote Window needs this too (Plan 0072), so an agent
+    /// cannot take a pane by running the relay itself inside a Splint.
+    ///
+    /// # Errors
+    /// Why the connection is ineligible; `Unverified` when the check did not
+    /// finish.
+    pub async fn check_remote_window(
+        self: &Arc<Self>,
+        connection_id: u64,
+        peer: &PeerIdentity,
+        context: TreeContext,
+    ) -> Result<(), Ineligible> {
+        let registry = Arc::clone(self);
+        let checked = peer.clone();
+        tokio::task::spawn_blocking(move || {
+            registry.eligible(
+                connection_id,
+                ConsentResponderKind::Window,
+                &checked,
+                Some(&context),
+            )
+        })
+        .await
+        .unwrap_or(Err(Ineligible::Unverified))
+    }
+
     /// Whether no responder is registered.
     pub fn is_empty(&self) -> bool {
         self.inner().responders.is_empty()

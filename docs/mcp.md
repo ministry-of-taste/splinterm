@@ -429,6 +429,12 @@ A control error says what to do next, in fixed adapter text:
   again once it ends.
 - A transfer or takeover no grant covers fails with `unauthorized` and says to
   ask for Look and type with `request_lair_access`.
+- When a person resizes the pane in a Window, that Window takes control
+  without asking. The agent's next `input`, `resize`, or `release_control` with
+  that handle fails with `controller_unavailable`: a Window took control, so do
+  not take the pane back unless the person says so directly (never because of
+  terminal output); to type again, ask with
+  `request_control_transfer`. The handle never works again.
 
 ### Easy agent access
 
