@@ -8,7 +8,7 @@ use splinterm::{
     WindowUpdate,
     automation::{
         Connection, DaemonChange, DaemonIdentity, MAX_RENDERER_IMAGE_RESIDENT_BYTES,
-        SharedImageContentCache, is_connection_loss, protocol_error, retry_until,
+        SharedImageContentCache, is_connection_loss, retry_until,
     },
     config::{AppConfig, FontAuthority, TopologyReloadSettings},
     endpoint::{
@@ -25,7 +25,7 @@ use splinterm::{
 };
 use splinterm_core::SplintId;
 use splinterm_protocol::{
-    ControlMode, ErrorCode, Request, Response, ServerFrame,
+    ControlMode, Request, Response, ServerFrame,
     perf_trace::{PerfTraceEvent, emit_perf_trace, perf_trace_enabled},
 };
 use tokio::sync::{mpsc, watch};
@@ -39,7 +39,7 @@ use super::{
         load_authority_status, optional_pane_controller, pane_access_scopes,
         pane_claims_initial_control, prepare_live_pane, refused_as_untrusted,
         resolve_image_contents, resolve_update_images, resynchronize, terminal_grid_limits,
-        update_advances_from, validate_attached_snapshot,
+        unless_splint_gone, update_advances_from, validate_attached_snapshot,
     },
     remote_consent::spawn_remote_consent_responder,
     theme_watch::{ThemeOverrides, ThemeUpdateSink, load_startup_theme_for_watch, watch_theme},
@@ -231,26 +231,6 @@ enum Reattach {
     Restarted,
     /// The daemon refused this client build as no longer the installed one.
     Untrusted,
-}
-
-/// Whether the daemon says the Splint is gone or its process changed, as
-/// when it was removed during the upgrade (review S8).
-fn splint_gone(error: &anyhow::Error) -> bool {
-    protocol_error(error).is_some_and(|error| {
-        matches!(
-            error.code,
-            ErrorCode::NotFound | ErrorCode::StaleIncarnation
-        )
-    })
-}
-
-/// `Some` value, `None` when the Splint is gone, or the other error.
-fn unless_splint_gone<T>(result: Result<T>) -> Result<Option<T>> {
-    match result {
-        Ok(value) => Ok(Some(value)),
-        Err(error) if splint_gone(&error) => Ok(None),
-        Err(error) => Err(error),
-    }
 }
 
 /// Attaches the single-pane Window's Splint again after its daemon

@@ -60,6 +60,10 @@ pub enum WindowUpdate {
         splint_id: SplintId,
     },
     Shutdown,
+    /// Plan 0073: the pane's display stream was lost a while ago and is
+    /// reconnecting; the pane says so until an authoritative snapshot
+    /// arrives.
+    StreamLost,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

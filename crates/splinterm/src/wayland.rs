@@ -1181,6 +1181,7 @@ fn assemble_app(
                 painted_history: None,
                 history_page_pending: false,
                 resync_pending: false,
+                display_lost: false,
                 history_page_top: None,
                 history_selection_pin_blocked: false,
                 scroll_started_at: None,
@@ -1536,6 +1537,9 @@ struct PaneView {
     /// A return-to-live resynchronization was sent and its authoritative
     /// snapshot has not arrived; another would only queue behind it.
     resync_pending: bool,
+    /// Plan 0073: the pane's display stream has been lost for a while and
+    /// is reconnecting; the pane says so until an authoritative snapshot.
+    display_lost: bool,
     history_page_pending: bool,
     /// The oldest cached history row when older history was last requested.
     /// Pages join the cache only while that row is still its first.
@@ -1823,6 +1827,7 @@ impl PaneView {
             painted_history: None,
             history_page_pending: false,
             resync_pending: false,
+            display_lost: false,
             history_page_top: None,
             history_selection_pin_blocked: false,
             scroll_started_at: None,
@@ -2100,6 +2105,7 @@ impl PaneView {
                 authoritative,
             } => {
                 self.resync_pending &= !authoritative;
+                let notice_cleared = authoritative && std::mem::take(&mut self.display_lost);
                 snapshot
                     .validate()
                     .map_err(|error| anyhow::anyhow!(error.message))?;
@@ -2107,7 +2113,11 @@ impl PaneView {
                 if let Some(current) = self.snapshot.as_ref()
                     && !snapshot_replaces(current, &snapshot, authoritative)?
                 {
-                    return Ok(BackgroundUpdateImpact::NONE);
+                    return Ok(if notice_cleared {
+                        BackgroundUpdateImpact::VISUAL
+                    } else {
+                        BackgroundUpdateImpact::NONE
+                    });
                 }
                 let previous_generation = self
                     .snapshot
@@ -2284,6 +2294,11 @@ impl PaneView {
                 self.commands = None;
                 self.pending_control_transfer = None;
                 self.updates = None;
+                self.display_lost = false;
+                Ok(BackgroundUpdateImpact::VISUAL)
+            }
+            WindowUpdate::StreamLost => {
+                self.display_lost = true;
                 Ok(BackgroundUpdateImpact::VISUAL)
             }
         }
@@ -3651,6 +3666,34 @@ fn control_transfer_notice_rects<'a>(
         None => offered
             .filter(|splint_id| focused == Some(*splint_id))
             .map(|_| (content, true))
+            .collect(),
+    }
+}
+
+/// Plan 0073: what a pane whose display stream is lost says.
+const DISPLAY_LOST_NOTICE: &str = "Display disconnected; reconnecting…";
+
+/// Plan 0073: where the display-lost notices go, logical px: each pane of
+/// the shown `layout` whose display stream is lost, or `content` when the
+/// Window shows its one, `focused` pane. Like a control transfer notice,
+/// it is only drawn.
+fn display_lost_notice_rects<'a>(
+    panes: impl IntoIterator<Item = &'a PaneView>,
+    layout: Option<&PaneLayout>,
+    focused: Option<SplintId>,
+    content: Rect,
+) -> Vec<Rect> {
+    let lost = panes
+        .into_iter()
+        .filter(|pane| pane.display_lost)
+        .filter_map(|pane| pane.snapshot.as_ref().map(|snapshot| snapshot.splint_id));
+    match layout {
+        Some(layout) => lost
+            .filter_map(|splint_id| layout.rect(splint_id))
+            .collect(),
+        None => lost
+            .filter(|splint_id| focused == Some(*splint_id))
+            .map(|_| content)
             .collect(),
     }
 }
@@ -9820,6 +9863,17 @@ impl App {
         )
     }
 
+    /// Plan 0073: the visible panes, logical px, whose display stream is
+    /// lost; see [`display_lost_notice_rects`].
+    fn display_lost_notice_panes(&self, layout: Option<&PaneLayout>) -> Vec<Rect> {
+        display_lost_notice_rects(
+            std::iter::once(&self.panes.pane).chain(self.panes.inactive_panes.iter()),
+            layout,
+            self.panes.focused_splint(),
+            self.content_rect(),
+        )
+    }
+
     /// The focused pane's terminal title, or `None` before it has a snapshot.
     fn terminal_window_title(&self) -> Option<String> {
         let snapshot = self.panes.pane.snapshot.as_ref()?;
@@ -11625,6 +11679,11 @@ impl App {
                 } => {
                     self.panes.pane.history_page_pending = false;
                     self.panes.pane.resync_pending &= !authoritative;
+                    if authoritative && self.panes.pane.display_lost {
+                        self.panes.pane.display_lost = false;
+                        visual_changed = true;
+                        self.presentation.full_redraw = true;
+                    }
                     snapshot
                         .validate()
                         .map_err(|error| anyhow::anyhow!(error.message))?;
@@ -12022,6 +12081,12 @@ impl App {
                 WindowUpdate::Font(update) => {
                     retain_newest_font(&mut self.presentation.pending_font_update, update);
                 }
+                // Plan 0073: drawn in the pane, as a control transfer notice is.
+                WindowUpdate::StreamLost => {
+                    self.panes.pane.display_lost = true;
+                    visual_changed = true;
+                    self.presentation.full_redraw = true;
+                }
                 WindowUpdate::Exited { splint_id } => {
                     anyhow::ensure!(
                         self.panes.focused_splint() == Some(splint_id),
@@ -12033,6 +12098,7 @@ impl App {
                         self.panes.pane.commands = None;
                         self.panes.pane.pending_control_transfer = None;
                         self.panes.pane.updates = None;
+                        self.panes.pane.display_lost = false;
                         title_changed = true;
                         visual_changed = true;
                         focused_visual_changed = true;
@@ -12049,6 +12115,7 @@ impl App {
                         self.panes.pane.commands = None;
                         self.panes.pane.pending_control_transfer = None;
                         self.panes.pane.updates = None;
+                        self.panes.pane.display_lost = false;
                         title_changed = true;
                         visual_changed = true;
                         focused_visual_changed = true;
@@ -12734,8 +12801,11 @@ impl App {
             .explorer_layout
             .clone_from(&explorer_layout);
         let pane_layout = self.computed_pane_layout();
-        // Plan 0067 M4: where this draw puts control transfer notices.
-        let notice_panes = self.control_transfer_notice_panes(pane_layout.as_ref());
+        // Plan 0067 M4: where this draw puts control transfer notices, and
+        // Plan 0073 its display-lost notices, which take their place.
+        let lost_panes = self.display_lost_notice_panes(pane_layout.as_ref());
+        let mut notice_panes = self.control_transfer_notice_panes(pane_layout.as_ref());
+        notice_panes.retain(|(pane, _)| !lost_panes.contains(pane));
         let (pane_cell_width, pane_cell_height) = self
             .panes
             .pane
@@ -13348,7 +13418,7 @@ impl App {
         // banner and every popup draw over it. The keys answer the focused
         // pane, so another pane asked says to focus it first.
         let mut control_notices = Vec::new();
-        if !notice_panes.is_empty()
+        if !(notice_panes.is_empty() && lost_panes.is_empty())
             && let Some(terminal) = search_paint_rect(content_rect, explorer_layout.as_ref())
         {
             let scale_120 = self.surface.scale_120;
@@ -13359,11 +13429,27 @@ impl App {
             } else {
                 None
             };
-            for (pane, answerable) in notice_panes {
+            let notices = notice_panes
+                .into_iter()
+                .map(|(pane, answerable)| (pane, Some(answerable)))
+                .chain(lost_panes.into_iter().map(|pane| (pane, None)));
+            for (pane, answerable) in notices {
                 let Some(pane) = rect_intersection(pane, terminal) else {
                     continue;
                 };
-                let legend = keys.legend_for(answerable);
+                let legend = answerable.map(|answerable| keys.legend_for(answerable));
+                let notice = match &legend {
+                    Some(legend) => crate::renderer::ControlTransferStrip {
+                        title: "control",
+                        label: crate::frontend::CONTROL_TRANSFER_NOTICE,
+                        legend,
+                    },
+                    None => crate::renderer::ControlTransferStrip {
+                        title: "display",
+                        label: DISPLAY_LOST_NOTICE,
+                        legend: &[],
+                    },
+                };
                 let panel = crate::renderer::paint_control_transfer_notice(
                     &mut self.presentation.control_notice_text_cache,
                     &self.presentation.render_context,
@@ -13375,10 +13461,7 @@ impl App {
                     scale_120,
                     self.presentation.renderer_generation,
                     chrome_panel_palette(self.presentation.theme, ChromeSurface::Popup),
-                    crate::renderer::ControlTransferStrip {
-                        label: crate::frontend::CONTROL_TRANSFER_NOTICE,
-                        legend: &legend,
-                    },
+                    notice,
                 )?;
                 control_notices.extend(panel.map(|panel| strip_bounds(panel, scale_120)));
             }
@@ -19590,6 +19673,72 @@ mod tests {
             )
             .is_empty()
         );
+    }
+
+    /// Plan 0073: a pane whose display stream is lost says so in its own
+    /// pane until an authoritative snapshot arrives; a plain snapshot does
+    /// not end it.
+    #[test]
+    fn a_lost_display_shows_its_notice_until_an_authoritative_snapshot() {
+        let theme = ResolvedTheme::default();
+        let (first, second) = (
+            Splint::shell(PathBuf::from("/")),
+            Splint::shell(PathBuf::from("/")),
+        );
+        let (first_id, second_id) = (first.id, second.id);
+        let root = LayoutNode::Branch {
+            axis: Axis::Horizontal,
+            ratio: SplitRatio::new(500).unwrap(),
+            first: Box::new(LayoutNode::Leaf(first)),
+            second: Box::new(LayoutNode::Leaf(second)),
+        };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 400,
+        };
+        let layout = PaneLayout::compute(&root, area, 1, 40, 40).unwrap();
+        let focused = PaneView::from_options(pane_options(first_id), SCALE_DENOMINATOR).unwrap();
+        let mut lost = PaneView::from_options(pane_options(second_id), SCALE_DENOMINATOR).unwrap();
+        let notices = |lost: &PaneView| {
+            display_lost_notice_rects([&focused, lost], Some(&layout), Some(first_id), area)
+        };
+        assert!(notices(&lost).is_empty());
+        let impact = lost
+            .apply_background_update(WindowUpdate::StreamLost, theme, "visible-inactive")
+            .unwrap();
+        assert_eq!(impact, BackgroundUpdateImpact::VISUAL);
+        assert_eq!(notices(&lost), [layout.rect(second_id).unwrap()]);
+        // A Window showing its one pane puts the notice over its content.
+        assert_eq!(
+            display_lost_notice_rects([&lost], None, Some(second_id), area),
+            [area]
+        );
+        let snapshot = |revision, authoritative| WindowUpdate::Snapshot {
+            snapshot: TerminalSnapshot {
+                revision,
+                ..valid_snapshot(second_id)
+            },
+            image_sources: ImageContentLeaseSet::default(),
+            authoritative,
+        };
+        let revision = valid_snapshot(second_id).revision;
+        lost.apply_background_update(snapshot(revision + 1, false), theme, "visible-inactive")
+            .unwrap();
+        assert_eq!(notices(&lost), [layout.rect(second_id).unwrap()]);
+        // The reattachment's snapshot ends it, even at the revision shown.
+        let impact = lost
+            .apply_background_update(snapshot(revision + 1, true), theme, "visible-inactive")
+            .unwrap();
+        assert_eq!(impact, BackgroundUpdateImpact::FRAME);
+        assert!(notices(&lost).is_empty());
+        // A pane whose stream ended is not reconnecting.
+        lost.apply_background_update(WindowUpdate::StreamLost, theme, "visible-inactive")
+            .unwrap();
+        lost.apply_background_update(WindowUpdate::Shutdown, theme, "visible-inactive")
+            .unwrap();
+        assert!(notices(&lost).is_empty());
     }
 
     /// The current match is outlined only while the strip is open and

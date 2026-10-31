@@ -1348,3 +1348,758 @@ async fn a_pane_without_a_ticket_or_with_a_refused_claim_falls_back() {
     drop(control);
     assert_eq!(server.await.unwrap(), 2);
 }
+
+// Plan 0073: a pane's display subscription survives a dropped connection.
+
+type DuplexReader = tokio::io::ReadHalf<tokio::io::DuplexStream>;
+type DuplexWriter = tokio::io::WriteHalf<tokio::io::DuplexStream>;
+type ScriptedAttempts = Arc<std::sync::Mutex<std::collections::VecDeque<Result<StreamReconnect>>>>;
+
+/// One daemon connection after its handshake, `buffer` bytes buffered each
+/// way, with the daemon's ends for the test to script.
+async fn daemon_end(buffer: usize) -> (Connection, DuplexReader, DuplexWriter) {
+    let (client, server) = tokio::io::duplex(buffer);
+    let (mut reader, mut writer) = tokio::io::split(server);
+    let (client_reader, client_writer) = tokio::io::split(client);
+    let (connection, ()) = tokio::join!(
+        Connection::connect_remote_interactive_transport(client_reader, client_writer),
+        async {
+            let _hello = read_client(&mut reader).await;
+            send_frame(&mut writer, server_hello(ServerLimits::default())).await;
+        },
+    );
+    (connection.unwrap(), reader, writer)
+}
+
+fn stream_snapshot(splint_id: SplintId, revision: u64) -> TerminalSnapshot {
+    TerminalSnapshot {
+        splint_id,
+        incarnation: 7,
+        revision,
+        columns: 1,
+        rows: 1,
+        cursor_column: 0,
+        cursor_row: 0,
+        cursor_deferred_wrap: false,
+        active_screen: splinterm_protocol::ActiveScreen::Normal,
+        input_modes: splinterm_protocol::TerminalInputModes {
+            application_cursor: false,
+            application_keypad: false,
+            focus_reporting: false,
+            bracketed_paste: false,
+            cursor_visible: true,
+            cursor_blink: true,
+            mouse_tracking: splinterm_protocol::MouseTracking::None,
+            sgr_mouse: false,
+        },
+        palette: vec![0; 256],
+        default_colors: [0, 0, 0],
+        title: String::new(),
+        visible_rows: vec![splinterm_protocol::TerminalRow {
+            row_id: Some(1),
+            linebreak: true,
+            cells: Vec::new(),
+        }],
+        history_generation: 1,
+        oldest_available_scrollback_row_id: None,
+        newest_available_scrollback_row_id: None,
+        scrollback_rows: Vec::new(),
+        available_scrollback_rows: 0,
+        omitted_oldest_scrollback_rows: 0,
+        images: None,
+        exited_code: None,
+        exited_signal: None,
+    }
+}
+
+fn update_event(subscription_id: u64, sequence: u64, base_revision: u64) -> ServerFrame {
+    ServerFrame::Event {
+        subscription_id,
+        sequence,
+        event: SubscriptionEvent::Update {
+            update: TerminalUpdate {
+                base_revision,
+                revision: base_revision + 1,
+                rows: Vec::new(),
+                scrolls: Vec::new(),
+                cursor: None,
+                title: None,
+                input_modes: None,
+                active_screen: None,
+                palette: None,
+                default_colors: None,
+                columns: None,
+                row_count: None,
+                scrollback: None,
+                images: None,
+            },
+        },
+    }
+}
+
+fn attached_stream(
+    connection: Connection,
+    splint_id: SplintId,
+    subscription_id: u64,
+    revision: u64,
+) -> PaneStream {
+    PaneStream {
+        connection,
+        attachment: Attachment {
+            subscription_id,
+            snapshot: stream_snapshot(splint_id, revision),
+        },
+    }
+}
+
+/// A controller stand-in that runs until the pane is cancelled.
+fn idle_controller(
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<Result<()>> {
+    let cancellation = cancellation.clone();
+    tokio::spawn(async move {
+        cancellation.cancelled().await;
+        Ok(())
+    })
+}
+
+fn stream_pane(
+    splint_id: SplintId,
+    controller: tokio::task::JoinHandle<Result<()>>,
+    resyncs: mpsc::Receiver<()>,
+    updates: mpsc::Sender<WindowUpdate>,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> PaneSubscription {
+    PaneSubscription {
+        controller,
+        controller_completed: false,
+        resyncs,
+        updates,
+        splint_id,
+        incarnation: 7,
+        image_transport: ImageTransport::Unavailable,
+        image_cache: SharedImageContentCache::default(),
+        cancellation: cancellation.clone(),
+        detach_on_cancel: Arc::new(AtomicBool::new(false)),
+        lagged: false,
+    }
+}
+
+/// Reconnects with each scripted outcome in turn, then with refusals;
+/// counts the attempts.
+fn scripted_reconnect(
+    outcomes: Vec<Result<StreamReconnect>>,
+    attempts: &Arc<std::sync::atomic::AtomicUsize>,
+) -> impl FnMut() -> std::future::Ready<Result<StreamReconnect>> + Send + 'static {
+    let outcomes: ScriptedAttempts = Arc::new(std::sync::Mutex::new(outcomes.into()));
+    let attempts = Arc::clone(attempts);
+    move || {
+        attempts.fetch_add(1, Ordering::SeqCst);
+        let next = outcomes.lock().unwrap().pop_front();
+        std::future::ready(next.unwrap_or_else(|| Err(anyhow::anyhow!("connection refused"))))
+    }
+}
+
+async fn next_update(updates: &mut mpsc::Receiver<WindowUpdate>) -> WindowUpdate {
+    tokio::time::timeout(Duration::from_secs(60), updates.recv())
+        .await
+        .expect("an update arrives")
+        .expect("the update queue stays open")
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_display_stream_the_daemon_dropped_reattaches_with_a_snapshot_then_live_updates() {
+    let id = SplintId::new();
+    let (first, first_reader, first_writer) = daemon_end(65536).await;
+    let (second, second_reader, mut second_writer) = daemon_end(65536).await;
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let reconnect = scripted_reconnect(
+        vec![Ok(StreamReconnect::Attached(Box::new(attached_stream(
+            second, id, 2, 9,
+        ))))],
+        &attempts,
+    );
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let (updates, mut window) = mpsc::channel(WINDOW_UPDATE_QUEUE);
+    let (_resync_sender, resyncs) = mpsc::channel(1);
+    let pane = stream_pane(
+        id,
+        idle_controller(&cancellation),
+        resyncs,
+        updates,
+        &cancellation,
+    );
+    let task = tokio::spawn(run_pane_subscription(
+        attached_stream(first, id, 1, 5),
+        pane,
+        HandoffStatusHub::default(),
+        reconnect,
+    ));
+    // The daemon ends the connection, as after a stalled write.
+    drop((first_reader, first_writer));
+    let WindowUpdate::Snapshot {
+        snapshot,
+        authoritative: true,
+        ..
+    } = next_update(&mut window).await
+    else {
+        panic!("the reattachment's snapshot comes first, as authoritative");
+    };
+    assert_eq!(snapshot.revision, 9);
+    send_frame(&mut second_writer, update_event(2, 1, 9)).await;
+    let WindowUpdate::Update { update, .. } = next_update(&mut window).await else {
+        panic!("live updates follow the reattachment");
+    };
+    assert_eq!(update.revision, 10);
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    cancellation.cancel();
+    tokio::time::timeout(Duration::from_millis(1), task)
+        .await
+        .expect("a cancelled pane stops at once")
+        .unwrap()
+        .unwrap();
+    drop(second_reader);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_resynchronization_during_an_outage_never_ends_the_controller() {
+    let id = SplintId::new();
+    let (control, control_server) = scripted_control(vec![(
+        Request::SubscribeControl {
+            splint_id: id,
+            incarnation: 7,
+        },
+        Ok(control_subscribed(id, true)),
+    )])
+    .await;
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let (updates, mut window) = mpsc::channel(WINDOW_UPDATE_QUEUE);
+    let (resync_sender, resyncs) = mpsc::channel(1);
+    let (command_sender, commands) = mpsc::channel(WINDOW_COMMAND_QUEUE);
+    let (ended_sender, mut ended) = tokio::sync::oneshot::channel();
+    let hub = HandoffStatusHub::default();
+    let outputs = ControllerOutputs {
+        updates: updates.clone(),
+        resyncs: resync_sender,
+        handoff: hub.source(),
+    };
+    let token = cancellation.clone();
+    let controller = tokio::spawn(async move {
+        let result = run_controller(
+            control,
+            commands,
+            outputs,
+            None,
+            id,
+            7,
+            ForcedControlTransfer::Disabled,
+            0,
+            token,
+        )
+        .await;
+        let _ = ended_sender.send(result.is_ok());
+        result
+    });
+    let (first, first_reader, first_writer) = daemon_end(65536).await;
+    drop((first_reader, first_writer));
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let task = tokio::spawn(run_pane_subscription(
+        attached_stream(first, id, 1, 5),
+        stream_pane(id, controller, resyncs, updates, &cancellation),
+        hub.clone(),
+        scripted_reconnect(Vec::new(), &attempts),
+    ));
+    assert!(matches!(
+        next_update(&mut window).await,
+        WindowUpdate::Control(true)
+    ));
+    // Return to live, again and again, while the display cannot reconnect.
+    for _ in 0..3 {
+        command_sender
+            .send(WindowCommand::Resynchronize)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    assert!(attempts.load(Ordering::SeqCst) > 1);
+    assert!(
+        matches!(
+            ended.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ),
+        "the controller keeps serving through the outage"
+    );
+    cancellation.cancel();
+    tokio::time::timeout(Duration::from_millis(1), task)
+        .await
+        .expect("a cancelled pane stops at once")
+        .unwrap()
+        .unwrap();
+    assert_eq!(ended.await, Ok(true));
+    drop(command_sender);
+    assert_eq!(control_server.await.unwrap(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_display_lost_for_a_while_says_so_until_its_reattachment() {
+    let id = SplintId::new();
+    let (first, first_reader, first_writer) = daemon_end(65536).await;
+    let (second, second_reader, second_writer) = daemon_end(65536).await;
+    drop((first_reader, first_writer));
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let refused = || Err(anyhow::anyhow!("connection refused"));
+    let reconnect = scripted_reconnect(
+        vec![
+            refused(),
+            refused(),
+            refused(),
+            refused(),
+            Ok(StreamReconnect::Attached(Box::new(attached_stream(
+                second, id, 2, 9,
+            )))),
+        ],
+        &attempts,
+    );
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let (updates, mut window) = mpsc::channel(WINDOW_UPDATE_QUEUE);
+    let (_resync_sender, resyncs) = mpsc::channel(1);
+    let started = tokio::time::Instant::now();
+    let task = tokio::spawn(run_pane_subscription(
+        attached_stream(first, id, 1, 5),
+        stream_pane(
+            id,
+            idle_controller(&cancellation),
+            resyncs,
+            updates,
+            &cancellation,
+        ),
+        HandoffStatusHub::default(),
+        reconnect,
+    ));
+    assert!(matches!(
+        next_update(&mut window).await,
+        WindowUpdate::StreamLost
+    ));
+    assert_eq!(started.elapsed(), PANE_STREAM_NOTICE_DELAY);
+    let WindowUpdate::Snapshot {
+        authoritative: true,
+        ..
+    } = next_update(&mut window).await
+    else {
+        panic!("the reattachment's authoritative snapshot ends the notice");
+    };
+    // Attempts back off from 250 ms, doubling: 0.25 + 0.5 + 1 + 2 + 4 s.
+    assert_eq!(started.elapsed(), Duration::from_millis(7750));
+    assert_eq!(attempts.load(Ordering::SeqCst), 5);
+    cancellation.cancel();
+    task.await.unwrap().unwrap();
+    drop((second_reader, second_writer));
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancelling_a_pane_stops_its_reconnection_at_once() {
+    let id = SplintId::new();
+    let (first, first_reader, first_writer) = daemon_end(65536).await;
+    drop((first_reader, first_writer));
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let (updates, _window) = mpsc::channel(WINDOW_UPDATE_QUEUE);
+    let (_resync_sender, resyncs) = mpsc::channel(1);
+    let task = tokio::spawn(run_pane_subscription(
+        attached_stream(first, id, 1, 5),
+        stream_pane(
+            id,
+            idle_controller(&cancellation),
+            resyncs,
+            updates,
+            &cancellation,
+        ),
+        HandoffStatusHub::default(),
+        scripted_reconnect(Vec::new(), &attempts),
+    ));
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let tried = attempts.load(Ordering::SeqCst);
+    assert!(tried >= 2);
+    cancellation.cancel();
+    tokio::time::timeout(Duration::from_millis(1), task)
+        .await
+        .expect("a cancelled pane stops at once")
+        .unwrap()
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    assert_eq!(attempts.load(Ordering::SeqCst), tried);
+
+    // An attempt still waiting on the daemon is abandoned as promptly.
+    let (first, first_reader, first_writer) = daemon_end(65536).await;
+    drop((first_reader, first_writer));
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let (updates, _window) = mpsc::channel(WINDOW_UPDATE_QUEUE);
+    let (_resync_sender, resyncs) = mpsc::channel(1);
+    let task = tokio::spawn(run_pane_subscription(
+        attached_stream(first, id, 1, 5),
+        stream_pane(
+            id,
+            idle_controller(&cancellation),
+            resyncs,
+            updates,
+            &cancellation,
+        ),
+        HandoffStatusHub::default(),
+        std::future::pending::<Result<StreamReconnect>>,
+    ));
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    cancellation.cancel();
+    tokio::time::timeout(Duration::from_millis(1), task)
+        .await
+        .expect("a cancelled pane abandons its attempt")
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_reconnection_that_cannot_succeed_stops_and_the_pane_waits_to_close() {
+    let id = SplintId::new();
+    let (first, first_reader, first_writer) = daemon_end(65536).await;
+    drop((first_reader, first_writer));
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let (updates, mut window) = mpsc::channel(WINDOW_UPDATE_QUEUE);
+    let (_resync_sender, resyncs) = mpsc::channel(1);
+    let task = tokio::spawn(run_pane_subscription(
+        attached_stream(first, id, 1, 5),
+        stream_pane(
+            id,
+            idle_controller(&cancellation),
+            resyncs,
+            updates,
+            &cancellation,
+        ),
+        HandoffStatusHub::default(),
+        scripted_reconnect(
+            vec![Ok(StreamReconnect::Stop("the Splint is gone"))],
+            &attempts,
+        ),
+    ));
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    // The pane keeps its queue open: a closed queue would end the Window.
+    assert!(matches!(window.try_recv(), Ok(WindowUpdate::StreamLost)));
+    assert!(matches!(
+        window.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    assert!(!task.is_finished());
+    cancellation.cancel();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_process_that_exited_while_the_display_was_lost_takes_the_exit_path() {
+    let id = SplintId::new();
+    let (first, first_reader, first_writer) = daemon_end(65536).await;
+    drop((first_reader, first_writer));
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let (updates, mut window) = mpsc::channel(WINDOW_UPDATE_QUEUE);
+    let (_resync_sender, resyncs) = mpsc::channel(1);
+    let task = tokio::spawn(run_pane_subscription(
+        attached_stream(first, id, 1, 5),
+        stream_pane(
+            id,
+            idle_controller(&cancellation),
+            resyncs,
+            updates,
+            &cancellation,
+        ),
+        HandoffStatusHub::default(),
+        scripted_reconnect(vec![Ok(StreamReconnect::Exited)], &attempts),
+    ));
+    let WindowUpdate::Exited { splint_id } = next_update(&mut window).await else {
+        panic!("the Window takes the exit path the stream would have started");
+    };
+    assert_eq!(splint_id, id);
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    cancellation.cancel();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn no_reconnection_is_tried_while_a_handoff_pauses_the_window() {
+    let id = SplintId::new();
+    let (first, first_reader, first_writer) = daemon_end(65536).await;
+    drop((first_reader, first_writer));
+    let hub = HandoffStatusHub::default();
+    let pane_source = hub.source();
+    pane_source.observe(4, HandoffStatusPhase::Fenced);
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let (updates, mut window) = mpsc::channel(WINDOW_UPDATE_QUEUE);
+    let (_resync_sender, resyncs) = mpsc::channel(1);
+    let task = tokio::spawn(run_pane_subscription(
+        attached_stream(first, id, 1, 5),
+        stream_pane(
+            id,
+            idle_controller(&cancellation),
+            resyncs,
+            updates,
+            &cancellation,
+        ),
+        hub.clone(),
+        scripted_reconnect(Vec::new(), &attempts),
+    ));
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    assert_eq!(attempts.load(Ordering::SeqCst), 0);
+    // The handoff banner speaks for the Window: no notice of its own.
+    assert!(matches!(
+        window.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    cancellation.cancel();
+    task.await.unwrap().unwrap();
+    drop(pane_source);
+}
+
+fn live_splint(splint_id: SplintId, live_incarnation: Option<u64>) -> Response {
+    Response::Splint {
+        lair_id: LairId::new(),
+        dojo_id: DojoId::new(),
+        title: String::new(),
+        topology_revision: splinterm_core::TopologyRevision::new(1),
+        resolved_cwd: None,
+        runtime: splinterm_protocol::SplintRuntimeSummary {
+            splint_id,
+            live_incarnation,
+            last_incarnation: live_incarnation,
+            restorable: false,
+            lifecycle: splinterm_protocol::SplintLifecycle::Running,
+            exit_status: None,
+            agent_status: None,
+            foreground_app: None,
+        },
+    }
+}
+
+const fn daemon_at(generation: u64) -> DaemonIdentity {
+    DaemonIdentity {
+        generation,
+        pid: None,
+    }
+}
+
+async fn reattach_against(
+    steps: Vec<(Request, Reply)>,
+    before: DaemonIdentity,
+    splint_id: SplintId,
+) -> (Result<StreamReconnect>, usize) {
+    let (connection, server) = scripted_control(steps).await;
+    let outcome = reattach_pane_stream(
+        Ok(connection),
+        before,
+        splint_id,
+        7,
+        ImageTransport::Unavailable,
+        &SharedImageContentCache::default(),
+    )
+    .await;
+    if let Ok(StreamReconnect::Attached(stream)) = &outcome {
+        assert_eq!(stream.attachment.subscription_id, 3);
+        assert_eq!(stream.attachment.snapshot.revision, 9);
+        // Its stream keeps the connection, and so the script, open.
+        return (outcome, 3);
+    }
+    (outcome, server.await.unwrap())
+}
+
+#[tokio::test]
+async fn reattachment_follows_the_first_attachment_and_stops_when_the_splint_changed() {
+    let id = SplintId::new();
+    let inspect = Request::InspectSplint { splint_id: id };
+    // A new process took the Splint's place, or none runs: the pane's
+    // process exited meanwhile.
+    for live_incarnation in [Some(8), None] {
+        let (outcome, answered) = reattach_against(
+            vec![(inspect.clone(), Ok(live_splint(id, live_incarnation)))],
+            daemon_at(1),
+            id,
+        )
+        .await;
+        assert!(matches!(outcome, Ok(StreamReconnect::Exited)));
+        assert_eq!(answered, 1);
+    }
+    // The Splint is gone.
+    let (outcome, _) = reattach_against(
+        vec![(inspect.clone(), Err(ErrorCode::NotFound))],
+        daemon_at(1),
+        id,
+    )
+    .await;
+    assert!(matches!(outcome, Ok(StreamReconnect::Stop(_))));
+    // A restarted daemon (an older generation) is not asked anything.
+    let (outcome, answered) = reattach_against(Vec::new(), daemon_at(5), id).await;
+    assert!(matches!(outcome, Ok(StreamReconnect::Stop(_))));
+    assert_eq!(answered, 0);
+    // Refused access stops too; another failure is retried.
+    let access = Request::RequestAccess {
+        splint_id: id,
+        incarnation: 7,
+        scopes: pane_access_scopes(),
+    };
+    let (outcome, _) = reattach_against(
+        vec![
+            (inspect.clone(), Ok(live_splint(id, Some(7)))),
+            (access.clone(), Err(ErrorCode::Unauthorized)),
+        ],
+        daemon_at(1),
+        id,
+    )
+    .await;
+    assert!(matches!(outcome, Ok(StreamReconnect::Stop(_))));
+    let (outcome, _) = reattach_against(
+        vec![
+            (inspect.clone(), Ok(live_splint(id, Some(7)))),
+            (access.clone(), Err(ErrorCode::ResourceLimit)),
+        ],
+        daemon_at(1),
+        id,
+    )
+    .await;
+    assert!(outcome.is_err());
+    // The same steps as the pane's first attachment.
+    let granted = Response::AccessGranted {
+        lair_id: LairId::new(),
+        dojo_id: DojoId::new(),
+        authorization_revision: 1,
+        grant: splinterm_protocol::AccessGrant {
+            grant_id: 0,
+            splint_id: id,
+            incarnation: 7,
+            scopes: pane_access_scopes(),
+            requester: String::new(),
+            expires_at_unix_seconds: 0,
+        },
+    };
+    let (outcome, _) = reattach_against(
+        vec![
+            (inspect, Ok(live_splint(id, Some(7)))),
+            (access, Ok(granted)),
+            (
+                Request::Attach {
+                    splint_id: id,
+                    incarnation: Some(7),
+                    scrollback_rows: splinterm_protocol::MAX_SNAPSHOT_SCROLLBACK_ROWS,
+                },
+                Ok(Response::Attached {
+                    subscription_id: 3,
+                    provenance: page_provenance(id, 9),
+                    snapshot: stream_snapshot(id, 9),
+                }),
+            ),
+        ],
+        daemon_at(1),
+        id,
+    )
+    .await;
+    assert!(matches!(outcome, Ok(StreamReconnect::Attached(_))));
+}
+
+/// The Window's update queue is full and nobody drains it, as for a pane held
+/// back while the Dojo picker is open: frames sent meanwhile are read anyway,
+/// so splinterd never finds the connection stalled.
+async fn serve_while_the_window_is_away(
+    mut reader: DuplexReader,
+    mut writer: DuplexWriter,
+    splint_id: SplintId,
+    written: tokio::sync::oneshot::Sender<()>,
+) {
+    for sequence in 1..=100 {
+        send_frame(&mut writer, update_event(1, sequence, 4 + sequence)).await;
+    }
+    let _ = written.send(());
+    for (expected, result) in [
+        (
+            Request::Detach { subscription_id: 1 },
+            Response::Acknowledged,
+        ),
+        (
+            Request::Attach {
+                splint_id,
+                incarnation: Some(7),
+                scrollback_rows: splinterm_protocol::MAX_SNAPSHOT_SCROLLBACK_ROWS,
+            },
+            Response::Attached {
+                subscription_id: 2,
+                provenance: page_provenance(splint_id, 300),
+                snapshot: stream_snapshot(splint_id, 300),
+            },
+        ),
+    ] {
+        let ClientFrame::Request {
+            request_id,
+            request,
+            ..
+        } = read_client(&mut reader).await
+        else {
+            panic!("expected a request");
+        };
+        assert_eq!(request, expected);
+        send_frame(&mut writer, ServerFrame::Response { request_id, result }).await;
+    }
+    let mut rest = Vec::new();
+    let _ = reader.read_to_end(&mut rest).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_window_that_stops_draining_never_stalls_the_daemon_and_gets_a_snapshot_later() {
+    let id = SplintId::new();
+    // Far less buffering than the frames sent: only reading drains them.
+    let (connection, reader, writer) = daemon_end(4096).await;
+    let (written_sender, written) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(serve_while_the_window_is_away(
+        reader,
+        writer,
+        id,
+        written_sender,
+    ));
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let (updates, mut window) = mpsc::channel(WINDOW_UPDATE_QUEUE);
+    let (_resync_sender, resyncs) = mpsc::channel(1);
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let task = tokio::spawn(run_pane_subscription(
+        attached_stream(connection, id, 1, 5),
+        stream_pane(
+            id,
+            idle_controller(&cancellation),
+            resyncs,
+            updates,
+            &cancellation,
+        ),
+        HandoffStatusHub::default(),
+        scripted_reconnect(Vec::new(), &attempts),
+    ));
+    tokio::time::timeout(Duration::from_secs(30), written)
+        .await
+        .expect("every frame was read while the Window was away")
+        .unwrap();
+    // The Window comes back: what it had queued, then the snapshot it is owed.
+    for revision in 6..=9 {
+        let WindowUpdate::Update { update, .. } = next_update(&mut window).await else {
+            panic!("the queued updates come first");
+        };
+        assert_eq!(update.revision, revision);
+    }
+    let WindowUpdate::Snapshot {
+        snapshot,
+        authoritative: true,
+        ..
+    } = next_update(&mut window).await
+    else {
+        panic!("an authoritative snapshot replaces what was dropped");
+    };
+    assert_eq!(snapshot.revision, 300);
+    assert_eq!(attempts.load(Ordering::SeqCst), 0);
+    cancellation.cancel();
+    task.await.unwrap().unwrap();
+    server.await.unwrap();
+}

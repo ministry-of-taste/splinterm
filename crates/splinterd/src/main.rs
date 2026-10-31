@@ -4151,7 +4151,14 @@ async fn serve_client(stream: UnixStream, state: Arc<DaemonState>) -> Result<()>
     let (writer_closed_tx, writer_closed_rx) = watch::channel(false);
     let terminal_transaction_memory = Arc::clone(&state.terminal_transaction_memory);
     let writer_task = AbortOnDrop::new(tokio::spawn(async move {
-        write_frames(writer, outbound_rx, control_rx, terminal_transaction_memory).await;
+        write_frames(
+            writer,
+            outbound_rx,
+            control_rx,
+            terminal_transaction_memory,
+            connection_id,
+        )
+        .await;
         writer_closed_tx.send_replace(true);
     }));
     let authenticated = Box::pin(serve_authenticated(
@@ -4954,6 +4961,7 @@ async fn serve_authenticated(
                                         SubscriptionOutputs {
                                             outbound: outbound.clone(),
                                             control: control.clone(),
+                                            connection_id,
                                         },
                                         revocations,
                                         access,
@@ -15287,6 +15295,25 @@ impl Drop for ConnectionResponder {
 struct SubscriptionOutputs {
     outbound: mpsc::Sender<QueuedServerFrame>,
     control: mpsc::Sender<ControlFrame>,
+    /// The connection the subscription writes to, for its logs (Plan 0073).
+    connection_id: u64,
+}
+
+/// Plan 0073: a terminal subscription ends with `ResyncRequired`, so its
+/// client must attach again; says which and why.
+fn log_subscription_resync(
+    outputs: &SubscriptionOutputs,
+    subscription_id: u64,
+    splint_id: SplintId,
+    reason: &str,
+) {
+    warn!(
+        connection_id = outputs.connection_id,
+        subscription_id,
+        %splint_id,
+        reason,
+        "ending a terminal subscription; its client must resynchronize"
+    );
 }
 
 struct SubscriptionAudit {
@@ -15494,6 +15521,12 @@ fn spawn_subscription(
             };
             match received {
                 SubscriptionReceive::ResnapshotRequired => {
+                    log_subscription_resync(
+                        &outputs,
+                        id,
+                        handle.splint_id,
+                        "the subscriber fell behind the terminal's updates",
+                    );
                     let revision = current_revision(&handle, access.scrollback_rows).await;
                     let _ = outputs
                         .control
@@ -15567,6 +15600,12 @@ fn spawn_subscription(
                             event,
                         };
                         if !frame_within_policy_limit(&frame, access.maximum_returned_bytes) {
+                            log_subscription_resync(
+                                &outputs,
+                                id,
+                                handle.splint_id,
+                                "an update exceeds the grant's returned-bytes limit",
+                            );
                             let revision = current_revision(&handle, access.scrollback_rows).await;
                             let _ = outputs
                                 .control
@@ -15582,7 +15621,16 @@ fn spawn_subscription(
                         }
                         let publication_bytes = match serde_json::to_vec(&frame) {
                             Ok(encoded) => encoded.len().saturating_add(4),
-                            Err(_) => break,
+                            Err(error) => {
+                                warn!(
+                                    connection_id = outputs.connection_id,
+                                    subscription_id = id,
+                                    splint_id = %handle.splint_id,
+                                    %error,
+                                    "ending a terminal subscription: an update could not be encoded"
+                                );
+                                break;
+                            }
                         };
                         let Some(reservation) = try_reserve_terminal_publication(
                             &audit.state,
@@ -15593,6 +15641,12 @@ fn spawn_subscription(
                         )
                         .await
                         else {
+                            log_subscription_resync(
+                                &outputs,
+                                id,
+                                handle.splint_id,
+                                "terminal publication memory is exhausted",
+                            );
                             let revision = current_revision(&handle, access.scrollback_rows).await;
                             let _ = outputs
                                 .control
@@ -15622,6 +15676,12 @@ fn spawn_subscription(
                             break;
                         }
                         if outputs.outbound.try_send(queued).is_err() {
+                            log_subscription_resync(
+                                &outputs,
+                                id,
+                                handle.splint_id,
+                                "the connection's outbound queue is full or closed",
+                            );
                             let revision = current_revision(&handle, access.scrollback_rows).await;
                             let _ = outputs
                                 .control
@@ -15816,11 +15876,20 @@ fn frame_trace_identity(frame: &ServerFrame) -> Option<(u64, u64, u64, u64)> {
 /// completely before the next is taken, so each item starts at a frame
 /// boundary with no earlier frame partly written. A handoff prepare frame
 /// relies on that ([`write_handoff_prepare`]).
+///
+/// Ending early ends the connection's writes, so each such end is logged
+/// with `connection_id` (Plan 0073): its client otherwise only sees its
+/// subscriptions go quiet.
+#[allow(
+    clippy::too_many_lines,
+    reason = "frame selection, transaction memory, tracing, and timed writes are one writer loop"
+)]
 async fn write_frames(
     mut writer: OwnedWriteHalf,
     mut normal: mpsc::Receiver<QueuedServerFrame>,
     mut control: mpsc::Receiver<ControlFrame>,
     terminal_transaction_memory: Arc<Semaphore>,
+    connection_id: u64,
 ) {
     loop {
         let (frame, _publication_reservation, written) = tokio::select! {
@@ -15838,6 +15907,10 @@ async fn write_frames(
                         if write_handoff_prepare(&mut writer, prepare).await {
                             continue;
                         }
+                        warn!(
+                            connection_id,
+                            "closing a connection: its handoff prepare frame was not written"
+                        );
                         return;
                     }
                 }
@@ -15856,6 +15929,10 @@ async fn write_frames(
                 .acquire_many_owned(permits)
                 .await
             else {
+                warn!(
+                    connection_id,
+                    "closing a connection: terminal transaction memory closed"
+                );
                 break;
             };
             Some(permit)
@@ -15864,6 +15941,11 @@ async fn write_frames(
         };
         let encode_started = perf_trace_enabled().then(Instant::now);
         let Ok(encoded_frames) = encode_server_frame_transaction(&frame) else {
+            warn!(
+                connection_id,
+                subscription_id = identity.map(|(subscription_id, ..)| subscription_id),
+                "closing a connection: a frame could not be encoded"
+            );
             break;
         };
         let encoded_bytes = encoded_frames
@@ -15892,10 +15974,16 @@ async fn write_frames(
         let write_started = perf_trace_enabled().then(Instant::now);
         let mut complete = true;
         for encoded in &encoded_frames {
-            match time::timeout(WRITE_TIMEOUT, writer.write_all(encoded)).await {
-                Ok(result) => complete &= result.is_ok(),
-                Err(_) => return,
-            }
+            let Ok(result) = time::timeout(WRITE_TIMEOUT, writer.write_all(encoded)).await else {
+                warn!(
+                    connection_id,
+                    subscription_id = identity.map(|(subscription_id, ..)| subscription_id),
+                    timeout_ms = u64::try_from(WRITE_TIMEOUT.as_millis()).unwrap_or(u64::MAX),
+                    "closing a connection: its client read nothing while a frame write waited"
+                );
+                return;
+            };
+            complete &= result.is_ok();
         }
         if let Some(written) = written {
             let _ = written.send(complete);
@@ -26705,6 +26793,7 @@ mod tests {
             outbound_rx,
             control_rx,
             Arc::clone(&state.terminal_transaction_memory),
+            0,
         )));
         let mut windows = state.handoff_windows.lock().unwrap();
         windows.register_connection(connection_id, process.pid, process.start_time);
@@ -27798,6 +27887,7 @@ mod tests {
                 outbound_rx,
                 control_rx,
                 Arc::clone(&state.terminal_transaction_memory),
+                0,
             ))),
         };
         let (control, _prompts) = mpsc::channel(CONTROL_QUEUE);
@@ -27811,6 +27901,69 @@ mod tests {
         assert_eq!(exec.windows.windows.len(), 1);
         exec.cancel(HandoffCancelReason::Failed).await;
         assert!(continuation_closed(descriptors.continuation()));
+    }
+
+    /// Plan 0073: a client that reads nothing for [`WRITE_TIMEOUT`] loses
+    /// its connection's writes, and the daemon says which connection and why.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_write_ends_the_writer_and_logs_why() {
+        #[derive(Clone, Default)]
+        struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let logs = Captured::default();
+        let sink = logs.clone();
+        let _logging = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || sink.clone())
+                .finish(),
+        );
+        let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        server.set_nonblocking(true).unwrap();
+        let (_reader, writer) = UnixStream::from_std(server).unwrap().into_split();
+        let (_outbound, outbound_rx) = mpsc::channel(OUTBOUND_QUEUE);
+        let (control, control_rx) = mpsc::channel(CONTROL_QUEUE);
+        let writer = tokio::spawn(write_frames(
+            writer,
+            outbound_rx,
+            control_rx,
+            Arc::new(Semaphore::new(1)),
+            77,
+        ));
+        // The client never reads: the socket fills, and a write then waits.
+        let producer = tokio::spawn(async move {
+            let mut request_id = 1;
+            while control
+                .send(ControlFrame::Frame(ServerFrame::Response {
+                    request_id,
+                    result: Response::Acknowledged,
+                }))
+                .await
+                .is_ok()
+            {
+                request_id += 1;
+            }
+        });
+        time::timeout(WRITE_TIMEOUT * 4, writer)
+            .await
+            .expect("a stalled write ends the writer")
+            .unwrap();
+        producer.await.unwrap();
+        let logs = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains("connection_id=77") && logs.contains("its client read nothing"),
+            "{logs}"
+        );
+        drop(client);
     }
 
     #[tokio::test]
@@ -27829,6 +27982,7 @@ mod tests {
             outbound_rx,
             control_rx,
             Arc::clone(&state.terminal_transaction_memory),
+            0,
         )));
         let mut initiator = TestWindow {
             connection_id: 41,
