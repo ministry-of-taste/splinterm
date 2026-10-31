@@ -1247,7 +1247,9 @@ pub struct ConsentOffer {
     pub daemon_generation: u64,
     /// Monotonic and never reused within a daemon generation.
     pub offer_id: u64,
-    /// The pending request's agent-visible ID.
+    /// The pending request's agent-visible ID; 0 for a forced-takeover
+    /// confirmation ([`OfferedConsentPrompt::is_forced_takeover`]), which no
+    /// agent request names.
     pub request_id: u64,
     pub nonce: ConsentOfferNonce,
     /// Seconds the responder has to answer, at least one and at most
@@ -1684,7 +1686,9 @@ pub enum SubscriptionEvent {
     },
     /// Sent only on a consent responder subscription
     /// ([`Request::SubscribeConsentOffers`]): a workspace access prompt this
-    /// responder may answer with [`Request::AnswerConsentOffer`].
+    /// responder may answer with [`Request::AnswerConsentOffer`], or, to a
+    /// remote Window only, the confirmation of a forced takeover that Window
+    /// asked for itself (Plan 0072 M3).
     ConsentOffered {
         offer: ConsentOffer,
     },
@@ -3279,17 +3283,41 @@ impl ConsentPrompt {
 
 impl OfferedConsentPrompt {
     /// Checks the bounds of [`ConsentPrompt::validate`] that apply to the
-    /// content, and that it asks for a workspace: only Lair access is
-    /// offered to consent responders.
+    /// content, and that it asks for one of the two things a consent
+    /// responder is offered: workspace (Lair) access, or the confirmation of
+    /// a forced takeover a remote Window asked for itself
+    /// ([`Self::is_forced_takeover`], Plan 0072 M3).
     ///
     /// # Errors
     /// Any content error [`ConsentPrompt::validate`] reports, or a target
-    /// that is not a Lair.
+    /// that is neither a Lair nor a forced takeover.
     pub fn validate(&self) -> Result<(), &'static str> {
-        if !matches!(self.target, ConsentTarget::Lair { .. }) {
+        if !matches!(self.target, ConsentTarget::Lair { .. }) && !self.is_forced_takeover() {
             return Err("a consent offer asks for something other than a workspace");
         }
         self.content().validate()
+    }
+
+    /// Whether this is a forced-takeover confirmation (Plan 0072 M3, ADR
+    /// 0015): one Splint, only the takeover scope, no level or agent name,
+    /// and "Just this once" as its only duration. The daemon offers it only
+    /// to the remote Window that asked to force control, never to another
+    /// responder.
+    #[must_use]
+    pub fn is_forced_takeover(&self) -> bool {
+        matches!(self.target, ConsentTarget::Splint { .. })
+            && self.scopes == [AccessScope::ControlTakeover]
+            && self.level.is_none()
+            && self.agent_name.is_none()
+            && matches!(
+                self.durations.as_slice(),
+                [ConsentDurationOffer {
+                    duration: GrantDuration::Once,
+                    withheld: None,
+                    shared_by: None,
+                    replaces: None,
+                }]
+            )
     }
 
     /// Whether the offered prompt offers `duration`.
@@ -9580,12 +9608,14 @@ mod tests {
         assert!(no_capability.validate().is_err());
         assert_eq!(no_capability.offered().validate(), Ok(()));
 
-        // Only workspace access is offered to responders.
+        // Only workspace access is offered to responders, and a forced
+        // takeover's confirmation.
         let mut splint = consent_prompt().offered();
         splint.target = ConsentTarget::Splint {
             splint_id: SplintId::new(),
             incarnation: 1,
         };
+        assert!(!splint.is_forced_takeover());
         assert!(splint.validate().is_err());
         let mut offer = consent_offer();
         offer.prompt = splint;
@@ -9599,6 +9629,81 @@ mod tests {
             offer.validate().unwrap_err().code,
             ErrorCode::InvalidArgument
         );
+    }
+
+    /// Plan 0072 M3: a remote Window is offered the confirmation of its own
+    /// forced takeover. It is one Splint, the takeover scope alone, and
+    /// "Just this once" alone; any other Splint prompt is still refused, so
+    /// no agent's Splint request reaches a responder.
+    #[test]
+    fn a_forced_takeover_confirmation_is_once_only_and_takeover_only() {
+        let takeover = || OfferedConsentPrompt {
+            requester: "/usr/bin/splinterm-relay".to_owned(),
+            requester_pid: 10,
+            requester_uid: 1000,
+            agent_name: None,
+            target: ConsentTarget::Splint {
+                splint_id: SplintId::new(),
+                incarnation: 3,
+            },
+            scopes: vec![AccessScope::ControlTakeover],
+            level: None,
+            durations: vec![ConsentDurationOffer {
+                duration: GrantDuration::Once,
+                withheld: None,
+                shared_by: None,
+                replaces: None,
+            }],
+        };
+        let prompt = takeover();
+        assert!(prompt.is_forced_takeover());
+        assert_eq!(prompt.validate(), Ok(()));
+        assert!(prompt.offers(GrantDuration::Once));
+        assert!(!prompt.offers(GrantDuration::WorkspaceSession));
+        assert!(!prompt.offers(GrantDuration::Remembered));
+        let mut offer = consent_offer();
+        offer.request_id = 0;
+        offer.prompt = prompt.clone();
+        assert_eq!(offer.validate(), Ok(()));
+        // The dialog a remote Window builds from it is valid too.
+        let origin = ConsentOrigin::Remote {
+            profile: "loop".to_owned(),
+            daemon_hostname: None,
+        };
+        assert_eq!(
+            prompt
+                .into_prompt(vec![9; CONSENT_CAPABILITY_BYTES], 18, origin)
+                .validate(),
+            Ok(())
+        );
+
+        let refused = |change: fn(&mut OfferedConsentPrompt)| {
+            let mut prompt = takeover();
+            change(&mut prompt);
+            assert!(!prompt.is_forced_takeover());
+            prompt.validate()
+        };
+        assert!(refused(|prompt| prompt.scopes.push(AccessScope::Input)).is_err());
+        assert!(refused(|prompt| prompt.scopes = vec![AccessScope::Input]).is_err());
+        assert!(refused(|prompt| prompt.agent_name = Some("agent".to_owned())).is_err());
+        assert!(
+            refused(|prompt| prompt.durations.push(ConsentDurationOffer {
+                duration: GrantDuration::WorkspaceSession,
+                withheld: None,
+                shared_by: None,
+                replaces: None,
+            }))
+            .is_err()
+        );
+        // A Lair prompt with the takeover scope is workspace access, not a
+        // forced takeover.
+        let lair = refused(|prompt| {
+            prompt.target = ConsentTarget::Lair {
+                lair_id: LairId::new(),
+                lair_name: "api".to_owned(),
+            };
+        });
+        assert_eq!(lair, Ok(()));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # ADR 0010: Multiplex native remote channels over one authenticated SSH process
 
-- **Status:** Accepted and validated — transport, native human-interactive routing, and reviewed real-host graphical closure are complete; which workspace access prompts a relay connection may answer amended by [ADR 0015](0015-remote-consent.md)
+- **Status:** Accepted and validated — transport, native human-interactive routing, and reviewed real-host graphical closure are complete; which workspace access prompts a relay connection may answer amended by [ADR 0015](0015-remote-consent.md); a remote Window's resize reclaim and confirmed forced takeover amended for protocol 47
 - **Date:** 2026-08-07
 
 ## Context
@@ -147,8 +147,9 @@ pane's controller when a person resizes the pane (`ReclaimControl`), without
 a dialog and from any holder, as the installed local client may (ADR 0007).
 This belongs to the relay's human-interactive role. It is not trusted-UI
 identity, which SSH still never grants: the relay connection still cannot
-send the confirmed forced takeover, whose dialog shows on the daemon host, or
-the requests kept for the local client, such as daemon handoff.
+send the requests kept for the local client, such as daemon handoff. (The
+forced takeover, local-only when this amendment was written, is amended
+below.)
 
 Running the relay in `--graphical-stdio` mode needs no SSH, so the daemon
 checks a reclaiming relay connection as it checks a remote consent responder
@@ -167,3 +168,50 @@ reclaim has no dialog:
 - `ssh localhost` gives a same-user process on the daemon host such a relay
   too, as do the other ways out of the Splint cgroups that ADR 0007's
   amendment lists.
+
+## Amendment: a remote Window forces control (protocol 47)
+
+Operator decision, 2026-10-30 ("Force key in remote Windows: Yes, in
+0.2.0"). Forced takeover (`ForceControlTransfer`, Ctrl+Shift+U, Plan 0072
+M3) is no longer local-only. A remote Window's relay connection may force
+control of a pane another connection holds, with a confirmation the person
+answers in that same remote Window.
+
+- The daemon first checks the forcing relay connection as it checks a
+  reclaim and a consent responder (ADR 0015): the installed relay it ran at
+  `Hello`, outside every Splint's process tree, scope, and Dojo slice.
+  Failing that, it is refused as unauthorized, audited as denied, and nobody
+  is asked.
+- The confirmation goes through the remote-consent route (ADR 0015's
+  amendment): only to the consent responder on the forcing connection's own
+  relay process, which is that Window's. It is never shown on the daemon
+  host's display and never offered to another Window or to the terminal
+  approver. A Window without a responder that may show it (remote agent
+  prompts turned off, the responder refused or not yet subscribed, or
+  already showing another prompt) fails at once with `consent_unavailable`;
+  nothing waits and nothing falls back to the local dialog.
+- The prompt offers "Just this once" only. A Deny, or a confirmation left
+  unanswered for its 20 seconds, ends the force with `consent_denied`; the
+  holder keeps the pane.
+- A takeover confirmed so is audited with the reason
+  `forced_transfer_confirmed_in_remote_window`, and the answer itself as
+  `answered_in_remote_window`, as a remote grant is.
+- This is still not trusted-UI identity. Automation connections, policy
+  rules, and agent grants are unchanged: no policy scope reaches the remote
+  path, and an agent's own grant-based force is as before.
+
+Residual risk. A forced takeover now has a remote path, with a dialog:
+
+- Any holder of the user's SSH credentials for the daemon host, including an
+  agent on another host using the user's key, gets an sshd-spawned relay
+  that passes the check. It could force control and answer its own
+  confirmation, since it also controls the responder that shows it. The net
+  change from a resize reclaim (above) is none: that connection can already
+  take a pane without a dialog, and the key already gives a shell on the
+  daemon host.
+- `ssh localhost`, and the other ways out of the Splint cgroups that ADR
+  0007's amendment lists, give a same-user process on the daemon host such a
+  relay and responder too, with the same reach as a reclaim.
+- The confirmation can be no stronger than the remote Window's own account:
+  a compromised viewer account or relay can forge the answer, as it can for
+  a workspace prompt (ADR 0015).

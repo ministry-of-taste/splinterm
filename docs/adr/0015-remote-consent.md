@@ -2,7 +2,9 @@
 
 - **Status:** Accepted for `0.2.0` (Plan 0066); implemented: the protocol
   contract (protocol 45), the daemon's routing, the countdown and host row in
-  the dialog, the remote Window responder, and `splinterm approvals`.
+  the dialog, the remote Window responder, and `splinterm approvals`. Amended
+  for protocol 47 (Plan 0072 M3): a remote Window's forced-takeover
+  confirmation.
 - **Date:** 2026-10-27
 - **Amends:** [ADR 0005](0005-trusted-consent-broker.md) (where the trusted
   prompt is shown), [ADR 0010](0010-one-authentication-graphical-relay.md)
@@ -124,7 +126,9 @@ while a cancelled handoff leaves them in place.
 ### Scope
 
 Only workspace (Lair) access prompts go to responders. Splint access requests
-and forced control takeover keep their local dialog only.
+and forced control takeover keep their local dialog only. (Amended for
+protocol 47: a remote Window's own forced takeover confirms in that Window;
+see the amendment below.)
 
 ### Durations
 
@@ -208,3 +212,47 @@ opt-in by subscribing. MCP gains no tools or error codes.
     ancestry passes through the requester's session leader, for example when
     the agent runs as a session leader high in the person's own login tree.
 - Every host connected by a remote Window must run protocol 45 together.
+
+## Amendment: a remote Window confirms its own forced takeover (protocol 47)
+
+Operator decision, 2026-10-30 ("Force key in remote Windows: Yes, in
+0.2.0"); Plan 0072 M3; [ADR 0010](0010-one-authentication-graphical-relay.md)
+carries the matching amendment.
+
+A remote Window may force control of a pane (`ForceControlTransfer`,
+Ctrl+Shift+U). Its confirmation goes through this route, with these rules:
+
+- **Single target.** The offer goes only to the Window responder on the same
+  relay process as the forcing connection: same PID and start time, which is
+  that Window's, since each remote Window has one relay process carrying its
+  panes and its responder. Of two such responders (a reconnect overlap), the
+  newest subscription gets it. It is never fanned out to another Window or a
+  terminal approver, and never shown in the daemon's own dialog.
+- **Eligibility.** The forcing relay connection must pass the Window
+  responder checks first (installed relay, outside every Splint's tree,
+  scope, and Dojo slice), or the force is refused as unauthorized and nobody
+  is asked. The target responder is checked again before the offer, without
+  the "outside the requester" rule, since the requester is that Window.
+- **No fallback, no waiting.** Without such a responder, or while it shows
+  another offer, the force fails at once with `consent_unavailable`. A
+  responder holds one outstanding offer at a time, so a workspace prompt
+  that opens meanwhile is not offered to that Window; with no other route it
+  is unavailable at once, as with no route at all, and the agent may ask
+  again. If the responder goes before it answers, the force ends
+  `consent_unavailable`.
+- **Content.** The offer carries a Splint target, the takeover scope alone,
+  no level or agent name, and "Just this once" alone
+  (`OfferedConsentPrompt::is_forced_takeover`); its `request_id` is 0, since
+  no agent request names it. Any other Splint prompt still fails validation,
+  so no agent's Splint request reaches a responder.
+- **Answers.** "Just this once" moves the lease. Deny ends the force with
+  `consent_denied`, and so does expiry after 20 seconds (an expired prompt
+  counts as a Deny); the offer is withdrawn as `expired`. A longer duration
+  is refused as `InvalidArgument` and leaves the offer open, as for any
+  prompt.
+- **Audit.** The answer is audited as `answered_in_remote_window`, and the
+  forced takeover as `forced_transfer_confirmed_in_remote_window`.
+
+The residual risks are ADR 0010's amendment and this ADR's: a relay that
+leaves the Splint cgroups, or one reached with the user's SSH key, can force
+and answer its own confirmation, with no more reach than a resize reclaim.

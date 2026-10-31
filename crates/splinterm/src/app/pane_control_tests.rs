@@ -186,7 +186,8 @@ async fn run_case_in_window(
             owned.then_some(1),
             splint_id,
             7,
-            ForcedControlTransfer::Disabled,
+            // A remote Window forces control too (Plan 0072 M3).
+            ForcedControlTransfer::Enabled,
             0,
             tokio_util::sync::CancellationToken::new(),
         )
@@ -2489,4 +2490,80 @@ async fn input_cut_short_outside_a_paste_sends_no_closing_marker() {
     .await;
     result.unwrap();
     assert_eq!(input_dropped_count(&updates), 1);
+}
+
+fn force(splint_id: SplintId) -> Request {
+    Request::ForceControlTransfer {
+        splint_id,
+        incarnation: 7,
+    }
+}
+
+/// Plan 0072 M3: a remote Window's forced takeover that is refused, denied,
+/// expired, or cannot be confirmed leaves the pane a viewer that says why,
+/// and the next force still reaches the daemon.
+#[tokio::test]
+async fn a_refused_force_keeps_the_pane_and_says_why() {
+    for (code, notice) in [
+        (ErrorCode::ConsentDenied, "Force control: not confirmed"),
+        (
+            ErrorCode::ConsentUnavailable,
+            "Force control: this Window cannot show the confirmation",
+        ),
+        (
+            ErrorCode::Unauthorized,
+            "Force control: not allowed from here",
+        ),
+        (
+            ErrorCode::ControlTransferUnavailable,
+            "Force control: nobody else holds this pane",
+        ),
+    ] {
+        let id = SplintId::new();
+        let (result, updates, _) = run_case(
+            id,
+            false,
+            vec![
+                WindowCommand::ForceControlTransfer,
+                WindowCommand::ForceControlTransfer,
+            ],
+            vec![
+                (force(id), Err(code)),
+                (force(id), Ok(granted())),
+                (
+                    Request::ReleaseControl { controller_id: 2 },
+                    Ok(Response::Acknowledged),
+                ),
+            ],
+        )
+        .await;
+        result.unwrap();
+        let shown: Vec<_> = updates
+            .into_iter()
+            .filter_map(|update| match update {
+                WindowUpdate::ForceRefused(notice) => Some(Err(notice)),
+                WindowUpdate::Control(active) => Some(Ok(active)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(shown, [Ok(false), Err(notice), Ok(true)], "{code:?}");
+    }
+}
+
+/// Any other failure of a forced takeover still ends the pane task.
+#[tokio::test]
+async fn a_failed_force_of_another_kind_still_ends_the_pane() {
+    let id = SplintId::new();
+    let (result, updates, _) = run_case(
+        id,
+        false,
+        vec![WindowCommand::ForceControlTransfer],
+        vec![(force(id), Err(ErrorCode::Internal))],
+    )
+    .await;
+    assert!(result.is_err());
+    let refused = updates
+        .iter()
+        .any(|update| matches!(update, WindowUpdate::ForceRefused(_)));
+    assert!(!refused);
 }

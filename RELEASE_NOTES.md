@@ -440,6 +440,15 @@ a hostile program running as your account.
   explicit `no` cannot be told from the default, so use `ask` to decide each
   time. Keys are never added to gpg-agent, which would store them on disk. See
   [Remote Windows](docs/remote.md#finding-the-ssh-agent).
+- Force control (`Ctrl+Shift+U`, or **Force control transfer** in the
+  palette) now works in a remote Window. The confirmation, "Just this once"
+  or Deny, shows in that Window only, never on the remote computer or in
+  another Window. A denied or expired confirmation, a Window with
+  `[integration] remote-agent-prompts = no`, or one already showing a prompt
+  leaves the pane a viewer and says why in the Window title, and a refused
+  force no longer closes the pane in any Window. The remote computer's audit
+  records the takeover as confirmed in a remote Window. ADR 0010 lists the
+  residual risks.
 - A launch whose command ends before its Window opens, such as
   `splinterm-xdg-terminal-exec -- true`, now prints "splinterm: the command
   ended before its Window opened." and succeeds instead of failing.

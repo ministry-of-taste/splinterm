@@ -63,7 +63,9 @@ pub enum LaunchSemantics {
     RemoteInteractive,
 }
 
-/// Whether trusted graphical force-transfer authority is available.
+/// Whether this Window may force control of a pane (Ctrl+Shift+U). A local
+/// Window confirms in the daemon's own dialog; a remote one in its own
+/// dialog, through its consent responder (Plan 0072 M3).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ForcedControlTransfer {
     Enabled,
@@ -166,7 +168,9 @@ impl ConnectionFactory {
                 image_transport: ImageTransport::Unavailable,
                 graphical_focus_publication: GraphicalFocusPublication::Disabled,
                 launch_semantics: LaunchSemantics::RemoteInteractive,
-                forced_control_transfer: ForcedControlTransfer::Disabled,
+                // Plan 0072 M3: confirmed in this Window's own dialog, through
+                // its consent responder (ADR 0015).
+                forced_control_transfer: ForcedControlTransfer::Enabled,
                 recency_namespace: format!("remote-{profile_name}"),
                 remote_consent: RemoteConsent::Enabled {
                     profile: profile_name.to_owned(),

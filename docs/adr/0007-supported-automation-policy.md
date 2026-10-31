@@ -191,7 +191,7 @@ checked in addition to every listed scope.
 | `SubscribeControl` | `terminal_visible_read` for Splint |
 | `RequestControlTransfer` | `controller_transfer` plus at least one of `input` or `resize` |
 | `DecideControlTransfer` | own pending transfer as current controller; no additional scope |
-| `ForceControlTransfer` | trusted graphical UI confirmation only; no persistent policy scope |
+| `ForceControlTransfer` | trusted graphical UI confirmation only: the daemon's own dialog for the installed client, or (v47) the forcing remote Window's own consent responder, its relay outside every Splint; no persistent policy scope |
 | `ReclaimControl` (v47) | installed trusted graphical client or remote Window only, without confirmation; no persistent policy scope or grant; audited as `reclaim_control` |
 | `ReleaseControl` | own controller; no additional scope |
 | `Input` | own controller and `input` |

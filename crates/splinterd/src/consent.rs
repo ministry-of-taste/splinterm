@@ -1647,6 +1647,31 @@ pub fn offered_lair_prompt(
     .offered()
 }
 
+/// The confirmation of a forced takeover as a remote Window is offered it
+/// (Plan 0072 M3): what [`prompt`] shows a local Window, "Just this once"
+/// only, without the dialog capability, the origin, or the countdown.
+pub fn offered_takeover_prompt(
+    peer: &PeerIdentity,
+    splint_id: SplintId,
+    incarnation: u64,
+) -> splinterm_protocol::OfferedConsentPrompt {
+    consent_prompt(
+        peer,
+        ConsentTarget::Splint {
+            splint_id,
+            incarnation,
+        },
+        vec![AccessScope::ControlTakeover],
+        PromptDetails::once_only(),
+        Duration::ZERO,
+    )
+    .offered()
+}
+
+/// How long a remote Window's forced-takeover confirmation stays open: as
+/// long as a local one.
+pub const TAKEOVER_CONFIRMATION_DEADLINE: Duration = CONSENT_DEADLINE;
+
 /// Closes an open consent prompt from another task: the pending request was
 /// cancelled, expired, or ended while the person had not answered.
 ///

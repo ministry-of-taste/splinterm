@@ -1266,7 +1266,15 @@ pub(in crate::app) async fn drive_controller(
                     active_controller = match control.request(request).await {
                         Ok(Response::ControlGranted { controller_id, .. }) => Some(controller_id),
                         Err(error) if handoff_refused(&error) => continue,
-                        Err(error) => return Err(error),
+                        // Plan 0072 M3: the pane stays a viewer and says why.
+                        Err(error) => {
+                            let notice = forced_control_refusal(&error).ok_or(error)?;
+                            let _ = outputs
+                                .updates
+                                .send(WindowUpdate::ForceRefused(notice))
+                                .await;
+                            continue;
+                        }
                         Ok(_) => bail!("splinterd did not grant forced control"),
                     };
                     let _ = outputs.updates.send(WindowUpdate::Control(true)).await;
@@ -1371,6 +1379,20 @@ fn forced_control_request(
     (capability == ForcedControlTransfer::Enabled).then_some(Request::ForceControlTransfer {
         splint_id,
         incarnation,
+    })
+}
+
+/// The Window's notice for a forced takeover the daemon refused, or whose
+/// confirmation was denied, expired, or could not be shown (Plan 0072 M3);
+/// `None` for an error that still ends the pane.
+fn forced_control_refusal(error: &anyhow::Error) -> Option<&'static str> {
+    Some(match protocol_error(error)?.code {
+        ErrorCode::ConsentDenied => "Force control: not confirmed",
+        ErrorCode::ConsentUnavailable => "Force control: this Window cannot show the confirmation",
+        ErrorCode::Unauthorized => "Force control: not allowed from here",
+        ErrorCode::ControlTransferUnavailable => "Force control: nobody else holds this pane",
+        ErrorCode::ControllerUnavailable => "Force control: this pane already has control",
+        _ => return None,
     })
 }
 
@@ -2672,7 +2694,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_forced_control_transfer_is_rejected_before_request_construction() {
+    fn a_disabled_force_capability_builds_no_request() {
         let splint_id = SplintId::new();
         assert_eq!(
             forced_control_request(ForcedControlTransfer::Disabled, splint_id, 7),

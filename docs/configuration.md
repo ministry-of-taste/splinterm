@@ -321,7 +321,8 @@ configuration reload, copy mode, focused-pane zoom, Dojo and Lair choosers,
 Dojo reordering, Lair rename/navigation/termination, and clean Window detach in
 addition to recent Dojos, tab navigation, splits, pane focus/closing/resizing,
 tab-strip and font zoom, history/search, and bounded control actions. Force
-control is trusted-local only and remains visibly disabled in remote Windows.
+control transfer works in local and remote Windows; a remote Window confirms
+it in its own dialog (see [Remote access](remote.md)).
 Typing filters
 titles, categories, and keywords; arrows skip unavailable commands, Enter runs,
 and Escape closes. Actions without an available captured target remain visible

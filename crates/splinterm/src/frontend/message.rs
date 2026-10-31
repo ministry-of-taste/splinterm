@@ -69,6 +69,10 @@ pub enum WindowUpdate {
     /// Plan 0074: the daemon's input queue for the pane was full, so the
     /// rest of some input, such as a large paste, was dropped.
     InputDropped,
+    /// Plan 0072 M3: a forced takeover was refused or could not be
+    /// confirmed; the pane stays a viewer and the Window shows this short
+    /// notice.
+    ForceRefused(&'static str),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -4101,12 +4101,13 @@ mod tests {
         };
         assert!(command_dispatch(BuiltInCommandId::ReleaseControl, &controller).is_some());
         assert!(command_dispatch(BuiltInCommandId::RequestControl, &controller).is_none());
-        let remote = CommandPaletteContext {
+        // Without the endpoint capability, Force control is unavailable.
+        let no_force = CommandPaletteContext {
             forced_control_transfer: false,
             ..context.clone()
         };
-        assert!(!command_enabled(BuiltInCommandId::ForceControl, &remote));
-        assert!(command_dispatch(BuiltInCommandId::ForceControl, &remote).is_none());
+        assert!(!command_enabled(BuiltInCommandId::ForceControl, &no_force));
+        assert!(command_dispatch(BuiltInCommandId::ForceControl, &no_force).is_none());
         assert_eq!(
             command_dispatch(BuiltInCommandId::AcceptControlTransfer, &context),
             Some(BuiltInCommandDispatch::Control {

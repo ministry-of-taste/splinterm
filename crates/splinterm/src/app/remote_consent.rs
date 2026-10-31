@@ -3,7 +3,9 @@
 //! A Window of a remote (SSH profile) endpoint registers one dedicated relay
 //! connection as a consent responder (`SubscribeConsentOffers { kind:
 //! window }`). The daemon offers it every workspace access prompt at the same
-//! time as its other routes, and the first valid answer wins.
+//! time as its other routes, and the first valid answer wins. It is also
+//! where the Window confirms its own forced takeover (Ctrl+Shift+U, Plan
+//! 0072 M3): the daemon offers that confirmation to this responder alone.
 //!
 //! For each offer the Window shows the trusted consent dialog itself, as
 //! `/proc/self/exe consent`, the same image as the Window and the same child
@@ -399,7 +401,8 @@ impl Subscription {
     }
 
     /// Accepts a new offer while none shows: it is valid, asks for a
-    /// workspace, counts down 1 to 120 seconds, comes from this connection's
+    /// workspace or confirms this Window's own forced takeover (Plan 0072
+    /// M3), counts down 1 to 120 seconds, comes from this connection's
     /// daemon generation, and is newer than every earlier one, which it ends.
     fn accept(&mut self, offer: &ConsentOffer) -> Result<()> {
         offer
@@ -1229,6 +1232,39 @@ mod tests {
         assert!(subscription.withdrawn(4).is_err());
     }
 
+    /// Plan 0072 M3: the confirmation of this Window's own forced takeover
+    /// is shown like a workspace prompt, "Just this once" only, with this
+    /// Window's origin.
+    #[test]
+    fn a_forced_takeover_confirmation_is_shown() {
+        let mut takeover = offer(1, 18);
+        takeover.request_id = 0;
+        takeover.prompt = OfferedConsentPrompt {
+            requester: "/usr/bin/splinterm-relay".to_owned(),
+            requester_pid: 40,
+            requester_uid: 1000,
+            agent_name: None,
+            target: ConsentTarget::Splint {
+                splint_id: splinterm_core::SplintId::new(),
+                incarnation: 2,
+            },
+            scopes: vec![splinterm_protocol::AccessScope::ControlTakeover],
+            level: None,
+            durations: vec![ConsentDurationOffer {
+                duration: GrantDuration::Once,
+                withheld: None,
+                shared_by: None,
+                replaces: None,
+            }],
+        };
+        Subscription::new(5, GENERATION).accept(&takeover).unwrap();
+        let prompt = prompt_for(&takeover).unwrap();
+        assert_eq!(prompt.validate(), Ok(()));
+        assert_eq!(prompt.origin, origin());
+        assert_eq!(prompt.durations.len(), 1);
+        assert_eq!(prompt.respond_within_seconds, 18);
+    }
+
     #[test]
     fn events_must_be_this_subscriptions_and_in_sequence() {
         let event = |subscription_id, sequence| ServerFrame::Event {
@@ -1850,6 +1886,12 @@ mod tests {
                 .await
                 .unwrap();
         let factory = ConnectionFactory::from_remote_session("loop", session);
+        // The same Window forces control with Ctrl+Shift+U, and confirms it
+        // in its own dialog through this responder (Plan 0072 M3).
+        assert_eq!(
+            factory.capabilities().forced_control_transfer,
+            splinterm::endpoint::ForcedControlTransfer::Enabled
+        );
         let first = factory.connect().await.unwrap();
         let identity = factory.remote_display_identity(&first);
         drop(first);

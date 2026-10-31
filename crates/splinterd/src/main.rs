@@ -1252,6 +1252,10 @@ struct DaemonState {
     /// trusted consent client.
     #[cfg(test)]
     consent_script: StdMutex<Option<tokio::sync::mpsc::UnboundedSender<ScriptedPrompt>>>,
+    /// Unit tests answer a local Window's forced-takeover confirmation
+    /// through this instead of the trusted consent client.
+    #[cfg(test)]
+    takeover_script: StdMutex<Option<tokio::sync::mpsc::UnboundedSender<TakeoverAnswer>>>,
     revocations: broadcast::Sender<Revocation>,
     image_transfers: Mutex<TransferAdmission>,
     image_transfer_expiry_changed: Notify,
@@ -3621,6 +3625,8 @@ fn build_daemon_state(inputs: DaemonStateInputs) -> Arc<DaemonState> {
         local_consent_display: local_graphical_session(),
         #[cfg(test)]
         consent_script: StdMutex::default(),
+        #[cfg(test)]
+        takeover_script: StdMutex::default(),
         revocations,
         image_transfers: Mutex::new(TransferAdmission::default()),
         image_transfer_expiry_changed: Notify::new(),
@@ -6905,9 +6911,9 @@ fn interactive_bypass(
             request,
             Request::PublishGraphicalFocus { .. }
                 | Request::RequestImageContent { .. }
-                // Its confirmation is shown on the daemon host. A remote Window
-                // still takes control by resizing (`ReclaimControl`, Plan 0072).
-                | Request::ForceControlTransfer { .. }
+                // A remote Window forces control too (Plan 0072 M3): the
+                // handler checks its relay runs outside every Splint and
+                // confirms in that Window's own dialog.
                 | Request::MaterializePreset { .. }
                 | Request::PrepareDaemonHandoff { .. }
                 | Request::ClaimHandoffControl { .. }
@@ -11776,7 +11782,11 @@ async fn handle_authorized_request(
             incarnation,
         } => {
             let trusted_local = trusted_ui_client && peer.connection_matches_splinterm();
+            // Plan 0072 M3: a remote Window forces control too, and confirms
+            // it in its own dialog, never on this host's display.
+            let remote_window = !trusted_local && remote_interactive_client;
             if !trusted_local
+                && !remote_window
                 && !authorization.policy_authorized()
                 && authorization.authorized_grant_id().is_none()
             {
@@ -11785,18 +11795,49 @@ async fn handle_authorized_request(
                     "forced transfer requires trusted confirmation, policy, or an ephemeral grant",
                 ));
             }
+            let remote_context = if remote_window {
+                // The relay role needs no SSH, so an agent could run the
+                // relay itself; as for a consent responder (ADR 0015), it
+                // must run outside every Splint.
+                let context = remote_consent::TreeContext {
+                    splint_leaders: splint_leaders(state).await,
+                    workload_slices: workload_slices(state),
+                    requester: None,
+                };
+                state
+                    .consent_responders
+                    .check_remote_window(connection_id, peer, context.clone())
+                    .await
+                    .map_err(|_| {
+                        ProtocolError::new(
+                            ErrorCode::Unauthorized,
+                            "a remote Window inside a Splint cannot force control",
+                        )
+                    })?;
+                Some(context)
+            } else {
+                None
+            };
             let _ = current_handle(state, splint_id, incarnation).await?;
+            if let Some(context) = remote_context {
+                // Released while the Window's dialog shows, and retaken
+                // before the lease is forced.
+                let confirmation = confirm_remote_takeover(
+                    state,
+                    peer,
+                    splint_id,
+                    incarnation,
+                    context,
+                    consent::TAKEOVER_CONFIRMATION_DEADLINE,
+                );
+                admission.outside(confirmation).await?;
+                refuse_while_fenced(state)?;
+            }
             if trusted_local {
                 // Released for the confirmation, which a person answers, and
                 // retaken before the lease is forced.
                 let confirmed = admission
-                    .outside(consent::prompt(
-                        &state.install_prefix,
-                        peer,
-                        splint_id,
-                        incarnation,
-                        vec![AccessScope::ControlTakeover],
-                    ))
+                    .outside(local_takeover_prompt(state, peer, splint_id, incarnation))
                     .await
                     .map_err(|error| {
                         warn!(%error, "trusted forced-control confirmation failed closed");
@@ -11825,11 +11866,17 @@ async fn handle_authorized_request(
             let (lair_id, dojo_id, _) =
                 splint_containment(&*state.topology.read().await, splint_id)
                     .ok_or_else(not_found)?;
-            Response::ControlGranted {
-                controller_id: lease.id,
-                lair_id,
-                dojo_id,
-            }
+            return Ok(Handled {
+                response: Response::ControlGranted {
+                    controller_id: lease.id,
+                    lair_id,
+                    dojo_id,
+                },
+                subscription: None,
+                // Marked remote, as a remote Window's answer to a workspace
+                // prompt is (ADR 0015).
+                audit_reason: remote_window.then_some(REMOTE_FORCE_AUDIT_REASON),
+            });
         }
         Request::ReclaimControl {
             splint_id,
@@ -12348,6 +12395,116 @@ async fn reclaim_control(
         subscription: None,
         audit_reason: Some(reclaim_audit_reason(requester, from)),
     })
+}
+
+/// A test's answer to a local Window's forced-takeover confirmation.
+#[cfg(test)]
+type TakeoverAnswer = tokio::sync::oneshot::Sender<bool>;
+
+/// The daemon's own dialog confirming a local Window's forced takeover:
+/// `true` only for "Just this once".
+async fn local_takeover_prompt(
+    state: &DaemonState,
+    peer: &PeerIdentity,
+    splint_id: SplintId,
+    incarnation: u64,
+) -> anyhow::Result<bool> {
+    #[cfg(test)]
+    {
+        let script = state
+            .takeover_script
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(script) = script {
+            let (answer, answered) = tokio::sync::oneshot::channel();
+            script
+                .send(answer)
+                .ok()
+                .context("the test prompter is gone")?;
+            return answered.await.context("the test prompt closed unanswered");
+        }
+    }
+    consent::prompt(
+        &state.install_prefix,
+        peer,
+        splint_id,
+        incarnation,
+        vec![AccessScope::ControlTakeover],
+    )
+    .await
+}
+
+/// The request audit's reason for a forced takeover a remote Window
+/// confirmed in its own dialog (Plan 0072 M3).
+const REMOTE_FORCE_AUDIT_REASON: &str = "forced_transfer_confirmed_in_remote_window";
+
+/// Asks the remote Window that forces control of a Splint to confirm it in
+/// its own dialog (Plan 0072 M3, ADR 0015), for at most `deadline`. The
+/// confirmation goes only to that Window's consent responder, the one on the
+/// same relay process as `peer`, and offers "Just this once" only. It is
+/// never shown on this host's display or to another responder.
+///
+/// # Errors
+/// `ConsentUnavailable` at once when that Window has no responder that may
+/// show it, or shows another prompt, and when its responder goes before it
+/// answers; `ConsentDenied` for a Deny, and for a confirmation left
+/// unanswered until it expires.
+async fn confirm_remote_takeover(
+    state: &Arc<DaemonState>,
+    peer: &PeerIdentity,
+    splint_id: SplintId,
+    incarnation: u64,
+    context: remote_consent::TreeContext,
+    deadline: Duration,
+) -> Result<(), ProtocolError> {
+    use remote_consent::OpenRound;
+    use splinterm_protocol::{ConsentOfferEnd, GrantDuration};
+
+    let expires = Instant::now() + deadline;
+    let prompt = consent::offered_takeover_prompt(peer, splint_id, incarnation);
+    let mut round = state
+        .consent_responders
+        .open_takeover_round(peer, prompt, expires, context)
+        .await
+        .map_err(|why| ProtocolError::new(ErrorCode::ConsentUnavailable, why.0))?;
+    let mut outstanding = round.outstanding();
+    let expiry = time::sleep_until(time::Instant::from_std(expires));
+    tokio::pin!(expiry);
+    loop {
+        tokio::select! {
+            // An accepted answer has already won: it goes first.
+            biased;
+            answer = round.answered() => {
+                return match answer.decision {
+                    ConsentDecision::Grant {
+                        duration: GrantDuration::Once,
+                    } => Ok(()),
+                    _ => Err(ProtocolError::new(
+                        ErrorCode::ConsentDenied,
+                        "forced control transfer denied",
+                    )),
+                };
+            }
+            () = OpenRound::every_route_closed(&mut outstanding) => {
+                // An answer withdrew the offer; it is next.
+                if !round.settled() {
+                    return Err(ProtocolError::new(
+                        ErrorCode::ConsentUnavailable,
+                        remote_consent::ROUTES_CLOSED,
+                    ));
+                }
+            }
+            () = &mut expiry => {
+                // As anywhere else, an unanswered prompt is a Deny.
+                round.end_with(ConsentOfferEnd::Expired);
+                return Err(ProtocolError::new(
+                    ErrorCode::ConsentDenied,
+                    remote_consent::TAKEOVER_EXPIRED,
+                ));
+            }
+        }
+    }
 }
 
 /// The handler's own role and kind check of a consent responder request
@@ -18300,6 +18457,7 @@ mod tests {
             // local (scripted) dialog. Headless tests clear it.
             local_consent_display: true,
             consent_script: StdMutex::default(),
+            takeover_script: StdMutex::default(),
             revocations,
             image_transfers: Mutex::new(TransferAdmission::default()),
             image_transfer_expiry_changed: Notify::new(),
@@ -25499,8 +25657,13 @@ mod tests {
                     splinterm_protocol::ControlMode::Resize,
                 ],
             },
-            // Plan 0072: a remote Window takes control by resizing.
+            // Plan 0072: a remote Window takes control by resizing, and
+            // forces it with its own confirmation.
             reclaim_request(splint_id, 1),
+            Request::ForceControlTransfer {
+                splint_id,
+                incarnation: 1,
+            },
         ] {
             let authorization = authorize_request(&request, &state, &peer, 0, false, true)
                 .await
@@ -25509,6 +25672,8 @@ mod tests {
             assert!(!authorization.policy_authorized());
         }
 
+        // The handler still refuses a process that is not the installed
+        // relay, before it asks anyone.
         let forced = handle_request(
             Request::ForceControlTransfer {
                 splint_id,
@@ -30981,6 +31146,315 @@ mod tests {
                 "authorization_denied",
                 "resize_reclaim_by_remote_window_already_held",
                 "resize_reclaim_by_window_from_closed_connection",
+            ]
+        );
+    }
+
+    /// One `ForceControlTransfer` in flight, as a Window's pane sends it: a
+    /// remote Window's when `remote`, otherwise the local Window's.
+    fn spawn_force(
+        state: &Arc<DaemonState>,
+        peer: &PeerIdentity,
+        connection_id: u64,
+        remote: bool,
+        (splint_id, incarnation): (SplintId, u64),
+    ) -> tokio::task::JoinHandle<Result<Handled, ProtocolError>> {
+        let state = Arc::clone(state);
+        let peer = peer.clone();
+        tokio::spawn(async move {
+            handle_request(
+                Request::ForceControlTransfer {
+                    splint_id,
+                    incarnation,
+                },
+                &state,
+                &peer,
+                connection_id,
+                0,
+                !remote,
+                remote,
+            )
+            .await
+        })
+    }
+
+    async fn forced(
+        forcing: tokio::task::JoinHandle<Result<Handled, ProtocolError>>,
+    ) -> Result<Handled, ProtocolError> {
+        time::timeout(Duration::from_secs(10), forcing)
+            .await
+            .expect("the forced takeover finishes")
+            .unwrap()
+    }
+
+    /// The request audit's reasons for every forced takeover, oldest first.
+    async fn force_audit_reasons(state: &DaemonState) -> Vec<String> {
+        let page = state.audit.lock().await.page(None, 64);
+        page.records
+            .into_iter()
+            .filter(|record| {
+                record.operation == splinterm_protocol::AuditOperation::ForceControlTransfer
+            })
+            .map(|record| record.reason)
+            .collect()
+    }
+
+    /// Plan 0072 M3: a remote Window forces control of a pane another
+    /// Window holds. Its confirmation goes only to that Window's own consent
+    /// responder, never to another Window, the terminal approver, or this
+    /// host's display, and only "Just this once" answers it. Accepted, the
+    /// lease moves, and the audit marks the takeover remote.
+    #[tokio::test]
+    async fn a_remote_window_forces_control_confirming_only_in_its_own_window() {
+        use splinterm_protocol::{ConsentTarget, GrantDuration};
+
+        let state = headless(test_state_with_backend(false, test_pty_backend()));
+        let handle = live_cat_splints(&state, 1).await.remove(0);
+        let target = (handle.splint_id, handle.incarnation.value());
+        let (splint_id, incarnation) = target;
+        let holder = state
+            .controller
+            .lock()
+            .await
+            .acquire(501, splint_id, incarnation, None)
+            .unwrap();
+        let remote = with_start_time(remote_window_peer());
+        state.remote_window_connections.lock().unwrap().insert(601);
+        let mut own = TestResponder::subscribe_as(&state, 611, remote.clone(), false).await;
+        let mut other = TestResponder::subscribe(&state, 612).await;
+        let mut terminal = TestResponder::subscribe_terminal(&state, 613).await;
+        let (prompts, mut local_prompts) = mpsc::unbounded_channel();
+        *state.takeover_script.lock().unwrap() = Some(prompts);
+
+        let forcing = spawn_force(&state, &remote, 601, true, target);
+        let offer = own.offer().await;
+        assert!(offer.prompt.is_forced_takeover());
+        assert_eq!(offer.request_id, 0);
+        assert_eq!(
+            offer.prompt.target,
+            ConsentTarget::Splint {
+                splint_id,
+                incarnation,
+            }
+        );
+        assert_eq!(offer.prompt.scopes, [AccessScope::ControlTakeover]);
+        assert_eq!(offer.prompt.durations.len(), 1, "Just this once only");
+        assert!(offer.prompt.offers(GrantDuration::Once));
+        assert!(other.quiet(), "another Window is not asked");
+        assert!(terminal.quiet(), "the terminal approver is not asked");
+        assert!(
+            local_prompts.try_recv().is_err(),
+            "this host's display is not asked"
+        );
+        for duration in [GrantDuration::WorkspaceSession, GrantDuration::Remembered] {
+            assert_eq!(
+                own.answer(&state, &offer, ConsentDecision::Grant { duration })
+                    .await
+                    .unwrap_err()
+                    .code,
+                ErrorCode::InvalidArgument
+            );
+        }
+        assert_eq!(
+            own.answer(&state, &offer, ONCE).await,
+            Ok(Response::ConsentOfferAnswered)
+        );
+        let controller_id = granted_controller(forced(forcing).await);
+        {
+            let controllers = state.controller.lock().await;
+            assert_eq!(controllers.by_connection.get(&601), Some(&controller_id));
+            assert!(!controllers.by_id.contains_key(&holder.id));
+        }
+        assert!(other.quiet() && terminal.quiet());
+        assert_eq!(
+            force_audit_reasons(&state).await,
+            ["forced_transfer_confirmed_in_remote_window"]
+        );
+    }
+
+    /// Plan 0072 M3: a remote Window's takeover is refused, and the holder
+    /// keeps the pane, when its own Window has no responder (another
+    /// Window's does not count), when the person denies it, when the
+    /// confirmation expires, and when the Window closes while it shows.
+    /// Nothing waits for a route that does not exist.
+    #[tokio::test]
+    async fn a_remote_force_is_refused_when_denied_expired_or_unroutable() {
+        use splinterm_protocol::ConsentOfferEnd;
+
+        let state = headless(test_state_with_backend(false, test_pty_backend()));
+        let handle = live_cat_splints(&state, 1).await.remove(0);
+        let target = (handle.splint_id, handle.incarnation.value());
+        let (splint_id, incarnation) = target;
+        let holder = state
+            .controller
+            .lock()
+            .await
+            .acquire(501, splint_id, incarnation, None)
+            .unwrap();
+        let remote = with_start_time(remote_window_peer());
+        state.remote_window_connections.lock().unwrap().insert(601);
+        state.consent_responders.set_probe(Arc::new(|_, _| Ok(())));
+
+        let unroutable = forced(spawn_force(&state, &remote, 601, true, target))
+            .await
+            .unwrap_err();
+        assert_eq!(unroutable.code, ErrorCode::ConsentUnavailable);
+        assert_eq!(unroutable.message, remote_consent::NO_WINDOW_ROUTE);
+        let mut other = TestResponder::subscribe(&state, 612).await;
+        let unroutable = forced(spawn_force(&state, &remote, 601, true, target))
+            .await
+            .unwrap_err();
+        assert_eq!(unroutable.message, remote_consent::NO_WINDOW_ROUTE);
+        assert!(other.quiet());
+
+        let mut own = TestResponder::subscribe_as(&state, 611, remote.clone(), false).await;
+        let forcing = spawn_force(&state, &remote, 601, true, target);
+        let offer = own.offer().await;
+        assert_eq!(
+            own.answer(&state, &offer, ConsentDecision::Deny).await,
+            Ok(Response::ConsentOfferAnswered)
+        );
+        let denied = forced(forcing).await.unwrap_err();
+        assert_eq!(denied.code, ErrorCode::ConsentDenied);
+
+        // Left unanswered, it expires as a Deny and its offer is withdrawn.
+        let context = remote_consent::TreeContext {
+            splint_leaders: splint_leaders(&state).await,
+            workload_slices: None,
+            requester: None,
+        };
+        let expiring = {
+            let state = Arc::clone(&state);
+            let remote = remote.clone();
+            tokio::spawn(async move {
+                confirm_remote_takeover(
+                    &state,
+                    &remote,
+                    splint_id,
+                    incarnation,
+                    context,
+                    Duration::from_secs(4),
+                )
+                .await
+            })
+        };
+        let offer = own.offer().await;
+        let expired = time::timeout(Duration::from_secs(10), expiring)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(expired.code, ErrorCode::ConsentDenied);
+        assert_eq!(expired.message, remote_consent::TAKEOVER_EXPIRED);
+        assert_eq!(
+            own.withdrawn().await,
+            (offer.offer_id, ConsentOfferEnd::Expired)
+        );
+
+        // The Window closes while its confirmation shows.
+        let forcing = spawn_force(&state, &remote, 601, true, target);
+        let _offer = own.offer().await;
+        own.close();
+        let closed = forced(forcing).await.unwrap_err();
+        assert_eq!(closed.code, ErrorCode::ConsentUnavailable);
+        assert_eq!(closed.message, remote_consent::ROUTES_CLOSED);
+
+        assert_eq!(
+            state.controller.lock().await.by_id.get(&holder.id),
+            Some(&holder),
+            "the holder keeps the pane"
+        );
+        assert!(other.quiet());
+        assert_eq!(
+            force_audit_reasons(&state).await,
+            ["authorization_denied"; 4]
+        );
+    }
+
+    /// Plan 0072 M3, ADR 0015: a relay inside a Splint (an agent running it
+    /// itself) cannot force control, and an automation connection cannot
+    /// either, even from the Window's own process; neither asks anyone. The
+    /// local Window still confirms in this host's own dialog, never in a
+    /// remote Window.
+    #[tokio::test]
+    async fn only_a_remote_window_outside_every_splint_forces_through_its_own_window() {
+        let state = headless(test_state_with_backend(false, test_pty_backend()));
+        let handle = live_cat_splints(&state, 1).await.remove(0);
+        let target = (handle.splint_id, handle.incarnation.value());
+        let (splint_id, incarnation) = target;
+        let holder = state
+            .controller
+            .lock()
+            .await
+            .acquire(501, splint_id, incarnation, None)
+            .unwrap();
+        let remote = with_start_time(remote_window_peer());
+        state.remote_window_connections.lock().unwrap().insert(602);
+        let mut own = TestResponder::subscribe_as(&state, 611, remote.clone(), false).await;
+        let leaders = splint_leaders(&state).await;
+        assert!(!leaders.is_empty());
+        state
+            .consent_responders
+            .set_probe(Arc::new(move |connection_id, context| {
+                let Some(context) = context.filter(|_| connection_id == 602) else {
+                    return Ok(());
+                };
+                assert_eq!(context.splint_leaders, leaders);
+                assert!(context.requester.is_none());
+                Err(remote_consent::Ineligible::InsideSplint)
+            }));
+
+        let inside = forced(spawn_force(&state, &remote, 602, true, target))
+            .await
+            .unwrap_err();
+        assert_eq!(inside.code, ErrorCode::Unauthorized);
+        let agent = handle_request(
+            Request::ForceControlTransfer {
+                splint_id,
+                incarnation,
+            },
+            &state,
+            &remote,
+            701,
+            0,
+            false,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(agent.code, ErrorCode::Unauthorized);
+        assert!(own.quiet(), "nobody is asked");
+
+        let pinned = Arc::new(consent::PinnedClientSnapshot::own_executable_for_test());
+        let window = pinned_window_peer(&pinned);
+        let (prompts, mut local_prompts) = mpsc::unbounded_channel::<TakeoverAnswer>();
+        *state.takeover_script.lock().unwrap() = Some(prompts);
+        for confirmed in [false, true] {
+            let forcing = spawn_force(&state, &window, 502, false, target);
+            time::timeout(Duration::from_secs(5), local_prompts.recv())
+                .await
+                .expect("the local dialog asks")
+                .expect("the test prompter runs")
+                .send(confirmed)
+                .unwrap();
+            let result = forced(forcing).await;
+            if confirmed {
+                granted_controller(result);
+            } else {
+                assert_eq!(result.unwrap_err().code, ErrorCode::ConsentDenied);
+            }
+            assert!(own.quiet(), "a remote Window is never asked");
+        }
+        let controllers = state.controller.lock().await;
+        assert!(!controllers.by_id.contains_key(&holder.id));
+        drop(controllers);
+        assert_eq!(
+            force_audit_reasons(&state).await,
+            [
+                "authorization_denied",
+                "policy_rejected",
+                "authorization_denied",
+                "trusted_or_owned_authority",
             ]
         );
     }
