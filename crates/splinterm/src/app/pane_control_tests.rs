@@ -5,7 +5,23 @@ use splinterm_core::{DojoId, LairId};
 use splinterm_protocol::{ClientFrame, ClientRole, ControlStatus, PROTOCOL_VERSION, ProtocolError};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-type Reply = std::result::Result<Response, ErrorCode>;
+type Reply = std::result::Result<Response, Refusal>;
+
+/// A scripted daemon refusal: its code, and the reason it gives.
+#[derive(Clone, Copy)]
+struct Refusal {
+    code: ErrorCode,
+    message: &'static str,
+}
+
+impl From<ErrorCode> for Refusal {
+    fn from(code: ErrorCode) -> Self {
+        Self {
+            code,
+            message: "scripted rejection",
+        }
+    }
+}
 
 async fn read_client(reader: &mut (impl AsyncRead + Unpin)) -> ClientFrame {
     let length = reader.read_u32().await.unwrap() as usize;
@@ -165,9 +181,9 @@ async fn run_case_debounced(
                 }
                 let response = match reply {
                     Ok(result) => ServerFrame::Response { request_id, result },
-                    Err(code) => ServerFrame::Error {
+                    Err(refusal) => ServerFrame::Error {
                         request_id: Some(request_id),
-                        error: ProtocolError::new(code, "scripted rejection"),
+                        error: ProtocolError::new(refusal.code, refusal.message),
                     },
                 };
                 send_frame(&mut writer, response).await;
@@ -568,7 +584,7 @@ async fn contested_request_uses_consent_and_duplicate_pending_is_nonfatal() {
             WindowCommand::Resynchronize,
         ],
         vec![
-            (acquire(id), Err(ErrorCode::ControllerUnavailable)),
+            (acquire(id), Err(ErrorCode::ControllerUnavailable.into())),
             (
                 transfer(id),
                 Ok(Response::ControlTransferPending {
@@ -577,8 +593,11 @@ async fn contested_request_uses_consent_and_duplicate_pending_is_nonfatal() {
                     dojo_id: DojoId::new(),
                 }),
             ),
-            (acquire(id), Err(ErrorCode::ControllerUnavailable)),
-            (transfer(id), Err(ErrorCode::ControlTransferUnavailable)),
+            (acquire(id), Err(ErrorCode::ControllerUnavailable.into())),
+            (
+                transfer(id),
+                Err(ErrorCode::ControlTransferUnavailable.into()),
+            ),
         ],
     )
     .await;
@@ -603,8 +622,11 @@ async fn owner_release_race_is_nonfatal_and_later_request_can_acquire() {
             WindowCommand::RequestControlTransfer,
         ],
         vec![
-            (acquire(id), Err(ErrorCode::ControllerUnavailable)),
-            (transfer(id), Err(ErrorCode::ControlTransferUnavailable)),
+            (acquire(id), Err(ErrorCode::ControllerUnavailable.into())),
+            (
+                transfer(id),
+                Err(ErrorCode::ControlTransferUnavailable.into()),
+            ),
             (acquire(id), Ok(granted())),
             (
                 Request::ReleaseControl { controller_id: 2 },
@@ -633,8 +655,8 @@ async fn denied_control_request_remains_observing_without_retry_or_takeover() {
             WindowCommand::Resynchronize,
         ],
         vec![
-            (acquire(id), Err(ErrorCode::Unauthorized)),
-            (transfer(id), Err(ErrorCode::Unauthorized)),
+            (acquire(id), Err(ErrorCode::Unauthorized.into())),
+            (transfer(id), Err(ErrorCode::Unauthorized.into())),
         ],
     )
     .await;
@@ -669,7 +691,10 @@ async fn already_owned_control_request_is_a_noop() {
 
 #[tokio::test]
 async fn unexpected_control_errors_and_responses_are_still_fatal() {
-    for transfer_reply in [Err(ErrorCode::InvalidArgument), Ok(Response::Acknowledged)] {
+    for transfer_reply in [
+        Err(ErrorCode::InvalidArgument.into()),
+        Ok(Response::Acknowledged),
+    ] {
         let id = SplintId::new();
         let (result, _, resyncs) = run_case(
             id,
@@ -679,7 +704,7 @@ async fn unexpected_control_errors_and_responses_are_still_fatal() {
                 WindowCommand::Resynchronize,
             ],
             vec![
-                (acquire(id), Err(ErrorCode::ControllerUnavailable)),
+                (acquire(id), Err(ErrorCode::ControllerUnavailable.into())),
                 (transfer(id), transfer_reply),
             ],
         )
@@ -841,7 +866,7 @@ async fn control_loss_between_coalesced_input_batches_is_observed_before_the_nex
             ),
             (
                 acquire(id),
-                Err(ErrorCode::ControllerUnavailable),
+                Err(ErrorCode::ControllerUnavailable.into()),
                 Vec::new(),
             ),
         ],
@@ -1126,7 +1151,7 @@ async fn a_handoff_refusal_drops_input_without_failing_the_controller() {
         vec![
             (
                 controlled_input(id, b"raced", false),
-                Err(ErrorCode::HandoffInProgress),
+                Err(ErrorCode::HandoffInProgress.into()),
             ),
             (
                 Request::ReleaseControl { controller_id: 1 },
@@ -1244,9 +1269,9 @@ async fn scripted_control(
             assert_eq!(request, expected);
             let frame = match reply {
                 Ok(result) => ServerFrame::Response { request_id, result },
-                Err(code) => ServerFrame::Error {
+                Err(refusal) => ServerFrame::Error {
                     request_id: Some(request_id),
-                    error: ProtocolError::new(code, "scripted rejection"),
+                    error: ProtocolError::new(refusal.code, refusal.message),
                 },
             };
             send_frame(&mut writer, frame).await;
@@ -1348,7 +1373,7 @@ async fn a_pane_without_a_ticket_or_with_a_refused_claim_falls_back() {
     let (mut control, server) = scripted_control(vec![
         (
             handoff_claim_request(ticket, refused),
-            Err(ErrorCode::InvalidHandoffTicket),
+            Err(ErrorCode::InvalidHandoffTicket.into()),
         ),
         (
             handoff_claim_request(ticket, empty),
@@ -1972,7 +1997,7 @@ async fn reattachment_follows_the_first_attachment_and_stops_when_the_splint_cha
     }
     // The Splint is gone.
     let (outcome, _) = reattach_against(
-        vec![(inspect.clone(), Err(ErrorCode::NotFound))],
+        vec![(inspect.clone(), Err(ErrorCode::NotFound.into()))],
         daemon_at(1),
         id,
     )
@@ -1995,7 +2020,7 @@ async fn reattachment_follows_the_first_attachment_and_stops_when_the_splint_cha
     let (outcome, _) = reattach_against(
         vec![
             (inspect.clone(), Ok(live_splint(id, Some(7)))),
-            (access.clone(), Err(ErrorCode::Unauthorized)),
+            (access.clone(), Err(ErrorCode::Unauthorized.into())),
         ],
         daemon_at(1),
         id,
@@ -2005,7 +2030,7 @@ async fn reattachment_follows_the_first_attachment_and_stops_when_the_splint_cha
     let (outcome, _) = reattach_against(
         vec![
             (inspect.clone(), Ok(live_splint(id, Some(7)))),
-            (access.clone(), Err(ErrorCode::ResourceLimit)),
+            (access.clone(), Err(ErrorCode::ResourceLimit.into())),
         ],
         daemon_at(1),
         id,
@@ -2342,7 +2367,7 @@ fn paste_cut_steps(id: SplintId) -> Vec<(Request, Reply, Vec<ServerFrame>)> {
         ),
         (
             controlled_input(id, b"cdefghij", false),
-            Err(ErrorCode::ResourceLimit),
+            Err(ErrorCode::ResourceLimit.into()),
             Vec::new(),
         ),
     ]
@@ -2401,7 +2426,7 @@ async fn a_closing_marker_the_full_queue_refuses_goes_ahead_of_the_next_input() 
     for _ in 0..PASTE_CLOSE_ATTEMPTS {
         steps.push((
             controlled_input(id, b"\x1b[201~", false),
-            Err(ErrorCode::ResourceLimit),
+            Err(ErrorCode::ResourceLimit.into()),
             Vec::new(),
         ));
     }
@@ -2442,13 +2467,13 @@ async fn a_closing_marker_refused_with_the_next_input_stays_owed() {
     for _ in 0..PASTE_CLOSE_ATTEMPTS {
         steps.push((
             controlled_input(id, b"[201~", false),
-            Err(ErrorCode::ResourceLimit),
+            Err(ErrorCode::ResourceLimit.into()),
             Vec::new(),
         ));
     }
     steps.push((
         controlled_input(id, b"[201~xx", false),
-        Err(ErrorCode::ResourceLimit),
+        Err(ErrorCode::ResourceLimit.into()),
         Vec::new(),
     ));
     steps.push((
@@ -2494,7 +2519,7 @@ async fn input_cut_short_outside_a_paste_sends_no_closing_marker() {
         vec![
             (
                 controlled_input(id, b"abcdefgh", false),
-                Err(ErrorCode::ResourceLimit),
+                Err(ErrorCode::ResourceLimit.into()),
                 Vec::new(),
             ),
             (
@@ -2658,24 +2683,37 @@ async fn a_persons_resize_of_a_viewer_reclaims_then_resizes() {
     assert_eq!(control_updates(&updates), vec![false, true]);
 }
 
-/// Plan 0072 M2b: a pane that controls its Splint just resizes.
+/// Plan 0072 M2b: a pane that believes it controls its Splint still asks,
+/// so a lease another Window took a moment ago is taken back rather than
+/// refusing the resize. The daemon keeps a lease the pane still holds.
 #[tokio::test]
-async fn a_persons_resize_of_a_controlling_pane_does_not_reclaim() {
+async fn a_persons_resize_of_a_controlling_pane_still_reclaims() {
     let id = SplintId::new();
-    let (result, _, _) = run_case(
+    let kept = Response::ControlGranted {
+        controller_id: 1,
+        lair_id: LairId::new(),
+        dojo_id: DojoId::new(),
+    };
+    let (result, updates, _) = run_case(
         id,
         true,
-        vec![reclaim_resize(100, 40)],
+        vec![reclaim_resize(100, 40), reclaim_resize(90, 30)],
         vec![
+            (reclaim(id), Ok(kept)),
             (sized(1, id, 100, 40), Ok(input_acknowledged(id))),
+            // Taken by another Window since: the reclaim takes it back.
+            (reclaim(id), Ok(granted())),
+            (sized(2, id, 90, 30), Ok(input_acknowledged(id))),
             (
-                Request::ReleaseControl { controller_id: 1 },
+                Request::ReleaseControl { controller_id: 2 },
                 Ok(Response::Acknowledged),
             ),
         ],
     )
     .await;
     result.unwrap();
+    // Keeping its own lease changes nothing the Window shows.
+    assert_eq!(control_updates(&updates), vec![true, true]);
 }
 
 /// Plan 0072 M2b: a layout resize of a viewer still only asks for control
@@ -2692,7 +2730,7 @@ async fn a_layout_resize_of_a_viewer_acquires_and_does_not_reclaim() {
             pixel_width: 1_000,
             pixel_height: 800,
         }],
-        vec![(acquire(id), Err(ErrorCode::ControllerUnavailable))],
+        vec![(acquire(id), Err(ErrorCode::ControllerUnavailable.into()))],
     )
     .await;
     result.unwrap();
@@ -2710,8 +2748,8 @@ async fn a_refused_reclaim_leaves_the_pane_a_working_viewer() {
         false,
         vec![reclaim_resize(100, 40), WindowCommand::Resynchronize],
         vec![
-            (reclaim(id), Err(ErrorCode::Unauthorized)),
-            (acquire(id), Err(ErrorCode::ControllerUnavailable)),
+            (reclaim(id), Err(ErrorCode::Unauthorized.into())),
+            (acquire(id), Err(ErrorCode::ControllerUnavailable.into())),
         ],
     )
     .await;
@@ -2724,7 +2762,7 @@ async fn a_refused_reclaim_leaves_the_pane_a_working_viewer() {
             id,
             false,
             vec![reclaim_resize(100, 40), WindowCommand::Resynchronize],
-            vec![(reclaim(id), Err(code))],
+            vec![(reclaim(id), Err(code.into()))],
         )
         .await;
         result.unwrap();
@@ -2742,7 +2780,7 @@ async fn a_reclaim_fenced_by_a_handoff_is_dropped() {
         id,
         false,
         vec![reclaim_resize(100, 40), WindowCommand::Resynchronize],
-        vec![(reclaim(id), Err(ErrorCode::HandoffInProgress))],
+        vec![(reclaim(id), Err(ErrorCode::HandoffInProgress.into()))],
     )
     .await;
     result.unwrap();
@@ -2835,4 +2873,152 @@ async fn control_reclaimed_by_another_window_is_announced() {
             ));
         }
     }
+}
+
+const RECLAIMED: Refusal = Refusal {
+    code: ErrorCode::Unauthorized,
+    message: CONTROL_RECLAIMED_BY_WINDOW,
+};
+
+/// Plan 0072 M2b: when another Window reclaims the lease just before this
+/// pane uses it, the daemon refuses the stale lease. The pane becomes a
+/// viewer, says so when a Window took it by resizing, keeps its size, and
+/// keeps serving; the Window never closes.
+#[tokio::test]
+async fn a_lease_another_window_took_leaves_the_pane_serving() {
+    let id = SplintId::new();
+    let other_takeover = Refusal::from(ErrorCode::Unauthorized);
+    for (refusal, notices) in [(RECLAIMED, 1), (other_takeover, 0)] {
+        // A resize.
+        let (result, updates, resyncs) = run_case(
+            id,
+            true,
+            vec![
+                WindowCommand::Resize {
+                    columns: 100,
+                    rows: 40,
+                    pixel_width: 1_000,
+                    pixel_height: 800,
+                },
+                WindowCommand::Resynchronize,
+            ],
+            vec![(sized(1, id, 100, 40), Err(refusal))],
+        )
+        .await;
+        result.unwrap();
+        assert_eq!(resyncs, 1);
+        assert_eq!(control_updates(&updates), vec![true, false]);
+        assert_eq!(reclaimed_notices(&updates), notices);
+
+        // Input, which is dropped as a viewer's is.
+        let (result, updates, resyncs) = run_case(
+            id,
+            true,
+            vec![
+                WindowCommand::Input(b"a".to_vec()),
+                WindowCommand::Resynchronize,
+            ],
+            vec![(controlled_input(id, b"a", false), Err(refusal))],
+        )
+        .await;
+        result.unwrap();
+        assert_eq!(resyncs, 1);
+        assert_eq!(control_updates(&updates), vec![true, false]);
+        assert_eq!(reclaimed_notices(&updates), notices);
+    }
+
+    // A release of a lease that is already gone.
+    let (result, updates, resyncs) = run_case(
+        id,
+        true,
+        vec![WindowCommand::ReleaseControl, WindowCommand::Resynchronize],
+        vec![(Request::ReleaseControl { controller_id: 1 }, Err(RECLAIMED))],
+    )
+    .await;
+    result.unwrap();
+    assert_eq!(resyncs, 1);
+    assert_eq!(control_updates(&updates), vec![true, false]);
+}
+
+/// Plan 0072 M2b: after a refused stale lease, the pane's next acquisition
+/// applies the size it kept.
+#[tokio::test]
+async fn a_pane_whose_lease_was_taken_reapplies_its_size_when_it_acquires_again() {
+    let id = SplintId::new();
+    let (result, _, _) = run_case(
+        id,
+        true,
+        vec![
+            WindowCommand::Resize {
+                columns: 100,
+                rows: 40,
+                pixel_width: 1_000,
+                pixel_height: 800,
+            },
+            WindowCommand::Input(b"a".to_vec()),
+        ],
+        vec![
+            (sized(1, id, 100, 40), Err(RECLAIMED)),
+            (acquire(id), Ok(granted())),
+            (sized(2, id, 100, 40), Ok(input_acknowledged(id))),
+            (
+                Request::Input {
+                    controller_id: 2,
+                    splint_id: id,
+                    incarnation: 7,
+                    bytes: b"a".to_vec(),
+                    focus_report: false,
+                },
+                Ok(input_acknowledged(id)),
+            ),
+            (
+                Request::ReleaseControl { controller_id: 2 },
+                Ok(Response::Acknowledged),
+            ),
+        ],
+    )
+    .await;
+    result.unwrap();
+}
+
+/// Plan 0072 M2b: a person's resize the Window cancelled, because it lost
+/// keyboard focus within the debounce, resizes without taking control.
+#[tokio::test]
+async fn a_cancelled_reclaim_resizes_without_taking_control() {
+    let id = SplintId::new();
+    let hub = HandoffStatusHub::default();
+    let (result, _, _) = run_case_debounced(
+        id,
+        false,
+        ServerLimits::default(),
+        vec![reclaim_resize(90, 30), WindowCommand::CancelReclaim],
+        vec![
+            (acquire(id), Ok(granted()), Vec::new()),
+            (sized(2, id, 90, 30), Ok(input_acknowledged(id)), Vec::new()),
+            (
+                Request::ReleaseControl { controller_id: 2 },
+                Ok(Response::Acknowledged),
+                Vec::new(),
+            ),
+        ],
+        &hub,
+        100,
+    )
+    .await;
+    result.unwrap();
+}
+
+/// Plan 0072 M2b: only a daemon refusal of a reclaim is not fatal; an answer
+/// that is not a grant is.
+#[tokio::test]
+async fn a_reclaim_answered_with_anything_but_a_grant_or_a_refusal_is_fatal() {
+    let id = SplintId::new();
+    let (result, _, _) = run_case(
+        id,
+        false,
+        vec![reclaim_resize(100, 40)],
+        vec![(reclaim(id), Ok(Response::Acknowledged))],
+    )
+    .await;
+    assert!(result.is_err());
 }

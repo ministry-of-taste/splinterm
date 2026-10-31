@@ -26,10 +26,10 @@ use splinterm::{
 };
 use splinterm_core::{LayoutNode, SplintId};
 use splinterm_protocol::{
-    AccessGrant, AccessScope, ControlLossReason, ControlMode, ControlTransferOutcome, ErrorCode,
-    FORCED_TAKEOVER_AGENT_PROMPT_OPEN, FORCED_TAKEOVER_ALREADY_CONFIRMING, HandoffStatusPhase,
-    LairAccessGrant, Request, Response, ServerFrame, ServerLimits, SubscriptionEvent,
-    TerminalSnapshot, TerminalUpdate,
+    AccessGrant, AccessScope, CONTROL_RECLAIMED_BY_WINDOW, ControlLossReason, ControlMode,
+    ControlTransferOutcome, ErrorCode, FORCED_TAKEOVER_AGENT_PROMPT_OPEN,
+    FORCED_TAKEOVER_ALREADY_CONFIRMING, HandoffStatusPhase, LairAccessGrant, Request, Response,
+    ServerFrame, ServerLimits, SubscriptionEvent, TerminalSnapshot, TerminalUpdate,
     perf_trace::{PerfTraceEvent, emit_perf_trace, perf_trace_enabled},
 };
 use tokio::sync::mpsc;
@@ -555,10 +555,40 @@ async fn close_cut_paste(
             Ok(_) => bail!("splinterd did not acknowledge a window input command"),
             Err(error) if recoverable_input_error(&error) => {}
             Err(error) if handoff_refused(&error) => return Ok(true),
+            // Still owed; the control subscription ends the lost lease.
+            Err(error) if lost_lease(&error).is_some() => return Ok(false),
             Err(error) => return Err(error),
         }
     }
     Ok(false)
+}
+
+/// Plan 0072 M2b: whether the daemon refused a request bearing this pane's
+/// controller lease because the lease is gone, and whether a Window took it
+/// by resizing (`Some(true)`) or it ended otherwise (`Some(false)`), as by
+/// another Window's forced takeover. The control subscription says so too,
+/// but the refusal can arrive first.
+pub(in crate::app) fn lost_lease(error: &anyhow::Error) -> Option<bool> {
+    protocol_error(error)
+        .filter(|error| error.code == ErrorCode::Unauthorized)
+        .map(|error| error.message == CONTROL_RECLAIMED_BY_WINDOW)
+}
+
+/// Plan 0072 M2b: makes a pane whose lease is gone a viewer, as its control
+/// subscription would. The pane keeps working and keeps its requested size
+/// for its next acquisition.
+async fn forget_lost_lease(
+    active_controller: &mut Option<u64>,
+    updates: &mpsc::Sender<WindowUpdate>,
+    reclaimed: bool,
+) {
+    if active_controller.take().is_none() {
+        return;
+    }
+    let _ = updates.send(WindowUpdate::Control(false)).await;
+    if reclaimed {
+        let _ = updates.send(WindowUpdate::ControlReclaimed).await;
+    }
 }
 
 fn recoverable_input_error(error: &anyhow::Error) -> bool {
@@ -603,6 +633,7 @@ pub(in crate::app) const fn paused_during_handoff(command: &WindowCommand) -> bo
         | WindowCommand::RevokeAccess(_)
         | WindowCommand::CancelPendingAccess
         | WindowCommand::Search { .. }
+        | WindowCommand::CancelReclaim
         | WindowCommand::ReleaseControl => false,
     }
 }
@@ -674,6 +705,9 @@ pub(in crate::app) async fn apply_requested_pane_resize(
         Ok(response) => response,
         // Fenced by a handoff: dropped, and re-sent by the frontend on resume.
         Err(error) if handoff_refused(&error) => return Ok(()),
+        // Taken again at once (Plan 0072 M2b): kept for the next acquisition;
+        // the control subscription ends the lost lease.
+        Err(error) if lost_lease(&error).is_some() => return Ok(()),
         Err(error) => return Err(error),
     };
     if !terminal_action_matches(&response, splint_id, incarnation) {
@@ -809,26 +843,30 @@ pub(in crate::app) async fn active_resize_request(
 }
 
 /// Plan 0072 M2b: takes control of a pane the person resized in this
-/// Window, from whoever holds it, unless the pane already has it. Returns
-/// whether the resize goes on as a `Resize` does.
+/// Window, from whoever holds it. Returns whether the resize goes on as a
+/// `Resize` does.
 ///
-/// A refusal is logged, never fatal, and leaves the pane a viewer. When the
-/// daemon refused the request itself, as for a client it does not trust to
-/// reclaim, the resize goes on and still takes control nobody holds, as
-/// before Plan 0072. Otherwise, as for a Splint that is gone, the pane only
-/// keeps the size for its next acquisition. A handoff fence is returned, so
-/// the resize is dropped as any other is.
+/// It asks even when the pane believes it holds control: the daemon keeps a
+/// lease this connection still holds, and a lease another Window took a
+/// moment ago is taken back instead of refusing the resize.
+///
+/// A daemon refusal is logged, never fatal, and leaves the pane a viewer.
+/// When the daemon refused the request itself, as for a client it does not
+/// trust to reclaim, the resize goes on and still takes control nobody
+/// holds, as before Plan 0072; that refusal is logged once per pane, since
+/// it repeats on every drag. Otherwise, as for a Splint that is gone, a
+/// viewer only keeps the size for its next acquisition. A handoff fence and a
+/// broken connection are returned: the resize is dropped as any other is,
+/// and the pane reconnects.
 pub(in crate::app) async fn reclaim_pane_control(
     control: &mut Connection,
     active_controller: &mut Option<u64>,
     updates: &mpsc::Sender<WindowUpdate>,
-    splint_id: SplintId,
-    incarnation: u64,
+    identity: (SplintId, u64),
+    refusal_logged: &mut bool,
 ) -> Result<bool> {
-    if active_controller.is_some() {
-        return Ok(true);
-    }
-    match control
+    let (splint_id, incarnation) = identity;
+    let error = match control
         .reclaim_control(
             splint_id,
             incarnation,
@@ -837,21 +875,29 @@ pub(in crate::app) async fn reclaim_pane_control(
         .await
     {
         Ok(controller_id) => {
-            *active_controller = Some(controller_id);
-            let _ = updates.send(WindowUpdate::Control(true)).await;
-            Ok(true)
+            if active_controller.replace(controller_id) != Some(controller_id) {
+                let _ = updates.send(WindowUpdate::Control(true)).await;
+            }
+            return Ok(true);
         }
-        Err(error) if handoff_refused(&error) => Err(error),
-        Err(error) => {
-            eprintln!("splinterm could not take control of the resized pane: {error:#}");
-            Ok(protocol_error(&error).is_some_and(|error| {
-                matches!(
-                    error.code,
-                    ErrorCode::Unauthorized | ErrorCode::UnsupportedOperation
-                )
-            }))
-        }
+        Err(error) => error,
+    };
+    if handoff_refused(&error) {
+        return Err(error);
     }
+    let Some(refusal) = protocol_error(&error) else {
+        return Err(error);
+    };
+    let refused_request = matches!(
+        refusal.code,
+        ErrorCode::Unauthorized | ErrorCode::UnsupportedOperation
+    );
+    if !refused_request || !std::mem::replace(refusal_logged, true) {
+        eprintln!("splinterm could not take control of the resized pane: {error:#}");
+    }
+    // A pane that holds control resizes with it; a lease that is gone is
+    // refused there and makes it a viewer.
+    Ok(refused_request || active_controller.is_some())
 }
 
 pub(in crate::app) async fn handle_control_event(
@@ -963,6 +1009,7 @@ pub(in crate::app) async fn drive_controller(
     let mut deferred_command = None;
     let mut coalescing_barrier = None;
     let mut paste_close_pending = false;
+    let mut reclaim_refusal_logged = false;
     let resize_delay = Duration::from_millis(resize_delay_ms);
     let Response::ControlSubscribed {
         subscription_id: control_subscription,
@@ -1059,6 +1106,14 @@ pub(in crate::app) async fn drive_controller(
                         };
                         command
                     }
+                    // Plan 0072 M2b: the Window lost keyboard focus before a
+                    // person's resize went out, so it does not take control.
+                    Err(WindowCommand::CancelReclaim) => {
+                        if let Some(pending) = &mut pending_resize {
+                            pending.reclaim = false;
+                        }
+                        continue;
+                    }
                     Err(command) => {
                         if let Some(pending) = pending_resize.take() {
                             resize_deadline = None;
@@ -1133,6 +1188,7 @@ pub(in crate::app) async fn drive_controller(
                     let mut sent = 0;
                     let mut cut = false;
                     let mut fenced = false;
+                    let mut lost = false;
                     for (request, length) in input_requests(
                         controller_id,
                         splint_id,
@@ -1166,7 +1222,21 @@ pub(in crate::app) async fn drive_controller(
                                 fenced = true;
                                 break;
                             }
-                            Err(error) => return Err(error),
+                            // Plan 0072 M2b: another Window took the lease, so
+                            // the rest is dropped, as a viewer's input is.
+                            Err(error) => {
+                                let Some(reclaimed) = lost_lease(&error) else {
+                                    return Err(error);
+                                };
+                                forget_lost_lease(
+                                    &mut active_controller,
+                                    &outputs.updates,
+                                    reclaimed,
+                                )
+                                .await;
+                                lost = true;
+                                break;
+                            }
                         }
                     }
                     // A closing marker put ahead of this input that did not
@@ -1186,14 +1256,17 @@ pub(in crate::app) async fn drive_controller(
                         } else if close_owed {
                             paste_close_pending = true;
                         }
-                    } else if fenced {
-                        // Input stays paused through the handoff; the marker
-                        // goes ahead of the first input after it.
+                    } else if fenced || lost {
+                        // Input stays paused through the handoff, or the pane
+                        // views; the marker goes ahead of the first input
+                        // after it.
                         paste_close_pending =
                             close_owed || bracketed_paste_left_open(&bytes[..sent]);
                     }
                     continue;
                 }
+                // Only a pending resize can take control; none is waiting.
+                WindowCommand::CancelReclaim => continue,
                 WindowCommand::Resynchronize => {
                     // A resynchronization already waiting covers this one: it
                     // starts after this request, so its snapshot is at least as
@@ -1246,8 +1319,8 @@ pub(in crate::app) async fn drive_controller(
                         &mut control,
                         &mut active_controller,
                         &outputs.updates,
-                        splint_id,
-                        incarnation,
+                        (splint_id, incarnation),
+                        &mut reclaim_refusal_logged,
                     )
                     .await
                     {
@@ -1469,11 +1542,24 @@ pub(in crate::app) async fn drive_controller(
                 matches!(&request, Request::Input { .. } | Request::Resize { .. });
             let expects_transfer_decision =
                 matches!(&request, Request::DecideControlTransfer { .. });
+            let bears_lease = matches!(
+                &request,
+                Request::Resize { .. } | Request::ReleaseControl { .. }
+            );
             let response = match control.request(request).await {
                 Ok(response) => response,
                 // Fenced before this pane heard the pause: dropped.
                 Err(error) if handoff_refused(&error) => continue,
-                Err(error) => return Err(error),
+                // Plan 0072 M2b: another Window took the lease. The pane
+                // views, and keeps its size for its next acquisition.
+                Err(error) => match lost_lease(&error).filter(|_| bears_lease) {
+                    Some(reclaimed) => {
+                        forget_lost_lease(&mut active_controller, &outputs.updates, reclaimed)
+                            .await;
+                        continue;
+                    }
+                    None => return Err(error),
+                },
             };
             let acknowledged = if expects_terminal_action {
                 terminal_action_matches(&response, splint_id, incarnation)

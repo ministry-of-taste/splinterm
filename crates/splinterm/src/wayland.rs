@@ -1206,6 +1206,8 @@ fn assemble_app(
                 authority: options.authority,
                 last_resize: None,
                 pending_resize: None,
+                reclaim_sent: false,
+                reclaim_cancel_pending: false,
                 prepare_dirty_rows: Vec::new(),
                 raster_dirty_rows: Vec::new(),
                 surface_dirty_rows: Vec::new(),
@@ -1568,6 +1570,11 @@ struct PaneView {
     authority: AuthorityStatus,
     last_resize: Option<(u16, u16, u16, u16)>,
     pending_resize: Option<PendingPaneResize>,
+    /// Plan 0072 M2b: a person's resize went to the controller since the
+    /// Window last lost keyboard focus.
+    reclaim_sent: bool,
+    /// Plan 0072 M2b: a `CancelReclaim` the full command queue refused.
+    reclaim_cancel_pending: bool,
     prepare_dirty_rows: Vec<bool>,
     raster_dirty_rows: Vec<bool>,
     surface_dirty_rows: Vec<bool>,
@@ -1852,6 +1859,8 @@ impl PaneView {
             authority: options.authority,
             last_resize: None,
             pending_resize: None,
+            reclaim_sent: false,
+            reclaim_cancel_pending: false,
             prepare_dirty_rows: Vec::new(),
             raster_dirty_rows: Vec::new(),
             surface_dirty_rows: Vec::new(),
@@ -2283,9 +2292,16 @@ impl PaneView {
                 self.authority = authority;
                 Ok(BackgroundUpdateImpact::VISUAL)
             }
+            // A repeated status, as each refused acquisition sends, changes
+            // nothing to draw.
             WindowUpdate::Control(active) => {
+                let changed = self.controller_active != active;
                 self.controller_active = active;
-                Ok(BackgroundUpdateImpact::VISUAL)
+                Ok(if changed {
+                    BackgroundUpdateImpact::VISUAL
+                } else {
+                    BackgroundUpdateImpact::NONE
+                })
             }
             // A pane that lost its stream cannot answer, so it is not asked.
             WindowUpdate::ControlTransferRequested(transfer_id) => {
@@ -8371,6 +8387,7 @@ impl App {
         if !focused {
             self.cancel_clipboard_image();
             self.clipboard.palette_image_target = None;
+            self.cancel_pane_reclaims();
         }
         self.input.keyboard_focused = focused;
         self.input.ime.focused = focused;
@@ -10884,6 +10901,56 @@ impl App {
         Self::retry_pending_pane_resize(pane)
     }
 
+    /// Plan 0072 M2b: the Window lost keyboard focus, so no visible pane
+    /// takes control for a resize that has not reached the daemon yet: the
+    /// size it gave a moment ago, as when a new tiled window opens beside
+    /// it, was not the person's.
+    fn cancel_pane_reclaims(&mut self) {
+        for pane in
+            std::iter::once(&mut self.panes.pane).chain(self.panes.inactive_panes.iter_mut())
+        {
+            Self::cancel_pane_reclaim(pane);
+        }
+    }
+
+    /// A person's resize waiting for room in the queue becomes a layout
+    /// resize; one already sent is cancelled in the controller's debounce,
+    /// which the cancellation reaches first, as commands stay in order.
+    fn cancel_pane_reclaim(pane: &mut PaneView) {
+        if let Some(pending) = &mut pane.pending_resize
+            && let WindowCommand::ReclaimResize {
+                columns,
+                rows,
+                pixel_width,
+                pixel_height,
+            } = pending.command
+        {
+            pending.command = WindowCommand::Resize {
+                columns,
+                rows,
+                pixel_width,
+                pixel_height,
+            };
+        }
+        if !(pane.reclaim_sent || pane.reclaim_cancel_pending) {
+            return;
+        }
+        pane.reclaim_sent = false;
+        pane.reclaim_cancel_pending = false;
+        let Some(commands) = &pane.commands else {
+            return;
+        };
+        if let Err(TrySendError::Full(_)) = commands.try_send(WindowCommand::CancelReclaim) {
+            pane.reclaim_cancel_pending = true;
+        }
+    }
+
+    fn retry_pane_reclaim_cancel(pane: &mut PaneView) {
+        if pane.reclaim_cancel_pending {
+            Self::cancel_pane_reclaim(pane);
+        }
+    }
+
     fn retry_pending_pane_resize(pane: &mut PaneView) -> Result<()> {
         let Some(pending) = pane.pending_resize.take() else {
             return Ok(());
@@ -10891,8 +10958,17 @@ impl App {
         let Some(commands) = &pane.commands else {
             return Ok(());
         };
+        let reclaim = matches!(pending.command, WindowCommand::ReclaimResize { .. });
         match commands.try_send(pending.command) {
-            Ok(()) => pane.last_resize = Some(pending.size),
+            Ok(()) => {
+                pane.last_resize = Some(pending.size);
+                if reclaim {
+                    // Sent while focused, so it supersedes a cancellation
+                    // still waiting for room.
+                    pane.reclaim_sent = true;
+                    pane.reclaim_cancel_pending = false;
+                }
+            }
             Err(TrySendError::Full(command)) => {
                 // Preserve the exact newest resize across ordinary queue
                 // backpressure. The event loop retries deferred pane commands
@@ -11769,6 +11845,11 @@ impl App {
         );
         Self::retry_pane_focus_report(&mut self.panes.pane, active_input_pending);
         Self::retry_pane_control_release(&mut self.panes.pane, active_input_pending);
+        for pane in
+            std::iter::once(&mut self.panes.pane).chain(self.panes.inactive_panes.iter_mut())
+        {
+            Self::retry_pane_reclaim_cancel(pane);
+        }
         let inline_picker_open = self.modal.inline_picker_open();
         let picker_reconcile_pending = self.modal.session_picker_reconcile_pending;
         let mut next_theme = (!inline_picker_open)
@@ -12216,11 +12297,16 @@ impl App {
                 WindowUpdate::Control(active) => {
                     self.cancel_clipboard_image();
                     self.clipboard.palette_image_target = None;
-                    self.panes.pane.controller_active = active;
-                    title_changed = true;
-                    visual_changed = true;
-                    focused_visual_changed = true;
-                    self.presentation.full_redraw = true;
+                    // Plan 0072 M2b: a repeated status, as each refused
+                    // acquisition sends, leaves the title, and a notice in
+                    // it, alone.
+                    if self.panes.pane.controller_active != active {
+                        self.panes.pane.controller_active = active;
+                        title_changed = true;
+                        visual_changed = true;
+                        focused_visual_changed = true;
+                        self.presentation.full_redraw = true;
+                    }
                 }
                 // The pane's notice shows and clears with the title (Plan 0067
                 // M4); neither moves focus or the active tab.
@@ -18978,6 +19064,94 @@ mod tests {
             assert_eq!(shown(&pane), before);
         }
         assert!(!pane.controller_active);
+    }
+
+    /// Plan 0072 M2b: when the Window loses keyboard focus, a person's
+    /// resize already sent is cancelled in the controller's debounce, once,
+    /// and one still waiting for room is sent as a layout resize.
+    #[test]
+    fn losing_keyboard_focus_cancels_a_reclaim_not_yet_taken() {
+        let (mut pane, mut commands) = reclaim_test_pane(false, 4);
+        App::emit_active_pane_resize(
+            &mut pane,
+            320,
+            240,
+            SCALE_DENOMINATOR,
+            PaneResizeCause::User,
+        )
+        .unwrap();
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            WindowCommand::ReclaimResize { .. }
+        ));
+        App::cancel_pane_reclaim(&mut pane);
+        assert_eq!(commands.try_recv().unwrap(), WindowCommand::CancelReclaim);
+        App::cancel_pane_reclaim(&mut pane);
+        assert!(commands.try_recv().is_err(), "cancelled once");
+
+        // Held back by a full queue: the resize itself is downgraded.
+        let (mut pane, mut commands) = reclaim_test_pane(false, 1);
+        let sender = pane.commands.clone().unwrap();
+        sender.try_send(WindowCommand::Resynchronize).unwrap();
+        App::emit_active_pane_resize(
+            &mut pane,
+            320,
+            240,
+            SCALE_DENOMINATOR,
+            PaneResizeCause::User,
+        )
+        .unwrap();
+        App::cancel_pane_reclaim(&mut pane);
+        assert_eq!(commands.try_recv().unwrap(), WindowCommand::Resynchronize);
+        App::retry_pending_pane_resize(&mut pane).unwrap();
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            WindowCommand::Resize { .. }
+        ));
+        App::cancel_pane_reclaim(&mut pane);
+        assert!(commands.try_recv().is_err(), "nothing to cancel");
+    }
+
+    /// Plan 0072 M2b: a cancellation the full queue refused is sent once
+    /// there is room.
+    #[test]
+    fn a_reclaim_cancellation_waits_for_room_in_the_queue() {
+        let (mut pane, mut commands) = reclaim_test_pane(false, 1);
+        App::emit_active_pane_resize(
+            &mut pane,
+            320,
+            240,
+            SCALE_DENOMINATOR,
+            PaneResizeCause::User,
+        )
+        .unwrap();
+        App::cancel_pane_reclaim(&mut pane);
+        assert!(pane.reclaim_cancel_pending);
+        App::retry_pane_reclaim_cancel(&mut pane);
+        assert!(pane.reclaim_cancel_pending, "still no room");
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            WindowCommand::ReclaimResize { .. }
+        ));
+        App::retry_pane_reclaim_cancel(&mut pane);
+        assert!(!pane.reclaim_cancel_pending);
+        assert_eq!(commands.try_recv().unwrap(), WindowCommand::CancelReclaim);
+    }
+
+    /// Plan 0072 M2b: the same control status again, as each refused
+    /// acquisition sends, changes nothing to draw.
+    #[test]
+    fn a_repeated_control_status_changes_nothing() {
+        let (mut pane, _commands) = reclaim_test_pane(false, 1);
+        let theme = ResolvedTheme::default();
+        let impact = pane
+            .apply_background_update(WindowUpdate::Control(false), theme, "visible-inactive")
+            .unwrap();
+        assert!(!impact.visual_changed);
+        let impact = pane
+            .apply_background_update(WindowUpdate::Control(true), theme, "visible-inactive")
+            .unwrap();
+        assert!(impact.visual_changed);
     }
 
     fn reduce_history_merge_case(

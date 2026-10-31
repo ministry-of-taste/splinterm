@@ -209,6 +209,10 @@ pub enum WindowCommand {
         decision: ControlTransferDecision,
     },
     ForceControlTransfer,
+    /// Plan 0072 M2b: the Window lost keyboard focus, so a
+    /// [`WindowCommand::ReclaimResize`] still waiting in the pane's resize
+    /// debounce resizes without taking control.
+    CancelReclaim,
     Search {
         terminal_revision: u64,
         history_generation: u64,
