@@ -2570,7 +2570,7 @@ async fn a_refused_force_keeps_the_pane_and_says_why() {
                 WindowCommand::ForceControlTransfer,
             ],
             vec![
-                (force(id), Err(code)),
+                (force(id), Err(code.into())),
                 (force(id), Ok(granted())),
                 (
                     Request::ReleaseControl { controller_id: 2 },
@@ -2603,7 +2603,7 @@ async fn a_failed_force_of_another_kind_still_ends_the_pane() {
             id,
             false,
             vec![WindowCommand::ForceControlTransfer],
-            vec![(force(id), Err(code))],
+            vec![(force(id), Err(code.into()))],
         )
         .await;
         assert!(result.is_err(), "{code:?}");
