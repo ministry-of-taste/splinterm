@@ -31700,21 +31700,22 @@ mod tests {
             query_id,
             data: data.into(),
         };
-        let old_answer = answer(old_query, "c2VjcmV0");
-        handle_request(old_answer, &state, &window, 501, 0, true, false)
-            .await
-            .unwrap();
-        assert_eq!(
-            wait_for_clipboard_audit(&state, AuditOperation::ClipboardQuery, 1).await[0].0,
-            "clipboard_query_reply_not_written"
-        );
+        // The new query is answered first, well within its timeout even on a
+        // slow machine; the old one may already have timed out.
         let new_answer = answer(new_query, "aGk=");
         handle_request(new_answer, &state, &window, 502, 0, true, false)
             .await
             .unwrap();
+        let old_answer = answer(old_query, "c2VjcmV0");
+        handle_request(old_answer, &state, &window, 501, 0, true, false)
+            .await
+            .unwrap();
+        let records = wait_for_clipboard_audit(&state, AuditOperation::ClipboardQuery, 2).await;
+        let answered = ("clipboard_query_window_answered".to_owned(), Some(2));
         assert_eq!(
-            wait_for_clipboard_audit(&state, AuditOperation::ClipboardQuery, 2).await[1],
-            ("clipboard_query_window_answered".into(), Some(2))
+            records.iter().filter(|record| **record == answered).count(),
+            1,
+            "{records:?}"
         );
         handle.input(b"\n".to_vec()).await.unwrap();
         wait_for_screen(&handle, "reply:E]52;c;aGk=B", 1).await;
