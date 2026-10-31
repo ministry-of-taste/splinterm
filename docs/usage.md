@@ -566,8 +566,10 @@ terminal interrupt. These Super shortcuts work only when the compositor
 delivers the chord to the Splinterm Window. Splinterm-owned command-palette,
 keybinding-help, search, and rename fields accept effective clipboard bindings
 such as `Ctrl+Shift+C/V` and also offer bounded local selection, cut, paste, and
-undo; terminal `Super+X/Z` remain owned
-by the running application.
+undo with `Super+A/X/C/V/Z`. They also take `Ctrl+A/X/C/V`, which Omarchy's
+`Super+A/X/C/V` send, with the same meaning. Only those fields do: in the
+terminal, `Ctrl+C` and the rest stay the program's keys, and terminal
+`Super+X/Z` remain owned by the running application.
 
 The same profile ships atomic `omarchy.t`, `omarchy.tdl`, `omarchy.tds`,
 `omarchy.tdlm`, and `omarchy.tsl` presets. Optional Bash functions use the
@@ -579,9 +581,28 @@ explicit collision-safe workflow. See [Presets](presets.md) for exact behavior.
 - Click a pane to focus it; click a tab to activate it.
 - Drag terminal text to select. Selection is client-local presentation state.
 - `Ctrl+Shift+C` copies the active selection and `Ctrl+Shift+V` pastes clipboard
-  text through the controlled terminal input path.
-- Primary selection, URL recognition/activation, and pointer reporting follow the
-  implemented Foot-derived terminal behavior and current control ownership.
+  text through the controlled terminal input path. Holding a copy or paste
+  chord never repeats it into the program as `Ctrl+C` or `Ctrl+V`.
+- Copying a line the terminal wrapped gives the one line, without a newline
+  where it wrapped. Full-screen programs' rows always copy as separate lines.
+- A paste loses control characters other than tab and line ends, so pasted
+  text cannot send escape sequences or end a bracketed paste early. Without
+  bracketed paste, each line end is sent as the carriage return Enter sends,
+  as in foot, xterm and Alacritty.
+- When the clipboard holds an image and no text, `Ctrl+Shift+V` (or `Super+V`)
+  sends `Ctrl+V` to the program, so an agent such as Claude Code can read the
+  image itself.
+- A paste that cannot be delivered says why in the Window title: more than
+  1 MiB of text, text that is not UTF-8, a clipboard that did not answer within
+  five seconds, focus that changed while it was read, a pane that takes no
+  input, or input paused by a dialog or an upgrade. Input the program is too
+  busy to take is cut short with a notice, and a bracketed paste cut short
+  still gets its closing marker.
+- A middle click pastes the primary selection. Set
+  `[clipboard] middle-click-paste=no` to make it an ordinary button, reported
+  to programs that track the mouse.
+- URL recognition/activation and pointer reporting follow the implemented
+  Foot-derived terminal behavior and current control ownership.
 - Right-clicking trusted tab chrome opens the tab menu; terminal-controlled
   content cannot paint or activate trusted chrome.
 

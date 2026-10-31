@@ -126,6 +126,7 @@ substitution, but do not sandbox hostile processes running as your own user.
 | `colors.<role>` | a semantic chrome role's colour, such as `colors.accent` or `colors.status-working`; `[colors-dark]` and `[colors-light]` take the same keys for one appearance ([Role overrides](#role-overrides)) | `#RRGGBB`, `0xRRGGBB`, `color0`–`color15` or `auto`; unset (theme-owned) |
 | `scrollback.lines` | daemon terminal history budget | 0–1,000,000; 1000 |
 | `clipboard.image-directory` | explicit absolute private directory for user-requested local clipboard PNG saves | unset; no temporary fallback |
+| `clipboard.middle-click-paste` | a middle click pastes the primary selection into the terminal; `no` makes it an ordinary button, reported to a program that tracks the mouse ([Pointer, selection, clipboard, and URLs](usage.md#pointer-selection-clipboard-and-urls)); configuration reload applies it | strict boolean; yes |
 | `cursor.style` | `block`, `beam`, or `underline` | block |
 | `cursor.blink` | permit cursor blink | yes |
 | `multiplexer.persistent-by-default` | ordinary unnamed local graphical terminals create persistent (`yes`) or Window-owned transient (`no`) Lairs | yes |

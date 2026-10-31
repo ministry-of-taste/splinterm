@@ -2297,3 +2297,143 @@ async fn a_reattachment_that_stays_up_starts_the_next_outage_afresh() {
     assert_eq!(retry.lost(later), later + PANE_STREAM_NOTICE_DELAY);
     assert_eq!(retry.delay, PANE_STREAM_RETRY_INITIAL);
 }
+
+#[test]
+fn a_bracketed_paste_is_open_until_its_closing_marker() {
+    assert!(!bracketed_paste_left_open(b""));
+    assert!(!bracketed_paste_left_open(b"typed"));
+    assert!(bracketed_paste_left_open(b"\x1b[200~half a pa"));
+    assert!(!bracketed_paste_left_open(b"\x1b[200~whole\x1b[201~"));
+    assert!(bracketed_paste_left_open(
+        b"\x1b[200~one\x1b[201~\x1b[200~two"
+    ));
+    // A closing marker cut in half has not closed the paste.
+    assert!(bracketed_paste_left_open(b"\x1b[200~text\x1b[20"));
+}
+
+fn paste_cut_steps(id: SplintId) -> Vec<(Request, Reply, Vec<ServerFrame>)> {
+    vec![
+        (
+            controlled_input(id, b"\x1b[200~ab", false),
+            Ok(input_acknowledged(id)),
+            Vec::new(),
+        ),
+        (
+            controlled_input(id, b"cdefghij", false),
+            Err(ErrorCode::ResourceLimit),
+            Vec::new(),
+        ),
+    ]
+}
+
+fn input_dropped_count(updates: &[WindowUpdate]) -> usize {
+    updates
+        .iter()
+        .filter(|update| matches!(update, WindowUpdate::InputDropped))
+        .count()
+}
+
+/// Plan 0074: a full daemon input queue that cuts a bracketed paste short
+/// still gets the paste's closing marker, and the Window hears of the cut.
+#[tokio::test]
+async fn a_bracketed_paste_cut_short_still_sends_its_closing_marker() {
+    let id = SplintId::new();
+    let limits = ServerLimits {
+        maximum_input_bytes: 8,
+        ..ServerLimits::default()
+    };
+    let mut steps = paste_cut_steps(id);
+    steps.push((
+        controlled_input(id, b"\x1b[201~", false),
+        Ok(input_acknowledged(id)),
+        Vec::new(),
+    ));
+    steps.push((
+        Request::ReleaseControl { controller_id: 1 },
+        Ok(Response::Acknowledged),
+        Vec::new(),
+    ));
+    let (result, updates, _) = run_case_with(
+        id,
+        true,
+        limits,
+        vec![WindowCommand::Input(
+            b"\x1b[200~abcdefghij\x1b[201~".to_vec(),
+        )],
+        steps,
+    )
+    .await;
+    result.unwrap();
+    assert_eq!(input_dropped_count(&updates), 1);
+}
+
+/// A queue that stays full keeps the closing marker for the next input.
+#[tokio::test]
+async fn a_closing_marker_the_full_queue_refuses_goes_ahead_of_the_next_input() {
+    let id = SplintId::new();
+    let limits = ServerLimits {
+        maximum_input_bytes: 8,
+        ..ServerLimits::default()
+    };
+    let mut steps = paste_cut_steps(id);
+    for _ in 0..PASTE_CLOSE_ATTEMPTS {
+        steps.push((
+            controlled_input(id, b"\x1b[201~", false),
+            Err(ErrorCode::ResourceLimit),
+            Vec::new(),
+        ));
+    }
+    steps.push((
+        controlled_input(id, b"\x1b[201~x", false),
+        Ok(input_acknowledged(id)),
+        Vec::new(),
+    ));
+    steps.push((
+        Request::ReleaseControl { controller_id: 1 },
+        Ok(Response::Acknowledged),
+        Vec::new(),
+    ));
+    let (result, _, _) = run_case_with(
+        id,
+        true,
+        limits,
+        vec![
+            WindowCommand::Input(b"\x1b[200~abcdefghij\x1b[201~".to_vec()),
+            WindowCommand::Input(b"x".to_vec()),
+        ],
+        steps,
+    )
+    .await;
+    result.unwrap();
+}
+
+/// Typed input cut short sends no closing marker of its own.
+#[tokio::test]
+async fn input_cut_short_outside_a_paste_sends_no_closing_marker() {
+    let id = SplintId::new();
+    let limits = ServerLimits {
+        maximum_input_bytes: 8,
+        ..ServerLimits::default()
+    };
+    let (result, updates, _) = run_case_with(
+        id,
+        true,
+        limits,
+        vec![WindowCommand::Input(b"abcdefghijkl".to_vec())],
+        vec![
+            (
+                controlled_input(id, b"abcdefgh", false),
+                Err(ErrorCode::ResourceLimit),
+                Vec::new(),
+            ),
+            (
+                Request::ReleaseControl { controller_id: 1 },
+                Ok(Response::Acknowledged),
+                Vec::new(),
+            ),
+        ],
+    )
+    .await;
+    result.unwrap();
+    assert_eq!(input_dropped_count(&updates), 1);
+}

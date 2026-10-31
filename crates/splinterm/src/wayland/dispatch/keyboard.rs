@@ -4,10 +4,10 @@ use super::super::{
     ActionId, App, CommandPaletteShortcutAction, Connection, ExitClass, KeyEvent, KeyboardHandler,
     KeymapPress, Keysym, Modifiers, PaneFocusAction, PaneTopologyAction, PasteTarget, QueueHandle,
     RawModifiers, SessionPickerShortcutAction, TabShortcutAction, WaylandSurface, WindowCommand,
-    WindowTopologyCommand, close_other_tabs_command, command_palette_shortcut_action,
-    consume_detached_enter_press, font_zoom_action, key_repeat_reaches_phase,
-    keymap_press_consumes_key, keymap_press_for, lair_lifecycle_command, pane_focus_action,
-    pane_topology_action, session_picker_shortcut_action, shortcut_action_for,
+    WindowTopologyCommand, clipboard_chord, close_other_tabs_command,
+    command_palette_shortcut_action, consume_detached_enter_press, font_zoom_action,
+    key_repeat_reaches_phase, keymap_press_consumes_key, keymap_press_for, lair_lifecycle_command,
+    pane_focus_action, pane_topology_action, session_picker_shortcut_action, shortcut_action_for,
     shortcut_paused_during_handoff, tab_action_dispatch_allowed, tab_shortcut_action, wl_keyboard,
     wl_surface,
 };
@@ -562,12 +562,15 @@ impl KeyboardHandler for App {
             }
             return;
         }
-        if shortcut == Some(ActionId::ClipboardCopy) {
-            self.publish_clipboard(queue_handle, serial, false);
-        } else if shortcut == Some(ActionId::ClipboardSaveImage) {
+        if clipboard_chord(shortcut) {
+            // Plan 0074: the key stays the Window's until released.
             self.modal
                 .session_picker_consumed_keys
                 .insert(event.raw_code);
+        }
+        if shortcut == Some(ActionId::ClipboardCopy) {
+            self.publish_clipboard(queue_handle, serial, false);
+        } else if shortcut == Some(ActionId::ClipboardSaveImage) {
             self.begin_clipboard_image();
         } else if shortcut == Some(ActionId::ClipboardPaste) {
             self.begin_clipboard_read(PasteTarget::Clipboard);
@@ -655,6 +658,15 @@ impl KeyboardHandler for App {
             return;
         }
         let shortcut = shortcut_action_for(&self.input.keymap, &event, self.input.modifiers);
+        // Plan 0074: a clipboard chord whose press this Window did not see
+        // (a synthetic key, or one pressed during a modal) still never
+        // repeats into the program.
+        if clipboard_chord(shortcut) {
+            self.modal
+                .session_picker_consumed_keys
+                .insert(event.raw_code);
+            return;
+        }
         if command_palette_shortcut_action(
             shortcut,
             true,

@@ -66,6 +66,9 @@ pub enum WindowUpdate {
     StreamLost {
         reconnecting: bool,
     },
+    /// Plan 0074: the daemon's input queue for the pane was full, so the
+    /// rest of some input, such as a large paste, was dropped.
+    InputDropped,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

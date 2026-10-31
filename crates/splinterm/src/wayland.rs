@@ -203,9 +203,10 @@ use chrome::{
 };
 pub use clipboard::encode_bracketed_paste;
 use clipboard::{
-    ACTIVE_CLIPBOARD_WORKERS, CLIPBOARD_IO_TIMEOUT, ClipboardRead, OwnedFieldTarget, PasteTarget,
-    TEXT_MIMES, accepted_text_mime, safe_paste, spawn_clipboard_read, try_clipboard_worker,
-    write_clipboard_with_deadline,
+    ACTIVE_CLIPBOARD_WORKERS, CLIPBOARD_IO_TIMEOUT, ClipboardRead, MAX_PASTE_INPUT_BYTES,
+    OwnedFieldTarget, PasteDrop, PasteOffer, PasteTarget, TEXT_MIMES, accepted_text_mime,
+    clipboard_read_drop, image_paste_key, paste_offer, safe_paste, sanitize_paste,
+    spawn_clipboard_read, try_clipboard_worker, write_clipboard_with_deadline,
 };
 use damage::{
     BackingDamage, control_notice_damage, pending_draw_waits_for_frame, search_panel_damage,
@@ -217,14 +218,14 @@ use file_drop::{
 };
 use handoff::{HandoffFrontend, HeldFailure};
 use input::{
-    CommandPaletteShortcutAction, CopyModeDesktopAction, FontZoomAction, HistoryNavigation,
-    ModalPointerFrame, MouseAction, PaneFocusAction, PaneTopologyAction, PickerImeReconcile,
-    PressOwner, SessionPickerShortcutAction, TabShortcutAction, WheelAccumulator, WheelOutcome,
-    application_motion, binding_help_repeat_consumed, classify_press, clipboard_read_is_current,
-    command_palette_shortcut_action, consume_detached_enter_press, copy_mode_desktop_action,
-    font_zoom_action, history_overlay_status, history_return_to_live_hit, key_input,
-    keymap_press_consumes_key, keymap_press_for, local_selection_owner, mouse_report,
-    owned_field_clipboard_action, pane_focus_action, pane_topology_action,
+    CommandPaletteShortcutAction, CopyModeDesktopAction, FieldEdit, FontZoomAction,
+    HistoryNavigation, ModalPointerFrame, MouseAction, PaneFocusAction, PaneTopologyAction,
+    PickerImeReconcile, PressOwner, SessionPickerShortcutAction, TabShortcutAction,
+    WheelAccumulator, WheelOutcome, application_motion, binding_help_repeat_consumed,
+    classify_press, clipboard_chord, command_palette_shortcut_action, consume_detached_enter_press,
+    copy_mode_desktop_action, font_zoom_action, history_overlay_status, history_return_to_live_hit,
+    key_input, keymap_press_consumes_key, keymap_press_for, local_selection_owner, mouse_report,
+    owned_field_clipboard_action, owned_field_edit, pane_focus_action, pane_topology_action,
     pending_selection_drag_anchor, picker_ime_reconcile, picker_release_activation,
     picker_repeat_consumed, pointer_axis_focus_target, reconciled_focus_report,
     session_picker_shortcut_action, shortcut_action_for, shortcut_paused_during_handoff,
@@ -268,6 +269,8 @@ const SCALE_DENOMINATOR: u32 = 120;
 const MIN_SCALE_120: u32 = 120;
 const MAX_SCALE_120: u32 = 960;
 const MAX_PREEDIT_BYTES: usize = 4 * 1024;
+/// Plan 0074: shown when the daemon's full input queue cut input short.
+const INPUT_DROPPED_NOTICE: &str = "Input cut short: the program is not reading it";
 const MAX_PENDING_TERMINAL_INPUT_BYTES: usize =
     clipboard::MAX_CLIPBOARD_BYTES + clipboard::BRACKETED_PASTE_OVERHEAD;
 const PENDING_INPUT_RETRY_INTERVAL: Duration = Duration::from_millis(5);
@@ -1163,6 +1166,7 @@ fn assemble_app(
             clipboard_sources: Vec::new(),
             primary_sources: Vec::new(),
             image_directory: options.clipboard_image_directory,
+            middle_click_paste: options.middle_click_paste,
             local_endpoint: options.local_endpoint,
             image_request: None,
             palette_image_target: None,
@@ -2310,7 +2314,9 @@ impl PaneView {
             } else {
                 BackgroundUpdateImpact::NONE
             }),
-            WindowUpdate::Theme(_) | WindowUpdate::Font(_) => Ok(BackgroundUpdateImpact::NONE),
+            WindowUpdate::Theme(_) | WindowUpdate::Font(_) | WindowUpdate::InputDropped => {
+                Ok(BackgroundUpdateImpact::NONE)
+            }
             WindowUpdate::Exited { .. } | WindowUpdate::Shutdown => {
                 self.end_stream();
                 Ok(BackgroundUpdateImpact::VISUAL)
@@ -2642,6 +2648,8 @@ struct InputState {
 
 struct ClipboardState {
     image_directory: Option<PathBuf>,
+    /// `[clipboard] middle-click-paste`; configuration reload applies it.
+    middle_click_paste: bool,
     local_endpoint: bool,
     image_request: Option<clipboard_image::ImageRequest>,
     palette_image_target: Option<FileDropTarget>,
@@ -6439,6 +6447,7 @@ impl App {
     fn owned_field_consumes_repeat(&mut self, event: &KeyEvent) -> bool {
         self.active_owned_field().is_some()
             && (self.input.modifiers.logo
+                || owned_field_edit(event.keysym, self.input.modifiers).is_some()
                 || owned_field_clipboard_action(
                     &self.input.keymap,
                     event.keysym,
@@ -6485,20 +6494,16 @@ impl App {
         } else if clipboard_action == Some(ActionId::ClipboardPaste) {
             paste = true;
             true
-        } else if desktop {
-            match event.keysym {
-                Keysym::c | Keysym::C => {
+        } else if let Some(edit) = owned_field_edit(event.keysym, self.input.modifiers) {
+            match edit {
+                FieldEdit::Copy => {
                     copied = self
                         .owned_field_editor_mut(target)
                         .and_then(|editor| editor.selected_text().map(str::as_bytes))
                         .map(<[u8]>::to_vec);
-                    true
                 }
-                Keysym::v | Keysym::V => {
-                    paste = true;
-                    true
-                }
-                Keysym::x | Keysym::X => {
+                FieldEdit::Paste => paste = true,
+                FieldEdit::Cut => {
                     if clipboard_available {
                         copied = self
                             .owned_field_editor_mut(target)
@@ -6506,22 +6511,22 @@ impl App {
                             .map(String::into_bytes);
                         changed = copied.is_some();
                     }
-                    true
                 }
-                Keysym::z | Keysym::Z => {
+                FieldEdit::Undo => {
                     changed = self
                         .owned_field_editor_mut(target)
                         .is_some_and(BoundedTextEditor::undo);
-                    true
                 }
-                Keysym::a | Keysym::A => {
+                FieldEdit::SelectAll => {
                     changed = self
                         .owned_field_editor_mut(target)
                         .is_some_and(BoundedTextEditor::select_all);
-                    true
                 }
-                _ => true,
             }
+            true
+        } else if desktop {
+            // Other Super chords do nothing in a field.
+            true
         } else if plain {
             match event.keysym {
                 Keysym::BackSpace => {
@@ -6581,34 +6586,54 @@ impl App {
 
     fn begin_clipboard_read(&mut self, target: PasteTarget) {
         if self.pty_input_blocked() && !matches!(target, PasteTarget::OwnedField(_)) {
+            self.window_notice(PasteDrop::InputPaused.notice());
             return;
         }
-        let tx = self.clipboard.clipboard_tx.clone();
-        let waker = self.platform.update_waker.clone();
-        let input_generation = self.input.input_generation;
-        match target {
+        let pipe = match target {
             PasteTarget::Clipboard | PasteTarget::OwnedField(_) => {
                 let Some(offer) = self.clipboard.clipboard_offer.clone() else {
+                    self.window_notice(PasteDrop::NoText.notice());
                     return;
                 };
-                let mime = offer.with_mime_types(accepted_text_mime);
-                let Some(mime) = mime else { return };
-                if let Ok(pipe) = offer.receive(mime) {
-                    spawn_clipboard_read(pipe.into(), target, input_generation, None, tx, waker);
+                match offer.with_mime_types(|mimes| paste_offer(mimes, target)) {
+                    PasteOffer::Text(mime) => offer.receive(mime).ok().map(OwnedFd::from),
+                    PasteOffer::ImageKey => {
+                        let key = image_paste_key(self.panes.input_modes());
+                        self.send_command(WindowCommand::Input(key));
+                        return;
+                    }
+                    PasteOffer::NoText => {
+                        self.window_notice(PasteDrop::NoText.notice());
+                        return;
+                    }
                 }
             }
+            // A middle click with no selection text pastes nothing, quietly.
             PasteTarget::Primary => {
                 let Some(offer) = self.clipboard.primary_offer.clone() else {
                     return;
                 };
-                let mime = offer.with_mime_types(accepted_text_mime);
-                let Some(mime) = mime else { return };
-                if let Ok(pipe) = offer.receive(mime) {
-                    spawn_clipboard_read(pipe.into(), target, input_generation, None, tx, waker);
-                }
+                let PasteOffer::Text(mime) =
+                    offer.with_mime_types(|mimes| paste_offer(mimes, target))
+                else {
+                    return;
+                };
+                offer.receive(mime).ok().map(OwnedFd::from)
             }
-            PasteTarget::FileDrop(_) => {}
-        }
+            PasteTarget::FileDrop(_) => return,
+        };
+        let Some(pipe) = pipe else {
+            self.window_notice(PasteDrop::ReadFailed.notice());
+            return;
+        };
+        spawn_clipboard_read(
+            pipe,
+            target,
+            self.input.input_generation,
+            None,
+            self.clipboard.clipboard_tx.clone(),
+            self.platform.update_waker.clone(),
+        );
     }
 
     fn apply_clipboard_reads(&mut self) -> Result<()> {
@@ -6617,91 +6642,128 @@ impl App {
                 offer.finish();
                 offer.destroy();
             }
-            if self.input.input_generation != read.input_generation {
-                if matches!(read.target, PasteTarget::FileDrop(_)) {
-                    eprintln!("splinterm file drop rejected: input target changed");
-                }
-                continue;
-            }
-            let Ok(bytes) = read.bytes else {
-                if matches!(read.target, PasteTarget::FileDrop(_)) {
-                    eprintln!("splinterm file drop rejected: offer read failed");
-                }
-                continue;
-            };
-            let Ok(bytes) = safe_paste(&bytes) else {
-                if matches!(read.target, PasteTarget::FileDrop(_)) {
-                    eprintln!("splinterm file drop rejected: unsafe offer bytes");
-                }
-                continue;
-            };
-            match read.target {
-                PasteTarget::Clipboard | PasteTarget::Primary => {
-                    if !clipboard_read_is_current(
-                        self.pty_input_blocked(),
-                        self.input.input_generation,
-                        read.input_generation,
-                    ) {
-                        continue;
-                    }
-                    let bracketed = self
-                        .panes
-                        .pane
-                        .snapshot
-                        .as_ref()
-                        .is_some_and(|snapshot| snapshot.input_modes.bracketed_paste);
-                    self.send_input(encode_bracketed_paste(bytes, bracketed))?;
-                }
-                PasteTarget::OwnedField(target) => {
-                    let text = std::str::from_utf8(bytes)
-                        .expect("safe_paste already validated clipboard UTF-8");
-                    if self
-                        .owned_field_editor_mut(target)
-                        .is_some_and(|editor| editor.insert(text))
-                    {
-                        self.refresh_owned_field(target);
-                    }
-                }
-                PasteTarget::FileDrop(target) => {
-                    let Some(pane) = self.pane_for_splint(target.splint_id) else {
-                        eprintln!("splinterm file drop rejected: target pane unavailable");
-                        continue;
-                    };
-                    let Some(snapshot) = pane.snapshot.as_ref() else {
-                        eprintln!("splinterm file drop rejected: target snapshot unavailable");
-                        continue;
-                    };
-                    let current = FileDropTarget {
-                        topology_revision: self.tab_state.active_identity.topology_revision,
-                        dojo_id: self.tab_state.active_dojo_id(),
-                        splint_id: snapshot.splint_id,
-                        incarnation: snapshot.incarnation,
-                        input_generation: self.input.input_generation,
-                    };
-                    if !file_drop_target_is_current(
-                        target,
-                        current,
-                        self.pty_input_blocked(),
-                        pane.controller_active,
-                        pane.commands.is_some(),
-                    ) {
-                        eprintln!("splinterm file drop rejected: target became stale");
-                        continue;
-                    }
-                    let Ok(payload) = dropped_file_payload(bytes) else {
-                        eprintln!("splinterm file drop rejected: invalid URI list");
-                        continue;
-                    };
-                    let encoded =
-                        encode_bracketed_paste(&payload, snapshot.input_modes.bracketed_paste);
-                    let Some(commands) = pane.commands.clone() else {
-                        eprintln!("splinterm file drop rejected: command channel unavailable");
-                        continue;
-                    };
-                    self.queue_terminal_input_for(Some(&commands), encoded)?;
-                }
+            if let PasteTarget::FileDrop(target) = read.target {
+                self.apply_file_drop_read(target, read.input_generation, read.bytes)?;
+            } else if let Some(dropped) = self.apply_paste_read(read)? {
+                self.window_notice(dropped.notice());
             }
         }
+        Ok(())
+    }
+
+    /// Plan 0074: delivers a finished clipboard or primary-selection read
+    /// to its target, or says why it was dropped. Disallowed control
+    /// characters are removed rather than refusing the paste.
+    fn apply_paste_read(&mut self, read: ClipboardRead) -> Result<Option<PasteDrop>> {
+        // Owned fields still take a paste while terminal input is blocked.
+        let blocked =
+            !matches!(read.target, PasteTarget::OwnedField(_)) && self.pty_input_blocked();
+        if let Some(dropped) =
+            clipboard_read_drop(blocked, self.input.input_generation, read.input_generation)
+        {
+            return Ok(Some(dropped));
+        }
+        let bytes = match read.bytes {
+            Ok(bytes) => bytes,
+            Err(error) => return Ok(Some(PasteDrop::from_read_error(&error))),
+        };
+        let text = match sanitize_paste(&bytes) {
+            Ok(text) => text,
+            Err(dropped) => return Ok(Some(dropped)),
+        };
+        match read.target {
+            PasteTarget::OwnedField(target) => {
+                if self
+                    .owned_field_editor_mut(target)
+                    .is_some_and(|editor| editor.insert(&text))
+                {
+                    self.refresh_owned_field(target);
+                }
+                Ok(None)
+            }
+            PasteTarget::Clipboard | PasteTarget::Primary => self.send_paste(&text),
+            PasteTarget::FileDrop(_) => Ok(None),
+        }
+    }
+
+    /// Sends pasted text to the focused pane, bracketed when its program
+    /// asked for bracketed paste. A paste is sent whole or not at all: one
+    /// too large for the daemon's input queue is refused up front, so a
+    /// bracketed paste is never left open.
+    fn send_paste(&mut self, text: &str) -> Result<Option<PasteDrop>> {
+        let Some(commands) = self.panes.pane.commands.clone() else {
+            return Ok(Some(PasteDrop::NoInput));
+        };
+        let bracketed = self
+            .panes
+            .pane
+            .snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.input_modes.bracketed_paste);
+        let encoded = encode_bracketed_paste(text.as_bytes(), bracketed);
+        if encoded.len() > MAX_PASTE_INPUT_BYTES {
+            return Ok(Some(PasteDrop::TooLarge));
+        }
+        self.queue_terminal_input_for(Some(&commands), encoded)?;
+        Ok(self
+            .input
+            .terminal_input_saturated
+            .then_some(PasteDrop::Backlog))
+    }
+
+    fn apply_file_drop_read(
+        &mut self,
+        target: FileDropTarget,
+        input_generation: u64,
+        bytes: std::io::Result<Vec<u8>>,
+    ) -> Result<()> {
+        if self.input.input_generation != input_generation {
+            eprintln!("splinterm file drop rejected: input target changed");
+            return Ok(());
+        }
+        let Ok(bytes) = bytes else {
+            eprintln!("splinterm file drop rejected: offer read failed");
+            return Ok(());
+        };
+        let Ok(bytes) = safe_paste(&bytes) else {
+            eprintln!("splinterm file drop rejected: unsafe offer bytes");
+            return Ok(());
+        };
+        let Some(pane) = self.pane_for_splint(target.splint_id) else {
+            eprintln!("splinterm file drop rejected: target pane unavailable");
+            return Ok(());
+        };
+        let Some(snapshot) = pane.snapshot.as_ref() else {
+            eprintln!("splinterm file drop rejected: target snapshot unavailable");
+            return Ok(());
+        };
+        let current = FileDropTarget {
+            topology_revision: self.tab_state.active_identity.topology_revision,
+            dojo_id: self.tab_state.active_dojo_id(),
+            splint_id: snapshot.splint_id,
+            incarnation: snapshot.incarnation,
+            input_generation: self.input.input_generation,
+        };
+        if !file_drop_target_is_current(
+            target,
+            current,
+            self.pty_input_blocked(),
+            pane.controller_active,
+            pane.commands.is_some(),
+        ) {
+            eprintln!("splinterm file drop rejected: target became stale");
+            return Ok(());
+        }
+        let Ok(payload) = dropped_file_payload(bytes) else {
+            eprintln!("splinterm file drop rejected: invalid URI list");
+            return Ok(());
+        };
+        let encoded = encode_bracketed_paste(&payload, snapshot.input_modes.bracketed_paste);
+        let Some(commands) = pane.commands.clone() else {
+            eprintln!("splinterm file drop rejected: command channel unavailable");
+            return Ok(());
+        };
+        self.queue_terminal_input_for(Some(&commands), encoded)?;
         Ok(())
     }
 
@@ -6947,6 +7009,7 @@ impl App {
                     .theme_colors
                     .reload(loaded.config.theme_colors());
                 self.clipboard.image_directory = loaded.config.clipboard_image_directory;
+                self.clipboard.middle_click_paste = loaded.config.middle_click_paste;
                 self.input.keymap = loaded.config.keymap;
                 self.input.prefix_timeout =
                     std::time::Duration::from_millis(loaded.config.prefix_timeout_ms);
@@ -12110,6 +12173,9 @@ impl App {
                     visual_changed = true;
                     self.presentation.full_redraw = true;
                 }
+                WindowUpdate::InputDropped => {
+                    self.window_notice(INPUT_DROPPED_NOTICE);
+                }
                 WindowUpdate::Exited { splint_id } => {
                     anyhow::ensure!(
                         self.panes.focused_splint() == Some(splint_id),
@@ -14608,11 +14674,10 @@ mod tests {
         assert!(terminal_input_blocked(false, true, false));
         assert!(terminal_input_blocked(true, true, false));
         // A clipboard read finishing under a pending consent prompt is stale.
-        assert!(!clipboard_read_is_current(
-            terminal_input_blocked(false, true, false),
-            7,
-            7
-        ));
+        assert_eq!(
+            clipboard_read_drop(terminal_input_blocked(false, true, false), 7, 7),
+            Some(PasteDrop::InputPaused)
+        );
     }
 
     #[test]
@@ -16370,11 +16435,10 @@ mod tests {
         assert!(terminal_input_blocked(false, false, true));
         assert!(!terminal_input_blocked(false, false, false));
         // A clipboard read that finishes during the pause is dropped.
-        assert!(!clipboard_read_is_current(
-            terminal_input_blocked(false, false, true),
-            7,
-            7
-        ));
+        assert_eq!(
+            clipboard_read_drop(terminal_input_blocked(false, false, true), 7, 7),
+            Some(PasteDrop::InputPaused)
+        );
         // No composition reaches the terminal: the text input is disabled
         // for it and any batch is dropped.
         let paused = ImeContext {
@@ -19902,6 +19966,7 @@ mod tests {
         view.visible_rows = vec![blank_row(4), blank_row(4)];
         view.visible_rows[0].row_id = Some(1);
         view.visible_rows[1].row_id = Some(2);
+        view.visible_rows[0].linebreak = true;
         view.visible_rows[0].cells[0].content = "A".to_owned();
         view.visible_rows[0].cells[1].content = "界".to_owned();
         view.visible_rows[0].cells[2].spacer_remaining = Some(0);
@@ -19998,6 +20063,7 @@ mod tests {
         let row = |row_id, text: &str| {
             let mut row = blank_row(2);
             row.row_id = Some(row_id);
+            row.linebreak = true;
             for (cell, character) in row.cells.iter_mut().zip(text.chars()) {
                 cell.content = character.to_string();
             }
@@ -20028,6 +20094,88 @@ mod tests {
         assert_eq!(selection_text(&state, &state.visible_rows, selection), None);
     }
 
+    /// A selection over rows `texts` (one per row, `|` for an empty cell)
+    /// with these hard linebreaks, from the first row's first cell to the
+    /// last row's last cell.
+    fn copied_rows(texts: &[&str], linebreaks: &[bool], screen: ActiveScreen) -> String {
+        let columns = texts
+            .iter()
+            .map(|text| text.chars().count())
+            .max()
+            .unwrap_or(1);
+        let mut state = snapshot(SplintId::new(), 1, 1);
+        state.columns = columns;
+        state.rows = texts.len();
+        state.active_screen = screen;
+        state.visible_rows = texts
+            .iter()
+            .zip(linebreaks)
+            .zip(1..)
+            .map(|((text, linebreak), row_id)| {
+                let mut row = blank_row(columns);
+                row.row_id = Some(row_id);
+                row.linebreak = *linebreak;
+                for (cell, character) in row.cells.iter_mut().zip(text.chars()) {
+                    if character != '|' {
+                        cell.content = character.to_string();
+                    }
+                }
+                row
+            })
+            .collect();
+        let endpoint = |row_id, column| SelectionEndpoint {
+            active_screen: screen,
+            history_generation: 1,
+            row_id,
+            column,
+        };
+        let last = u64::try_from(texts.len()).unwrap();
+        let selection = Selection {
+            anchor: endpoint(1, 0),
+            end: endpoint(last, columns - 1),
+        };
+        selection_text(&state, &state.visible_rows, selection).expect("rows resolve")
+    }
+
+    /// Plan 0074: a soft-wrapped row copies as one line with the next; a
+    /// hard linebreak ends the line.
+    #[test]
+    fn copying_joins_soft_wrapped_rows_and_keeps_hard_line_ends() {
+        let normal = ActiveScreen::Normal;
+        // "echo hello world" wrapped at four columns, then a second line.
+        assert_eq!(
+            copied_rows(
+                &["echo", " hel", "lo w", "orld", "ok||"],
+                &[false, false, false, true, true],
+                normal
+            ),
+            "echo hello world\nok"
+        );
+        // Every row a hard line: one line each, trailing spaces trimmed.
+        assert_eq!(
+            copied_rows(&["ab  ", "cd||"], &[true, true], normal),
+            "ab\ncd"
+        );
+        // A wrapped row keeps a space it wrapped at, and drops the empty
+        // cell a wide character left when it moved to the next row.
+        assert_eq!(
+            copied_rows(&["ab |", "cd||"], &[false, true], normal),
+            "ab cd"
+        );
+        // An empty row never joins, even without a linebreak.
+        assert_eq!(
+            copied_rows(&["ab||", "||||", "cd||"], &[true, false, true], normal),
+            "ab\n\ncd"
+        );
+        // Gaps a program left with cursor moves or tabs copy as spaces.
+        assert_eq!(copied_rows(&["a||b"], &[true], normal), "a  b");
+        // Full-screen programs' rows stay separate lines.
+        assert_eq!(
+            copied_rows(&["abcd", "ef||"], &[false, true], ActiveScreen::Alternate),
+            "abcd\nef"
+        );
+    }
+
     #[test]
     fn selection_copy_spans_three_loaded_pages_by_row_identity() {
         let mut state = snapshot(SplintId::new(), 1, 1);
@@ -20037,6 +20185,7 @@ mod tests {
             .map(|row_id| {
                 let mut row = blank_row(1);
                 row.row_id = Some(row_id);
+                row.linebreak = true;
                 row.cells[0].content = "x".to_owned();
                 row
             })
@@ -20358,9 +20507,15 @@ mod tests {
 
     #[test]
     fn modal_input_generations_reject_stale_clipboard_and_reconcile_focus_once() {
-        assert!(clipboard_read_is_current(false, 4, 4));
-        assert!(!clipboard_read_is_current(true, 4, 4));
-        assert!(!clipboard_read_is_current(false, 5, 4));
+        assert_eq!(clipboard_read_drop(false, 4, 4), None);
+        assert_eq!(
+            clipboard_read_drop(true, 4, 4),
+            Some(PasteDrop::InputPaused)
+        );
+        assert_eq!(
+            clipboard_read_drop(false, 5, 4),
+            Some(PasteDrop::FocusChanged)
+        );
         assert_eq!(
             reconciled_focus_report(true, false, true),
             Some(b"\x1b[I".to_vec())

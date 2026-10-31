@@ -223,6 +223,7 @@ impl PointerHandler for App {
                         self.input.modifiers,
                         self.panes.input_modes(),
                         self.panes.pane.hovered_url.is_some(),
+                        self.clipboard.middle_click_paste,
                     );
                     match owner {
                         PressOwner::Application {

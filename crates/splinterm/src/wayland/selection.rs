@@ -464,6 +464,16 @@ pub(super) fn selection_is_retained(
     selection_range(snapshot, screen, selection).is_some()
 }
 
+/// The text of `selection`, one line per terminal line.
+///
+/// A row the terminal soft-wrapped (it has content and no hard
+/// `linebreak`) joins the next row without a newline, so a long command or
+/// URL copies as the one line it is (Plan 0074). The alternate screen never
+/// joins: full-screen programs place text with the cursor, and their rows
+/// are separate lines. An empty cell reads as a space, so text a program
+/// spaced with tabs or cursor moves keeps its gaps; each copied line loses
+/// its trailing spaces, and a wrapped row loses only trailing empty cells,
+/// such as the one a wide character left when it wrapped.
 pub(super) fn selection_text(
     snapshot: &TerminalSnapshot,
     screen: &[TerminalRow],
@@ -471,6 +481,7 @@ pub(super) fn selection_text(
 ) -> Option<String> {
     let range = selection_range(snapshot, screen, selection)?;
     let rows = snapshot.scrollback_rows.iter().chain(screen);
+    let joins = snapshot.active_screen != ActiveScreen::Alternate;
     let mut output = String::new();
     for (row_index, row) in rows
         .enumerate()
@@ -487,18 +498,46 @@ pub(super) fn selection_text(
         } else {
             snapshot.columns.saturating_sub(1)
         };
+        let wraps = joins && row_soft_wraps(row);
+        let cells = row.cells.iter().take(last.saturating_add(1)).skip(first);
+        let cells: Vec<_> = cells
+            .filter(|cell| cell.spacer_remaining.is_none())
+            .collect();
+        let kept = if wraps {
+            cells.len()
+                - cells
+                    .iter()
+                    .rev()
+                    .take_while(|cell| cell.content.is_empty())
+                    .count()
+        } else {
+            cells.len()
+        };
         let mut line = String::new();
-        for cell in row.cells.iter().take(last.saturating_add(1)).skip(first) {
-            if cell.spacer_remaining.is_none() {
-                line.push_str(&cell.content);
-            }
+        for cell in &cells[..kept] {
+            line.push_str(if cell.content.is_empty() {
+                " "
+            } else {
+                &cell.content
+            });
         }
-        output.push_str(line.trim_end_matches(' '));
-        if row_index != range.end_row {
-            output.push('\n');
+        if wraps && row_index != range.end_row {
+            output.push_str(&line);
+        } else {
+            output.push_str(line.trim_end_matches(' '));
+            if row_index != range.end_row {
+                output.push('\n');
+            }
         }
     }
     Some(output)
+}
+
+/// Whether the terminal soft-wrapped `row` into the next: an autowrap
+/// clears the row's hard linebreak, and a row with no content never joins,
+/// as in the terminal's own reflow.
+fn row_soft_wraps(row: &TerminalRow) -> bool {
+    !row.linebreak && row.cells.iter().any(|cell| !cell.content.is_empty())
 }
 
 pub(super) fn url_at(

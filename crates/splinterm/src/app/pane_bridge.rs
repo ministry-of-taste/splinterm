@@ -476,6 +476,61 @@ fn coalesce_input(
     (bytes, None)
 }
 
+const PASTE_START: &[u8] = b"\x1b[200~";
+const PASTE_END: &[u8] = b"\x1b[201~";
+const PASTE_CLOSE_ATTEMPTS: usize = 10;
+const PASTE_CLOSE_RETRY: Duration = Duration::from_millis(50);
+
+/// Plan 0074: whether input sent so far opened a bracketed paste it did not
+/// close, as when the daemon's full input queue cut the paste short.
+fn bracketed_paste_left_open(sent: &[u8]) -> bool {
+    let last = |marker: &[u8]| {
+        sent.windows(marker.len())
+            .rposition(|window| window == marker)
+    };
+    match (last(PASTE_START), last(PASTE_END)) {
+        (Some(start), Some(end)) => start > end,
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
+}
+
+/// Plan 0074: sends the closing marker of a bracketed paste the daemon's
+/// full input queue cut short, so the program does not stay in paste mode.
+/// The queue drains as the program reads, so a full queue is tried again
+/// for a moment. `false` when the marker still could not be sent: the
+/// caller then sends it ahead of the next input. A handoff refusal drops
+/// it, as it drops all input.
+async fn close_cut_paste(
+    control: &mut Connection,
+    controller_id: u64,
+    splint_id: SplintId,
+    incarnation: u64,
+) -> Result<bool> {
+    for attempt in 0..PASTE_CLOSE_ATTEMPTS {
+        if attempt > 0 {
+            tokio::time::sleep(PASTE_CLOSE_RETRY).await;
+        }
+        let request = Request::Input {
+            controller_id,
+            splint_id,
+            incarnation,
+            bytes: PASTE_END.to_vec(),
+            focus_report: false,
+        };
+        match control.request(request).await {
+            Ok(response) if terminal_action_matches(&response, splint_id, incarnation) => {
+                return Ok(true);
+            }
+            Ok(_) => bail!("splinterd did not acknowledge a window input command"),
+            Err(error) if recoverable_input_error(&error) => {}
+            Err(error) if handoff_refused(&error) => return Ok(true),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(false)
+}
+
 fn recoverable_input_error(error: &anyhow::Error) -> bool {
     protocol_error(error).is_some_and(|error| error.code == ErrorCode::ResourceLimit)
 }
@@ -826,6 +881,7 @@ pub(in crate::app) async fn drive_controller(
     let mut resize_deadline = None;
     let mut deferred_command = None;
     let mut coalescing_barrier = None;
+    let mut paste_close_pending = false;
     let resize_delay = Duration::from_millis(resize_delay_ms);
     let Response::ControlSubscribed {
         subscription_id: control_subscription,
@@ -982,18 +1038,35 @@ pub(in crate::app) async fn drive_controller(
                     let Some(controller_id) = controller_id else {
                         continue;
                     };
+                    // Plan 0074: the closing marker of a bracketed paste cut
+                    // short earlier goes ahead of the next input.
+                    let bytes = if paste_close_pending && !focus_report {
+                        paste_close_pending = false;
+                        [PASTE_END, bytes.as_slice()].concat()
+                    } else {
+                        bytes
+                    };
                     let maximum_input_bytes = control.limits().maximum_input_bytes;
-                    for request in input_requests(
+                    let lengths = bytes.chunks(maximum_input_bytes.max(1)).map(<[u8]>::len);
+                    let mut sent = 0;
+                    let mut cut = false;
+                    for (request, length) in input_requests(
                         controller_id,
                         splint_id,
                         incarnation,
                         &bytes,
                         focus_report,
                         maximum_input_bytes,
-                    )? {
+                    )?
+                    .into_iter()
+                    .zip(lengths)
+                    {
                         match control.request(request).await {
                             Ok(response)
-                                if terminal_action_matches(&response, splint_id, incarnation) => {}
+                                if terminal_action_matches(&response, splint_id, incarnation) =>
+                            {
+                                sent += length;
+                            }
                             Ok(_) => {
                                 bail!("splinterd did not acknowledge a window input command");
                             }
@@ -1001,12 +1074,23 @@ pub(in crate::app) async fn drive_controller(
                                 eprintln!(
                                     "splinterm input queue saturated; dropping remaining terminal input"
                                 );
+                                cut = true;
                                 break;
                             }
                             // Fenced before this pane heard the pause: the
                             // rest of the batch is dropped, not queued.
                             Err(error) if handoff_refused(&error) => break,
                             Err(error) => return Err(error),
+                        }
+                    }
+                    if cut {
+                        // The Window says so; a full update queue loses
+                        // only the notice.
+                        let _ = outputs.updates.try_send(WindowUpdate::InputDropped);
+                        if bracketed_paste_left_open(&bytes[..sent]) {
+                            paste_close_pending =
+                                !close_cut_paste(&mut control, controller_id, splint_id, incarnation)
+                                    .await?;
                         }
                     }
                     continue;
