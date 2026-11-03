@@ -3025,7 +3025,7 @@ hl.env("GUM_CHOOSE_SELECTED_BACKGROUND", "#d4bda2")
                         "/bin/sh".into(),
                         "-c".into(),
                         format!(
-                            "touch {}; while [ ! -e {} ]; do sleep 0.01; done; printf '%s|%s|%s' \"$BACKGROUND\" \"$GUM_CHOOSE_SELECTED_BACKGROUND\" \"${{GUM_OLD_THEME_ONLY-unset}}\" > {}",
+                            "touch {}; while [ ! -e {} ]; do sleep 0.01; done; printf '%s|%s|%s' \"$BACKGROUND\" \"$GUM_CHOOSE_SELECTED_BACKGROUND\" \"${{GUM_OLD_THEME_ONLY-unset}}\" > {2}.part && mv {2}.part {2}",
                             existing_ready.display(),
                             existing_trigger.display(),
                             existing_marker.display()
@@ -3065,7 +3065,7 @@ hl.env("GUM_CHOOSE_SELECTED_BACKGROUND", "#d4bda2")
                         "/bin/sh".into(),
                         "-c".into(),
                         format!(
-                            "printf '%s|%s|%s' \"$BACKGROUND\" \"$GUM_CHOOSE_SELECTED_BACKGROUND\" \"${{GUM_OLD_THEME_ONLY-unset}}\" > {}",
+                            "printf '%s|%s|%s' \"$BACKGROUND\" \"$GUM_CHOOSE_SELECTED_BACKGROUND\" \"${{GUM_OLD_THEME_ONLY-unset}}\" > {0}.part && mv {0}.part {0}",
                             refreshed_marker.display()
                         ),
                     ],
@@ -3105,7 +3105,7 @@ hl.env("GUM_CHOOSE_SELECTED_BACKGROUND", "#d4bda2")
                         "/bin/sh".into(),
                         "-c".into(),
                         format!(
-                            "printf '%s|%s|%s' \"$BACKGROUND\" \"$GUM_CHOOSE_SELECTED_BACKGROUND\" \"${{GUM_OLD_THEME_ONLY-unset}}\" > {}",
+                            "printf '%s|%s|%s' \"$BACKGROUND\" \"$GUM_CHOOSE_SELECTED_BACKGROUND\" \"${{GUM_OLD_THEME_ONLY-unset}}\" > {0}.part && mv {0}.part {0}",
                             malformed_marker.display()
                         ),
                     ],
@@ -3128,6 +3128,9 @@ hl.env("GUM_CHOOSE_SELECTED_BACKGROUND", "#d4bda2")
             time::sleep(Duration::from_millis(10)).await;
         }
 
+        // Each child writes its marker to a sibling `.part` file and renames it
+        // into place, so a marker that exists is complete: polling for its
+        // existence can never read an empty or partially written file.
         fs::write(existing_trigger, b"ready").unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while !existing_marker.exists() {
