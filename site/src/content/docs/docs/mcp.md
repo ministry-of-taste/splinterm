@@ -8,7 +8,7 @@ description: Install the optional Splinterm MCP adapter, connect a supported hos
 The adapter is an optional, separately identified third-party client—not a trusted part of `splinterd`. Installing or launching it grants nothing until an owner-controlled policy authorizes its exact executable identity, operations, resources, and limits.
 
 :::note
-The optional MCP adapter is included in the stable 0.1.1 release. The host examples below document the currently validated local environment, not broad host compatibility or a stable API promise.
+The optional MCP adapter is included in the stable 0.2.0 release. The host examples below document the currently validated local environment, not broad host compatibility or a stable API promise.
 :::
 
 ## 1. Verify the installed identity

@@ -20,10 +20,9 @@ Add Splinterm to your configuration flake and commit the resulting `flake.lock`:
 inputs.splinterm.url = "github:ministry-of-taste/splinterm/<reviewed-revision>";
 ```
 
-Replace `<reviewed-revision>` with a reviewed 0.1 maintenance commit containing
-Nix support. It is included in the maintenance ancestry used for 0.1.1, but the
-original `v0.1.0` tag predates it. Before 0.1.1 publication, use a reviewed
-maintenance revision or local checkout containing Nix support, not that older tag.
+Replace `<reviewed-revision>` with `v0.1.1` or a later reviewed release or
+revision. Nix support has been available since 0.1.1; the original `v0.1.0` tag
+predates it and must not be used for these instructions.
 The public release installer and Arch packages are **not** NixOS installers.
 The package's own pinned nixpkgs supplies its Rust/native toolchain; following a
 host's older nixpkgs input may not provide a sufficiently recent Rust compiler.

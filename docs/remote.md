@@ -511,7 +511,7 @@ leave the prompts to the remote computer ([configuration](configuration.md)).
 
 ## Remote window hostname tag
 
-Available in the 0.1.1 source; publication is pending.
+Available since 0.1.1.
 
 Remote graphical windows show a compact `Remote: hostname` tag in the upper-right
 application header. The hostname is the connected daemon's kernel OS nodename,

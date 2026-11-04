@@ -84,7 +84,7 @@ hero:
 </nav>
 
 <div class="docs-home-footer">
-  <p><span>Stable 0.1.1</span> The source is open; the validated Omarchy/Arch Linux environment remains intentionally narrow. Broader compatibility and a support lifetime are not promised.</p>
+  <p><span>Stable 0.2.0</span> The source is open; the validated Omarchy/Arch Linux environment remains intentionally narrow. Broader compatibility and a support lifetime are not promised.</p>
   <div>
     <a href="/docs/status/">Read current status</a>
     <a href="/docs/roadmap/">Product roadmap</a>

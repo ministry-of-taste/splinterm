@@ -3,20 +3,21 @@
 Release authority, candidate construction, approval boundaries, and the future
 n8n notification role are defined in [Release automation](release-automation.md).
 
-Splinterm **0.1.1 is the current stable release** for x86_64 Omarchy/Arch Linux
+Splinterm **0.2.0 is the current stable release** for x86_64 Omarchy/Arch Linux
 with native Wayland under Hyprland. Newer release candidates are prereleases,
 not new stable releases. Stable notes and immutable assets:
 
-https://github.com/ministry-of-taste/splinterm/releases/tag/v0.1.1
+https://github.com/ministry-of-taste/splinterm/releases/tag/v0.2.0
 
 `packaging/PKGBUILD` produces split packages for reviewed local and CI builds.
-Its version comes from the checked-out commit; `main` is development code, not
-the stable release, and carries the next development version. Published 0.1
-releases originate from `maint/0.1`. Use the exact `v0.1.1` tag for a stable
-0.1.1 source build, as shown below; do not relabel a development build as stable.
+Its version comes from the checked-out commit; the current tip of `main` is
+development code and may differ from the immutable stable release. Stable
+releases are published from `main` or a maintenance branch; `v0.2.0` came from
+`main`. Use the exact `v0.2.0` tag for a stable 0.2.0 source build, as shown
+below; do not relabel a development build as stable.
 The local source archive and `SKIP` checksum are valid only in that workflow.
 
-The closed `packaging/release-state.json` record identifies `v0.1.1` as the
+The closed `packaging/release-state.json` record identifies `v0.2.0` as the
 current public release and predecessor for future candidates. It is the machine-readable authority for that
 boundary; candidate construction and promotion both reject a
 different supplied tag even when it exists. `docs/status.md` carries the same
@@ -41,9 +42,10 @@ for unpublished assets; use the reviewed candidate's generated drafts.
 
 **AUR is prerelease-capable, not stable-only.** The same `splinterm` and
 `splinterm-bin` package bases distribute stable releases and release candidates;
-a candidate can be offered as an upgrade over stable 0.1.1. Check the offered
-version before confirming. For stable 0.1.1 specifically, use the exact-tag
-build below or its verified release assets instead.
+a candidate can be offered as an upgrade over stable 0.2.0. AUR distribution
+of 0.2.0 is pending: both bases still offer `0.1.1-1`. Check the offered version
+before confirming. For stable 0.2.0 specifically, use the exact-tag build below
+or its verified release assets instead.
 
 Install the prebuilt main package and optional exact-version MCP adapter with
 an AUR helper:
@@ -77,7 +79,7 @@ against the digest recorded by GitHub, then validates the reviewed candidate
 identity, repository, version, architecture, exact commit-bound package pair,
 and SHA-256 package digests before downloading either package. Historical
 `edge-*` releases cannot be selected. **Prereleases are eligible**: this is not
-a stable-only selector. To install stable 0.1.1 specifically, use the exact-tag
+a stable-only selector. To install stable 0.2.0 specifically, use the exact-tag
 source build below or the verified assets from its release page.
 
 An authenticated GitHub CLI session is used when one is already available;
@@ -118,18 +120,18 @@ implies `--source`) to run the complete `PKGBUILD` `check()` function.
 
 ## Build without installing
 
-The package source must be an exact committed snapshot. For stable 0.1.1, create
+The package source must be an exact committed snapshot. For stable 0.2.0, create
 a separate checkout of the published tag rather than building development
 `main` or changing its version metadata:
 
 ```bash
-git fetch origin tag v0.1.1
-git worktree add --detach .worktrees/stable-0.1.1 v0.1.1
-cd .worktrees/stable-0.1.1
+git fetch origin tag v0.2.0
+git worktree add --detach .worktrees/stable-0.2.0 v0.2.0
+cd .worktrees/stable-0.2.0
 ```
 
 Run the following build and install examples from that stable checkout.
-At that tag, `packaging/PKGBUILD` declares `pkgver=0.1.1` and `pkgrel=1`.
+At that tag, `packaging/PKGBUILD` declares `pkgver=0.2.0` and `pkgrel=1`.
 For other reviewed commits, use the version declared by that commit rather than these filenames.
 The guarded build and validation entry point is:
 
@@ -156,8 +158,8 @@ VM testbed (`tools/testbed/omarchy-vm.sh package-install --confirm-guest-install
 Its equivalent manual build from a clean checkout is:
 
 ```bash
-git archive --format=tar.gz --prefix=splinterm-0.1.1/ \
-  -o packaging/splinterm-0.1.1.tar.gz HEAD
+git archive --format=tar.gz --prefix=splinterm-0.2.0/ \
+  -o packaging/splinterm-0.2.0.tar.gz HEAD
 ```
 
 The archive honors `.gitattributes` `export-ignore` entries; website source and
@@ -176,8 +178,8 @@ creates the main package plus the explicitly optional `splinterm-mcp` split
 package without installing either. Inspect them with:
 
 ```bash
-pacman -Qlp packaging/splinterm-0.1.1-1-x86_64.pkg.tar.zst
-pacman -Qlp packaging/splinterm-mcp-0.1.1-1-x86_64.pkg.tar.zst
+pacman -Qlp packaging/splinterm-0.2.0-1-x86_64.pkg.tar.zst
+pacman -Qlp packaging/splinterm-mcp-0.2.0-1-x86_64.pkg.tar.zst
 namcap packaging/PKGBUILD packaging/*.pkg.tar.zst   # optional
 ```
 
@@ -429,29 +431,32 @@ launches use the new install. Verify the new daemon/client sibling identity
 before launching graphical acceptance; graphical testing remains a separately
 approved, guarded operation.
 
-The equivalent manual lifecycle for the stable 0.1.1 packages built above is
+The manual restart lifecycle for the stable 0.2.0 packages built above is
 shown below. Run it from a terminal not owned by `splinterd`; stopping the daemon
 ends its child processes. Saved topology does not checkpoint running programs.
 
 ```bash
 systemctl --user stop splinterd.service
-sudo pacman -U packaging/splinterm-0.1.1-1-x86_64.pkg.tar.zst
+sudo pacman -U packaging/splinterm-0.2.0-1-x86_64.pkg.tar.zst
 systemctl --user daemon-reload
 systemctl --user start splinterd.service
 ```
 
-`splinterm upgrade` reports whether the running daemon could instead hand its
-terminals to the newly installed build without a restart, and
-`splinterm upgrade --now` does so. The 0.1.x packages above predate live
-upgrade, so for them the restart above is the upgrade path; see
-[Daemon upgrade](cli.md#daemon-upgrade). Without the manual restart, the next
-desktop launch asks before restarting; see
+From 0.2.0 on, install a compatible new build with `pacman -U` without first
+stopping the daemon to preserve running terminals. `splinterm upgrade` reports
+whether it can hand them to the installed build without a restart, and
+`splinterm upgrade --now` performs the live upgrade when available. The one-time
+0.1.x to 0.2.0 upgrade requires the restart above and ends its shells; the
+private protocol versions cannot communicate. Nix installations also require
+a restart in 0.2.0. See [Daemon upgrade](cli.md#daemon-upgrade). Without the
+manual restart or live upgrade, the next desktop launch asks before restarting;
+see
 [Desktop launcher and the running daemon](#desktop-launcher-and-the-running-daemon).
 
 Install the adapter only when an MCP host will be configured:
 
 ```bash
-sudo pacman -U packaging/splinterm-mcp-0.1.1-1-x86_64.pkg.tar.zst
+sudo pacman -U packaging/splinterm-mcp-0.2.0-1-x86_64.pkg.tar.zst
 ```
 
 The guarded upgrade script upgrades `splinterm-mcp` only when that optional

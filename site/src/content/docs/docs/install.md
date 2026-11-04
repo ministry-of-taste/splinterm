@@ -3,14 +3,14 @@ title: Installation
 description: Install or update Splinterm on Arch Linux and Omarchy.
 ---
 
-The validated installation target is **x86_64 Omarchy/Arch Linux with native Wayland under Hyprland**. **0.1.1 is the current stable release**; future release candidates remain prereleases. Stable 0.1.1 does not promise broader platform compatibility or a support lifetime. Future 0.x releases may change interfaces with documented migration. Stopping or replacing the daemon ends its child processes; save your work and upgrade from a terminal not owned by `splinterd`.
+The validated installation target is **x86_64 Omarchy/Arch Linux with native Wayland under Hyprland**. **0.2.0 is the current stable release**; future release candidates remain prereleases. Stable 0.2.0 does not promise broader platform compatibility or a support lifetime. Future 0.x releases may change interfaces with documented migration. Live daemon upgrade is supported from 0.2.0 on, but the one-time 0.1.x to 0.2.0 upgrade restarts the daemon and ends its shells. Save your work and perform that upgrade from a terminal not owned by `splinterd`.
 
 ## Install the prebuilt AUR package
 
 **AUR is prerelease-capable, not stable-only.** The same package names can advance
-to release candidates and offer them as upgrades over stable 0.1.1. The current
-verified AUR version is `0.1.1-1`. Check the offered version before confirming
-installation or upgrades. For stable 0.1.1 specifically,
+to release candidates and offer them as upgrades over stable 0.2.0. Both AUR
+bases still offer `0.1.1-1`; 0.2.0 distribution is pending. Check the offered
+version before confirming installation or upgrades. For stable 0.2.0 specifically,
 use its verified release assets or the packaging guide's exact-tag build:
 
 https://github.com/ministry-of-taste/splinterm/blob/main/docs/packaging.md
@@ -39,7 +39,7 @@ cd splinterm
 ./install.sh
 ```
 
-The installer selects the newest published qualifying SemVer `v…` release, **including prereleases**; it is not a stable-only selector. For stable 0.1.1 specifically, use its release assets or the exact-tag build instructions in the packaging guide:
+The installer selects the newest published qualifying SemVer `v…` release, **including prereleases**; it is not a stable-only selector. For stable 0.2.0 specifically, use its release assets or the exact-tag build instructions in the packaging guide:
 
 https://github.com/ministry-of-taste/splinterm/blob/main/docs/packaging.md
 
@@ -48,7 +48,7 @@ The installer verifies the GitHub-recorded candidate-manifest digest and exact p
 The repository and versioned release assets are public. GitHub CLI authentication is optional; the installer falls back to anonymous verified downloads.
 
 :::caution
-The default installer downloads only a published versioned release; it never selects historical `edge-*` releases or an arbitrary `main` commit. Source mode operates on a clean committed `HEAD` and does not package uncommitted worktree changes. A development checkout is not the published stable release; use the exact `v0.1.1` tag when building stable 0.1.1. Review the current worktree before using source mode.
+The default installer downloads only a published versioned release; it never selects historical `edge-*` releases or an arbitrary `main` commit. Source mode operates on a clean committed `HEAD` and does not package uncommitted worktree changes. A development checkout is not the published stable release; use the exact `v0.2.0` tag when building stable 0.2.0. Review the current worktree before using source mode.
 :::
 
 ## Build from committed source

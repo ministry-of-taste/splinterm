@@ -2,7 +2,7 @@
 
 - **Status:** Active strategic direction
 - **Horizon model:** Now / Next / Later / Explore; no date promise
-- **Product maturity:** Stable 0.1.1 on the documented Omarchy/Arch target
+- **Product maturity:** Stable 0.2.0 on the documented Omarchy/Arch target
 - **Current-state authority:** [Current product status](status.md)
 - **Delivery authority:** Maintainer-controlled delivery coordination; accepted public decisions are promoted to the PRD, ADRs, and specialist documentation
 
@@ -59,7 +59,7 @@ The labels in this document have deliberate meanings:
 - **Now** — product outcomes that strengthen daily-driver confidence on the
   validated Omarchy/Arch target.
 - **Next** — outcomes required for a broader 1.0 support contract; these future
-  guarantees are not implied by stable 0.1.1.
+  guarantees are not implied by stable 0.2.0.
 - **Later** — strategic expansion that follows a trustworthy primary product.
 - **Explore** — options worth researching, not commitments.
 

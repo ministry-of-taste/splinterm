@@ -26,7 +26,7 @@ BRANCH = "main"
 
 class CandidateFixture:
     def __init__(
-        self, root: Path, previous_version_tag: str = "v0.1.1",
+        self, root: Path, previous_version_tag: str = "v0.2.0",
         version: str = VERSION,
     ) -> None:
         self.root = root
