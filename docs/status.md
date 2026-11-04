@@ -1,6 +1,6 @@
 # Current product status
 
-- **Current public version tag:** `v0.1.1`
+- **Current public version tag:** `v0.2.0`
 
 This document is the repository authority for Splinterm's current maturity,
 validated product scope, availability, and release gates. Retained public
@@ -10,11 +10,12 @@ sequence, and this page owns what the product is today.
 
 ## Maturity
 
-**Splinterm 0.1.1 is the current stable release.**
-0.1.0 remains the first stable release.
+**Splinterm 0.2.0 is the current stable release.**
+0.1.1 and 0.1.0 remain historical stable releases; 0.1.0 was the first.
 
-Source, documentation, and immutable versioned GitHub and AUR packages are
-publicly available. Core terminal emulation, daemon-owned persistence, multiplexing,
+Source, documentation, and immutable versioned GitHub packages are publicly
+available. AUR distribution of 0.2.0 is pending; both AUR bases still offer
+0.1.1-1. Core terminal emulation, daemon-owned persistence, multiplexing,
 native Wayland presentation, Arch packaging, and bounded automation workflows
 are implemented and validated in the scopes named below. Public availability is
 not a promise of broader platform compatibility or a support lifetime. The
@@ -37,7 +38,7 @@ The current product target is:
   tests as release authority; Foot 1.27.0 commit
   `3c5b584b0eafa772eb4376fb6eaf6643399e190e` remains an optional historical
   differential under [ADR 0013](adr/0013-splinterm-owned-renderer-acceptance.md);
-- stable `v0.1.1` release assets built from clean committed source; and
+- stable `v0.2.0` release assets built from clean committed source; and
 - guarded installed-package evidence for the Alpha3 command, scrollback,
   saved-Lair, Wayland file-drop, and Omarchy screensaver workflows; isolated
   exact-package acceptance for the Alpha3.1 transient-tab hotfixes; accepted
@@ -70,7 +71,50 @@ guarded live valid-font replacement and invalid-candidate rollback acceptance
 without replacing the Window, daemon, shell, or Splint incarnation. This behavior
 shipped in stable 0.1.0 after the release-candidate cycle.
 
-## Stable 0.1.1 publication
+## Stable 0.2.0 publication
+
+`v0.2.0` was published on 2026-11-03 at 04:43 UTC (2026-11-02 in the
+maintainer's local time) from
+`1f129ff88c1cfdcd498ec44eed38b3328d9c94a1` on `main`, as **Splinterm 0.2.0**.
+It is GitHub Latest, not a prerelease.
+
+Current stable release notes and assets:
+https://github.com/ministry-of-taste/splinterm/releases/tag/v0.2.0
+
+The release adds live daemon upgrade from 0.2.0 on, easy agent access under
+[ADR 0014](adr/0014-easy-agent-access.md), explicitly reported agent status,
+the startup Dojo picker, remote launch from inside the app, and Omarchy 4 theme
+integration. The one-time upgrade from 0.1.x to 0.2.0 restarts the daemon and
+ends its shells. The private protocol changed: a 0.2.0 client and a 0.1.x daemon
+cannot communicate, or vice versa; upgrade remote hosts and the optional MCP
+adapter together. See [Packaging](packaging.md) for the upgrade procedure.
+
+- Exact merged-commit CI run `41226461095` passed.
+- Candidate run `41523853666` built the main and optional MCP packages once.
+- Protected promotion run `41578629716` published those exact artifacts without
+  rebuilding and verified all five assets: `candidate-manifest.json`,
+  `SHA256SUMS`, `splinterm-0.2.0.tar.gz`,
+  `splinterm-1f129ff88c1cfdcd498ec44eed38b3328d9c94a1-x86_64.pkg.tar.zst`, and
+  `splinterm-mcp-1f129ff88c1cfdcd498ec44eed38b3328d9c94a1-x86_64.pkg.tar.zst`.
+- Manifest SHA-256:
+  `42a7012051ba5422b33c1ac0f9fbcb35d786ab99634a45b58c8daa4ab953e917`.
+- Source archive SHA-256:
+  `285d2eb815bbf90cd83bcdf79d8a1ed4b8106586a7cd34dca42d50b505a1428f`.
+- Main package SHA-256:
+  `61936ffb9df2917e25e69e65360c4813103da265dae4697d4043e78ff73c48ee`.
+- MCP package SHA-256:
+  `9841678a36fb518db2bd9d6dd683bb7f2ec46f2541bb614d6c52f7b748fb9dda`.
+- AUR distribution of 0.2.0 has not happened. Both source and prebuilt package
+  bases still publish `0.1.1-1`, including their matching optional MCP packages.
+
+No new graphical sequence was run for finalization. Feature acceptance was
+recorded in the Omarchy VM on earlier builds of the same features; this is not
+a fresh installed-final-package matrix. Live upgrade remains capability-gated:
+Nix installations refuse it in 0.2.0, and a daemon adopted through live upgrade
+or rollback needs a restart before another upgrade. Stopping the daemon still
+ends its child processes; saved topology does not checkpoint running programs.
+
+## Historical stable 0.1.1 publication
 
 `v0.1.1` was published on 2026-10-09 from
 `136ef81d268d9734f5ffb687089859438ba99579` on `maint/0.1`.
@@ -78,7 +122,7 @@ It retains the product implementation from `v0.1.1-rc.3` unchanged;
 finalization changed workspace/package version metadata and release notes,
 not runtime source, configuration, dependencies, or fixtures.
 
-Current stable release notes and assets:
+Historical 0.1.1 release notes and assets:
 https://github.com/ministry-of-taste/splinterm/releases/tag/v0.1.1
 
 The release adds the RC series' Explorer navigation and context actions,
@@ -111,9 +155,9 @@ No new graphical sequence or package installation was run for finalization.
 Recorded RC3 guest package/search/cwd acceptance used `55d7c7b9`; its product
 source matches published RC3, with only testbed cleanup changes afterward.
 This does not claim a fresh installed-final-package matrix or close every
-Explorer follow-up. There is no live daemon-upgrade handoff. Save work and
-upgrade from an independent terminal; stopping the daemon ends its child
-processes. See [Packaging](packaging.md) for exact-tag installation and recovery.
+Explorer follow-up. Live daemon upgrade is supported from 0.2.0 on; the
+one-time 0.1.x to 0.2.0 upgrade restarts the daemon and ends its shells. Save
+work and perform that upgrade from an independent terminal. See [Packaging](packaging.md) for exact-tag installation and recovery.
 
 ## Historical stable 0.1.0 and release candidates
 
@@ -131,10 +175,10 @@ are historical prereleases now superseded by stable `v0.1.1`. Release listing:
 
 https://github.com/ministry-of-taste/splinterm/releases
 
-**Splinterm 0.1 does not support live daemon upgrade handoff.** Stopping or
-replacing the daemon ends its child processes; saved topology does not
-checkpoint running applications. Save your work and upgrade from a terminal
-not owned by `splinterd`, then reopen Splinterm Windows. See
+**Live daemon upgrade is supported from 0.2.0 on.** The one-time 0.1.x to
+0.2.0 upgrade restarts the daemon and ends its shells; saved topology does not
+checkpoint running applications. Save your work and perform that upgrade from
+a terminal not owned by `splinterd`, then reopen Splinterm Windows. See
 [Packaging](packaging.md) for upgrade and recovery instructions.
 
 ## Historical releases
@@ -349,14 +393,15 @@ post-alpha3, pre-1.0 roadmap milestone.
 | SSH relay | Implemented and validated | Policy-scoped stdio automation relay and private human graphical relay; no daemon network listener. See [Remote access](remote.md). |
 | Native remote graphical client | Implemented and validated | Profile-bound OpenSSH transport, native picker/window workflow, control, reconnect diagnostics, and client-local lifecycle; remote image transfer is not supported. See [Remote access](remote.md). |
 | MCP adapter | Implemented and validated | Optional, separately packaged, exact-identity adapter over the supported automation surface. See [MCP](mcp.md). |
-| Agent status reporting | Implemented on `main` for 0.2, accepted in the Omarchy VM, unreleased | Agents explicitly report `working`, `needs_input`, `done`, `error`, or `idle` through `splinterm agent-status`, `--output json`, or the MCP tool `splinterm.report_agent_status`; `inspect` and `topology` outputs carry an optional `agent_status`. A process inside the Splint's session or ancestry self-reports without a grant; detached agents need `agent_status_report`. Nothing is inferred from terminal content. The graphical client shows a static built-in Tabler icon per Splint in the Explorer, a per-Dojo tab badge, stale and unavailable markers, state-word search, accessible state names and filtered announcements, and a **Clear agent status** palette command; `[explorer] agent-status=no` hides it. See [Automation](automation.md#agent-status), [Human usage](usage.md#agent-status-in-the-explorer-and-on-dojo-tabs), and [MCP](mcp.md). |
-| Easy agent access | Implemented on `main` for 0.2, accepted in the Omarchy VM, unreleased | Per [ADR 0014](adr/0014-easy-agent-access.md): three access levels (Look, Look and type, Manage), three durations (just this once, while this workspace is open, always for this workspace), remembered grants for protected and Nix profile installs, a default-deny trusted prompt, and bounded, cancellable pending requests; a request a grant already covers is answered without a prompt. The access list with per-entry revoke and Revoke all access work through `splinterm access` (human and JSON), and `splinterm mcp setup` adds the MCP adapter to Claude Code, Codex, or VS Code in one step without granting anything (human and JSON). The **Agent access** list in the command palette revokes per entry, **Revoke all access** in the palette first shows exact counts, the Explorer marks which workspaces, Dojos, and Splints an agent can reach or is connected to, and a waiting indicator (an Explorer mark, the Window title, and the palette count) shows requests awaiting an answer. A click in the **Agent access** list only selects a row; Enter revokes. See [Automation](automation.md#easy-agent-access) and [MCP](mcp.md#easy-agent-access). |
+| Agent status reporting | Released in 0.2.0; accepted in the Omarchy VM | Agents explicitly report `working`, `needs_input`, `done`, `error`, or `idle` through `splinterm agent-status`, `--output json`, or the MCP tool `splinterm.report_agent_status`; `inspect` and `topology` outputs carry an optional `agent_status`. A process inside the Splint's session or ancestry self-reports without a grant; detached agents need `agent_status_report`. Nothing is inferred from terminal content. The graphical client shows a static built-in Tabler icon per Splint in the Explorer, a per-Dojo tab badge, stale and unavailable markers, state-word search, accessible state names and filtered announcements, and a **Clear agent status** palette command; `[explorer] agent-status=no` hides it. See [Automation](automation.md#agent-status), [Human usage](usage.md#agent-status-in-the-explorer-and-on-dojo-tabs), and [MCP](mcp.md). |
+| Easy agent access | Released in 0.2.0; accepted in the Omarchy VM | Per [ADR 0014](adr/0014-easy-agent-access.md): three access levels (Look, Look and type, Manage), three durations (just this once, while this workspace is open, always for this workspace), remembered grants for protected and Nix profile installs, a default-deny trusted prompt, and bounded, cancellable pending requests; a request a grant already covers is answered without a prompt. The access list with per-entry revoke and Revoke all access work through `splinterm access` (human and JSON), and `splinterm mcp setup` adds the MCP adapter to Claude Code, Codex, or VS Code in one step without granting anything (human and JSON). The **Agent access** list in the command palette revokes per entry, **Revoke all access** in the palette first shows exact counts, the Explorer marks which workspaces, Dojos, and Splints an agent can reach or is connected to, and a waiting indicator (an Explorer mark, the Window title, and the palette count) shows requests awaiting an answer. A click in the **Agent access** list only selects a row; Enter revokes. See [Automation](automation.md#easy-agent-access) and [MCP](mcp.md#easy-agent-access). |
 | Terminal images | Supported documented subset | Sixel, practical static Kitty, and inline iTerm2 PNG subsets are bounded; full Kitty graphics is not claimed. See [Images](images.md). |
 | Arch/Omarchy packaging | Stable release available | Immutable versioned GitHub and AUR split packages, service, desktop metadata, upgrade checks, trusted-client identity, and rollback guidance. See [Packaging](packaging.md). |
-| AUR packages | Available | Prerelease-capable channel, not stable-only. Prebuilt [`splinterm-bin`](https://aur.archlinux.org/packages/splinterm-bin) publishes `splinterm-bin` and optional `splinterm-mcp-bin` from checksummed immutable versioned-release assets without local compilation. Source-built [`splinterm`](https://aur.archlinux.org/packages/splinterm) and `splinterm-mcp` remain available. |
+| AUR packages | 0.1.1-1 available; 0.2.0 distribution pending | Prerelease-capable channel, not stable-only. Prebuilt [`splinterm-bin`](https://aur.archlinux.org/packages/splinterm-bin) publishes `splinterm-bin` and optional `splinterm-mcp-bin` from checksummed immutable versioned-release assets without local compilation. Source-built [`splinterm`](https://aur.archlinux.org/packages/splinterm) and `splinterm-mcp` remain available. |
 | Public source and versioned releases | Available | The repository, documentation, versioned GitHub releases and prereleases, and AUR packages are public. The retired rolling edge channel is no longer produced or consumed. |
-| Stable release scope | 0.1.1 released | The documented Omarchy/Arch Linux target only; broader compatibility and a support lifetime are not promised. |
-| Nix and broader distribution | Release-scoped Nix checks | Stable 0.1.1 includes a source flake and desktop/headless module; wider deployment acceptance and broader Linux support remain separate. |
+| Live daemon upgrade | Implemented and validated | From 0.2.0 on a newly installed build takes over running terminals; 0.1.x to 0.2.0 restarts once. See [Packaging](packaging.md). |
+| Stable release scope | 0.2.0 released | The documented Omarchy/Arch Linux target only; broader compatibility and a support lifetime are not promised. |
+| Nix and broader distribution | Release-scoped Nix checks | Stable 0.2.0 includes a source flake and desktop/headless module; wider deployment acceptance and broader Linux support remain separate. |
 
 **Classification meanings:** implemented means present in current code; validated
 means required recorded evidence exists for the named scope; supported means a
@@ -386,7 +431,7 @@ behavior; deferred means intentionally outside the present product.
   comparison gates. Earlier burst-output no-go evidence remains historical; new
   performance concerns require fresh attribution against the current baseline.
 
-## Boundaries beyond stable 0.1.0
+## Boundaries beyond stable 0.2.0
 
 The stable release does not imply broader guarantees. Expanding its scope
 requires explicit decisions and validation about:
@@ -400,7 +445,7 @@ requires explicit decisions and validation about:
 - public installation and recovery testing beyond the maintainer workflow; and
 - any promised Nix, sandboxed package, or broader Linux support.
 
-These boundaries do not change the published stable 0.1.0 designation and
+These boundaries do not change the published stable 0.2.0 designation and
 must not be inferred as additional compatibility or support promises.
 
 ## Documentation authority

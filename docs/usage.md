@@ -375,8 +375,8 @@ foreground palette or confirmation owns input rather than the Explorer search
 field behind it.
 
 [Navigation accessibility](accessibility.md) describes the bounded native AT-SPI
-interface and its limitations. The guide is included in the 0.1.1 Arch and Nix
-package documentation. This is not whole-terminal screen-reader support.
+interface and its limitations. The guide has been included in Arch and Nix
+package documentation since 0.1.1. This is not whole-terminal screen-reader support.
 
 ### Agent status in the Explorer and on Dojo tabs
 
@@ -617,7 +617,7 @@ Pasting requires the graphical client to hold terminal input control.
 
 ### Save a clipboard screenshot as a path
 
-Available in the 0.1.1 source (publication pending): configure a private existing
+Available since 0.1.1: configure a private existing
 `[clipboard] image-directory`, then choose **Save clipboard image and insert path**
 from the command palette. The bindable action is `clipboard.save-image`; there is
 no default shortcut. Only bounded static PNG is supported, and normal text paste

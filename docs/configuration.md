@@ -7,8 +7,8 @@ default path is `${XDG_CONFIG_HOME:-~/.config}/splinterm/config.ini`; set
 
 ## Clipboard PNG saving
 
-Available in the 0.1.1 source; publication is pending. The published `v0.1.0`
-release does not include this action.
+Available since 0.1.1. The historical `v0.1.0` release does not include this
+action.
 
 `[clipboard] image-directory` opts into a persistent destination for explicit
 clipboard-image saves. Use **Save clipboard image and insert path** in the command

@@ -1,13 +1,13 @@
 ---
 title: Roadmap
-description: Product direction from stable 0.1.1 toward a broader 1.0 support contract.
+description: Product direction from stable 0.2.0 toward a broader 1.0 support contract.
 ---
 
 Splinterm's roadmap uses **Now / Next / Later / Explore** horizons instead of release dates. These horizons describe intended product outcomes. They are not delivery dates, implementation order, compatibility guarantees, or promises that every listed idea will ship.
 
 [Current status](/docs/status/) remains the authority for what works today. The repository [product roadmap](https://github.com/ministry-of-taste/splinterm/blob/main/docs/product-roadmap.md) contains the full strategic rationale. Maintainer dependency order, implementation plans, and delivery gates are tracked separately from the public product repository; accepted decisions needed to understand shipped behavior are promoted into public ADRs and documentation.
 
-Stable 0.1.1 is available on the documented Omarchy/Arch target. The future 1.0
+Stable 0.2.0 is available on the documented Omarchy/Arch target. The future 1.0
 support contract below is a roadmap goal, not a guarantee added by that release.
 
 ## Now: strengthen daily-driver confidence
@@ -19,7 +19,7 @@ Planned outcomes include:
 - recognizable named, pinned, disposable, restorable, and expired Lair states;
 - clear save, restore, pin, delete, and bounded-retention controls without persisting terminal contents or secrets;
 - exact theme fidelity and supported Omarchy desktop integration;
-- continued validation of bounded local-file drop path insertion and local clipboard-image saving shipped in 0.1.1, excluding remote image transfer;
+- continued validation of bounded local-file drop path insertion and local clipboard-image saving available in 0.2.0, excluding remote image transfer;
 - stronger installation, upgrade, recovery, diagnostics, and automation-consent journeys; and
 - continued performance and memory validation, with explicit dispositions for regressions.
 
@@ -56,7 +56,7 @@ This horizon does not imply a public daemon listener, cloud account, hosted cont
 
 The following are research directions rather than commitments:
 
-- broader Nix and Home Manager deployment acceptance beyond the 0.1.1 release's source flake and module;
+- broader Nix and Home Manager deployment acceptance beyond the 0.2.0 release's source flake and module;
 - additional Wayland compositors backed by compatibility matrices;
 - additional distribution artifacts with coherent service and upgrade behavior;
 - a carefully bounded extension model; and
