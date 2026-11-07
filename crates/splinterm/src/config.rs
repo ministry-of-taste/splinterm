@@ -2462,7 +2462,10 @@ fn omarchy_theme_input(
             ansi,
         },
         hints,
-        components: ThemeComponents::default(),
+        components: ThemeComponents {
+            active_tab_background: omarchy_role(&colors, &["active_tab_background"])?,
+            ..ThemeComponents::default()
+        },
         shell: ThemeShellInput {
             background_alpha: foot_alpha(alpha),
             background_blur: blur,
@@ -4075,7 +4078,7 @@ pub(crate) mod tests {
     ];
 
     #[test]
-    fn stock_omarchy_4_themes_drive_the_selected_tab_from_lighter_background() {
+    fn stock_omarchy_4_themes_drive_selected_tabs_from_their_authored_colors() {
         // (fixture, selected tab, accent, active border, muted, terminal
         // background)
         let expected = [
@@ -4098,7 +4101,7 @@ pub(crate) mod tests {
             // Its active_border_color is the focus ring.
             (
                 "last-horizon",
-                0x0c0b0c,
+                0xa5a0b6,
                 0xb59790,
                 0xd6d3de,
                 Some(0x584e51),
@@ -4159,7 +4162,7 @@ pub(crate) mod tests {
             assert_eq!(theme.background_alpha, u16::MAX, "{name} alpha");
             assert!(theme.background_blur, "{name} blur");
         }
-        // last-horizon's own active_tab_background extension stays ignored.
+        // last-horizon's explicit tab body wins over its raised surface.
         assert!(
             OMARCHY4_FIXTURES[2]
                 .1
@@ -4328,17 +4331,68 @@ pub(crate) mod tests {
         assert_eq!(semantic.active_tab_background, 0xf8_f9_fa);
         assert_eq!(semantic.active_tab_foreground, semantic.background);
 
-        let ignored_extensions = resolve_omarchy_theme(
+        let empty = resolve_omarchy_theme(
+            "lighter_bg=\"#f8f9fa\"\nactive_tab_background=\"\"\n",
+            &foot,
+        )
+        .unwrap();
+        assert_eq!(empty, semantic);
+
+        let explicit = resolve_omarchy_theme(
             "lighter_bg=\"#f8f9fa\"\nactive_tab_background=\"#010203\"\nactive_tab_foreground=\"#ffffff\"\n",
             &foot,
         )
         .unwrap();
-        assert_eq!(ignored_extensions, semantic);
+        assert_eq!(explicit.active_tab_background, 0x01_02_03);
+        assert_eq!(explicit.roles.surface_raised, semantic.roles.surface_raised);
+        // Only the background extension is read; the label is chosen for contrast.
+        assert_eq!(
+            explicit.active_tab_foreground,
+            active_tab_foreground_fallback(explicit.background, explicit.foreground, 0x01_02_03)
+        );
 
         let legacy = resolve_omarchy_theme("", &foot).unwrap();
         assert_eq!(legacy.selection, 0xf0_e0_d0);
         assert_eq!(legacy.active_tab_background, legacy.ansi[8]);
         assert_ne!(legacy.active_tab_background, legacy.selection);
+    }
+
+    #[test]
+    fn omarchy_explicit_active_tab_validates_and_keeps_user_override_precedence() {
+        let foot = complete_foot_palette("101112", "d0d1d2", "f0e0d0", "c0b0a0");
+        for invalid in ["not-a-color", "#12345g", "#123"] {
+            let error =
+                resolve_omarchy_theme(&format!("active_tab_background=\"{invalid}\"\n"), &foot)
+                    .unwrap_err();
+            assert!(error.to_string().contains("invalid active_tab_background"));
+        }
+        let input = omarchy_theme_input(
+            "lighter_background=\"#1b1b20\"\nactive_tab_background=\"#1c1c22\"\n",
+            &foot,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            ResolvedTheme::from_input(&input).active_tab_background,
+            0x1c_1c_22
+        );
+        for (settings, expected) in [
+            ("surface-raised=#f0f0f0", 0xf0_f0_f0),
+            (
+                "surface-raised=#f0f0f0\nactive-tab-background=#102030",
+                0x10_20_30,
+            ),
+        ] {
+            let theme = ResolvedTheme::from_input_with_colors(
+                &input,
+                &theme_colors(&format!("[colors]\n{settings}\n")),
+            );
+            assert_eq!(theme.active_tab_background, expected);
+            assert_eq!(
+                theme.active_tab_foreground,
+                active_tab_foreground_fallback(theme.background, theme.foreground, expected)
+            );
+        }
     }
 
     #[test]
@@ -5331,7 +5385,8 @@ pub(crate) mod tests {
     /// tab label ramped toward the text, now in linear light (`json`
     /// 79818a, `tokyo-night` 8f97bb, `flexoki-light` 64625e,
     /// `last-horizon` 817a7c, `legacy-gruvbox` 9d8d76, `semantic-keys`
-    /// 8680a1).
+    /// 8680a1). Issue #183 honors last-horizon's authored selected-tab body
+    /// (a5a0b6), choosing the terminal background for its contrasting label.
     #[allow(clippy::type_complexity)]
     const PROVIDER_PINS: [(&str, [u32; 12], u16, bool); 9] = [
         (
@@ -5382,7 +5437,7 @@ pub(crate) mod tests {
         (
             "last-horizon",
             [
-                0x0c0b0c, 0xfafcfb, 0xe2dddc, 0x584e51, 0xe2dddc, 0xb59790, 0x0c0b0c, 0xfafcfb,
+                0x0c0b0c, 0xfafcfb, 0xe2dddc, 0x584e51, 0xe2dddc, 0xb59790, 0xa5a0b6, 0x0c0b0c,
                 0x989596, 0xb59790, 0x584e51, 0xd6d3de,
             ],
             u16::MAX,

@@ -1350,15 +1350,15 @@ def test_omarchy_theme_generator_uses_foot_presentation_and_legacy_roles(
     assert semantic_ramp["active_tab_background"] == "#f8f9fa"
     assert semantic_ramp["active_tab_foreground"] == legacy["background"]
     assert semantic_ramp["selection"] == legacy["selection_background"]
-    ignored_extensions = module.generate(
+    explicit_background = module.generate(
         {
             **legacy,
             "active_tab_background": "#303132",
             "active_tab_foreground": "#a0b0c0",
         }
     )
-    assert ignored_extensions["active_tab_background"] == legacy["color8"]
-    assert ignored_extensions["active_tab_foreground"] == legacy["foreground"]
+    assert explicit_background["active_tab_background"] == "#303132"
+    assert explicit_background["active_tab_foreground"] == legacy["foreground"]
     light_tab = module.generate({**legacy, "lighter_bg": "#f0f1f2"})
     assert light_tab["active_tab_foreground"] == legacy["background"]
     assert module.active_tab_foreground_fallback(

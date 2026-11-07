@@ -172,7 +172,10 @@ def generate(
     roles["selection_foreground"] = (
         roles["bright_fg"] if selection_foreground is None else selection_foreground
     )
-    roles["active_tab_background"] = roles["lighter_bg"]
+    active_tab_background = resolve_role(colors, ("active_tab_background",))
+    roles["active_tab_background"] = (
+        roles["lighter_bg"] if active_tab_background is None else active_tab_background
+    )
     missing = [name for name, value in roles.items() if value is None]
     if missing:
         raise ValueError("missing Omarchy roles: " + ", ".join(missing))

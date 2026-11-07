@@ -22,7 +22,7 @@ FIXTURES = ROOT / "crates/splinterm/tests/fixtures/omarchy4"
 SELECTED_TAB = {
     "tokyo-night": "#24283b",
     "flexoki-light": "#E6E4D9",
-    "last-horizon": "#0c0b0c",
+    "last-horizon": "#a5a0b6",
     "legacy-gruvbox": "#3c3836",
     # No lighter_background or lighter_bg: Splinterm's color8 ramp.
     "alacritty-kanagawa": "#727169",
@@ -54,7 +54,7 @@ class GenerateOmarchyThemeTests(unittest.TestCase):
         with (FIXTURES / name / "colors.toml").open("rb") as source:
             return tomllib.load(source)
 
-    def test_stock_themes_export_lighter_background_and_the_omarchy_palette(self) -> None:
+    def test_stock_themes_export_authored_tabs_and_the_omarchy_palette(self) -> None:
         for name, selected_tab in SELECTED_TAB.items():
             with self.subTest(theme=name):
                 generated = self.exporter.generate(self.colors(name))
@@ -93,6 +93,39 @@ class GenerateOmarchyThemeTests(unittest.TestCase):
         )
         self.assertEqual(fallthrough["active_tab_background"], "#444444")
         self.assertEqual(fallthrough["pane_border"], "#565f89")
+
+    def test_explicit_active_tab_background_and_long_form_only_colors(self) -> None:
+        colors = {
+            key: value for key, value in self.colors("tokyo-night").items()
+            if not key.startswith("color")
+            and key not in {"bg", "fg", "darker_bg", "lighter_bg", "bright_fg"}
+        }
+        colors.update({
+            "background": "#000000",
+            "foreground": "#E8E8ED",
+            "darker_background": "#000000",
+            "lighter_background": "#1B1B20",
+            "bright_foreground": "#FAFAFC",
+        })
+        self.assertEqual(self.exporter.generate(colors)["active_tab_background"], "#1B1B20")
+        for color in ("#1C1C22", "#f8f9fa"):
+            with self.subTest(color=color):
+                generated = self.exporter.generate({**colors, "active_tab_background": color})
+                self.assertEqual(generated["active_tab_background"], color)
+                self.assertEqual(generated["ansi"][0], "#000000")
+                self.assertEqual(generated["ansi"][15], "#FAFAFC")
+                self.assertEqual(
+                    generated["active_tab_foreground"],
+                    self.exporter.active_tab_foreground_fallback(
+                        colors["background"], colors["foreground"], color
+                    ),
+                )
+        empty = self.exporter.generate({**colors, "active_tab_background": ""})
+        self.assertEqual(empty["active_tab_background"], "#1B1B20")
+        for invalid in ("not-a-color", "#12345g", "#123", 123):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(ValueError, "active_tab_background must be #RRGGBB"):
+                    self.exporter.generate({**colors, "active_tab_background": invalid})
 
     def test_missing_bright_accents_are_derived_like_omarchy(self) -> None:
         colors = dict(self.colors("tokyo-night"))

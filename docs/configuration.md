@@ -919,7 +919,11 @@ terminal background. That would make the selected tab and the popups
 invisible, so Splinterm uses Foot `bright0` for the selected tab instead, and
 for popups the foreground mixed 8% over the background in encoded sRGB, a step
 like a theme's own `lighter_background`. The selected-tab body never borrows
-the terminal selection background. Its label and close affordance use
+the terminal selection background. An optional `active_tab_background` in
+`colors.toml` overrides only the selected-tab body, not the raised surfaces
+of menus and popups. Missing or empty values keep the ramp above; malformed
+explicit colours fail theme loading. User `[colors]` overrides still take
+precedence. Its label and close affordance use
 whichever effective Foot background or foreground has higher WCAG contrast
 against that resolved tab body, preferring the foreground on an exact tie.
 
@@ -1130,8 +1134,9 @@ other JSON roles from the standard Omarchy background ramp and
 foreground/background endpoints. It reads the canonical Omarchy 4 names first,
 then the legacy short names and ANSI `colorN` aliases. Like Omarchy, it derives a
 missing bright accent by mixing its base colour 20 % toward white. The
-selected-tab body comes from `lighter_background`, then `lighter_bg`, then
-`color8`. The exporter reads `alpha` and `blur` with the same Foot section
+selected-tab body uses a non-empty explicit `active_tab_background`, then
+`lighter_background`, `lighter_bg`, or `color8`; malformed explicit colours
+are rejected. The exporter reads `alpha` and `blur` with the same Foot section
 merge as above. It leaves `inactive_tab_foreground` unset, so that role is
 derived from ANSI color 8, which the exporter fills from `muted`, when the theme
 loads.
