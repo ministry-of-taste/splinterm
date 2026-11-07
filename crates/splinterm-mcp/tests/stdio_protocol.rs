@@ -4593,6 +4593,172 @@ fn controller_modes_overlay_control_resources_and_clear_on_release() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one isolated fake-daemon exchange checks exact bytes under atomic and retained control"
+)]
+fn input_control_characters_reach_the_daemon_unchanged() {
+    let texts = [
+        "\r",
+        " \r",
+        "MCP_CONTROL_BYTES\r",
+        "\n",
+        "\r\n",
+        "\t",
+        "\x1b",
+        "\x03",
+        "\0",
+        "é\r",
+    ];
+    for retained in [false, true] {
+        let (directory, socket) = isolated_socket("input-bytes");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let splint_id: SplintId = "018f4d8c-2a18-4b31-8c2f-9e7c5de77103".parse().unwrap();
+        let lair_id: LairId = "018f4d8c-2a18-4b31-8c2f-9e7c5de77101".parse().unwrap();
+        let dojo_id: DojoId = "018f4d8c-2a18-4b31-8c2f-9e7c5de77102".parse().unwrap();
+        let daemon = thread::spawn(move || {
+            let mut connection = None;
+            for (index, text) in texts.iter().enumerate() {
+                if connection.is_none() {
+                    let mut stream = accept_automation(&listener);
+                    stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+                    let ClientFrame::Request {
+                        request_id,
+                        request:
+                            Request::AcquireControl {
+                                splint_id: requested,
+                                incarnation: 2,
+                                modes,
+                            },
+                        ..
+                    } = read_private_frame(&mut stream)
+                    else {
+                        panic!("expected input controller acquisition");
+                    };
+                    assert_eq!(requested, splint_id);
+                    assert_eq!(modes, vec![ControlMode::Input]);
+                    write_private_frame(
+                        &mut stream,
+                        &ServerFrame::Response {
+                            request_id,
+                            result: Response::ControlGranted {
+                                controller_id: 101,
+                                lair_id,
+                                dojo_id,
+                            },
+                        },
+                    );
+                    connection = Some(stream);
+                }
+                let stream = connection.as_mut().unwrap();
+                let ClientFrame::Request {
+                    request_id,
+                    request:
+                        Request::Input {
+                            controller_id: 101,
+                            splint_id: requested,
+                            incarnation: 2,
+                            bytes,
+                            focus_report: false,
+                        },
+                    ..
+                } = read_private_frame(stream)
+                else {
+                    panic!("expected unchanged input bytes");
+                };
+                assert_eq!(requested, splint_id);
+                assert_eq!(bytes, text.as_bytes(), "retained={retained}, text={text:?}");
+                write_private_frame(
+                    stream,
+                    &ServerFrame::Response {
+                        request_id,
+                        result: Response::TerminalActionAcknowledged {
+                            lair_id,
+                            dojo_id,
+                            splint_id,
+                            incarnation: 2,
+                            terminal_revision: u64::try_from(index).unwrap() + 1,
+                            history_generation: 1,
+                        },
+                    },
+                );
+                if !retained || index == texts.len() - 1 {
+                    let ClientFrame::Request {
+                        request_id,
+                        request: Request::ReleaseControl { controller_id: 101 },
+                        ..
+                    } = read_private_frame(stream)
+                    else {
+                        panic!("expected input controller cleanup");
+                    };
+                    write_private_frame(
+                        stream,
+                        &ServerFrame::Response {
+                            request_id,
+                            result: Response::Acknowledged,
+                        },
+                    );
+                    connection = None;
+                }
+            }
+        });
+        let mut server = Harness::spawn_with_socket(&socket, None);
+        server.initialize();
+        server.initialized();
+        let controller = if retained {
+            server.send(&request(2, "tools/call", json!({
+                "name":"splinterm.acquire_control",
+                "arguments":{"splint_id":splint_id.to_string(),"incarnation":2,"modes":["input"]}
+            })));
+            let acquired = server.receive_id(2);
+            assert_eq!(acquired["result"]["isError"], false);
+            Some(acquired["result"]["structuredContent"]["data"]["controller_handle"].clone())
+        } else {
+            None
+        };
+        for (index, text) in texts.iter().enumerate() {
+            let id = i64::try_from(index).unwrap() + 10;
+            let mut arguments =
+                json!({"splint_id":splint_id.to_string(),"incarnation":2,"text":text});
+            if let Some(handle) = &controller {
+                arguments["controller_handle"] = handle.clone();
+            }
+            server.send(&request(
+                id,
+                "tools/call",
+                json!({"name":"splinterm.input","arguments":arguments}),
+            ));
+            let response = server.receive_id(id);
+            assert_eq!(response["result"]["isError"], false, "{response}");
+            assert_eq!(
+                response["result"]["structuredContent"]["data"]["accepted_bytes"],
+                text.len()
+            );
+            assert!(
+                response["result"]["structuredContent"]["data"]
+                    .get("text")
+                    .is_none()
+            );
+            assert!(!response.to_string().contains("MCP_CONTROL_BYTES"));
+        }
+        if let Some(handle) = controller {
+            server.send(&request(
+                30,
+                "tools/call",
+                json!({
+                    "name":"splinterm.release_control","arguments":{"controller_handle":handle}
+                }),
+            ));
+            assert_eq!(server.receive_id(30)["result"]["isError"], false);
+        }
+        server.close_input();
+        assert!(server.wait().success());
+        daemon.join().unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+#[test]
 fn input_text_enforces_utf8_byte_limit_before_dispatch() {
     let mut server = Harness::spawn();
     server.initialize();

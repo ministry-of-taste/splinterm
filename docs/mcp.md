@@ -329,6 +329,41 @@ response, four active and 32 admitted requests, 5-second default daemon deadline
 combined controller/transfer handles, and 256 process-owned cursors. Handles and
 cursors expire with the adapter process and are not portable.
 
+### Sending terminal input
+
+`splinterm.input` sends `text` as UTF-8 bytes unchanged. It does not trim
+whitespace, remove control characters, translate LF to CR, or wrap text in
+bracketed-paste markers. Use `\r` (CR, U+000D) for Enter in a TUI; `\n` is LF
+and may insert a newline instead of submitting. Tab (`\t`), Escape (`\u001b`),
+Ctrl-C (`\u0003`), and other control characters also pass through. Input still
+requires the same scoped grant and exclusive controller authority.
+
+For example, the decoded `text` below ends with one carriage-return byte:
+
+```json
+{
+  "name": "splinterm.input",
+  "arguments": {
+    "splint_id": "018f4d8c-2a18-4b31-8c2f-9e7c5de77103",
+    "incarnation": 2,
+    "text": "hello\r"
+  }
+}
+```
+
+A CR-only string is valid; an empty string is not. JSON must escape control
+characters: send the serialized `"\r"`, not a literal CR inside a JSON string,
+and do not double-escape it into a literal backslash followed by `r`.
+`accepted_bytes` counts the UTF-8 bytes supplied to the adapter, including
+controls; it does not mean the foreground program interpreted them as a key
+or accepted the command. For example, space plus CR counts as two bytes.
+
+If a host reports CR-only input as empty, or space plus CR as one byte, compare
+its outgoing JSON-RPC arguments with a direct stdio call to the same adapter
+build using an isolated test target. That is not the adapter's expected
+behavior. Keep diagnostics to lengths and synthetic control-byte probes; do
+not log real terminal input or prompts.
+
 ### Reading terminal text
 
 `splinterm.read_terminal` and `splinterm.read_scrollback` return plain text by

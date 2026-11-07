@@ -250,7 +250,7 @@ const DEFINITIONS: &[ToolDefinition] = &[
     ),
     tool_definition!(
         "input",
-        "Sends explicit bounded UTF-8 input to one exact controlled Splint incarnation.",
+        "Sends bounded UTF-8 input unchanged to one exact controlled Splint incarnation. Use \\r for Enter; \\n is LF, not Enter. Control characters require JSON escaping.",
         false,
         false,
         false
@@ -880,6 +880,36 @@ mod tests {
                 "{name}: {arguments}"
             );
         }
+    }
+
+    #[test]
+    fn input_text_preserves_control_characters_and_rejects_only_empty_text() {
+        for text in [
+            "\r", " \r", "prompt\r", "\n", "\r\n", "\t", "\x1b", "\x03", "\0", "é\r",
+        ] {
+            let input = json!({
+                "splint_id": "11111111-2222-4333-8444-555555555555",
+                "incarnation": 1,
+                "text": text,
+            });
+            let decoded: Value = serde_json::from_str(&input.to_string()).unwrap();
+            assert_eq!(
+                decoded["text"].as_str().unwrap().as_bytes(),
+                text.as_bytes()
+            );
+            assert_eq!(validate_arguments("splinterm.input", &decoded), Ok(()));
+        }
+        assert_eq!(
+            validate_arguments(
+                "splinterm.input",
+                &json!({
+                    "splint_id": "11111111-2222-4333-8444-555555555555",
+                    "incarnation": 1,
+                    "text": "",
+                })
+            ),
+            Err(ValidationError::InvalidArgument)
+        );
     }
 
     #[test]
