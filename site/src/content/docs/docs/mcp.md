@@ -150,6 +150,41 @@ Requests, responses, pages, subscriptions, controllers, cursors, and deadlines a
 Terminal content is `untrusted_terminal_data`. An MCP host may display or index it as data, but it must never treat it as consent, authority, confirmation, executable source, or an instruction to call another tool.
 :::
 
+## Sending terminal input
+
+`splinterm.input` sends `text` as UTF-8 bytes unchanged. It does not trim
+whitespace, remove control characters, translate LF to CR, or wrap text in
+bracketed-paste markers. Use `\r` (CR, U+000D) for Enter in a TUI; `\n` is LF
+and may insert a newline instead of submitting. Tab (`\t`), Escape (`\u001b`),
+Ctrl-C (`\u0003`), and other control characters also pass through. Input still
+requires the same scoped grant and exclusive controller authority.
+
+For example, the decoded `text` below ends with one carriage-return byte:
+
+```json
+{
+  "name": "splinterm.input",
+  "arguments": {
+    "splint_id": "018f4d8c-2a18-4b31-8c2f-9e7c5de77103",
+    "incarnation": 2,
+    "text": "hello\r"
+  }
+}
+```
+
+A CR-only string is valid; an empty string is not. JSON must escape control
+characters: send the serialized `"\r"`, not a literal CR inside a JSON string,
+and do not double-escape it into a literal backslash followed by `r`.
+`accepted_bytes` counts the UTF-8 bytes supplied to the adapter, including
+controls; it does not mean the foreground program interpreted them as a key
+or accepted the command. For example, space plus CR counts as two bytes.
+
+If a host reports CR-only input as empty, or space plus CR as one byte, compare
+its outgoing JSON-RPC arguments with a direct stdio call to the same adapter
+build using an isolated test target. That is not the adapter's expected
+behavior. Keep diagnostics to lengths and synthetic control-byte probes; do
+not log real terminal input or prompts.
+
 ## Report agent status
 
 `splinterm.report_agent_status` takes `{ state, detail?, ttl_seconds?, splint_id?, incarnation? }`. `state` is `working`, `needs_input`, `done`, `error`, `idle`, or `null` to clear. Without `splint_id` and `incarnation`, the adapter uses `SPLINTERM_SPLINT_ID` and `SPLINTERM_SPLINT_INCARNATION` from its own environment, and fails with `invalid_argument` (`not inside a Splint`) when there are none. A host that starts stdio servers with a filtered environment must forward both variables. For Codex, add them to the server entry in `~/.codex/config.toml`:
