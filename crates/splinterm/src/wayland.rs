@@ -1800,6 +1800,44 @@ impl PaneView {
             })
     }
 
+    /// Draws the input method's `preedit` text, or its absence, into the
+    /// prepared frame's cursor row.
+    fn refresh_ime_preedit(
+        &mut self,
+        preedit: Option<&str>,
+        context: &RenderContext,
+    ) -> Result<()> {
+        // The prepared frame represents the display viewport, which may be
+        // detached from the live grid. Refreshing it from `self.snapshot`
+        // corrupts an unrelated history row when focus loss clears preedit.
+        let Some(mut render_snapshot) = self.display_snapshot() else {
+            return Ok(());
+        };
+        let Some(row) = apply_ime_preedit(&mut render_snapshot, preedit) else {
+            return Ok(());
+        };
+        let Some(frame) = &mut self.snapshot_frame else {
+            return Ok(());
+        };
+        // The view changed size since the frame was prepared, as when the
+        // Window was resized and its draw still waits for the compositor:
+        // the pane then shows fewer rows than the frame holds. That draw
+        // rebuilds the whole frame, so there is no row to refresh here, and
+        // refreshing one would fail the Window for an input method event.
+        if !frame.shows_grid_of(&render_snapshot) {
+            self.viewport_dirty = true;
+            return Ok(());
+        }
+        let mut dirty = vec![false; render_snapshot.rows];
+        dirty[row] = true;
+        frame.refresh_rows_with_context(&render_snapshot, &dirty, context)?;
+        self.raster_dirty_rows.resize(render_snapshot.rows, false);
+        self.surface_dirty_rows.resize(render_snapshot.rows, false);
+        self.raster_dirty_rows[row] = true;
+        self.surface_dirty_rows[row] = true;
+        Ok(())
+    }
+
     /// The pane's controller ended while its display stream goes on: the
     /// command queue's receiver is gone, so nothing the pane sends can
     /// arrive. The pane stops sending, drops what it had deferred, and with
@@ -2209,6 +2247,29 @@ impl PaneView {
         self.updates = None;
         self.display_lost = None;
         self.control_lost = false;
+    }
+
+    /// The pane's update stream ended with no word of an exit. Its
+    /// subscription reconnects by itself (Plan 0073), so it ends this way
+    /// only when it was stopped or failed: typically the pane is being
+    /// removed, and the topology update that removes it has not been applied
+    /// yet, as while the Dojo picker defers it. The pane keeps its last
+    /// screen and says its display is gone. Its Window and the Window's
+    /// other panes and tabs go on.
+    fn lose_stream(&mut self) {
+        if let Some(diagnostics) = diagnostics()
+            && let Some(snapshot) = &self.snapshot
+        {
+            diagnostics.emit_for_pane(
+                DiagnosticLevel::Warn,
+                DiagnosticEventCode::PaneStreamFailure,
+                Some(DiagnosticErrorCode::PaneStream),
+                snapshot.splint_id,
+                None,
+            );
+        }
+        self.end_stream();
+        self.display_lost = Some(display_lost_notice(false));
     }
 
     /// An inactive pane's process exited (`splint_id`).
@@ -8590,39 +8651,10 @@ impl App {
     }
 
     fn refresh_ime_preedit(&mut self) -> Result<()> {
-        // The prepared frame represents the display viewport, which may be
-        // detached from the live grid. Refreshing it from `self.panes.pane.snapshot`
-        // corrupts an unrelated history row when focus loss clears preedit.
-        let Some(mut render_snapshot) = self.panes.display_snapshot() else {
-            return Ok(());
-        };
-        let Some(row) = apply_ime_preedit(
-            &mut render_snapshot,
+        self.panes.pane.refresh_ime_preedit(
             self.input.ime.visible_preedit.as_deref(),
-        ) else {
-            return Ok(());
-        };
-        let Some(frame) = &mut self.panes.pane.snapshot_frame else {
-            return Ok(());
-        };
-        let mut dirty = vec![false; render_snapshot.rows];
-        dirty[row] = true;
-        frame.refresh_rows_with_context(
-            &render_snapshot,
-            &dirty,
             &self.presentation.render_context,
-        )?;
-        self.panes
-            .pane
-            .raster_dirty_rows
-            .resize(render_snapshot.rows, false);
-        self.panes
-            .pane
-            .surface_dirty_rows
-            .resize(render_snapshot.rows, false);
-        self.panes.pane.raster_dirty_rows[row] = true;
-        self.panes.pane.surface_dirty_rows[row] = true;
-        Ok(())
+        )
     }
 
     fn rebuild_scaled_pane_frames(&mut self, scale_120: u32) -> Result<bool> {
@@ -11909,6 +11941,7 @@ impl App {
                 pending = drained.items;
                 disconnected = drained.disconnected;
             }
+            let lost = disconnected && !pane_stream_has_terminal_notice(&pending);
             if disconnected {
                 pane.end_stream();
                 drain.changed = true;
@@ -11929,6 +11962,11 @@ impl App {
             }
             let impact =
                 apply_inactive_update_batch(pane, terminal_updates, self.presentation.theme)?;
+            // A visible pane whose stream ended with no word of an exit
+            // would otherwise only stop changing.
+            if lost {
+                pane.lose_stream();
+            }
             drain.record(
                 pane.snapshot.as_ref().map(|snapshot| snapshot.splint_id),
                 impact,
@@ -12027,6 +12065,7 @@ impl App {
         // post-topology focused receiver so it cannot fall back to the timed tick.
         let mut pending = Vec::new();
         let mut disconnected = false;
+        let mut focused_stream_lost = false;
         if let Some(updates) = &mut self.panes.pane.updates {
             let drained = drain_receiver(updates, &self.platform.update_waker);
             pending = drained.items;
@@ -12046,15 +12085,23 @@ impl App {
             self.panes.pane.updates = None;
             self.handoff.hold(HeldFailure::PaneStream);
         } else if disconnected && !pane_stream_has_terminal_notice(&pending) {
-            if let Some(diagnostics) = diagnostics() {
-                diagnostics.emit(
-                    DiagnosticLevel::Error,
-                    DiagnosticEventCode::PaneStreamFailure,
-                    Some(DiagnosticErrorCode::PaneStream),
-                );
+            // A Window that is only its one pane has nothing left to show.
+            // In a Window with tabs the loss is the pane's alone; see
+            // `PaneView::lose_stream`.
+            if self.tab_state.topology_commands.is_none() {
+                if let Some(diagnostics) = diagnostics() {
+                    diagnostics.emit(
+                        DiagnosticLevel::Error,
+                        DiagnosticEventCode::PaneStreamFailure,
+                        Some(DiagnosticErrorCode::PaneStream),
+                    );
+                }
+                self.scheduling.request_exit(ExitClass::ErrorPaneStream);
+                return Ok(());
             }
-            self.scheduling.request_exit(ExitClass::ErrorPaneStream);
-            return Ok(());
+            // Applied after this batch, whose snapshot must not clear the
+            // notice.
+            focused_stream_lost = true;
         }
         let receiver_batch_size = pending.len();
         let mut inactive = self.apply_inactive_updates()?;
@@ -12064,7 +12111,7 @@ impl App {
         if let Some(update) = inactive.theme.take() {
             retain_newest_theme(&mut next_theme, update);
         }
-        let mut visual_changed = topology_changed | inactive.changed;
+        let mut visual_changed = topology_changed | inactive.changed | focused_stream_lost;
         let mut focused_visual_changed = topology_changed;
         let mut title_changed = false;
         let mut full_frame_reload = false;
@@ -12559,6 +12606,10 @@ impl App {
                     }
                 }
             }
+        }
+        if focused_stream_lost {
+            self.panes.pane.lose_stream();
+            self.presentation.full_redraw = true;
         }
         if let Some(update) = self.presentation.pending_font_update.take() {
             match self.reconcile_font_generation(update) {
@@ -16701,8 +16752,9 @@ mod tests {
     }
 
     /// Plan 0061 M3.12a: a hidden pane's stream lost while a handoff is
-    /// fenced leaves the Window open with the pane disconnected; otherwise
-    /// the loss still ends the Window.
+    /// fenced leaves the Window open with the pane disconnected. Otherwise
+    /// the Window also stays, and the pane says its display is gone, even
+    /// when a last snapshot arrived with the loss.
     #[test]
     fn a_hidden_pane_lost_during_a_fenced_handoff_keeps_the_window() {
         let (_event_loop, waker) = update_test_waker();
@@ -16736,16 +16788,28 @@ mod tests {
                 &RenderContext::new(u16::MAX),
             )
             .unwrap();
+            let mut last = valid_snapshot(splint_id);
+            last.revision = 2;
+            updates
+                .try_send(WindowUpdate::Snapshot {
+                    snapshot: last,
+                    image_sources: ImageContentLeaseSet::default(),
+                    authoritative: true,
+                })
+                .unwrap();
             drop(updates);
-            let result = view.drain_hidden_updates(&waker, ResolvedTheme::default(), hold);
-            if hold {
-                assert!(result.unwrap(), "the loss is reported as held");
-                assert!(view.pane.commands.is_none());
-                assert!(view.pane.updates.is_none());
-                assert!(!view.pane.controller_active);
-            } else {
-                assert!(result.is_err());
-            }
+            let held = view
+                .drain_hidden_updates(&waker, ResolvedTheme::default(), hold)
+                .unwrap();
+            assert_eq!(held, hold, "only a handoff's loss is reported as held");
+            assert!(view.pane.commands.is_none());
+            assert!(view.pane.updates.is_none());
+            assert!(!view.pane.controller_active);
+            assert_eq!(view.pane.snapshot.as_ref().unwrap().revision, 2);
+            assert_eq!(
+                view.pane.display_lost,
+                (!hold).then_some(display_lost_notice(false))
+            );
         }
     }
 
@@ -18343,6 +18407,52 @@ mod tests {
 
     fn display_row_ids(display: &TerminalSnapshot) -> Vec<Option<u64>> {
         display.visible_rows.iter().map(|row| row.row_id).collect()
+    }
+
+    /// A Window resized below its pane's grid shows fewer rows than the
+    /// prepared frame holds until its next draw, which can wait for the
+    /// compositor. An input method event in between refreshed a row of that
+    /// stale frame, which failed the whole Window; it now leaves the frame
+    /// to the draw that rebuilds it.
+    #[test]
+    fn an_input_method_event_before_a_resized_panes_draw_leaves_the_frame_to_that_draw() {
+        let (mut pane, _commands) = viewer_pane(3, 6);
+        let context = RenderContext::new(u16::MAX);
+        let snapshot = pane.snapshot.clone().unwrap();
+        pane.snapshot_frame = Some(
+            SnapshotFrame::load_scaled_with_sources_and_context(
+                &snapshot,
+                SCALE_DENOMINATOR,
+                None,
+                &context,
+            )
+            .unwrap(),
+        );
+        pane.refresh_ime_preedit(Some("a"), &context)
+            .expect("a current frame takes the preedit");
+        assert!(!pane.viewport_dirty);
+
+        // The Window shrank: the pane shows four of the grid's six rows.
+        assert!(
+            pane.scrollback_viewport
+                .set_local_rows(Some(4), Some(&snapshot))
+        );
+        let display = pane.display_snapshot().unwrap();
+        assert_eq!(display.rows, 4);
+        let frame = pane.snapshot_frame.as_mut().unwrap();
+        assert!(!frame.shows_grid_of(&display));
+        assert!(
+            frame
+                .refresh_rows_with_context(&display, &[false; 4], &context)
+                .is_err(),
+            "the stale frame cannot take a row of the smaller view"
+        );
+
+        pane.refresh_ime_preedit(Some("a"), &context)
+            .expect("an input method event is not the Window's failure");
+        assert!(pane.viewport_dirty, "the next draw rebuilds the frame");
+        pane.refresh_ime_preedit(None, &context)
+            .expect("nor is the preedit clearing");
     }
 
     #[test]
