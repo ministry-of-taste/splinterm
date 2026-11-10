@@ -16473,6 +16473,8 @@ fn spawn_subscription(
                             event,
                         };
                         if !frame_within_policy_limit(&frame, access.maximum_returned_bytes) {
+                            // A slow client must not pin the admission while it is told.
+                            drop(publication_admission);
                             send_subscription_resync(
                                 &outputs,
                                 id,
@@ -16488,6 +16490,8 @@ fn spawn_subscription(
                         let publication_bytes = match serde_json::to_vec(&frame) {
                             Ok(encoded) => encoded.len().saturating_add(4),
                             Err(error) => {
+                                // A slow client must not pin the admission while it is told.
+                                drop(publication_admission);
                                 send_subscription_resync(
                                     &outputs,
                                     id,
@@ -29241,9 +29245,10 @@ mod tests {
         current_revision
     }
 
-    /// A Splint's event stream that closes without an exit, as a handoff
-    /// leaves it, ends the subscription with `ResyncRequired`, so its client
-    /// attaches again instead of watching a pane that never changes.
+    /// A Splint's event stream that closes without an exit, as it does when
+    /// the Splint's actor ends with an error, ends the subscription with
+    /// `ResyncRequired`, so its client attaches again instead of watching a
+    /// pane that never changes.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_terminal_stream_closed_without_an_exit_asks_its_client_to_attach_again() {
         let state = test_state_with_backend(false, test_pty_backend());
@@ -29266,7 +29271,9 @@ mod tests {
                 peer: None,
             },
         );
-        // A handoff ends the actor without publishing an exit.
+        // Handing the PTY off ends the actor without publishing an exit, as
+        // an actor that ends with an error does. A real handoff never reaches
+        // a client this way: `serve` stops every connection before it.
         let handed_off = handle
             .prepare_pty_handoff()
             .await
@@ -29312,14 +29319,108 @@ mod tests {
                 peer: None,
             },
         );
-        let revision = expect_subscription_resync(&mut control_rx, 6, 1).await;
-        assert_eq!(revision, current_revision(&handle, 0).await);
         time::timeout(Duration::from_secs(5), task)
             .await
             .expect("the subscription ends")
             .unwrap();
-        assert!(outbound_rx.try_recv().is_err());
+        // The subscription's wait is unbiased, so an update the Splint
+        // published before its first poll may be sent before the lag is
+        // heard. The lag is heard at the very next wait, so at most one is.
+        let mut next_sequence = 1;
+        while let Ok(queued) = outbound_rx.try_recv() {
+            let ServerFrame::Event {
+                subscription_id: 6,
+                sequence,
+                event: SubscriptionEvent::Snapshot { .. } | SubscriptionEvent::Update { .. },
+            } = queued.frame
+            else {
+                panic!("expected an update: {:?}", queued.frame);
+            };
+            assert_eq!(sequence, next_sequence);
+            next_sequence += 1;
+        }
+        assert!(next_sequence <= 2, "the lag ends the subscription at once");
+        let revision = expect_subscription_resync(&mut control_rx, 6, next_sequence).await;
+        assert_eq!(revision, current_revision(&handle, 0).await);
         cleanup_connection(&state, 42).await;
+    }
+
+    /// A subscription that a limit ends drops its wake-time publication
+    /// admission before it tells its client, so slow clients that are each
+    /// still to be told cannot pin the daemon's publication memory. Runs
+    /// alone, so it can measure the whole ceiling and hear the task's logs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_subscription_told_to_attach_again_holds_no_publication_memory() {
+        if !in_isolated_publication_process(
+            "a_subscription_told_to_attach_again_holds_no_publication_memory",
+        ) {
+            return;
+        }
+        let logs = CapturedLogs::default();
+        let sink = logs.clone();
+        tracing::subscriber::set_global_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || sink.clone())
+                .finish(),
+        )
+        .unwrap();
+        let state = test_state_with_backend(false, test_pty_backend());
+        let (handle, mut access, stream) = quiet_attached_splint(&state, 43).await;
+        // Every update exceeds the grant's returned-bytes limit.
+        access.maximum_returned_bytes = Some(1);
+        let (outbound, _outbound_rx) = mpsc::channel(OUTBOUND_QUEUE);
+        // The client reads nothing, so `ResyncRequired` waits behind this.
+        let (control, mut control_rx) = mpsc::channel(1);
+        control
+            .try_send(ControlFrame::Frame(ServerFrame::Event {
+                subscription_id: 0,
+                sequence: 0,
+                event: SubscriptionEvent::ResyncRequired {
+                    current_revision: 0,
+                },
+            }))
+            .unwrap();
+        let task = spawn_subscription(
+            7,
+            stream,
+            handle.clone(),
+            SubscriptionOutputs {
+                outbound,
+                control,
+                connection_id: 43,
+            },
+            state.revocations.subscribe(),
+            access,
+            SubscriptionAudit {
+                state: Arc::clone(&state),
+                peer: None,
+            },
+        );
+        // The terminal echoes the input, which publishes an update.
+        handle.input(b"x".to_vec()).await.unwrap();
+        time::timeout(Duration::from_secs(5), async {
+            while !logs.text().contains("returned-bytes limit") {
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the limit ends the subscription");
+        // Only the few bytes retained for the Splint's queue are still held,
+        // far less than the update's wake-time admission.
+        assert!(
+            TerminalPublicationMemoryLease::try_new(
+                TERMINAL_PUBLICATION_DAEMON_BYTES - TERMINAL_PUBLICATION_BYTES + 1
+            )
+            .is_some()
+        );
+        control_rx.recv().await.unwrap();
+        expect_subscription_resync(&mut control_rx, 7, 1).await;
+        time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the subscription ends")
+            .unwrap();
+        cleanup_connection(&state, 43).await;
     }
 
     #[tokio::test]

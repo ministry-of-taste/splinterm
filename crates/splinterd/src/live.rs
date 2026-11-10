@@ -2363,7 +2363,8 @@ impl CompactSubscription {
 
     /// Receives and materializes one coalesced event while holding a conservative
     /// process-wide publication reservation acquired only after an update wake.
-    /// The returned lease must remain alive through wire encoding and delivery.
+    /// The lease is returned only with an update, and must remain alive
+    /// through wire encoding and delivery.
     ///
     /// Once polled, the returned future must be polled to completion, not
     /// dropped: it may already have taken the subscription's wake while it
@@ -2421,6 +2422,13 @@ impl CompactSubscription {
             return (SubscriptionReceive::ResnapshotRequired, None, None);
         }
         let (received, trailing_exit) = self.coalesce_queued(&first);
+        // Only an update is published, so nothing else keeps the admission.
+        let publication_admission = publication_admission.filter(|_| {
+            matches!(
+                received,
+                SubscriptionReceive::Event(LiveEvent::Update { .. })
+            )
+        });
         (received, trailing_exit, publication_admission)
     }
 
