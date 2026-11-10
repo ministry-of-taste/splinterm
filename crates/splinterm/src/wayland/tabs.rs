@@ -550,10 +550,12 @@ impl DojoTabView {
         Ok(())
     }
 
-    /// Drains the hidden tab's pane updates. A stream lost unexpectedly ends
-    /// the Window unless `hold_on_disconnect`, the daemon handoff case, where
-    /// the pane is only marked disconnected (Plan 0061 M3.12a). Returns
-    /// whether it held such a loss.
+    /// Drains the hidden tab's pane updates. A stream lost unexpectedly is
+    /// that pane's loss: it keeps its last screen and says its display is
+    /// gone (see `PaneView::lose_stream`), and the Window goes on. With
+    /// `hold_on_disconnect`, the daemon handoff case, the pane is only
+    /// marked disconnected (Plan 0061 M3.12a). Returns whether it held such
+    /// a loss.
     pub(super) fn drain_hidden_updates(
         &mut self,
         waker: &Waker,
@@ -570,11 +572,8 @@ impl DojoTabView {
                 disconnected = drained.disconnected;
             }
             let terminal_notice = pane_stream_has_terminal_notice(&pending);
-            if disconnected && !terminal_notice {
-                anyhow::ensure!(
-                    hold_on_disconnect,
-                    "hidden pane update stream disconnected unexpectedly"
-                );
+            let lost = disconnected && !terminal_notice;
+            if lost && hold_on_disconnect {
                 pane.end_stream();
                 held = true;
             }
@@ -601,6 +600,10 @@ impl DojoTabView {
                 {
                     self.dirty_inactive_panes.insert(splint_id);
                 }
+            }
+            // After this batch, whose snapshot must not clear the notice.
+            if lost && !hold_on_disconnect {
+                pane.lose_stream();
             }
         }
         Ok(held)

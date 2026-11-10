@@ -451,6 +451,7 @@ mod tests {
             exit_class: Some(ExitClass::Panic),
             error_code: None,
             failure_location: None,
+            daemon_error: None,
         };
         let external = CrashEvidence {
             timestamp_unix_ms: 10,

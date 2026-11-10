@@ -77,6 +77,10 @@ pub enum WindowUpdate {
     /// took control of it without asking; the pane is a viewer now. Sent
     /// after the [`WindowUpdate::Control`] that says so.
     ControlReclaimed,
+    /// The pane has a new controller after an outage, and nothing the pane
+    /// sent before this will be answered. Sent before the new controller's
+    /// [`WindowUpdate::Control`].
+    ControlRestarted,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
