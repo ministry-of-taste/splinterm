@@ -16795,13 +16795,14 @@ fn frame_trace_identity(frame: &ServerFrame) -> Option<(u64, u64, u64, u64)> {
 /// boundary with no earlier frame partly written. A handoff prepare frame
 /// relies on that ([`write_handoff_prepare`]).
 ///
+/// While an ordinary frame waits for terminal transaction memory, the
+/// connection's control items are still written: nothing of the waiting
+/// frame has been written yet, so each of them starts at a frame boundary
+/// too.
+///
 /// Ending early ends the connection's writes, so each such end is logged
 /// with `connection_id` (Plan 0073): its client otherwise only sees its
 /// subscriptions go quiet.
-#[allow(
-    clippy::too_many_lines,
-    reason = "frame selection, transaction memory, tracing, and timed writes are one writer loop"
-)]
 async fn write_frames(
     mut writer: OwnedWriteHalf,
     mut normal: mpsc::Receiver<QueuedServerFrame>,
@@ -16810,117 +16811,183 @@ async fn write_frames(
     connection_id: u64,
 ) {
     loop {
-        let (frame, _held_memory, written) = tokio::select! {
+        let queued = tokio::select! {
             biased;
-            frame = control.recv() => {
-                match frame {
-                    None => break,
-                    Some(ControlFrame::Frame(frame)) => (frame, None, None),
-                    // A frame nothing waits for any more, such as a decision
-                    // prompt whose attempt cancelled while it was queued, is
-                    // not written.
-                    Some(ControlFrame::Confirmed { written, .. }) if written.is_closed() => continue,
-                    Some(ControlFrame::Confirmed { frame, written }) => (frame, None, Some(written)),
-                    Some(ControlFrame::HandoffPrepare(prepare)) => {
-                        if write_handoff_prepare(&mut writer, prepare).await {
-                            continue;
-                        }
-                        warn!(
-                            connection_id,
-                            "closing a connection: its handoff prepare frame was not written"
-                        );
-                        return;
-                    }
+            item = control.recv() => {
+                let Some(item) = item else { break };
+                if write_control_item(
+                    &mut writer,
+                    item,
+                    &terminal_transaction_memory,
+                    connection_id,
+                )
+                .await
+                {
+                    continue;
                 }
+                return;
             }
             queued = normal.recv() => {
                 let Some(queued) = queued else { break };
-                (
-                    queued.frame,
-                    Some((queued.terminal_publication, queued.clipboard_memory)),
-                    None,
-                )
+                queued
             }
         };
-        let identity = frame_trace_identity(&frame);
+        // The frame's publication reservation and clipboard memory are held
+        // until it has been written.
+        let QueuedServerFrame {
+            frame,
+            terminal_publication: _terminal_publication,
+            clipboard_memory: _clipboard_memory,
+        } = queued;
         let _memory_lease = if frame_uses_terminal_transaction_memory(&frame) {
-            Some(
-                terminal_transaction_memory
-                    .acquire(terminal_transaction_bytes(&frame))
-                    .await,
-            )
+            let admission = terminal_transaction_memory.acquire(terminal_transaction_bytes(&frame));
+            tokio::pin!(admission);
+            loop {
+                tokio::select! {
+                    biased;
+                    item = control.recv() => {
+                        let Some(item) = item else { return };
+                        if !write_control_item(
+                            &mut writer,
+                            item,
+                            &terminal_transaction_memory,
+                            connection_id,
+                        )
+                        .await
+                        {
+                            return;
+                        }
+                    }
+                    lease = &mut admission => break Some(lease),
+                }
+            }
         } else {
             None
         };
-        let encode_started = perf_trace_enabled().then(Instant::now);
-        let Ok(encoded_frames) = encode_server_frame_transaction(&frame) else {
+        if !write_admitted_frame(&mut writer, &frame, None, connection_id).await {
+            return;
+        }
+    }
+}
+
+/// Writes one control item for [`write_frames`] and returns whether the
+/// writer goes on.
+///
+/// A control frame that needs terminal transaction memory waits for it here
+/// without taking later control items, so control items keep their order.
+async fn write_control_item(
+    writer: &mut OwnedWriteHalf,
+    item: ControlFrame,
+    terminal_transaction_memory: &Arc<TerminalTransactionMemory>,
+    connection_id: u64,
+) -> bool {
+    let (frame, written) = match item {
+        ControlFrame::Frame(frame) => (frame, None),
+        // A frame nothing waits for any more, such as a decision prompt
+        // whose attempt cancelled while it was queued, is not written.
+        ControlFrame::Confirmed { written, .. } if written.is_closed() => return true,
+        ControlFrame::Confirmed { frame, written } => (frame, Some(written)),
+        ControlFrame::HandoffPrepare(prepare) => {
+            if write_handoff_prepare(writer, prepare).await {
+                return true;
+            }
+            warn!(
+                connection_id,
+                "closing a connection: its handoff prepare frame was not written"
+            );
+            return false;
+        }
+    };
+    let _memory_lease = if frame_uses_terminal_transaction_memory(&frame) {
+        Some(
+            terminal_transaction_memory
+                .acquire(terminal_transaction_bytes(&frame))
+                .await,
+        )
+    } else {
+        None
+    };
+    write_admitted_frame(writer, &frame, written, connection_id).await
+}
+
+/// Encodes `frame` and writes its encoded frames, each within
+/// [`WRITE_TIMEOUT`], then reports through `written` whether all of them
+/// were written. The caller holds whatever memory the frame needs.
+///
+/// Returns whether the writer goes on: a frame that cannot be encoded, or a
+/// write that times out, ends it.
+async fn write_admitted_frame(
+    writer: &mut OwnedWriteHalf,
+    frame: &ServerFrame,
+    written: Option<tokio::sync::oneshot::Sender<bool>>,
+    connection_id: u64,
+) -> bool {
+    let identity = frame_trace_identity(frame);
+    let encode_started = perf_trace_enabled().then(Instant::now);
+    let Ok(encoded_frames) = encode_server_frame_transaction(frame) else {
+        warn!(
+            connection_id,
+            subscription_id = identity.map(|(subscription_id, ..)| subscription_id),
+            "closing a connection: a frame could not be encoded"
+        );
+        return false;
+    };
+    let encoded_bytes = encoded_frames
+        .iter()
+        .try_fold(0_usize, |total, encoded| total.checked_add(encoded.len()))
+        .unwrap_or(usize::MAX);
+    if let (Some(started), Some((subscription_id, sequence, base_revision, revision))) =
+        (encode_started, identity)
+    {
+        emit_perf_trace(
+            "splinterd",
+            "frame_encode",
+            PerfTraceEvent {
+                base_revision: Some(base_revision),
+                revision: Some(revision),
+                subscription_id: Some(subscription_id),
+                transaction_sequence: Some(sequence),
+                duration_ns: Some(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)),
+                bytes: Some(u64::try_from(encoded_bytes).unwrap_or(u64::MAX)),
+                ..PerfTraceEvent::default()
+            },
+        );
+    }
+    let write_started = perf_trace_enabled().then(Instant::now);
+    let mut complete = true;
+    for encoded in &encoded_frames {
+        let Ok(result) = time::timeout(WRITE_TIMEOUT, writer.write_all(encoded)).await else {
             warn!(
                 connection_id,
                 subscription_id = identity.map(|(subscription_id, ..)| subscription_id),
-                "closing a connection: a frame could not be encoded"
+                timeout_ms = u64::try_from(WRITE_TIMEOUT.as_millis()).unwrap_or(u64::MAX),
+                "closing a connection: its client read nothing while a frame write waited"
             );
-            break;
+            return false;
         };
-        let encoded_bytes = encoded_frames
-            .iter()
-            .try_fold(0_usize, |total, encoded| total.checked_add(encoded.len()))
-            .unwrap_or(usize::MAX);
-        if let (Some(started), Some((subscription_id, sequence, base_revision, revision))) =
-            (encode_started, identity)
-        {
-            emit_perf_trace(
-                "splinterd",
-                "frame_encode",
-                PerfTraceEvent {
-                    base_revision: Some(base_revision),
-                    revision: Some(revision),
-                    subscription_id: Some(subscription_id),
-                    transaction_sequence: Some(sequence),
-                    duration_ns: Some(
-                        u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
-                    ),
-                    bytes: Some(u64::try_from(encoded_bytes).unwrap_or(u64::MAX)),
-                    ..PerfTraceEvent::default()
-                },
-            );
-        }
-        let write_started = perf_trace_enabled().then(Instant::now);
-        let mut complete = true;
-        for encoded in &encoded_frames {
-            let Ok(result) = time::timeout(WRITE_TIMEOUT, writer.write_all(encoded)).await else {
-                warn!(
-                    connection_id,
-                    subscription_id = identity.map(|(subscription_id, ..)| subscription_id),
-                    timeout_ms = u64::try_from(WRITE_TIMEOUT.as_millis()).unwrap_or(u64::MAX),
-                    "closing a connection: its client read nothing while a frame write waited"
-                );
-                return;
-            };
-            complete &= result.is_ok();
-        }
-        if let Some(written) = written {
-            let _ = written.send(complete);
-        }
-        if let (Some(started), Some((subscription_id, sequence, base_revision, revision))) =
-            (write_started, identity)
-        {
-            emit_perf_trace(
-                "splinterd",
-                "socket_write",
-                PerfTraceEvent {
-                    base_revision: Some(base_revision),
-                    revision: Some(revision),
-                    subscription_id: Some(subscription_id),
-                    transaction_sequence: Some(sequence),
-                    duration_ns: Some(
-                        u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
-                    ),
-                    bytes: Some(u64::try_from(encoded_bytes).unwrap_or(u64::MAX)),
-                    ..PerfTraceEvent::default()
-                },
-            );
-        }
+        complete &= result.is_ok();
     }
+    if let Some(written) = written {
+        let _ = written.send(complete);
+    }
+    if let (Some(started), Some((subscription_id, sequence, base_revision, revision))) =
+        (write_started, identity)
+    {
+        emit_perf_trace(
+            "splinterd",
+            "socket_write",
+            PerfTraceEvent {
+                base_revision: Some(base_revision),
+                revision: Some(revision),
+                subscription_id: Some(subscription_id),
+                transaction_sequence: Some(sequence),
+                duration_ns: Some(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)),
+                bytes: Some(u64::try_from(encoded_bytes).unwrap_or(u64::MAX)),
+                ..PerfTraceEvent::default()
+            },
+        );
+    }
+    true
 }
 
 /// Writes one handoff prepare frame with its two descriptors (the Plan 0061
@@ -26897,6 +26964,52 @@ mod tests {
             .expect("the frame is written while a larger one waits for memory");
         assert!(is_snapshot_titled(&frame, "live"), "{frame:?}");
         drop(stopped);
+    }
+
+    /// While a connection's terminal frame waits for memory, its control
+    /// frames are still written, and the terminal frame follows once its
+    /// memory is free.
+    #[tokio::test]
+    async fn control_frames_are_written_while_a_terminal_frame_waits_for_memory() {
+        let memory = Arc::new(TerminalTransactionMemory::new(
+            TERMINAL_TRANSACTION_DAEMON_MEMORY_BYTES,
+        ));
+        let everything = memory
+            .acquire(TERMINAL_TRANSACTION_DAEMON_MEMORY_BYTES)
+            .await;
+        let (mut client, outbound, control, _writer) = spawn_test_writer(&memory, 1);
+        outbound
+            .send(titled_snapshot_event("waiting".to_owned()).into())
+            .await
+            .unwrap();
+        wait_until_writer_took(&outbound).await;
+
+        control
+            .send(ControlFrame::Frame(ServerFrame::Response {
+                request_id: 7,
+                result: Response::Pong,
+            }))
+            .await
+            .unwrap();
+        let frame = time::timeout(Duration::from_secs(2), read_test_server_frame(&mut client))
+            .await
+            .expect("the control frame is written while the terminal frame waits");
+        assert!(
+            matches!(
+                frame,
+                ServerFrame::Response {
+                    request_id: 7,
+                    result: Response::Pong,
+                }
+            ),
+            "{frame:?}"
+        );
+
+        drop(everything);
+        let frame = time::timeout(Duration::from_secs(2), read_test_server_frame(&mut client))
+            .await
+            .expect("the terminal frame is written once its memory is free");
+        assert!(is_snapshot_titled(&frame, "waiting"), "{frame:?}");
     }
 
     #[tokio::test]
