@@ -71,6 +71,27 @@ impl TerminalPublicationMemoryLease {
         )
         .then(|| Self { bytes })
     }
+
+    /// Lowers the lease to `bytes` and returns the difference to the
+    /// daemon's publication ceiling at once. The lease never grows: an amount
+    /// at or above its current size leaves it unchanged.
+    pub fn shrink_to(&mut self, bytes: usize) {
+        let Ok(bytes) = u64::try_from(bytes) else {
+            return;
+        };
+        if bytes < self.bytes {
+            DAEMON_TERMINAL_PUBLICATION_BYTES_CURRENT
+                .fetch_sub(self.bytes - bytes, Ordering::AcqRel);
+            self.bytes = bytes;
+        }
+    }
+
+    /// The bytes this lease holds.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
 }
 
 impl Drop for TerminalPublicationMemoryLease {
@@ -2329,6 +2350,11 @@ impl CompactSubscription {
     /// caller can publish final state before exit. If exact revision continuity
     /// cannot be proven, resnapshot is required instead of pairing mismatched
     /// state.
+    ///
+    /// Once polled, the returned future must be polled to completion, not
+    /// dropped: it may already have taken the subscription's wake, and the
+    /// producer queues a new wake only into an empty mailbox, so later updates
+    /// would then arrive without one.
     pub async fn recv_coalesced(&mut self) -> (SubscriptionReceive, Option<ProcessExit>) {
         let (received, trailing_exit, _admission) =
             self.recv_coalesced_with_publication_admission(0).await;
@@ -2337,7 +2363,13 @@ impl CompactSubscription {
 
     /// Receives and materializes one coalesced event while holding a conservative
     /// process-wide publication reservation acquired only after an update wake.
-    /// The returned lease must remain alive through wire encoding and delivery.
+    /// The lease is returned only with an update, and must remain alive
+    /// through wire encoding and delivery.
+    ///
+    /// Once polled, the returned future must be polled to completion, not
+    /// dropped: it may already have taken the subscription's wake while it
+    /// waits for the producer's batch, and the producer queues a new wake only
+    /// into an empty mailbox, so later updates would then arrive without one.
     pub async fn recv_coalesced_with_publication_admission(
         &mut self,
         publication_bytes: usize,
@@ -2390,6 +2422,13 @@ impl CompactSubscription {
             return (SubscriptionReceive::ResnapshotRequired, None, None);
         }
         let (received, trailing_exit) = self.coalesce_queued(&first);
+        // Only an update is published, so nothing else keeps the admission.
+        let publication_admission = publication_admission.filter(|_| {
+            matches!(
+                received,
+                SubscriptionReceive::Event(LiveEvent::Update { .. })
+            )
+        });
         (received, trailing_exit, publication_admission)
     }
 
@@ -9540,6 +9579,44 @@ mod tests {
         ));
         assert!(CompactMaterializationState::from_snapshot(denied_snapshot, 0, &denied).is_none());
         assert_eq!(denied.local_semantic_bytes.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn a_publication_lease_shrinks_once_and_never_grows() {
+        const ISOLATED_ENV: &str = "SPLINTERM_TEST_ISOLATED_PUBLICATION_SHRINK";
+        if std::env::var_os(ISOLATED_ENV).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "live::tests::a_publication_lease_shrinks_once_and_never_grows",
+                    "--test-threads=1",
+                ])
+                .env(ISOLATED_ENV, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "isolated publication-shrink test failed:\nstdout:\n{stdout}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+
+        // This child process runs only this test, so the process-wide counter
+        // holds exactly what its lease holds.
+        let counter = || DAEMON_TERMINAL_PUBLICATION_BYTES_CURRENT.load(Ordering::Acquire);
+        assert_eq!(counter(), 0);
+        let mut lease = TerminalPublicationMemoryLease::try_new(1024).unwrap();
+        assert_eq!((lease.bytes(), counter()), (1024, 1024));
+        lease.shrink_to(256);
+        assert_eq!((lease.bytes(), counter()), (256, 256));
+        lease.shrink_to(256);
+        assert_eq!((lease.bytes(), counter()), (256, 256));
+        lease.shrink_to(4096);
+        assert_eq!((lease.bytes(), counter()), (256, 256));
+        drop(lease);
+        assert_eq!(counter(), 0);
     }
 
     #[tokio::test]

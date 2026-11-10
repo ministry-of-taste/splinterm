@@ -1136,6 +1136,18 @@ struct TerminalPublicationReservation {
     _semantic: TerminalPublicationMemoryLease,
 }
 
+#[cfg(test)]
+impl TerminalPublicationReservation {
+    /// The process-wide publication bytes this reservation holds.
+    #[allow(
+        clippy::used_underscore_binding,
+        reason = "the lease is held only for its drop outside tests"
+    )]
+    fn semantic_bytes(&self) -> u64 {
+        self._semantic.bytes()
+    }
+}
+
 struct QueuedServerFrame {
     frame: ServerFrame,
     terminal_publication: Option<TerminalPublicationReservation>,
@@ -15832,7 +15844,7 @@ fn spawn_control_subscription(
                                     .await;
                                 break;
                             }
-                            RevocationDecision::Terminate => break,
+                            RevocationDecision::Lagged | RevocationDecision::Closed => break,
                         }
                     }
                 };
@@ -16095,6 +16107,33 @@ fn log_subscription_resync(
     }
 }
 
+/// Logs why a terminal subscription ends, as [`log_subscription_resync`]
+/// does, and tells its client with `ResyncRequired` at `sequence`, the
+/// subscription's next unused one. The client then attaches again, and that
+/// attach is authorized afresh.
+async fn send_subscription_resync(
+    outputs: &SubscriptionOutputs,
+    subscription_id: u64,
+    sequence: u64,
+    handle: &LiveSplintHandle,
+    scrollback_rows: usize,
+    reason: &str,
+    limit: bool,
+) {
+    log_subscription_resync(outputs, subscription_id, handle.splint_id, reason, limit);
+    let revision = current_revision(handle, scrollback_rows).await;
+    let _ = outputs
+        .control
+        .send(ControlFrame::Frame(ServerFrame::Event {
+            subscription_id,
+            sequence,
+            event: SubscriptionEvent::ResyncRequired {
+                current_revision: revision,
+            },
+        }))
+        .await;
+}
+
 struct SubscriptionAudit {
     state: Arc<DaemonState>,
     peer: Option<splinterm_protocol::AuditPeer>,
@@ -16138,6 +16177,8 @@ enum FramePacingOutcome {
     Ready,
     Revoke(u64),
     Expire(u64),
+    /// Revocations were missed; see [`RevocationDecision::Lagged`].
+    Lagged,
     Terminate,
 }
 
@@ -16145,7 +16186,11 @@ enum FramePacingOutcome {
 enum RevocationDecision {
     Continue,
     Revoke(u64),
-    Terminate,
+    /// Revocations were missed, so this subscription's own grant may have
+    /// been revoked; it must end.
+    Lagged,
+    /// The daemon dropped its revocation stream; it is going away.
+    Closed,
 }
 
 fn classify_revocation(
@@ -16157,8 +16202,48 @@ fn classify_revocation(
             RevocationDecision::Revoke(revocation.grant_id)
         }
         Ok(_) => RevocationDecision::Continue,
-        Err(broadcast::error::RecvError::Lagged(_) | broadcast::error::RecvError::Closed) => {
-            RevocationDecision::Terminate
+        Err(broadcast::error::RecvError::Lagged(_)) => RevocationDecision::Lagged,
+        Err(broadcast::error::RecvError::Closed) => RevocationDecision::Closed,
+    }
+}
+
+/// What ended a terminal subscription's wait for its next event.
+#[derive(Debug, Eq, PartialEq)]
+enum SubscriptionWait<T> {
+    Received(T),
+    Revoked(u64),
+    RevocationsLagged,
+    RevocationsClosed,
+    Expired,
+}
+
+/// Polls `receive` to completion while hearing the subscription's
+/// revocations and its grant's expiry. A revocation of another grant keeps
+/// polling the same `receive`, never a new one, so an event it has already
+/// taken from the subscription is never lost. Revocations are heard only for
+/// a subscription with a grant, and the expiry only when `expires`.
+async fn wait_subscription_event<F: Future>(
+    receive: F,
+    revocations: &mut broadcast::Receiver<Revocation>,
+    grant_id: Option<u64>,
+    expires: bool,
+    mut expiry: Pin<&mut time::Sleep>,
+) -> SubscriptionWait<F::Output> {
+    tokio::pin!(receive);
+    loop {
+        tokio::select! {
+            value = &mut receive => return SubscriptionWait::Received(value),
+            revoked = revocations.recv(), if grant_id.is_some() => {
+                match classify_revocation(&revoked, grant_id) {
+                    RevocationDecision::Continue => {}
+                    RevocationDecision::Revoke(grant_id) => {
+                        return SubscriptionWait::Revoked(grant_id);
+                    }
+                    RevocationDecision::Lagged => return SubscriptionWait::RevocationsLagged,
+                    RevocationDecision::Closed => return SubscriptionWait::RevocationsClosed,
+                }
+            }
+            () = expiry.as_mut(), if expires => return SubscriptionWait::Expired,
         }
     }
 }
@@ -16180,7 +16265,8 @@ async fn wait_terminal_subscription_frame(
                     RevocationDecision::Revoke(grant_id) => {
                         return FramePacingOutcome::Revoke(grant_id);
                     }
-                    RevocationDecision::Terminate => return FramePacingOutcome::Terminate,
+                    RevocationDecision::Lagged => return FramePacingOutcome::Lagged,
+                    RevocationDecision::Closed => return FramePacingOutcome::Terminate,
                 }
             }
             () = expiry.as_mut(), if expires => {
@@ -16277,21 +16363,35 @@ fn spawn_subscription(
         tokio::pin!(expiry);
         let subscriber_publication_memory = Arc::new(Semaphore::new(1));
         'subscription: loop {
-            let (received, trailing_exit, publication_admission) = tokio::select! {
-                value = subscription.recv_coalesced_with_publication_admission(
-                    TERMINAL_PUBLICATION_BYTES,
-                ) => value,
-                revoked = revocations.recv(), if access.grant_id.is_some() => {
-                    match classify_revocation(&revoked, access.grant_id) {
-                        RevocationDecision::Revoke(grant_id) => {
-                            send_access_revoked(&outputs.control, id, sequence, grant_id).await;
-                            break;
-                        }
-                        RevocationDecision::Continue => continue,
-                        RevocationDecision::Terminate => break,
-                    }
+            let (received, trailing_exit, publication_admission) = match wait_subscription_event(
+                subscription.recv_coalesced_with_publication_admission(TERMINAL_PUBLICATION_BYTES),
+                &mut revocations,
+                access.grant_id,
+                access.expires_in.is_some(),
+                expiry.as_mut(),
+            )
+            .await
+            {
+                SubscriptionWait::Received(value) => value,
+                SubscriptionWait::Revoked(grant_id) => {
+                    send_access_revoked(&outputs.control, id, sequence, grant_id).await;
+                    break;
                 }
-                () = &mut expiry, if access.expires_in.is_some() => {
+                SubscriptionWait::RevocationsLagged => {
+                    send_subscription_resync(
+                        &outputs,
+                        id,
+                        sequence,
+                        &handle,
+                        access.scrollback_rows,
+                        "the revocation stream lagged",
+                        true,
+                    )
+                    .await;
+                    break;
+                }
+                SubscriptionWait::RevocationsClosed => break,
+                SubscriptionWait::Expired => {
                     if let Some(grant_id) = access.grant_id {
                         send_access_revoked(&outputs.control, id, sequence, grant_id).await;
                         record_subscription_expiry(&audit, &handle).await;
@@ -16301,24 +16401,16 @@ fn spawn_subscription(
             };
             match received {
                 SubscriptionReceive::ResnapshotRequired => {
-                    log_subscription_resync(
+                    send_subscription_resync(
                         &outputs,
                         id,
-                        handle.splint_id,
+                        sequence,
+                        &handle,
+                        access.scrollback_rows,
                         "the subscriber fell behind the terminal's updates",
                         false,
-                    );
-                    let revision = current_revision(&handle, access.scrollback_rows).await;
-                    let _ = outputs
-                        .control
-                        .send(ControlFrame::Frame(ServerFrame::Event {
-                            subscription_id: id,
-                            sequence,
-                            event: SubscriptionEvent::ResyncRequired {
-                                current_revision: revision,
-                            },
-                        }))
-                        .await;
+                    )
+                    .await;
                     break;
                 }
                 SubscriptionReceive::Event(LiveEvent::Exited { status, .. }) => {
@@ -16381,36 +16473,35 @@ fn spawn_subscription(
                             event,
                         };
                         if !frame_within_policy_limit(&frame, access.maximum_returned_bytes) {
-                            log_subscription_resync(
+                            // A slow client must not pin the admission while it is told.
+                            drop(publication_admission);
+                            send_subscription_resync(
                                 &outputs,
                                 id,
-                                handle.splint_id,
+                                sequence,
+                                &handle,
+                                access.scrollback_rows,
                                 "an update exceeds the grant's returned-bytes limit",
                                 true,
-                            );
-                            let revision = current_revision(&handle, access.scrollback_rows).await;
-                            let _ = outputs
-                                .control
-                                .send(ControlFrame::Frame(ServerFrame::Event {
-                                    subscription_id: id,
-                                    sequence,
-                                    event: SubscriptionEvent::ResyncRequired {
-                                        current_revision: revision,
-                                    },
-                                }))
-                                .await;
+                            )
+                            .await;
                             break;
                         }
                         let publication_bytes = match serde_json::to_vec(&frame) {
                             Ok(encoded) => encoded.len().saturating_add(4),
                             Err(error) => {
-                                warn!(
-                                    connection_id = outputs.connection_id,
-                                    subscription_id = id,
-                                    splint_id = %handle.splint_id,
-                                    %error,
-                                    "ending a terminal subscription: an update could not be encoded"
-                                );
+                                // A slow client must not pin the admission while it is told.
+                                drop(publication_admission);
+                                send_subscription_resync(
+                                    &outputs,
+                                    id,
+                                    sequence,
+                                    &handle,
+                                    access.scrollback_rows,
+                                    &format!("an update could not be encoded: {error}"),
+                                    true,
+                                )
+                                .await;
                                 break;
                             }
                         };
@@ -16423,24 +16514,16 @@ fn spawn_subscription(
                         )
                         .await
                         else {
-                            log_subscription_resync(
+                            send_subscription_resync(
                                 &outputs,
                                 id,
-                                handle.splint_id,
+                                sequence,
+                                &handle,
+                                access.scrollback_rows,
                                 "terminal publication memory is exhausted",
                                 true,
-                            );
-                            let revision = current_revision(&handle, access.scrollback_rows).await;
-                            let _ = outputs
-                                .control
-                                .send(ControlFrame::Frame(ServerFrame::Event {
-                                    subscription_id: id,
-                                    sequence,
-                                    event: SubscriptionEvent::ResyncRequired {
-                                        current_revision: revision,
-                                    },
-                                }))
-                                .await;
+                            )
+                            .await;
                             break;
                         };
                         let queued = QueuedServerFrame {
@@ -16460,24 +16543,16 @@ fn spawn_subscription(
                             break;
                         }
                         if outputs.outbound.try_send(queued).is_err() {
-                            log_subscription_resync(
+                            send_subscription_resync(
                                 &outputs,
                                 id,
-                                handle.splint_id,
+                                sequence,
+                                &handle,
+                                access.scrollback_rows,
                                 "the connection's outbound queue is full or closed",
                                 false,
-                            );
-                            let revision = current_revision(&handle, access.scrollback_rows).await;
-                            let _ = outputs
-                                .control
-                                .send(ControlFrame::Frame(ServerFrame::Event {
-                                    subscription_id: id,
-                                    sequence,
-                                    event: SubscriptionEvent::ResyncRequired {
-                                        current_revision: revision,
-                                    },
-                                }))
-                                .await;
+                            )
+                            .await;
                             break;
                         }
                         sequence += 1;
@@ -16499,11 +16574,36 @@ fn spawn_subscription(
                                 record_subscription_expiry(&audit, &handle).await;
                                 break 'subscription;
                             }
+                            FramePacingOutcome::Lagged => {
+                                send_subscription_resync(
+                                    &outputs,
+                                    id,
+                                    sequence,
+                                    &handle,
+                                    access.scrollback_rows,
+                                    "the revocation stream lagged",
+                                    true,
+                                )
+                                .await;
+                                break 'subscription;
+                            }
                             FramePacingOutcome::Terminate => break 'subscription,
                         }
                     }
                 }
-                SubscriptionReceive::Closed => break,
+                SubscriptionReceive::Closed => {
+                    send_subscription_resync(
+                        &outputs,
+                        id,
+                        sequence,
+                        &handle,
+                        access.scrollback_rows,
+                        "the terminal's event stream closed without an exit",
+                        true,
+                    )
+                    .await;
+                    break;
+                }
             }
         }
     })
@@ -16520,8 +16620,13 @@ async fn try_reserve_terminal_publication(
         return None;
     }
     let permits = u32::try_from(publication_bytes).ok()?;
+    // The wake-time admission is sized for the largest update; once the
+    // frame's size is known, only that much stays held until it is written.
     let semantic = match publication_admission {
-        Some(admission) => admission,
+        Some(mut admission) => {
+            admission.shrink_to(publication_bytes);
+            admission
+        }
         None => TerminalPublicationMemoryLease::try_new(publication_bytes)?,
     };
     let subscriber = match subscriber {
@@ -18408,6 +18513,13 @@ mod tests {
 
         assert_eq!(
             wait_terminal_subscription_frame(&mut receiver, Some(7), true, expiry.as_mut()).await,
+            FramePacingOutcome::Lagged
+        );
+
+        // A closed revocation stream means the daemon is going away.
+        drop(revocations);
+        assert_eq!(
+            wait_terminal_subscription_frame(&mut receiver, Some(7), true, expiry.as_mut()).await,
             FramePacingOutcome::Terminate
         );
     }
@@ -18424,11 +18536,137 @@ mod tests {
         );
         assert_eq!(
             classify_revocation(&Err(broadcast::error::RecvError::Lagged(1)), Some(7)),
-            RevocationDecision::Terminate
+            RevocationDecision::Lagged
         );
         assert_eq!(
             classify_revocation(&Err(broadcast::error::RecvError::Closed), Some(7)),
-            RevocationDecision::Terminate
+            RevocationDecision::Closed
+        );
+    }
+
+    /// Sets its flag when dropped while still armed.
+    struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// A revocation of another grant arrives while the receive is under way;
+    /// the same receive is polled on and its event is delivered, never
+    /// dropped half-done.
+    #[tokio::test(start_paused = true)]
+    async fn a_foreign_revocation_keeps_polling_the_same_subscription_receive() {
+        let (revocations, mut receiver) = broadcast::channel(4);
+        let (release, released) = tokio::sync::oneshot::channel::<u8>();
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dropped_early = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let receive = {
+            let started = Arc::clone(&started);
+            let guard = DropFlag(Arc::clone(&dropped_early));
+            async move {
+                started.store(true, Ordering::SeqCst);
+                let value = released.await.unwrap();
+                std::mem::forget(guard);
+                value
+            }
+        };
+        let expiry = time::sleep(Duration::from_secs(1));
+        tokio::pin!(expiry);
+        let driver = async {
+            tokio::task::yield_now().await;
+            assert!(started.load(Ordering::SeqCst));
+            revocations.send(Revocation { grant_id: 8 }).unwrap();
+            // Two turns let the wait hear the revocation before the receive
+            // can finish, whichever of the two is polled first.
+            tokio::task::yield_now().await;
+            tokio::task::yield_now().await;
+            // Fails only when the receive was dropped; asserted below.
+            let _ = release.send(42);
+        };
+        let (outcome, ()) = tokio::join!(
+            wait_subscription_event(receive, &mut receiver, Some(7), true, expiry.as_mut()),
+            driver,
+        );
+        assert!(
+            !dropped_early.load(Ordering::SeqCst),
+            "the receive was dropped before it finished"
+        );
+        assert_eq!(outcome, SubscriptionWait::Received(42));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_subscription_wait_ends_on_its_revoke_lag_close_and_expiry() {
+        let expiry = time::sleep(Duration::from_secs(1));
+        tokio::pin!(expiry);
+        let (revocations, mut receiver) = broadcast::channel(4);
+        revocations.send(Revocation { grant_id: 7 }).unwrap();
+        // A Window's subscription has no grant and hears no revocations.
+        assert_eq!(
+            wait_subscription_event(
+                std::future::ready(5),
+                &mut receiver,
+                None,
+                false,
+                expiry.as_mut()
+            )
+            .await,
+            SubscriptionWait::Received(5)
+        );
+        assert_eq!(
+            wait_subscription_event(
+                std::future::pending::<()>(),
+                &mut receiver,
+                Some(7),
+                true,
+                expiry.as_mut(),
+            )
+            .await,
+            SubscriptionWait::Revoked(7)
+        );
+        assert_eq!(
+            wait_subscription_event(
+                std::future::pending::<()>(),
+                &mut receiver,
+                Some(7),
+                true,
+                expiry.as_mut(),
+            )
+            .await,
+            SubscriptionWait::Expired
+        );
+
+        drop(revocations);
+        assert_eq!(
+            wait_subscription_event(
+                std::future::pending::<()>(),
+                &mut receiver,
+                Some(7),
+                false,
+                expiry.as_mut(),
+            )
+            .await,
+            SubscriptionWait::RevocationsClosed
+        );
+
+        let (revocations, mut receiver) = broadcast::channel(1);
+        revocations.send(Revocation { grant_id: 1 }).unwrap();
+        revocations.send(Revocation { grant_id: 2 }).unwrap();
+        assert_eq!(
+            wait_subscription_event(
+                std::future::pending::<()>(),
+                &mut receiver,
+                Some(7),
+                false,
+                expiry.as_mut(),
+            )
+            .await,
+            SubscriptionWait::RevocationsLagged
         );
     }
 
@@ -27016,8 +27254,39 @@ mod tests {
         assert!(is_snapshot_titled(&frame, "waiting"), "{frame:?}");
     }
 
+    /// Runs the test named `test` alone in a child process of this test
+    /// binary and checks that it passed there. Returns whether the caller is
+    /// that child, which then runs the test's body with the process-wide
+    /// terminal publication counter entirely its own.
+    fn in_isolated_publication_process(test: &str) -> bool {
+        const ISOLATED_ENV: &str = "SPLINTERM_TEST_ISOLATED_PUBLICATION";
+        if std::env::var_os(ISOLATED_ENV).is_some() {
+            return true;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &format!("tests::{test}"), "--test-threads=1"])
+            .env(ISOLATED_ENV, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "isolated test {test} failed:\nstdout:\n{stdout}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        false
+    }
+
+    /// Runs alone: it fills the process-wide publication ceiling, which any
+    /// parallel test holding publication bytes would make unreachable, and
+    /// which would in turn starve those tests.
     #[tokio::test]
     async fn terminal_publication_admission_is_single_slot_per_subscriber_and_bounded_globally() {
+        if !in_isolated_publication_process(
+            "terminal_publication_admission_is_single_slot_per_subscriber_and_bounded_globally",
+        ) {
+            return;
+        }
         let state = test_state(true);
         let splint_id = SplintId::new();
         let first_subscriber = Arc::new(Semaphore::new(1));
@@ -27101,6 +27370,40 @@ mod tests {
         assert_eq!(
             state.terminal_publication_memory.available_permits(),
             TERMINAL_PUBLICATION_DAEMON_BYTES
+        );
+    }
+
+    /// The wake-time admission is sized for the largest update; a queued
+    /// update keeps only its own frame's bytes of it until it is written.
+    /// Runs alone, so it can measure the whole ceiling.
+    #[tokio::test]
+    async fn a_queued_update_holds_only_its_own_bytes_of_the_wake_admission() {
+        if !in_isolated_publication_process(
+            "a_queued_update_holds_only_its_own_bytes_of_the_wake_admission",
+        ) {
+            return;
+        }
+        let state = test_state(true);
+        let subscriber = Arc::new(Semaphore::new(1));
+        let admission =
+            TerminalPublicationMemoryLease::try_new(TERMINAL_PUBLICATION_BYTES).unwrap();
+        let reservation = try_reserve_terminal_publication(
+            &state,
+            SplintId::new(),
+            Some(&subscriber),
+            4096,
+            Some(admission),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reservation.semantic_bytes(), 4096);
+        let rest =
+            TerminalPublicationMemoryLease::try_new(TERMINAL_PUBLICATION_DAEMON_BYTES - 4096)
+                .unwrap();
+        assert!(TerminalPublicationMemoryLease::try_new(1).is_none());
+        drop((rest, reservation));
+        assert!(
+            TerminalPublicationMemoryLease::try_new(TERMINAL_PUBLICATION_DAEMON_BYTES).is_some()
         );
     }
 
@@ -29348,6 +29651,243 @@ mod tests {
             limit.contains("WARN") && limit.contains("subscription_id=2"),
             "{limit}"
         );
+    }
+
+    /// A transient Splint whose program prints nothing, attached through the
+    /// compact path as a Window attaches, for driving [`spawn_subscription`].
+    async fn quiet_attached_splint(
+        state: &Arc<DaemonState>,
+        connection_id: u64,
+    ) -> (LiveSplintHandle, SubscriptionAccess, CompactSubscription) {
+        let Response::LairCreated { lair, .. } = trusted_request(
+            state,
+            connection_id,
+            Request::CreateTransientLair {
+                expected_topology_revision: TopologyRevision::default(),
+                name: "quiet".into(),
+                launch: test_launch(&["/bin/sh", "-c", "while :; do sleep 1; done"]),
+                generated_name: false,
+            },
+        )
+        .await
+        .unwrap() else {
+            panic!("create")
+        };
+        let splint_id = lair.dojos[0].default_focus;
+        let handle = state.runtimes.lock().await.handle(splint_id).unwrap();
+        let (snapshot, stream) = handle.attach_compact_with_scrollback(0).await.unwrap();
+        let access = SubscriptionAccess {
+            grant_id: None,
+            expires_in: None,
+            maximum_returned_bytes: None,
+            scrollback_rows: 0,
+            include_images: false,
+            history: history_state(&snapshot),
+            visible_rows: snapshot.visible_rows.clone(),
+        };
+        (handle, access, stream)
+    }
+
+    async fn expect_subscription_resync(
+        control: &mut mpsc::Receiver<ControlFrame>,
+        subscription_id: u64,
+        sequence: u64,
+    ) -> u64 {
+        let frame = time::timeout(Duration::from_secs(5), control.recv())
+            .await
+            .expect("the subscription tells its client to resynchronize")
+            .expect("the subscription ended without telling its client");
+        let ControlFrame::Frame(ServerFrame::Event {
+            subscription_id: received_id,
+            sequence: received_sequence,
+            event: SubscriptionEvent::ResyncRequired { current_revision },
+        }) = frame
+        else {
+            panic!("expected ResyncRequired");
+        };
+        assert_eq!(
+            (received_id, received_sequence),
+            (subscription_id, sequence)
+        );
+        current_revision
+    }
+
+    /// A Splint's event stream that closes without an exit, as it does when
+    /// the Splint's actor ends with an error, ends the subscription with
+    /// `ResyncRequired`, so its client attaches again instead of watching a
+    /// pane that never changes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_terminal_stream_closed_without_an_exit_asks_its_client_to_attach_again() {
+        let state = test_state_with_backend(false, test_pty_backend());
+        let (handle, access, stream) = quiet_attached_splint(&state, 41).await;
+        let (outbound, mut outbound_rx) = mpsc::channel(OUTBOUND_QUEUE);
+        let (control, mut control_rx) = mpsc::channel(CONTROL_QUEUE);
+        let task = spawn_subscription(
+            5,
+            stream,
+            handle.clone(),
+            SubscriptionOutputs {
+                outbound,
+                control,
+                connection_id: 41,
+            },
+            state.revocations.subscribe(),
+            access,
+            SubscriptionAudit {
+                state: Arc::clone(&state),
+                peer: None,
+            },
+        );
+        // Handing the PTY off ends the actor without publishing an exit, as
+        // an actor that ends with an error does. A real handoff never reaches
+        // a client this way: `serve` stops every connection before it.
+        let handed_off = handle
+            .prepare_pty_handoff()
+            .await
+            .unwrap()
+            .into_handed_off();
+        // The actor is gone, so no revision can be read.
+        assert_eq!(expect_subscription_resync(&mut control_rx, 5, 1).await, 0);
+        time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the subscription ends")
+            .unwrap();
+        assert!(outbound_rx.try_recv().is_err());
+        drop(handed_off);
+        cleanup_connection(&state, 41).await;
+    }
+
+    /// An agent's subscription that missed revocations cannot know whether
+    /// its own grant was revoked, so it ends, and tells its client to attach
+    /// again; that attach is authorized afresh.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lagged_revocation_stream_asks_its_client_to_attach_again() {
+        let state = test_state_with_backend(false, test_pty_backend());
+        let (handle, mut access, stream) = quiet_attached_splint(&state, 42).await;
+        access.grant_id = Some(77);
+        let (revocations, lagged) = broadcast::channel(1);
+        revocations.send(Revocation { grant_id: 1 }).unwrap();
+        revocations.send(Revocation { grant_id: 2 }).unwrap();
+        let (outbound, mut outbound_rx) = mpsc::channel(OUTBOUND_QUEUE);
+        let (control, mut control_rx) = mpsc::channel(CONTROL_QUEUE);
+        let task = spawn_subscription(
+            6,
+            stream,
+            handle.clone(),
+            SubscriptionOutputs {
+                outbound,
+                control,
+                connection_id: 42,
+            },
+            lagged,
+            access,
+            SubscriptionAudit {
+                state: Arc::clone(&state),
+                peer: None,
+            },
+        );
+        time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the subscription ends")
+            .unwrap();
+        // The subscription's wait is unbiased, so an update the Splint
+        // published before its first poll may be sent before the lag is
+        // heard. The lag is heard at the very next wait, so at most one is.
+        let mut next_sequence = 1;
+        while let Ok(queued) = outbound_rx.try_recv() {
+            let ServerFrame::Event {
+                subscription_id: 6,
+                sequence,
+                event: SubscriptionEvent::Snapshot { .. } | SubscriptionEvent::Update { .. },
+            } = queued.frame
+            else {
+                panic!("expected an update: {:?}", queued.frame);
+            };
+            assert_eq!(sequence, next_sequence);
+            next_sequence += 1;
+        }
+        assert!(next_sequence <= 2, "the lag ends the subscription at once");
+        let revision = expect_subscription_resync(&mut control_rx, 6, next_sequence).await;
+        assert_eq!(revision, current_revision(&handle, 0).await);
+        cleanup_connection(&state, 42).await;
+    }
+
+    /// A subscription that a limit ends drops its wake-time publication
+    /// admission before it tells its client, so slow clients that are each
+    /// still to be told cannot pin the daemon's publication memory. Runs
+    /// alone, so it can measure the whole ceiling and hear the task's logs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_subscription_told_to_attach_again_holds_no_publication_memory() {
+        if !in_isolated_publication_process(
+            "a_subscription_told_to_attach_again_holds_no_publication_memory",
+        ) {
+            return;
+        }
+        let logs = CapturedLogs::default();
+        let sink = logs.clone();
+        tracing::subscriber::set_global_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || sink.clone())
+                .finish(),
+        )
+        .unwrap();
+        let state = test_state_with_backend(false, test_pty_backend());
+        let (handle, mut access, stream) = quiet_attached_splint(&state, 43).await;
+        // Every update exceeds the grant's returned-bytes limit.
+        access.maximum_returned_bytes = Some(1);
+        let (outbound, _outbound_rx) = mpsc::channel(OUTBOUND_QUEUE);
+        // The client reads nothing, so `ResyncRequired` waits behind this.
+        let (control, mut control_rx) = mpsc::channel(1);
+        control
+            .try_send(ControlFrame::Frame(ServerFrame::Event {
+                subscription_id: 0,
+                sequence: 0,
+                event: SubscriptionEvent::ResyncRequired {
+                    current_revision: 0,
+                },
+            }))
+            .unwrap();
+        let task = spawn_subscription(
+            7,
+            stream,
+            handle.clone(),
+            SubscriptionOutputs {
+                outbound,
+                control,
+                connection_id: 43,
+            },
+            state.revocations.subscribe(),
+            access,
+            SubscriptionAudit {
+                state: Arc::clone(&state),
+                peer: None,
+            },
+        );
+        // The terminal echoes the input, which publishes an update.
+        handle.input(b"x".to_vec()).await.unwrap();
+        time::timeout(Duration::from_secs(5), async {
+            while !logs.text().contains("returned-bytes limit") {
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the limit ends the subscription");
+        // Only the few bytes retained for the Splint's queue are still held,
+        // far less than the update's wake-time admission.
+        assert!(
+            TerminalPublicationMemoryLease::try_new(
+                TERMINAL_PUBLICATION_DAEMON_BYTES - TERMINAL_PUBLICATION_BYTES + 1
+            )
+            .is_some()
+        );
+        control_rx.recv().await.unwrap();
+        expect_subscription_resync(&mut control_rx, 7, 1).await;
+        time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the subscription ends")
+            .unwrap();
+        cleanup_connection(&state, 43).await;
     }
 
     #[tokio::test]
