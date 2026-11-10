@@ -26783,8 +26783,39 @@ mod tests {
         );
     }
 
+    /// Runs the test named `test` alone in a child process of this test
+    /// binary and checks that it passed there. Returns whether the caller is
+    /// that child, which then runs the test's body with the process-wide
+    /// terminal publication counter entirely its own.
+    fn in_isolated_publication_process(test: &str) -> bool {
+        const ISOLATED_ENV: &str = "SPLINTERM_TEST_ISOLATED_PUBLICATION";
+        if std::env::var_os(ISOLATED_ENV).is_some() {
+            return true;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &format!("tests::{test}"), "--test-threads=1"])
+            .env(ISOLATED_ENV, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "isolated test {test} failed:\nstdout:\n{stdout}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        false
+    }
+
+    /// Runs alone: it fills the process-wide publication ceiling, which any
+    /// parallel test holding publication bytes would make unreachable, and
+    /// which would in turn starve those tests.
     #[tokio::test]
     async fn terminal_publication_admission_is_single_slot_per_subscriber_and_bounded_globally() {
+        if !in_isolated_publication_process(
+            "terminal_publication_admission_is_single_slot_per_subscriber_and_bounded_globally",
+        ) {
+            return;
+        }
         let state = test_state(true);
         let splint_id = SplintId::new();
         let first_subscriber = Arc::new(Semaphore::new(1));
@@ -26873,31 +26904,14 @@ mod tests {
 
     /// The wake-time admission is sized for the largest update; a queued
     /// update keeps only its own frame's bytes of it until it is written.
+    /// Runs alone, so it can measure the whole ceiling.
     #[tokio::test]
     async fn a_queued_update_holds_only_its_own_bytes_of_the_wake_admission() {
-        const ISOLATED_ENV: &str = "SPLINTERM_TEST_ISOLATED_PUBLICATION_RESERVATION";
-        if std::env::var_os(ISOLATED_ENV).is_none() {
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "tests::a_queued_update_holds_only_its_own_bytes_of_the_wake_admission",
-                    "--test-threads=1",
-                ])
-                .env(ISOLATED_ENV, "1")
-                .output()
-                .unwrap();
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            assert!(
-                output.status.success() && stdout.contains("1 passed"),
-                "isolated publication-reservation test failed:\nstdout:\n{stdout}\nstderr:\n{}",
-                String::from_utf8_lossy(&output.stderr),
-            );
+        if !in_isolated_publication_process(
+            "a_queued_update_holds_only_its_own_bytes_of_the_wake_admission",
+        ) {
             return;
         }
-
-        // This child process runs only this test, so its whole-update
-        // admission cannot crowd the parallel tests that fill the
-        // process-wide ceiling, and that ceiling is entirely its own.
         let state = test_state(true);
         let subscriber = Arc::new(Semaphore::new(1));
         let admission =
