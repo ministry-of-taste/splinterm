@@ -571,6 +571,18 @@ impl ImeState {
     }
 }
 
+/// Whether a pane's update stream, `disconnected` after delivering
+/// `updates`, is lost: it ended with no word of an exit, and no daemon
+/// handoff holds the Window (`hold_on_disconnect`), whose coordinator
+/// replaces the pane.
+fn pane_stream_lost(
+    disconnected: bool,
+    updates: &[WindowUpdate],
+    hold_on_disconnect: bool,
+) -> bool {
+    disconnected && !hold_on_disconnect && !pane_stream_has_terminal_notice(updates)
+}
+
 fn pane_stream_has_terminal_notice(updates: &[WindowUpdate]) -> bool {
     updates
         .iter()
@@ -1861,6 +1873,7 @@ impl PaneView {
         self.history_page_pending = false;
         self.search.in_flight = 0;
         self.search.searching = false;
+        self.search.pending_reveal = None;
         self.control_lost = say;
         true
     }
@@ -11933,6 +11946,8 @@ impl App {
 
     fn apply_inactive_updates(&mut self) -> Result<InactiveUpdateDrain> {
         let mut drain = InactiveUpdateDrain::default();
+        // The handoff banner speaks for the Window while a handoff holds it.
+        let hold_on_disconnect = self.handoff.holds_window_on_disconnect();
         for pane in &mut self.panes.inactive_panes {
             let mut pending = Vec::new();
             let mut disconnected = false;
@@ -11941,7 +11956,7 @@ impl App {
                 pending = drained.items;
                 disconnected = drained.disconnected;
             }
-            let lost = disconnected && !pane_stream_has_terminal_notice(&pending);
+            let lost = pane_stream_lost(disconnected, &pending, hold_on_disconnect);
             if disconnected {
                 pane.end_stream();
                 drain.changed = true;
@@ -12610,6 +12625,7 @@ impl App {
         if focused_stream_lost {
             self.panes.pane.lose_stream();
             self.presentation.full_redraw = true;
+            title_changed = true;
         }
         if let Some(update) = self.presentation.pending_font_update.take() {
             match self.reconcile_font_generation(update) {
@@ -13044,11 +13060,18 @@ impl App {
     /// their panes.
     fn retire_closed_pane_commands(&mut self, queue_handle: &QueueHandle<Self>) -> Result<()> {
         let say = !self.handoff.holds_window_on_disconnect();
-        let mut shown = false;
-        for pane in
-            std::iter::once(&mut self.panes.pane).chain(self.panes.inactive_panes.iter_mut())
-        {
+        let focused = self.panes.pane.retire_closed_commands(say);
+        let mut shown = focused;
+        for pane in &mut self.panes.inactive_panes {
             shown |= pane.retire_closed_commands(say);
+        }
+        // The title may name the controller or a control transfer.
+        if focused
+            && !self.modal.input_modal_open()
+            && !self.modal.session_picker_reconcile_pending
+            && let Some(title) = self.terminal_window_title()
+        {
+            self.surface.window.set_title(title);
         }
         for tab in self.tab_state.tabs.iter_mut() {
             if let Some(view) = tab.value.as_mut() {
@@ -16811,6 +16834,20 @@ mod tests {
                 (!hold).then_some(display_lost_notice(false))
             );
         }
+    }
+
+    /// A stream that only ended is lost. One that ended with word of an
+    /// exit, or while a daemon handoff holds the Window, is not.
+    #[test]
+    fn a_stream_is_lost_only_without_an_exit_notice_or_a_handoff_hold() {
+        let exited = [WindowUpdate::Exited {
+            splint_id: SplintId::new(),
+        }];
+        assert!(pane_stream_lost(true, &[], false));
+        assert!(!pane_stream_lost(false, &[], false));
+        assert!(!pane_stream_lost(true, &[], true));
+        assert!(!pane_stream_lost(true, &exited, false));
+        assert!(!pane_stream_lost(true, &[WindowUpdate::Shutdown], false));
     }
 
     /// Plan 0061 M3.12a: the resize and focus report a controller dropped
