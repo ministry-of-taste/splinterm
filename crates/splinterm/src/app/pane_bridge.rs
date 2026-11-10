@@ -1063,6 +1063,7 @@ pub(in crate::app) async fn run_controller(
     drive_controller(
         control,
         &mut commands,
+        &mut None,
         outputs,
         controller_id,
         splint_id,
@@ -1077,7 +1078,9 @@ pub(in crate::app) async fn run_controller(
 /// A pane's controller on one control connection, on a borrowed command
 /// queue, so the queue its frontend sends to outlives the controller when a
 /// reconnection replaces it: in a single-pane Window (Plan 0061 M3.12b), and
-/// in a pane's supervisor ([`run_pane_controller`]).
+/// in a pane's supervisor ([`run_pane_controller`]). `requested_resize`, the
+/// size the pane last asked for, is borrowed too, so a controller that
+/// replaces this one applies it at its first acquisition.
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -1086,6 +1089,7 @@ pub(in crate::app) async fn run_controller(
 pub(in crate::app) async fn drive_controller(
     mut control: Connection,
     commands: &mut mpsc::Receiver<WindowCommand>,
+    requested_resize: &mut Option<PaneResize>,
     outputs: ControllerOutputs,
     controller_id: Option<u64>,
     splint_id: SplintId,
@@ -1095,8 +1099,7 @@ pub(in crate::app) async fn drive_controller(
     cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     let mut active_controller = controller_id;
-    let mut requested_resize = None;
-    let mut pending_resize = None;
+    let mut pending_resize: Option<PendingPaneResize> = None;
     let mut resize_deadline = None;
     let mut deferred_command = None;
     let mut coalescing_barrier = None;
@@ -1159,7 +1162,7 @@ pub(in crate::app) async fn drive_controller(
                             apply_requested_pane_resize(
                                 &mut control,
                                 active_controller,
-                                requested_resize,
+                                *requested_resize,
                                 splint_id,
                                 incarnation,
                             ).await?;
@@ -1265,7 +1268,7 @@ pub(in crate::app) async fn drive_controller(
                     let controller_id = match ensure_pane_control(
                         &mut control,
                         &mut active_controller,
-                        &mut requested_resize,
+                        requested_resize,
                         &outputs.updates,
                         splint_id,
                         incarnation,
@@ -1397,7 +1400,7 @@ pub(in crate::app) async fn drive_controller(
                     let request = match active_resize_request(
                         &mut control,
                         &mut active_controller,
-                        &mut requested_resize,
+                        requested_resize,
                         &outputs.updates,
                         (splint_id, incarnation),
                         (columns, rows, pixel_width, pixel_height),
@@ -1434,7 +1437,7 @@ pub(in crate::app) async fn drive_controller(
                         Ok(true) => {}
                         Ok(false) => {
                             // Kept for the pane's next acquisition.
-                            requested_resize = Some(resize);
+                            *requested_resize = Some(resize);
                             continue;
                         }
                         Err(error) if handoff_refused(&error) => continue,
@@ -1443,7 +1446,7 @@ pub(in crate::app) async fn drive_controller(
                     let request = match active_resize_request(
                         &mut control,
                         &mut active_controller,
-                        &mut requested_resize,
+                        requested_resize,
                         &outputs.updates,
                         (splint_id, incarnation),
                         resize,
@@ -1467,7 +1470,7 @@ pub(in crate::app) async fn drive_controller(
                 } => {
                     let Some(request) = resolved_resize_request(
                         active_controller,
-                        &mut requested_resize,
+                        requested_resize,
                         (splint_id, incarnation),
                         (columns, rows, pixel_width, pixel_height),
                     ) else {
@@ -1514,7 +1517,7 @@ pub(in crate::app) async fn drive_controller(
                     match ensure_pane_control(
                         &mut control,
                         &mut active_controller,
-                        &mut requested_resize,
+                        requested_resize,
                         &outputs.updates,
                         splint_id,
                         incarnation,
@@ -1592,7 +1595,7 @@ pub(in crate::app) async fn drive_controller(
                     apply_requested_pane_resize(
                         &mut control,
                         active_controller,
-                        requested_resize,
+                        *requested_resize,
                         splint_id,
                         incarnation,
                     )
@@ -1682,6 +1685,10 @@ pub(in crate::app) async fn drive_controller(
         Ok(())
     }
     .await;
+    // A resize still waiting out its delay is the size the pane asked for.
+    if let Some(pending) = pending_resize {
+        *requested_resize = Some(pending.size);
+    }
     if let Some(controller_id) = active_controller {
         let _ = control.release_control(controller_id).await;
     }
@@ -2945,41 +2952,66 @@ async fn reconnect_pane_control(
 /// A pane's command queue while it has no controller. Every command is
 /// dropped, never sent later, and the Window is told once when typed input
 /// was among them. Taking them at once keeps the queue from filling, which
-/// would end the Window.
+/// would end the Window. The size of a dropped resize is kept for the
+/// pane's next acquisition.
 struct ControlOutage<'a> {
     commands: &'a mut mpsc::Receiver<WindowCommand>,
     updates: &'a mpsc::Sender<WindowUpdate>,
     cancellation: &'a tokio_util::sync::CancellationToken,
+    requested_resize: &'a mut Option<PaneResize>,
     /// The Window is owed `Control(false)` once its update queue has room.
     control_lost_owed: bool,
+    /// Typed input was dropped in this outage.
     input_dropped: bool,
+    /// The Window is owed `InputDropped`, after `Control(false)`.
+    input_dropped_owed: bool,
 }
 
 impl ControlOutage<'_> {
-    /// Runs `work` while dropping the pane's commands; `None` when the pane
-    /// closes or its Window goes first.
+    /// Runs `work` while dropping the pane's commands and telling the
+    /// Window what it is owed as its update queue has room; `None` when the
+    /// pane closes or its Window goes first.
     async fn meanwhile<T>(&mut self, work: impl Future<Output = T>) -> Option<T> {
+        let updates = self.updates;
         tokio::pin!(work);
         loop {
             tokio::select! {
                 biased;
                 () = self.cancellation.cancelled() => return None,
-                permit = self.updates.reserve(), if self.control_lost_owed => {
-                    permit.ok()?.send(WindowUpdate::Control(false));
-                    self.control_lost_owed = false;
-                }
+                permit = updates.reserve(), if self.owes() => self.send_owed(permit.ok()?),
                 command = self.commands.recv() => self.drop_command(command?),
                 done = &mut work => return Some(done),
             }
         }
     }
 
+    fn owes(&self) -> bool {
+        self.control_lost_owed || self.input_dropped_owed
+    }
+
+    /// Sends the notice the Window is owed first.
+    fn send_owed(&mut self, permit: mpsc::Permit<'_, WindowUpdate>) {
+        if std::mem::take(&mut self.control_lost_owed) {
+            permit.send(WindowUpdate::Control(false));
+        } else if std::mem::take(&mut self.input_dropped_owed) {
+            permit.send(WindowUpdate::InputDropped);
+        }
+    }
+
     fn drop_command(&mut self, command: WindowCommand) {
+        // Its size is applied when the person next takes control. A dropped
+        // plain `Resize` therefore no longer takes control by itself.
+        let command = match PendingPaneResize::from_command(command) {
+            Ok(resize) => {
+                *self.requested_resize = Some(resize.size);
+                return;
+            }
+            Err(command) => command,
+        };
         let typed = terminal_input(command).is_some_and(|(_, focus_report)| !focus_report);
         if typed && !self.input_dropped {
             self.input_dropped = true;
-            // Best effort: a full update queue loses only the notice.
-            let _ = self.updates.try_send(WindowUpdate::InputDropped);
+            self.input_dropped_owed = true;
         }
     }
 
@@ -2987,6 +3019,26 @@ impl ControlOutage<'_> {
     fn drop_queued(&mut self) {
         while let Ok(command) = self.commands.try_recv() {
             self.drop_command(command);
+        }
+    }
+
+    /// Tells the Window, after what it is owed, that the pane has a new
+    /// controller; `false` when the pane closes or its Window goes first.
+    /// The last commands queued are dropped just before, so whatever the
+    /// Window sends once it has heard is served by the new controller.
+    async fn restart(&mut self) -> bool {
+        let updates = self.updates;
+        loop {
+            let Some(Ok(permit)) = self.meanwhile(updates.reserve()).await else {
+                return false;
+            };
+            self.drop_queued();
+            if self.owes() {
+                self.send_owed(permit);
+                continue;
+            }
+            permit.send(WindowUpdate::ControlRestarted);
+            return true;
         }
     }
 }
@@ -3004,12 +3056,20 @@ enum ControlOutcome {
 /// through `connect` with backoff (see [`StreamRetry`]). The Window is told
 /// that the pane lost control as soon as its update queue has room, every
 /// command it sends meanwhile is dropped, and no attempt is made while a
-/// daemon handoff pauses the Window:
-/// its coordinator replaces the pane. An upgraded daemon leaves the pane to
-/// that coordinator too, so the attempts stop and the pane waits to close.
+/// daemon handoff pauses the Window: its coordinator replaces the pane.
+/// After [`ControlReconnect::Handoff`], from an upgraded daemon, no further
+/// attempt is made either: the pane waits for that coordinator to replace it.
+///
+/// Once a connection is back, the Window hears that the pane has a new
+/// controller ([`WindowUpdate::ControlRestarted`]) and the commands queued
+/// until then are dropped. Commands that come after are served by the new
+/// controller as any viewer's are: typing can resume mid-line after a blip,
+/// and a focus report or a plain resize then takes control when the Splint
+/// is unowned, exactly as on a first connection.
 async fn wait_out_control_outage<C, F>(
     pane: &PaneControl,
     commands: &mut mpsc::Receiver<WindowCommand>,
+    requested_resize: &mut Option<PaneResize>,
     retry: &mut StreamRetry,
     connect: &mut C,
 ) -> ControlOutcome
@@ -3022,8 +3082,10 @@ where
         commands,
         updates: &pane.updates,
         cancellation: &pane.cancellation,
+        requested_resize,
         control_lost_owed: true,
         input_dropped: false,
+        input_dropped_owed: false,
     };
     let lost_at = tokio::time::Instant::now();
     retry.lost(lost_at);
@@ -3054,9 +3116,11 @@ where
                 eprintln!(
                     "splinterm pane {splint_id}: controller reconnected after {attempts} attempt(s)"
                 );
-                // The new controller tells the Window whether the pane
-                // controls its Splint; nothing from before it is sent.
-                outage.drop_queued();
+                // Nothing from before the new controller is sent; it then
+                // tells the Window whether the pane controls its Splint.
+                if !outage.restart().await {
+                    return ControlOutcome::Closed;
+                }
                 retry.reattached_at = Some(tokio::time::Instant::now());
                 return ControlOutcome::Reconnected(control);
             }
@@ -3088,7 +3152,10 @@ where
 /// controller on a new connection from `connect` (see
 /// [`wait_out_control_outage`]). The new controller starts as a viewer: it
 /// never takes control, presents a handoff ticket, or forces a transfer on
-/// its own; the person takes control back as from any viewer.
+/// its own, and sends the daemon nothing more than any viewer does; the
+/// person takes control back as from any viewer. The size the pane last
+/// asked for, even in an outage, outlives each controller and is applied
+/// the next time the pane takes control.
 ///
 /// It ends with `Ok` when the pane closes or its queue does, and with the
 /// failure when the controller cannot come back; the queue's receiver then
@@ -3105,10 +3172,12 @@ where
     F: Future<Output = Result<Connection>>,
 {
     let mut retry = StreamRetry::default();
+    let mut requested_resize = None;
     loop {
         let Err(error) = drive_controller(
             control,
             &mut commands,
+            &mut requested_resize,
             pane.outputs(),
             controller_id,
             pane.splint_id,
@@ -3123,12 +3192,21 @@ where
         };
         let closing = pane.cancellation.is_cancelled();
         report_pane_controller_failure(pane.splint_id, !closing, &error);
-        // A pane whose display subscription ended is closing, or its
-        // process ended: it needs no controller.
-        if closing || pane.resyncs.is_closed() {
+        // A closing pane needs no controller. Nor does one whose process
+        // ended: the reconnection's check of the Splint stops the attempts,
+        // or else the Window's cancellation does when it closes the pane.
+        if closing {
             return Err(error);
         }
-        match wait_out_control_outage(&pane, &mut commands, &mut retry, &mut connect).await {
+        match wait_out_control_outage(
+            &pane,
+            &mut commands,
+            &mut requested_resize,
+            &mut retry,
+            &mut connect,
+        )
+        .await
+        {
             ControlOutcome::Reconnected(next) => {
                 control = *next;
                 controller_id = None;

@@ -1862,20 +1862,39 @@ impl PaneView {
         }
         self.controller_active = false;
         self.commands = None;
-        self.pending_control_transfer = None;
         self.control_release_pending = false;
         self.pending_focus_report = None;
         self.pending_resize = None;
+        self.forget_sent_commands();
+        self.control_lost = say;
+        true
+    }
+
+    /// The pane's controller was replaced after an outage
+    /// ([`WindowUpdate::ControlRestarted`]): what the pane sent before is
+    /// never answered, so the pane stops waiting on it, and asks for an
+    /// authoritative snapshot in place of any resynchronization it lost.
+    /// The new controller's own status says whether the pane controls its
+    /// Splint.
+    fn restart_control(&mut self) {
+        self.forget_sent_commands();
+        self.resync_pending = self
+            .commands
+            .as_ref()
+            .is_some_and(|commands| try_advisory_command(commands, WindowCommand::Resynchronize));
+    }
+
+    /// Stops waiting on everything the pane sent: none of it is answered
+    /// any more.
+    fn forget_sent_commands(&mut self) {
+        self.pending_control_transfer = None;
         self.reclaim_sent = false;
         self.reclaim_cancel_pending = false;
-        // Nothing sent is answered any more.
         self.resync_pending = false;
         self.history_page_pending = false;
         self.search.in_flight = 0;
         self.search.searching = false;
         self.search.pending_reveal = None;
-        self.control_lost = say;
-        true
     }
 
     fn retain_trace_correlation(
@@ -2510,6 +2529,11 @@ impl PaneView {
             }
             WindowUpdate::ControlReclaimed => {
                 self.show_reclaimed_notice(Instant::now());
+                Ok(BackgroundUpdateImpact::VISUAL)
+            }
+            // A control transfer offer it showed is gone.
+            WindowUpdate::ControlRestarted => {
+                self.restart_control();
                 Ok(BackgroundUpdateImpact::VISUAL)
             }
             WindowUpdate::Exited { .. } | WindowUpdate::Shutdown => {
@@ -12590,6 +12614,15 @@ impl App {
                     visual_changed = true;
                     self.presentation.full_redraw = true;
                 }
+                // A control transfer offer and a search in progress, shown
+                // with the title, are gone.
+                WindowUpdate::ControlRestarted => {
+                    self.panes.pane.restart_control();
+                    title_changed = true;
+                    visual_changed = true;
+                    focused_visual_changed = true;
+                    self.presentation.full_redraw = true;
+                }
                 WindowUpdate::Exited { splint_id } => {
                     anyhow::ensure!(
                         self.panes.focused_splint() == Some(splint_id),
@@ -19177,6 +19210,73 @@ mod tests {
         // Its process exited: the pane has nothing left to say.
         pane.end_stream();
         assert_eq!(pane.status_notice(now), None);
+    }
+
+    /// A pane whose controller was replaced after an outage stops waiting
+    /// on what it sent, keeps sending, and asks for a snapshot; the new
+    /// controller's status says whether it controls its Splint.
+    #[test]
+    fn a_pane_whose_controller_restarted_forgets_what_it_sent() {
+        let (mut pane, mut commands) = reclaim_test_pane(true, 4);
+        let splint_id = pane.snapshot.as_ref().unwrap().splint_id;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 400,
+        };
+        pane.pending_control_transfer = Some(7);
+        pane.reclaim_sent = true;
+        pane.reclaim_cancel_pending = true;
+        pane.resync_pending = true;
+        pane.history_page_pending = true;
+        pane.search.in_flight = 2;
+        pane.search.searching = true;
+        pane.search.pending_reveal = Some(SearchMatch {
+            row_id: 1,
+            start_column: 0,
+            end_column: 1,
+            preview: String::new(),
+        });
+        assert_eq!(
+            control_transfer_notice_rects([&pane], false, None, Some(splint_id), area),
+            [(area, true)]
+        );
+
+        let impact = pane
+            .apply_background_update(
+                WindowUpdate::ControlRestarted,
+                ResolvedTheme::default(),
+                "visible-inactive",
+            )
+            .unwrap();
+        assert_eq!(impact, BackgroundUpdateImpact::VISUAL);
+        assert_eq!(pane.pending_control_transfer, None);
+        assert!(
+            control_transfer_notice_rects([&pane], false, None, Some(splint_id), area).is_empty()
+        );
+        assert!(!pane.reclaim_sent);
+        assert!(!pane.reclaim_cancel_pending);
+        assert!(!pane.history_page_pending);
+        assert_eq!(pane.search.in_flight, 0);
+        assert!(!pane.search.searching);
+        assert_eq!(pane.search.pending_reveal, None);
+        assert!(pane.commands.is_some(), "it keeps sending");
+        assert!(pane.controller_active, "until the new controller says");
+        assert!(!pane.control_lost);
+        // The one resynchronization pending now is the one it just asked for.
+        assert!(pane.resync_pending);
+        assert_eq!(commands.try_recv().unwrap(), WindowCommand::Resynchronize);
+        assert!(commands.try_recv().is_err());
+
+        // With no room for that request, none is pending.
+        let (mut full, _full_commands) = reclaim_test_pane(false, 1);
+        let sender = full.commands.clone().unwrap();
+        sender.try_send(WindowCommand::Input(vec![1])).unwrap();
+        full.resync_pending = true;
+        full.restart_control();
+        assert!(!full.resync_pending);
+        assert!(full.commands.is_some());
     }
 
     #[test]

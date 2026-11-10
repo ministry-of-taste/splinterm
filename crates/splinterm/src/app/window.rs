@@ -186,6 +186,7 @@ fn spawn_single_pane_controller(
         let result = drive_controller(
             control,
             &mut commands,
+            &mut None,
             outputs,
             controller_id,
             splint_id,

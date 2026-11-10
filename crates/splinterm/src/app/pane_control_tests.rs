@@ -3244,9 +3244,34 @@ where
     C: FnMut() -> F + Send + 'static,
     F: Future<Output = Result<Connection>> + Send + 'static,
 {
-    let cancellation = tokio_util::sync::CancellationToken::new();
     // Roomy, so no controller waits on the test to read its notices.
-    let (updates, window) = mpsc::channel(64);
+    let window = mpsc::channel(64);
+    supervise_into(
+        splint_id,
+        control,
+        controller_id,
+        daemon,
+        hub,
+        connect,
+        window,
+    )
+}
+
+/// Like [`supervise`], with the Window's update queue `window`.
+fn supervise_into<C, F>(
+    splint_id: SplintId,
+    control: Connection,
+    controller_id: Option<u64>,
+    daemon: DaemonIdentity,
+    hub: &HandoffStatusHub,
+    connect: C,
+    (updates, window): (mpsc::Sender<WindowUpdate>, mpsc::Receiver<WindowUpdate>),
+) -> SupervisedPane
+where
+    C: FnMut() -> F + Send + 'static,
+    F: Future<Output = Result<Connection>> + Send + 'static,
+{
+    let cancellation = tokio_util::sync::CancellationToken::new();
     let (resyncs, resync_receiver) = mpsc::channel(1);
     let (commands, receiver) = mpsc::channel(WINDOW_COMMAND_QUEUE);
     let task = tokio::spawn(run_pane_controller(
@@ -3293,6 +3318,24 @@ fn window_updates(window: &mut mpsc::Receiver<WindowUpdate>) -> Vec<WindowUpdate
     updates
 }
 
+fn restarts(updates: &[WindowUpdate]) -> usize {
+    updates
+        .iter()
+        .filter(|update| matches!(update, WindowUpdate::ControlRestarted))
+        .count()
+}
+
+/// Cancels `pane` and waits for its supervisor, which stops promptly; one
+/// stuck on a request its script does not answer fails here.
+async fn close_pane(pane: SupervisedPane) {
+    pane.cancellation.cancel();
+    tokio::time::timeout(Duration::from_secs(1), pane.task)
+        .await
+        .expect("a cancelled pane stops")
+        .unwrap()
+        .unwrap();
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_controller_whose_connection_ends_is_replaced_by_a_viewer_on_a_new_one() {
     let id = SplintId::new();
@@ -3335,6 +3378,11 @@ async fn a_controller_whose_connection_ends_is_replaced_by_a_viewer_on_a_new_one
         next_update(&mut pane.window).await,
         WindowUpdate::Control(false)
     ));
+    // Then that nothing the pane sent before is answered.
+    assert!(matches!(
+        next_update(&mut pane.window).await,
+        WindowUpdate::ControlRestarted
+    ));
     // The new controller reports the pane's status: a viewer.
     assert!(matches!(
         next_update(&mut pane.window).await,
@@ -3350,8 +3398,7 @@ async fn a_controller_whose_connection_ends_is_replaced_by_a_viewer_on_a_new_one
         .unwrap();
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert!(!pane.task.is_finished());
-    pane.cancellation.cancel();
-    pane.task.await.unwrap().unwrap();
+    close_pane(pane).await;
     assert_eq!(second_server.await.unwrap(), 3);
 }
 
@@ -3420,9 +3467,305 @@ async fn nothing_queued_before_or_during_a_controller_outage_is_sent_later() {
     let updates = window_updates(&mut pane.window);
     assert_eq!(input_dropped_count(&updates), 1, "{updates:?}");
     assert_eq!(control_updates(&updates), [false], "{updates:?}");
-    pane.cancellation.cancel();
-    pane.task.await.unwrap().unwrap();
+    assert_eq!(restarts(&updates), 1, "{updates:?}");
+    close_pane(pane).await;
     // The new connection heard only the viewer's subscription.
+    assert_eq!(second_server.await.unwrap(), 2);
+}
+
+const fn plain_resize(columns: u16, rows: u16) -> WindowCommand {
+    WindowCommand::Resize {
+        columns,
+        rows,
+        pixel_width: columns * 10,
+        pixel_height: rows * 20,
+    }
+}
+
+/// Supervises a pane that controls its Splint on a first connection that
+/// then ends. The pane asks for the size `before` on that connection and for
+/// `during` in the outage. Its first input on the new connection takes
+/// control, which applies `applied` first.
+async fn size_after_a_controller_outage(
+    before: Option<(u16, u16)>,
+    during: Option<(u16, u16)>,
+    applied: (u16, u16),
+) {
+    let id = SplintId::new();
+    let (first, mut first_reader, mut first_writer) = daemon_end(65536).await;
+    let (columns, rows) = applied;
+    let (second, second_server) = scripted_control(vec![
+        (inspect_splint(id), Ok(live_splint(id, Some(7)))),
+        (subscribe_control(id), Ok(control_subscribed(id, false))),
+        (acquire(id), Ok(granted())),
+        (sized(2, id, columns, rows), Ok(input_acknowledged(id))),
+        (
+            Request::Input {
+                controller_id: 2,
+                splint_id: id,
+                incarnation: 7,
+                bytes: b"x".to_vec(),
+                focus_report: false,
+            },
+            Ok(input_acknowledged(id)),
+        ),
+        (
+            Request::ReleaseControl { controller_id: 2 },
+            Ok(Response::Acknowledged),
+        ),
+    ])
+    .await;
+    let attempted_at = AttemptTimes::default();
+    let mut pane = supervise(
+        id,
+        first,
+        Some(1),
+        daemon_at(1),
+        &HandoffStatusHub::default(),
+        scripted_connections(vec![Ok(second)], &attempted_at),
+    );
+    expect_request(
+        &mut first_reader,
+        &mut first_writer,
+        subscribe_control(id),
+        control_subscribed(id, true),
+    )
+    .await;
+    assert!(matches!(
+        next_update(&mut pane.window).await,
+        WindowUpdate::Control(true)
+    ));
+    if let Some((columns, rows)) = before {
+        pane.commands
+            .send(plain_resize(columns, rows))
+            .await
+            .unwrap();
+        expect_request(
+            &mut first_reader,
+            &mut first_writer,
+            sized(1, id, columns, rows),
+            input_acknowledged(id),
+        )
+        .await;
+    }
+    drop((first_reader, first_writer));
+    assert!(matches!(
+        next_update(&mut pane.window).await,
+        WindowUpdate::Control(false)
+    ));
+    // Dropped, and no reason to take control on the new connection.
+    if let Some((columns, rows)) = during {
+        pane.commands
+            .send(plain_resize(columns, rows))
+            .await
+            .unwrap();
+    }
+    assert!(matches!(
+        next_update(&mut pane.window).await,
+        WindowUpdate::ControlRestarted
+    ));
+    assert!(matches!(
+        next_update(&mut pane.window).await,
+        WindowUpdate::Control(false)
+    ));
+    pane.commands
+        .send(WindowCommand::Input(b"x".to_vec()))
+        .await
+        .unwrap();
+    assert!(matches!(
+        next_update(&mut pane.window).await,
+        WindowUpdate::Control(true)
+    ));
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    close_pane(pane).await;
+    assert_eq!(second_server.await.unwrap(), 6);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_size_a_pane_asked_for_is_applied_when_it_next_takes_control_on_a_new_connection() {
+    // Asked for before the outage, and not since.
+    size_after_a_controller_outage(Some((100, 40)), None, (100, 40)).await;
+    // Asked for in the outage, which dropped the resize.
+    size_after_a_controller_outage(None, Some((120, 50)), (120, 50)).await;
+    // The latest size wins.
+    size_after_a_controller_outage(Some((100, 40)), Some((120, 50)), (120, 50)).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_full_update_queue_still_has_commands_taken_and_hears_once_that_typing_was_dropped() {
+    let id = SplintId::new();
+    // One slot, taken: the Window is slow to read.
+    let (updates, window) = mpsc::channel(1);
+    updates
+        .try_send(WindowUpdate::ScrollbackResyncRequired)
+        .unwrap();
+    let attempted_at = AttemptTimes::default();
+    let mut pane = supervise_into(
+        id,
+        failed_control().await,
+        None,
+        daemon_at(1),
+        &HandoffStatusHub::default(),
+        scripted_connections(Vec::new(), &attempted_at),
+        (updates, window),
+    );
+    // `Control(false)` is owed while typing arrives; each round fills the
+    // pane's queue exactly.
+    for _ in 0..3 {
+        for _ in 0..WINDOW_COMMAND_QUEUE {
+            pane.commands
+                .try_send(WindowCommand::Input(b"x".to_vec()))
+                .unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(pane.commands.capacity(), WINDOW_COMMAND_QUEUE);
+    assert!(matches!(
+        pane.window.try_recv(),
+        Ok(WindowUpdate::ScrollbackResyncRequired)
+    ));
+    // Each notice waits for room, in order.
+    assert!(matches!(
+        next_update(&mut pane.window).await,
+        WindowUpdate::Control(false)
+    ));
+    assert!(matches!(
+        next_update(&mut pane.window).await,
+        WindowUpdate::InputDropped
+    ));
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    let updates = window_updates(&mut pane.window);
+    assert!(updates.is_empty(), "said once: {updates:?}");
+    close_pane(pane).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_controller_back_while_notices_are_owed_gives_them_first() {
+    let id = SplintId::new();
+    let (second, second_server) = scripted_control(vec![
+        (inspect_splint(id), Ok(live_splint(id, Some(7)))),
+        (subscribe_control(id), Ok(control_subscribed(id, false))),
+    ])
+    .await;
+    let (updates, window) = mpsc::channel(1);
+    updates
+        .try_send(WindowUpdate::ScrollbackResyncRequired)
+        .unwrap();
+    let attempted_at = AttemptTimes::default();
+    let mut pane = supervise_into(
+        id,
+        failed_control().await,
+        None,
+        daemon_at(1),
+        &HandoffStatusHub::default(),
+        scripted_connections(vec![Ok(second)], &attempted_at),
+        (updates, window),
+    );
+    pane.commands
+        .send(WindowCommand::Input(b"x".to_vec()))
+        .await
+        .unwrap();
+    // Connected again while the update queue stays full: commands are
+    // still taken while the notices wait.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(attempted_at.lock().unwrap().len(), 1);
+    for _ in 0..WINDOW_COMMAND_QUEUE {
+        pane.commands
+            .try_send(WindowCommand::Input(b"y".to_vec()))
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    assert_eq!(pane.commands.capacity(), WINDOW_COMMAND_QUEUE);
+    let mut heard = Vec::new();
+    for _ in 0..5 {
+        heard.push(next_update(&mut pane.window).await);
+    }
+    assert!(
+        matches!(
+            heard.as_slice(),
+            [
+                WindowUpdate::ScrollbackResyncRequired,
+                WindowUpdate::Control(false),
+                WindowUpdate::InputDropped,
+                WindowUpdate::ControlRestarted,
+                WindowUpdate::Control(false),
+            ]
+        ),
+        "{heard:?}"
+    );
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let updates = window_updates(&mut pane.window);
+    assert!(updates.is_empty(), "{updates:?}");
+    close_pane(pane).await;
+    // Nothing typed reached the new connection.
+    assert_eq!(second_server.await.unwrap(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_command_sent_while_a_reconnection_is_under_way_is_dropped() {
+    let id = SplintId::new();
+    let (second, second_server) = scripted_control(vec![
+        (inspect_splint(id), Ok(live_splint(id, Some(7)))),
+        (subscribe_control(id), Ok(control_subscribed(id, false))),
+    ])
+    .await;
+    // The attempt waits on the daemon until the test gives it `second`.
+    let (deliver, delivered) = tokio::sync::oneshot::channel::<Connection>();
+    let mut delivered = Some(delivered);
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = Arc::clone(&attempts);
+    let connect = move || -> std::pin::Pin<Box<dyn Future<Output = Result<Connection>> + Send>> {
+        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let delivered = delivered.take();
+        Box::pin(async move {
+            let delivered = delivered.ok_or_else(|| anyhow::anyhow!("connection refused"))?;
+            Ok(delivered.await.expect("the test gives the connection"))
+        })
+    };
+    let mut pane = supervise(
+        id,
+        failed_control().await,
+        None,
+        daemon_at(1),
+        &HandoffStatusHub::default(),
+        connect,
+    );
+    assert!(matches!(
+        next_update(&mut pane.window).await,
+        WindowUpdate::Control(false)
+    ));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    pane.commands
+        .send(WindowCommand::Input(b"late".to_vec()))
+        .await
+        .unwrap();
+    pane.commands
+        .send(WindowCommand::RevokeAccess(5))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    assert_eq!(
+        pane.commands.capacity(),
+        WINDOW_COMMAND_QUEUE,
+        "taken at once"
+    );
+    assert!(deliver.send(second).is_ok());
+    assert!(matches!(
+        next_update(&mut pane.window).await,
+        WindowUpdate::InputDropped
+    ));
+    assert!(matches!(
+        next_update(&mut pane.window).await,
+        WindowUpdate::ControlRestarted
+    ));
+    assert!(matches!(
+        next_update(&mut pane.window).await,
+        WindowUpdate::Control(false)
+    ));
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    close_pane(pane).await;
+    // Neither the input nor the revocation reached the new connection.
     assert_eq!(second_server.await.unwrap(), 2);
 }
 
