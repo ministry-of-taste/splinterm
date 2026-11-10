@@ -16629,6 +16629,41 @@ fn frame_uses_terminal_transaction_memory(frame: &ServerFrame) -> bool {
     )
 }
 
+/// The share of the daemon's terminal transaction memory that writing
+/// `frame` holds, in bytes: what its body and that body's encoded frames can
+/// occupy together, which for the largest body is
+/// [`TERMINAL_TRANSACTION_MEMORY_BYTES`].
+///
+/// The writer holds it until the client has read the frame. Were every frame
+/// charged for the largest, two clients that stopped reading would stop
+/// every other connection's terminal output until their writes timed out.
+fn terminal_transaction_permits(frame: &ServerFrame) -> u32 {
+    struct ByteCount(usize);
+    impl std::io::Write for ByteCount {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(bytes.len());
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut body = ByteCount(0);
+    // A frame that cannot be encoded holds nothing; the writer reports it
+    // when it encodes the frame.
+    if serde_json::to_writer(&mut body, frame).is_err() {
+        return 1;
+    }
+    let bytes = body
+        .0
+        .saturating_mul(
+            TERMINAL_TRANSACTION_MEMORY_BYTES / splinterm_protocol::MAX_TERMINAL_TRANSACTION_BYTES,
+        )
+        .clamp(1, TERMINAL_TRANSACTION_MEMORY_BYTES);
+    u32::try_from(bytes).unwrap_or(u32::MAX)
+}
+
 fn frame_trace_identity(frame: &ServerFrame) -> Option<(u64, u64, u64, u64)> {
     let ServerFrame::Event {
         subscription_id,
@@ -16711,11 +16746,8 @@ async fn write_frames(
         };
         let identity = frame_trace_identity(&frame);
         let _memory_permit = if frame_uses_terminal_transaction_memory(&frame) {
-            let Ok(permits) = u32::try_from(TERMINAL_TRANSACTION_MEMORY_BYTES) else {
-                break;
-            };
             let Ok(permit) = Arc::clone(&terminal_transaction_memory)
-                .acquire_many_owned(permits)
+                .acquire_many_owned(terminal_transaction_permits(&frame))
                 .await
             else {
                 warn!(
@@ -26547,6 +26579,99 @@ mod tests {
             budget.available_permits(),
             TERMINAL_TRANSACTION_DAEMON_MEMORY_BYTES
         );
+    }
+
+    /// A terminal snapshot event whose title is `title`.
+    fn titled_snapshot_event(title: String) -> ServerFrame {
+        let mut event = chunked_snapshot_event();
+        let ServerFrame::Event {
+            event: SubscriptionEvent::Snapshot { snapshot },
+            ..
+        } = &mut event
+        else {
+            unreachable!("a snapshot event");
+        };
+        snapshot.title = title;
+        event
+    }
+
+    #[test]
+    fn a_terminal_frame_holds_transaction_memory_for_its_own_size() {
+        let small = terminal_transaction_permits(&titled_snapshot_event("x".to_owned()));
+        assert!((1..64 * 1024).contains(&small), "{small}");
+        let largest = terminal_transaction_permits(&titled_snapshot_event(
+            "x".repeat(splinterm_protocol::MAX_TERMINAL_TRANSACTION_BYTES),
+        ));
+        assert_eq!(
+            usize::try_from(largest).unwrap(),
+            TERMINAL_TRANSACTION_MEMORY_BYTES
+        );
+    }
+
+    /// Two clients that read nothing hold their large frames' memory until
+    /// their writes time out. Another connection's ordinary terminal frame
+    /// is written meanwhile.
+    #[tokio::test]
+    async fn clients_that_stopped_reading_do_not_stop_another_connections_terminal_output() {
+        let budget = Arc::new(Semaphore::new(TERMINAL_TRANSACTION_DAEMON_MEMORY_BYTES));
+        let connect = |connection_id| {
+            let (client, server) = UnixStream::pair().unwrap();
+            let (_reader, writer) = server.into_split();
+            let (outbound, outbound_rx) = mpsc::channel::<QueuedServerFrame>(OUTBOUND_QUEUE);
+            let (control, control_rx) = mpsc::channel(CONTROL_QUEUE);
+            let writer = AbortOnDrop::new(tokio::spawn(write_frames(
+                writer,
+                outbound_rx,
+                control_rx,
+                Arc::clone(&budget),
+                connection_id,
+            )));
+            (client, outbound, control, writer)
+        };
+        let mut stopped = Vec::new();
+        for connection_id in 1..=2 {
+            let connection = connect(connection_id);
+            connection
+                .1
+                .send(chunked_snapshot_event().into())
+                .await
+                .unwrap();
+            stopped.push(connection);
+        }
+        let held = terminal_transaction_permits(&chunked_snapshot_event()) as usize;
+        time::timeout(Duration::from_secs(4), async {
+            while budget.available_permits() > TERMINAL_TRANSACTION_DAEMON_MEMORY_BYTES - 2 * held {
+                time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("both stopped clients' writers hold their frames' memory");
+
+        let (mut client, outbound, _control, _writer) = connect(3);
+        outbound
+            .send(titled_snapshot_event("live".to_owned()).into())
+            .await
+            .unwrap();
+        let frame = time::timeout(Duration::from_secs(2), async {
+            let mut length = [0_u8; 4];
+            client.read_exact(&mut length).await.unwrap();
+            let mut body = vec![0_u8; u32::from_be_bytes(length) as usize];
+            client.read_exact(&mut body).await.unwrap();
+            serde_json::from_slice::<ServerFrame>(&body).unwrap()
+        })
+        .await
+        .expect("the frame is written while the other writes still wait");
+        assert!(
+            matches!(
+                &frame,
+                ServerFrame::Event {
+                    event: SubscriptionEvent::Snapshot { snapshot },
+                    ..
+                } if snapshot.title == "live"
+            ),
+            "{frame:?}"
+        );
+        drop(stopped);
     }
 
     #[tokio::test]
