@@ -1223,7 +1223,7 @@ struct DaemonState {
     /// its handler runs, and exclusively by [`HandoffAttempt::fence`] while
     /// the gate moves to `Fenced`; see [`HandoffAdmission`].
     handoff_in_flight: RwLock<()>,
-    terminal_transaction_memory: Arc<Semaphore>,
+    terminal_transaction_memory: Arc<TerminalTransactionMemory>,
     terminal_publication_memory: Arc<Semaphore>,
     terminal_splint_publication_memory: Mutex<HashMap<SplintId, std::sync::Weak<Semaphore>>>,
     exit_observers: TaskTracker,
@@ -3623,7 +3623,7 @@ fn build_daemon_state(inputs: DaemonStateInputs) -> Arc<DaemonState> {
         topology_transactions: Arc::new(Semaphore::new(1)),
         handoff_gate: HandoffGate::default(),
         handoff_in_flight: RwLock::new(()),
-        terminal_transaction_memory: Arc::new(Semaphore::new(
+        terminal_transaction_memory: Arc::new(TerminalTransactionMemory::new(
             TERMINAL_TRANSACTION_DAEMON_MEMORY_BYTES,
         )),
         terminal_publication_memory: Arc::new(Semaphore::new(TERMINAL_PUBLICATION_DAEMON_BYTES)),
@@ -16616,6 +16616,95 @@ fn event_base_revision(event: &SubscriptionEvent) -> u64 {
     }
 }
 
+/// The daemon's terminal transaction memory: the bytes that connection
+/// writers hold while they encode and write terminal frames
+/// ([`write_frames`]).
+///
+/// A request is admitted as soon as its own bytes are free. Waiters are not
+/// ordered and hold nothing while they wait, so a request that does not fit
+/// never holds back a smaller one that does. The leases alive at any time
+/// never hold more than the capacity together.
+struct TerminalTransactionMemory {
+    capacity: usize,
+    free: StdMutex<usize>,
+    released: Notify,
+}
+
+impl TerminalTransactionMemory {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            free: StdMutex::new(capacity),
+            released: Notify::new(),
+        }
+    }
+
+    /// Waits until `bytes` are free, then takes them for the returned lease.
+    /// A request for more than the capacity takes the whole capacity.
+    ///
+    /// Dropping the future before it resolves takes nothing.
+    async fn acquire(self: &Arc<Self>, bytes: usize) -> TerminalTransactionLease {
+        debug_assert!(
+            bytes <= self.capacity,
+            "terminal transaction memory request of {bytes} bytes exceeds its capacity"
+        );
+        let bytes = bytes.min(self.capacity);
+        loop {
+            let released = self.released.notified();
+            tokio::pin!(released);
+            // Registered before the check, so a lease returned after the
+            // check wakes this wait.
+            released.as_mut().enable();
+            if let Some(lease) = self.try_acquire(bytes) {
+                return lease;
+            }
+            released.await;
+        }
+    }
+
+    fn try_acquire(self: &Arc<Self>, bytes: usize) -> Option<TerminalTransactionLease> {
+        let mut free = self
+            .free
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *free = free.checked_sub(bytes)?;
+        Some(TerminalTransactionLease {
+            memory: Arc::clone(self),
+            bytes,
+        })
+    }
+
+    #[cfg(test)]
+    fn free_bytes(&self) -> usize {
+        *self
+            .free
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// Bytes taken from [`TerminalTransactionMemory`]. Dropping the lease
+/// returns them and wakes every waiter.
+struct TerminalTransactionLease {
+    memory: Arc<TerminalTransactionMemory>,
+    bytes: usize,
+}
+
+impl Drop for TerminalTransactionLease {
+    fn drop(&mut self) {
+        {
+            let mut free = self
+                .memory
+                .free
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *free += self.bytes;
+            debug_assert!(*free <= self.memory.capacity);
+        }
+        self.memory.released.notify_waiters();
+    }
+}
+
 fn frame_uses_terminal_transaction_memory(frame: &ServerFrame) -> bool {
     matches!(
         frame,
@@ -16637,10 +16726,10 @@ fn frame_uses_terminal_transaction_memory(frame: &ServerFrame) -> bool {
 /// The writer holds it until the client has read the frame. Were every frame
 /// charged for the largest, two clients that stopped reading would stop
 /// every other connection's terminal output until their writes timed out.
-/// Large frames can still do that: the semaphore serves its waiters in
-/// order, so a frame that waits for more than is free holds back the small
-/// frames behind it.
-fn terminal_transaction_permits(frame: &ServerFrame) -> u32 {
+/// A frame is admitted whenever its own bytes are free, so a large frame can
+/// wait while smaller ones keep being admitted, which small frames afford
+/// because they hold little and briefly.
+fn terminal_transaction_bytes(frame: &ServerFrame) -> usize {
     /// A body and its encoded frames together are at most this many times
     /// the body.
     const BYTES_PER_BODY_BYTE: usize =
@@ -16663,16 +16752,14 @@ fn terminal_transaction_permits(frame: &ServerFrame) -> u32 {
         }
     }
     let mut body = ByteCount(0);
-    // A frame that cannot be encoded holds one permit; the writer reports
-    // it when it encodes the frame.
+    // A frame that cannot be encoded holds one byte; the writer reports it
+    // when it encodes the frame.
     if serde_json::to_writer(&mut body, frame).is_err() {
         return 1;
     }
-    let bytes = body
-        .0
+    body.0
         .saturating_mul(BYTES_PER_BODY_BYTE)
-        .clamp(1, TERMINAL_TRANSACTION_MEMORY_BYTES);
-    u32::try_from(bytes).unwrap_or(u32::MAX)
+        .clamp(1, TERMINAL_TRANSACTION_MEMORY_BYTES)
 }
 
 fn frame_trace_identity(frame: &ServerFrame) -> Option<(u64, u64, u64, u64)> {
@@ -16719,7 +16806,7 @@ async fn write_frames(
     mut writer: OwnedWriteHalf,
     mut normal: mpsc::Receiver<QueuedServerFrame>,
     mut control: mpsc::Receiver<ControlFrame>,
-    terminal_transaction_memory: Arc<Semaphore>,
+    terminal_transaction_memory: Arc<TerminalTransactionMemory>,
     connection_id: u64,
 ) {
     loop {
@@ -16756,18 +16843,12 @@ async fn write_frames(
             }
         };
         let identity = frame_trace_identity(&frame);
-        let _memory_permit = if frame_uses_terminal_transaction_memory(&frame) {
-            let Ok(permit) = Arc::clone(&terminal_transaction_memory)
-                .acquire_many_owned(terminal_transaction_permits(&frame))
-                .await
-            else {
-                warn!(
-                    connection_id,
-                    "closing a connection: terminal transaction memory closed"
-                );
-                break;
-            };
-            Some(permit)
+        let _memory_lease = if frame_uses_terminal_transaction_memory(&frame) {
+            Some(
+                terminal_transaction_memory
+                    .acquire(terminal_transaction_bytes(&frame))
+                    .await,
+            )
         } else {
             None
         };
@@ -18717,7 +18798,7 @@ mod tests {
             topology_transactions: Arc::new(Semaphore::new(1)),
             handoff_gate: HandoffGate::default(),
             handoff_in_flight: RwLock::new(()),
-            terminal_transaction_memory: Arc::new(Semaphore::new(
+            terminal_transaction_memory: Arc::new(TerminalTransactionMemory::new(
                 TERMINAL_TRANSACTION_DAEMON_MEMORY_BYTES,
             )),
             terminal_publication_memory: Arc::new(Semaphore::new(
@@ -26579,17 +26660,81 @@ mod tests {
             TERMINAL_TRANSACTION_DAEMON_MEMORY_BYTES / TERMINAL_TRANSACTION_MEMORY_BYTES,
             2
         );
-        let budget = Arc::new(Semaphore::new(TERMINAL_TRANSACTION_DAEMON_MEMORY_BYTES));
-        let permits = u32::try_from(TERMINAL_TRANSACTION_MEMORY_BYTES).unwrap();
+        let memory = Arc::new(TerminalTransactionMemory::new(
+            TERMINAL_TRANSACTION_DAEMON_MEMORY_BYTES,
+        ));
         let admitted = (0..2)
-            .map(|_| Arc::clone(&budget).try_acquire_many_owned(permits).unwrap())
+            .map(|_| {
+                memory
+                    .try_acquire(TERMINAL_TRANSACTION_MEMORY_BYTES)
+                    .unwrap()
+            })
             .collect::<Vec<_>>();
-        assert!(Arc::clone(&budget).try_acquire_many_owned(permits).is_err());
+        assert!(
+            memory
+                .try_acquire(TERMINAL_TRANSACTION_MEMORY_BYTES)
+                .is_none()
+        );
         drop(admitted);
         assert_eq!(
-            budget.available_permits(),
+            memory.free_bytes(),
             TERMINAL_TRANSACTION_DAEMON_MEMORY_BYTES
         );
+    }
+
+    /// Polls `future` once.
+    fn poll_once<F: Future>(future: Pin<&mut F>) -> std::task::Poll<F::Output> {
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        future.poll(&mut context)
+    }
+
+    #[test]
+    fn terminal_transaction_memory_admits_a_request_whenever_its_bytes_are_free() {
+        let capacity = TERMINAL_TRANSACTION_DAEMON_MEMORY_BYTES;
+        let memory = Arc::new(TerminalTransactionMemory::new(capacity));
+        let first = memory
+            .try_acquire(TERMINAL_TRANSACTION_MEMORY_BYTES)
+            .unwrap();
+        let second = memory
+            .try_acquire(TERMINAL_TRANSACTION_MEMORY_BYTES)
+            .unwrap();
+        let free = capacity - 2 * TERMINAL_TRANSACTION_MEMORY_BYTES;
+        assert_eq!(memory.free_bytes(), free);
+
+        let large = memory.acquire(TERMINAL_TRANSACTION_MEMORY_BYTES);
+        tokio::pin!(large);
+        assert!(poll_once(large.as_mut()).is_pending());
+        assert_eq!(memory.free_bytes(), free, "a waiter holds nothing");
+
+        let small = memory.acquire(1024);
+        tokio::pin!(small);
+        let std::task::Poll::Ready(small) = poll_once(small.as_mut()) else {
+            panic!("a request whose bytes are free is admitted past a waiter");
+        };
+        assert_eq!(memory.free_bytes(), free - 1024);
+        drop(small);
+        assert_eq!(memory.free_bytes(), free);
+
+        {
+            let abandoned = memory.acquire(TERMINAL_TRANSACTION_MEMORY_BYTES);
+            tokio::pin!(abandoned);
+            assert!(poll_once(abandoned.as_mut()).is_pending());
+        }
+        assert_eq!(
+            memory.free_bytes(),
+            free,
+            "a dropped waiter leaves the accounting unchanged"
+        );
+
+        assert!(poll_once(large.as_mut()).is_pending());
+        drop(first);
+        let std::task::Poll::Ready(large) = poll_once(large.as_mut()) else {
+            panic!("the waiter is admitted once its bytes are free");
+        };
+        assert_eq!(memory.free_bytes(), free);
+        drop(large);
+        drop(second);
+        assert_eq!(memory.free_bytes(), capacity);
     }
 
     /// A terminal snapshot event whose title is `title`.
@@ -26608,15 +26753,67 @@ mod tests {
 
     #[test]
     fn a_terminal_frame_holds_transaction_memory_for_its_own_size() {
-        let small = terminal_transaction_permits(&titled_snapshot_event("x".to_owned()));
+        let small = terminal_transaction_bytes(&titled_snapshot_event("x".to_owned()));
         assert!((1..64 * 1024).contains(&small), "{small}");
-        let largest = terminal_transaction_permits(&titled_snapshot_event(
+        let largest = terminal_transaction_bytes(&titled_snapshot_event(
             "x".repeat(splinterm_protocol::MAX_TERMINAL_TRANSACTION_BYTES),
         ));
-        assert_eq!(
-            usize::try_from(largest).unwrap(),
-            TERMINAL_TRANSACTION_MEMORY_BYTES
-        );
+        assert_eq!(largest, TERMINAL_TRANSACTION_MEMORY_BYTES);
+    }
+
+    /// A connection's writer over a socket pair, with the client's end, the
+    /// writer's ordinary and control queues, and the writer task.
+    fn spawn_test_writer(
+        memory: &Arc<TerminalTransactionMemory>,
+        connection_id: u64,
+    ) -> (
+        UnixStream,
+        mpsc::Sender<QueuedServerFrame>,
+        mpsc::Sender<ControlFrame>,
+        AbortOnDrop,
+    ) {
+        let (client, server) = UnixStream::pair().unwrap();
+        let (_reader, writer) = server.into_split();
+        let (outbound, outbound_rx) = mpsc::channel(OUTBOUND_QUEUE);
+        let (control, control_rx) = mpsc::channel(CONTROL_QUEUE);
+        let writer = AbortOnDrop::new(tokio::spawn(write_frames(
+            writer,
+            outbound_rx,
+            control_rx,
+            Arc::clone(memory),
+            connection_id,
+        )));
+        (client, outbound, control, writer)
+    }
+
+    /// Reads one frame that fits in a single encoded frame.
+    async fn read_test_server_frame(client: &mut UnixStream) -> ServerFrame {
+        let mut length = [0_u8; 4];
+        client.read_exact(&mut length).await.unwrap();
+        let mut body = vec![0_u8; u32::from_be_bytes(length) as usize];
+        client.read_exact(&mut body).await.unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    /// Waits until the writer has taken everything queued on `outbound`.
+    async fn wait_until_writer_took(outbound: &mpsc::Sender<QueuedServerFrame>) {
+        time::timeout(Duration::from_secs(4), async {
+            while outbound.capacity() < OUTBOUND_QUEUE {
+                time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the writer takes its queued frame");
+    }
+
+    fn is_snapshot_titled(frame: &ServerFrame, title: &str) -> bool {
+        matches!(
+            frame,
+            ServerFrame::Event {
+                event: SubscriptionEvent::Snapshot { snapshot },
+                ..
+            } if snapshot.title == title
+        )
     }
 
     /// Two clients that read nothing hold their large frames' memory until
@@ -26624,24 +26821,12 @@ mod tests {
     /// is written meanwhile.
     #[tokio::test]
     async fn clients_that_stopped_reading_do_not_stop_another_connections_terminal_output() {
-        let budget = Arc::new(Semaphore::new(TERMINAL_TRANSACTION_DAEMON_MEMORY_BYTES));
-        let connect = |connection_id| {
-            let (client, server) = UnixStream::pair().unwrap();
-            let (_reader, writer) = server.into_split();
-            let (outbound, outbound_rx) = mpsc::channel::<QueuedServerFrame>(OUTBOUND_QUEUE);
-            let (control, control_rx) = mpsc::channel(CONTROL_QUEUE);
-            let writer = AbortOnDrop::new(tokio::spawn(write_frames(
-                writer,
-                outbound_rx,
-                control_rx,
-                Arc::clone(&budget),
-                connection_id,
-            )));
-            (client, outbound, control, writer)
-        };
+        let memory = Arc::new(TerminalTransactionMemory::new(
+            TERMINAL_TRANSACTION_DAEMON_MEMORY_BYTES,
+        ));
         let mut stopped = Vec::new();
         for connection_id in 1..=2 {
-            let connection = connect(connection_id);
+            let connection = spawn_test_writer(&memory, connection_id);
             connection
                 .1
                 .send(chunked_snapshot_event().into())
@@ -26649,39 +26834,68 @@ mod tests {
                 .unwrap();
             stopped.push(connection);
         }
-        let held = terminal_transaction_permits(&chunked_snapshot_event()) as usize;
+        let held = terminal_transaction_bytes(&chunked_snapshot_event());
         time::timeout(Duration::from_secs(4), async {
-            while budget.available_permits() > TERMINAL_TRANSACTION_DAEMON_MEMORY_BYTES - 2 * held {
+            while memory.free_bytes() > TERMINAL_TRANSACTION_DAEMON_MEMORY_BYTES - 2 * held {
                 time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await
         .expect("both stopped clients' writers hold their frames' memory");
 
-        let (mut client, outbound, _control, _writer) = connect(3);
+        let (mut client, outbound, _control, _writer) = spawn_test_writer(&memory, 3);
         outbound
             .send(titled_snapshot_event("live".to_owned()).into())
             .await
             .unwrap();
-        let frame = time::timeout(Duration::from_secs(2), async {
-            let mut length = [0_u8; 4];
-            client.read_exact(&mut length).await.unwrap();
-            let mut body = vec![0_u8; u32::from_be_bytes(length) as usize];
-            client.read_exact(&mut body).await.unwrap();
-            serde_json::from_slice::<ServerFrame>(&body).unwrap()
+        let frame = time::timeout(Duration::from_secs(2), read_test_server_frame(&mut client))
+            .await
+            .expect("the frame is written while the other writes still wait");
+        assert!(is_snapshot_titled(&frame, "live"), "{frame:?}");
+        drop(stopped);
+    }
+
+    /// Clients that read nothing hold all but less than one large frame's
+    /// memory, and a further large frame waits for memory. Another
+    /// connection's small terminal frame fits in what is free and is written
+    /// without waiting behind it.
+    ///
+    /// The frames are far larger than a socket buffer but small enough to
+    /// encode quickly, and the memory is sized to them, so every write still
+    /// waits when the assertion is made.
+    #[tokio::test]
+    async fn a_frame_waiting_for_terminal_memory_does_not_hold_back_one_that_fits() {
+        let large = || titled_snapshot_event("x".repeat(1 << 20));
+        let held = terminal_transaction_bytes(&large());
+        let memory = Arc::new(TerminalTransactionMemory::new(5 * held + held / 2));
+        let mut stopped = Vec::new();
+        for connection_id in 1..=5 {
+            let connection = spawn_test_writer(&memory, connection_id);
+            connection.1.send(large().into()).await.unwrap();
+            stopped.push(connection);
+        }
+        time::timeout(Duration::from_secs(4), async {
+            while memory.free_bytes() >= held {
+                time::sleep(Duration::from_millis(5)).await;
+            }
         })
         .await
-        .expect("the frame is written while the other writes still wait");
-        assert!(
-            matches!(
-                &frame,
-                ServerFrame::Event {
-                    event: SubscriptionEvent::Snapshot { snapshot },
-                    ..
-                } if snapshot.title == "live"
-            ),
-            "{frame:?}"
-        );
+        .expect("the stopped clients' writers hold all but less than one large frame's memory");
+
+        let waiting = spawn_test_writer(&memory, 6);
+        waiting.1.send(large().into()).await.unwrap();
+        wait_until_writer_took(&waiting.1).await;
+        stopped.push(waiting);
+
+        let (mut client, outbound, _control, _writer) = spawn_test_writer(&memory, 7);
+        outbound
+            .send(titled_snapshot_event("live".to_owned()).into())
+            .await
+            .unwrap();
+        let frame = time::timeout(Duration::from_secs(2), read_test_server_frame(&mut client))
+            .await
+            .expect("the frame is written while a larger one waits for memory");
+        assert!(is_snapshot_titled(&frame, "live"), "{frame:?}");
         drop(stopped);
     }
 
@@ -28920,7 +29134,7 @@ mod tests {
             writer,
             outbound_rx,
             control_rx,
-            Arc::new(Semaphore::new(1)),
+            Arc::new(TerminalTransactionMemory::new(1)),
             77,
         ));
         // The client never reads: the socket fills, and a write then waits.
