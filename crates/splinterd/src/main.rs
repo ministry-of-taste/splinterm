@@ -16798,7 +16798,11 @@ fn frame_trace_identity(frame: &ServerFrame) -> Option<(u64, u64, u64, u64)> {
 /// While an ordinary frame waits for terminal transaction memory, the
 /// connection's control items are still written: nothing of the waiting
 /// frame has been written yet, so each of them starts at a frame boundary
-/// too.
+/// too. A control frame can therefore be written ahead of the one frame
+/// already taken from the normal queue; the normal queue's own order is
+/// unchanged. The client tolerates that: a subscription's `ResyncRequired`
+/// or `AccessRevoked` ends it whatever its sequence, and the client ignores
+/// frames of a subscription that has ended.
 ///
 /// Ending early ends the connection's writes, so each such end is logged
 /// with `connection_id` (Plan 0073): its client otherwise only sees its
