@@ -12,7 +12,7 @@ use anyhow::{Result, bail};
 use splinterm::automation::response_protocol_error;
 use splinterm::automation::{
     Connection, DaemonChange, DaemonIdentity, ImageContentLeaseSet, SharedImageContentCache,
-    protocol_error,
+    is_daemon_closed_connection, protocol_error,
 };
 use splinterm::config::AppConfig;
 use splinterm::diagnostics::{DiagnosticErrorCode, DiagnosticEventCode, DiagnosticLevel};
@@ -2101,22 +2101,54 @@ pub(in crate::app) async fn resolve_update_images(
     Ok(())
 }
 
-fn report_pane_controller_result(result: Result<Result<()>, tokio::task::JoinError>) {
-    match result {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => eprintln!("splinterm pane controller stopped: {error:#}"),
-        Err(error) => eprintln!("splinterm pane controller task failed: {error}"),
+/// Says why a pane's controller ended, when it failed. stderr gets the
+/// error; a desktop launch discards stderr, so while the pane is `live`
+/// (not closing) the diagnostic log also keeps the failure's category and
+/// the daemon's refusal code, without the error's text.
+fn report_pane_controller_result(
+    splint_id: SplintId,
+    live: bool,
+    result: Result<Result<()>, tokio::task::JoinError>,
+) {
+    let (error_code, daemon_error) = match result {
+        Ok(Ok(())) => return,
+        Ok(Err(error)) => {
+            eprintln!("splinterm pane {splint_id}: controller stopped: {error:#}");
+            pane_controller_failure_codes(&error)
+        }
+        Err(error) => {
+            eprintln!("splinterm pane {splint_id}: controller task failed: {error}");
+            (DiagnosticErrorCode::InternalError, None)
+        }
+    };
+    if live && let Some(diagnostics) = splinterm::diagnostics::global() {
+        diagnostics.emit_for_pane(
+            DiagnosticLevel::Warn,
+            DiagnosticEventCode::PaneControllerFailure,
+            Some(error_code),
+            splint_id,
+            daemon_error,
+        );
     }
 }
 
-async fn finish_pane_controller(
-    controller: &mut tokio::task::JoinHandle<Result<()>>,
-    completed: bool,
-) -> Result<()> {
-    if !completed {
-        report_pane_controller_result(controller.await);
+/// What the diagnostic log keeps of a controller's failure: the daemon's
+/// refusal code for a refused request, a lost connection as I/O, and
+/// anything else as the client's own error.
+fn pane_controller_failure_codes(
+    error: &anyhow::Error,
+) -> (DiagnosticErrorCode, Option<ErrorCode>) {
+    if let Some(refusal) = protocol_error(error) {
+        return (DiagnosticErrorCode::Protocol, Some(refusal.code));
     }
-    Ok(())
+    if is_daemon_closed_connection(error)
+        || error
+            .chain()
+            .any(<dyn std::error::Error>::is::<std::io::Error>)
+    {
+        return (DiagnosticErrorCode::Io, None);
+    }
+    (DiagnosticErrorCode::InternalError, None)
 }
 
 /// Plan 0073: the first pause before a pane's lost display stream
@@ -2340,7 +2372,11 @@ impl PaneSubscription {
     }
 
     async fn finish(mut self) -> Result<()> {
-        finish_pane_controller(&mut self.controller, self.controller_completed).await
+        if !self.controller_completed {
+            let live = !self.cancellation.is_cancelled();
+            report_pane_controller_result(self.splint_id, live, (&mut self.controller).await);
+        }
+        Ok(())
     }
 
     /// Follows `stream` until the pane closes, its Splint exits, or the
@@ -2360,7 +2396,8 @@ impl PaneSubscription {
             tokio::select! {
                 () = self.cancellation.cancelled() => return Ok(()),
                 result = &mut self.controller, if !self.controller_completed => {
-                    report_pane_controller_result(result);
+                    let live = !self.cancellation.is_cancelled();
+                    report_pane_controller_result(self.splint_id, live, result);
                     self.controller_completed = true;
                     if !self.deliver_control_lost().await {
                         return Ok(());
@@ -2550,7 +2587,8 @@ impl PaneSubscription {
                 () = self.cancellation.cancelled() => return None,
                 () = self.updates.closed() => return None,
                 result = &mut self.controller, if !self.controller_completed => {
-                    report_pane_controller_result(result);
+                    let live = !self.cancellation.is_cancelled();
+                    report_pane_controller_result(self.splint_id, live, result);
                     self.controller_completed = true;
                     self.control_lost_owed = true;
                 }
@@ -2809,6 +2847,35 @@ mod tests {
         assert!(ensure_image_transport(ImageTransport::Unavailable, false).is_ok());
         assert!(ensure_image_transport(ImageTransport::Unavailable, true).is_err());
         assert!(ensure_image_transport(ImageTransport::LocalTrusted, true).is_ok());
+    }
+
+    /// The diagnostic log keeps why a controller ended as closed codes: the
+    /// daemon's refusal code, a lost connection, or the client's own error.
+    #[test]
+    fn controller_failures_are_recorded_as_closed_codes() {
+        let refused = response_protocol_error(splinterm_protocol::ProtocolError::new(
+            ErrorCode::StaleIncarnation,
+            "process text that must not be recorded",
+        ));
+        assert_eq!(
+            pane_controller_failure_codes(&refused),
+            (
+                DiagnosticErrorCode::Protocol,
+                Some(ErrorCode::StaleIncarnation)
+            )
+        );
+        let lost = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            .context("write request");
+        assert_eq!(
+            pane_controller_failure_codes(&lost),
+            (DiagnosticErrorCode::Io, None)
+        );
+        assert_eq!(
+            pane_controller_failure_codes(&anyhow::anyhow!(
+                "splinterd did not acknowledge a window control command"
+            )),
+            (DiagnosticErrorCode::InternalError, None)
+        );
     }
 
     #[test]

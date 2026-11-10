@@ -273,6 +273,9 @@ const MAX_SCALE_120: u32 = 960;
 const MAX_PREEDIT_BYTES: usize = 4 * 1024;
 /// Plan 0074: shown when the daemon's full input queue cut input short.
 const INPUT_DROPPED_NOTICE: &str = "Input cut short: the program is not reading it";
+/// Shown in a pane whose controller ended while its display goes on: the
+/// pane still shows its program, and nothing typed into it arrives.
+const CONTROL_LOST_NOTICE: &str = "Control disconnected";
 /// Plan 0072 M2b: shown in a pane a person resized in another Window, which
 /// took control of it.
 const CONTROL_RECLAIMED_NOTICE: &str = "Viewing — another Window took control";
@@ -965,15 +968,16 @@ impl WaylandSession {
     fn run_phase(&mut self, app: &mut App) -> Result<()> {
         let queue_handle = &self.queue_handle;
         while !app.scheduling.exit {
+            app.retire_closed_pane_commands(queue_handle)?;
             app.apply_updates(queue_handle)?;
             app.accessibility_turn(queue_handle);
             if !app.scheduling.exit {
                 app.flush_pending_terminal_input();
-                app.retry_pending_pane_resizes()?;
+                app.retry_pending_pane_resizes();
             }
             app.draw_if_pending(queue_handle)?;
             app.tick_signoff(queue_handle)?;
-            app.apply_clipboard_reads()?;
+            app.apply_clipboard_reads();
             app.apply_osc52_requests(queue_handle);
             app.apply_clipboard_image_events();
             app.tick_cursor_blink(queue_handle)?;
@@ -1204,6 +1208,7 @@ fn assemble_app(
                 history_page_pending: false,
                 resync_pending: false,
                 display_lost: None,
+                control_lost: false,
                 reclaimed_notice_until: None,
                 history_page_top: None,
                 history_selection_pin_blocked: false,
@@ -1565,6 +1570,9 @@ struct PaneView {
     /// Plan 0073: the notice a pane whose display stream has been lost for
     /// a while shows until an authoritative snapshot.
     display_lost: Option<&'static str>,
+    /// The pane's controller ended while its display stream goes on; see
+    /// [`PaneView::retire_closed_commands`].
+    control_lost: bool,
     /// Plan 0072 M2b: until when the pane says another Window took control.
     reclaimed_notice_until: Option<Instant>,
     history_page_pending: bool,
@@ -1778,16 +1786,45 @@ impl PaneView {
     }
 
     /// What the pane says over its content, if anything: a lost display
-    /// (Plan 0073) before another Window taking control (Plan 0072 M2b),
-    /// which only tells, while the lost display says why nothing changes. A
-    /// control transfer request outranks both; see
-    /// [`without_control_transfer_panes`].
+    /// (Plan 0073), then a lost controller, before another Window taking
+    /// control (Plan 0072 M2b), which only tells, while the first two say
+    /// why nothing changes or arrives. A control transfer request outranks
+    /// them all; see [`without_control_transfer_panes`].
     fn status_notice(&self, now: Instant) -> Option<&'static str> {
-        self.display_lost.or_else(|| {
-            self.reclaimed_notice_until
-                .is_some_and(|until| now < until)
-                .then_some(CONTROL_RECLAIMED_NOTICE)
-        })
+        self.display_lost
+            .or(self.control_lost.then_some(CONTROL_LOST_NOTICE))
+            .or_else(|| {
+                self.reclaimed_notice_until
+                    .is_some_and(|until| now < until)
+                    .then_some(CONTROL_RECLAIMED_NOTICE)
+            })
+    }
+
+    /// The pane's controller ended while its display stream goes on: the
+    /// command queue's receiver is gone, so nothing the pane sends can
+    /// arrive. The pane stops sending, drops what it had deferred, and with
+    /// `say` says so; returns whether it just did. Its Window and the
+    /// Window's other panes go on: one pane's lost controller is never
+    /// theirs.
+    fn retire_closed_commands(&mut self, say: bool) -> bool {
+        if !self.commands.as_ref().is_some_and(Sender::is_closed) {
+            return false;
+        }
+        self.controller_active = false;
+        self.commands = None;
+        self.pending_control_transfer = None;
+        self.control_release_pending = false;
+        self.pending_focus_report = None;
+        self.pending_resize = None;
+        self.reclaim_sent = false;
+        self.reclaim_cancel_pending = false;
+        // Nothing sent is answered any more.
+        self.resync_pending = false;
+        self.history_page_pending = false;
+        self.search.in_flight = 0;
+        self.search.searching = false;
+        self.control_lost = say;
+        true
     }
 
     fn retain_trace_correlation(
@@ -1899,6 +1936,7 @@ impl PaneView {
             history_page_pending: false,
             resync_pending: false,
             display_lost: None,
+            control_lost: false,
             reclaimed_notice_until: None,
             history_page_top: None,
             history_selection_pin_blocked: false,
@@ -2024,7 +2062,7 @@ impl PaneView {
             &mut self.resync_pending,
             previous_offset,
             current_offset,
-        )?;
+        );
         let remaining = viewport.max_offset(snapshot).saturating_sub(current_offset);
         let prefetch_distance = viewport.rows_shown(snapshot).saturating_mul(2).max(32);
         let near_oldest = action == MouseAction::WheelUp && remaining <= prefetch_distance;
@@ -2170,6 +2208,7 @@ impl PaneView {
         self.pending_control_transfer = None;
         self.updates = None;
         self.display_lost = None;
+        self.control_lost = false;
     }
 
     /// An inactive pane's process exited (`splint_id`).
@@ -3154,23 +3193,23 @@ fn queue_terminal_input(
     commands: Option<&Sender<WindowCommand>>,
     pending: &mut VecDeque<PendingTerminalInput>,
     bytes: Vec<u8>,
-) -> Result<TerminalInputQueueOutcome> {
+) -> TerminalInputQueueOutcome {
     let Some(commands) = commands else {
-        return Ok(TerminalInputQueueOutcome::Queued);
+        return TerminalInputQueueOutcome::Queued;
     };
     if terminal_input_pending_for(pending, Some(commands)) {
         let _ = try_flush_pending_terminal_input(pending);
         if terminal_input_pending_for(pending, Some(commands)) {
-            return Ok(retain_pending_terminal_input(pending, commands, bytes));
+            return retain_pending_terminal_input(pending, commands, bytes);
         }
     }
     match commands.try_send(WindowCommand::Input(bytes)) {
-        Ok(()) => Ok(TerminalInputQueueOutcome::Queued),
+        // The pane's controller ended: the bytes were bound to that pane,
+        // so they are dropped, never replayed or sent to another pane, and
+        // the Window goes on.
+        Ok(()) | Err(TrySendError::Closed(_)) => TerminalInputQueueOutcome::Queued,
         Err(TrySendError::Full(WindowCommand::Input(bytes))) => {
-            Ok(retain_pending_terminal_input(pending, commands, bytes))
-        }
-        Err(TrySendError::Closed(_)) => {
-            Err(anyhow::anyhow!("Wayland command receiver disconnected"))
+            retain_pending_terminal_input(pending, commands, bytes)
         }
         Err(TrySendError::Full(_)) => unreachable!("queued command remains terminal input"),
     }
@@ -3243,15 +3282,10 @@ fn propagate_raster_damage_through_scroll(
 /// Sends a command the Window can do without: a resynchronization, a
 /// history page or a search. When the queue is full the bridge is behind,
 /// for example while it delivers a flood of output, and the command is
-/// dropped instead of ending the Window. Returns whether it was sent.
-fn try_advisory_command(commands: &Sender<WindowCommand>, command: WindowCommand) -> Result<bool> {
-    match commands.try_send(command) {
-        Ok(()) => Ok(true),
-        Err(TrySendError::Full(_)) => Ok(false),
-        Err(TrySendError::Closed(_)) => {
-            Err(anyhow::anyhow!("Wayland command receiver disconnected"))
-        }
-    }
+/// dropped instead of ending the Window. So is one for a pane whose
+/// controller ended, which closed the queue. Returns whether it was sent.
+fn try_advisory_command(commands: &Sender<WindowCommand>, command: WindowCommand) -> bool {
+    commands.try_send(command).is_ok()
 }
 
 /// Asks for an authoritative snapshot when a viewport reaches live, unless
@@ -3262,15 +3296,15 @@ fn request_return_live_resync(
     pending: &mut bool,
     previous_offset: usize,
     current_offset: usize,
-) -> Result<bool> {
+) -> bool {
     if previous_offset == 0 || current_offset != 0 || *pending {
-        return Ok(false);
+        return false;
     }
     let Some(commands) = commands else {
-        return Ok(false);
+        return false;
     };
-    *pending = try_advisory_command(commands, WindowCommand::Resynchronize)?;
-    Ok(*pending)
+    *pending = try_advisory_command(commands, WindowCommand::Resynchronize);
+    *pending
 }
 
 /// The topology manager is still busy with earlier commands, for example
@@ -5605,22 +5639,22 @@ impl App {
         )?))
     }
 
-    fn request_older_history(&mut self) -> Result<()> {
+    fn request_older_history(&mut self) {
         if self.panes.pane.history_page_pending || self.panes.pane.history_selection_pin_blocked {
-            return Ok(());
+            return;
         }
         let Some(snapshot) = self.panes.pane.snapshot.as_ref() else {
-            return Ok(());
+            return;
         };
         if snapshot.omitted_oldest_scrollback_rows == 0 {
-            return Ok(());
+            return;
         }
         let Some(before_row_id) = snapshot.scrollback_rows.first().and_then(|row| row.row_id)
         else {
-            return Ok(());
+            return;
         };
         let Some(commands) = self.panes.pane.commands.as_ref() else {
-            return Ok(());
+            return;
         };
         if !try_advisory_command(
             commands,
@@ -5631,19 +5665,18 @@ impl App {
                 history_generation: snapshot.history_generation,
                 before_row_id,
             },
-        )? {
-            return Ok(());
+        ) {
+            return;
         }
         self.panes.pane.history_page_pending = true;
         self.panes.pane.history_page_top = Some(before_row_id);
-        Ok(())
     }
 
     fn scroll_history(&mut self, action: MouseAction, lines: usize) -> Result<bool> {
         self.cancel_clipboard_image();
         let (moved, near_oldest) = self.panes.pane.scroll_viewport(action, lines)?;
         if near_oldest {
-            self.request_older_history()?;
+            self.request_older_history();
         }
         if !moved {
             return Ok(false);
@@ -5963,11 +5996,10 @@ impl App {
         }
     }
 
-    fn send_input(&mut self, bytes: Vec<u8>) -> Result<()> {
-        if self.pty_input_blocked() {
-            return Ok(());
+    fn send_input(&mut self, bytes: Vec<u8>) {
+        if !self.pty_input_blocked() {
+            self.queue_terminal_input(bytes);
         }
-        self.queue_terminal_input(bytes)
     }
 
     fn handle_vertical_wheel(
@@ -6103,9 +6135,9 @@ impl App {
         event: &KeyEvent,
         queue_handle: &QueueHandle<Self>,
         serial: u32,
-    ) -> Result<bool> {
+    ) {
         let Some(mut state) = self.modal.copy_mode else {
-            return Ok(false);
+            return;
         };
         if !self
             .panes
@@ -6115,22 +6147,22 @@ impl App {
             .is_some_and(|snapshot| copy_mode_is_valid(snapshot, state))
         {
             self.close_copy_mode();
-            return Ok(true);
+            return;
         }
         let plain =
             !self.input.modifiers.ctrl && !self.input.modifiers.alt && !self.input.modifiers.logo;
         match copy_mode_desktop_action(event.keysym, self.input.modifiers) {
             Some(CopyModeDesktopAction::CopySelection) => {
                 self.publish_copy_mode_selection_and_close(state, queue_handle, serial);
-                return Ok(true);
+                return;
             }
-            Some(CopyModeDesktopAction::Consume) => return Ok(true),
+            Some(CopyModeDesktopAction::Consume) => return,
             None => {}
         }
         match event.keysym {
             Keysym::Escape => {
                 self.close_copy_mode();
-                return Ok(true);
+                return;
             }
             Keysym::v | Keysym::V if plain => {
                 state.begin_selection();
@@ -6140,11 +6172,11 @@ impl App {
                 self.panes.pane.selecting = true;
                 self.dirty_selection(self.panes.pane.selection);
                 self.presentation.full_redraw = true;
-                return Ok(true);
+                return;
             }
             Keysym::y | Keysym::Y if plain => {
                 self.publish_copy_mode_selection_and_close(state, queue_handle, serial);
-                return Ok(true);
+                return;
             }
             _ => {}
         }
@@ -6164,7 +6196,7 @@ impl App {
             _ => None,
         };
         let Some(motion) = motion else {
-            return Ok(true);
+            return;
         };
         let outcome = self
             .panes
@@ -6175,7 +6207,7 @@ impl App {
                 move_copy_cursor(snapshot, &mut state, motion)
             });
         if outcome.request_older {
-            self.request_older_history()?;
+            self.request_older_history();
         }
         if outcome.moved {
             self.dirty_selection(self.panes.pane.selection);
@@ -6192,7 +6224,6 @@ impl App {
             self.panes.pane.viewport_dirty = true;
             self.presentation.full_redraw = true;
         }
-        Ok(true)
     }
 
     fn clear_selection(&mut self) {
@@ -6795,40 +6826,39 @@ impl App {
         );
     }
 
-    fn apply_clipboard_reads(&mut self) -> Result<()> {
+    fn apply_clipboard_reads(&mut self) {
         while let Ok(read) = self.clipboard.clipboard_rx.try_recv() {
             if let Some(offer) = &read.drag_offer {
                 offer.finish();
                 offer.destroy();
             }
             if let PasteTarget::FileDrop(target) = read.target {
-                self.apply_file_drop_read(target, read.input_generation, read.bytes)?;
-            } else if let Some(dropped) = self.apply_paste_read(read)? {
+                self.apply_file_drop_read(target, read.input_generation, read.bytes);
+            } else if let Some(dropped) = self.apply_paste_read(read) {
                 self.window_notice(dropped.notice());
             }
         }
-        Ok(())
     }
 
     /// Plan 0074: delivers a finished clipboard or primary-selection read
     /// to its target, or says why it was dropped. Disallowed control
     /// characters are removed rather than refusing the paste.
-    fn apply_paste_read(&mut self, read: ClipboardRead) -> Result<Option<PasteDrop>> {
+    fn apply_paste_read(&mut self, read: ClipboardRead) -> Option<PasteDrop> {
         // Owned fields still take a paste while terminal input is blocked.
         let blocked =
             !matches!(read.target, PasteTarget::OwnedField(_)) && self.pty_input_blocked();
         if let Some(dropped) =
             clipboard_read_drop(blocked, self.input.input_generation, read.input_generation)
         {
-            return Ok(Some(dropped));
+            return Some(dropped);
         }
         let bytes = match read.bytes {
             Ok(bytes) => bytes,
-            Err(error) => return Ok(Some(PasteDrop::from_read_error(&error))),
+            Err(error) => return Some(PasteDrop::from_read_error(&error)),
         };
         let text = match sanitize_paste(&bytes) {
             Ok(text) => text,
-            Err(dropped) => return Ok(Some(dropped)),
+            Err(dropped) => return Some(dropped),
         };
         match read.target {
             PasteTarget::OwnedField(target) => {
@@ -6838,10 +6868,10 @@ impl App {
                 {
                     self.refresh_owned_field(target);
                 }
-                Ok(None)
+                None
             }
             PasteTarget::Clipboard | PasteTarget::Primary => self.send_paste(&text),
-            PasteTarget::FileDrop(_) => Ok(None),
+            PasteTarget::FileDrop(_) => None,
         }
     }
 
@@ -6849,9 +6879,9 @@ impl App {
     /// asked for bracketed paste. A paste is sent whole or not at all: one
     /// too large for the daemon's input queue is refused up front, so a
     /// bracketed paste is never left open.
-    fn send_paste(&mut self, text: &str) -> Result<Option<PasteDrop>> {
+    fn send_paste(&mut self, text: &str) -> Option<PasteDrop> {
         let Some(commands) = self.panes.pane.commands.clone() else {
-            return Ok(Some(PasteDrop::NoInput));
+            return Some(PasteDrop::NoInput);
         };
         let bracketed = self
             .panes
@@ -6861,13 +6891,12 @@ impl App {
             .is_some_and(|snapshot| snapshot.input_modes.bracketed_paste);
         let encoded = encode_bracketed_paste(text.as_bytes(), bracketed);
         if encoded.len() > MAX_PASTE_INPUT_BYTES {
-            return Ok(Some(PasteDrop::TooLarge));
+            return Some(PasteDrop::TooLarge);
         }
-        self.queue_terminal_input_for(Some(&commands), encoded)?;
-        Ok(self
-            .input
+        self.queue_terminal_input_for(Some(&commands), encoded);
+        self.input
             .terminal_input_saturated
-            .then_some(PasteDrop::Backlog))
+            .then_some(PasteDrop::Backlog)
     }
 
     fn apply_file_drop_read(
@@ -6875,26 +6904,26 @@ impl App {
         target: FileDropTarget,
         input_generation: u64,
         bytes: std::io::Result<Vec<u8>>,
-    ) -> Result<()> {
+    ) {
         if self.input.input_generation != input_generation {
             eprintln!("splinterm file drop rejected: input target changed");
-            return Ok(());
+            return;
         }
         let Ok(bytes) = bytes else {
             eprintln!("splinterm file drop rejected: offer read failed");
-            return Ok(());
+            return;
         };
         let Ok(bytes) = safe_paste(&bytes) else {
             eprintln!("splinterm file drop rejected: unsafe offer bytes");
-            return Ok(());
+            return;
         };
         let Some(pane) = self.pane_for_splint(target.splint_id) else {
             eprintln!("splinterm file drop rejected: target pane unavailable");
-            return Ok(());
+            return;
         };
         let Some(snapshot) = pane.snapshot.as_ref() else {
             eprintln!("splinterm file drop rejected: target snapshot unavailable");
-            return Ok(());
+            return;
         };
         let current = FileDropTarget {
             topology_revision: self.tab_state.active_identity.topology_revision,
@@ -6911,19 +6940,18 @@ impl App {
             pane.commands.is_some(),
         ) {
             eprintln!("splinterm file drop rejected: target became stale");
-            return Ok(());
+            return;
         }
         let Ok(payload) = dropped_file_payload(bytes) else {
             eprintln!("splinterm file drop rejected: invalid URI list");
-            return Ok(());
+            return;
         };
         let encoded = encode_bracketed_paste(&payload, snapshot.input_modes.bracketed_paste);
         let Some(commands) = pane.commands.clone() else {
             eprintln!("splinterm file drop rejected: command channel unavailable");
-            return Ok(());
+            return;
         };
-        self.queue_terminal_input_for(Some(&commands), encoded)?;
-        Ok(())
+        self.queue_terminal_input_for(Some(&commands), encoded);
     }
 
     fn publish_clipboard(&mut self, qh: &QueueHandle<Self>, serial: u32, primary: bool) {
@@ -8365,31 +8393,36 @@ impl App {
             // Keys and IME commits reach the PTY through here; pastes go
             // through `send_input` and file drops through the drop target
             // check. All three share `pty_input_blocked`.
-            if !self.pty_input_blocked()
-                && let Err(error) = self.queue_terminal_input(bytes)
-            {
-                self.scheduling.fail(error);
+            if !self.pty_input_blocked() {
+                self.queue_terminal_input(bytes);
             }
             return;
         }
         let Some(commands) = &self.panes.pane.commands else {
             return;
         };
-        if let Err(error) = try_window_command(commands, command) {
-            self.scheduling.fail(error);
+        match commands.try_send(command) {
+            // Closed: the pane's controller ended. The command is dropped
+            // and the pane stops sending (`PaneView::retire_closed_commands`);
+            // that is never the Window's failure.
+            Ok(()) | Err(TrySendError::Closed(_)) => {}
+            Err(TrySendError::Full(_)) => {
+                self.scheduling
+                    .fail(anyhow::anyhow!("Wayland command queue overflow"));
+            }
         }
     }
 
-    fn queue_terminal_input(&mut self, bytes: Vec<u8>) -> Result<()> {
+    fn queue_terminal_input(&mut self, bytes: Vec<u8>) {
         let commands = self.panes.pane.commands.clone();
-        self.queue_terminal_input_for(commands.as_ref(), bytes)
+        self.queue_terminal_input_for(commands.as_ref(), bytes);
     }
 
     fn queue_terminal_input_for(
         &mut self,
         commands: Option<&Sender<WindowCommand>>,
         bytes: Vec<u8>,
-    ) -> Result<()> {
+    ) {
         if let Some(commands) = commands
             && clear_reclaimed_notice_for_input(
                 std::iter::once(&mut self.panes.pane).chain(self.panes.inactive_panes.iter_mut()),
@@ -8398,13 +8431,11 @@ impl App {
         {
             self.presentation.full_redraw = true;
         }
-        let outcome =
-            queue_terminal_input(commands, &mut self.input.pending_terminal_input, bytes)?;
+        let outcome = queue_terminal_input(commands, &mut self.input.pending_terminal_input, bytes);
         if outcome == TerminalInputQueueOutcome::Saturated && !self.input.terminal_input_saturated {
             eprintln!("splinterm input queue saturated; dropping excess terminal input");
         }
         self.input.terminal_input_saturated = outcome == TerminalInputQueueOutcome::Saturated;
-        Ok(())
     }
 
     fn flush_pending_terminal_input(&mut self) {
@@ -8429,13 +8460,10 @@ impl App {
         let Some(commands) = &self.panes.pane.commands else {
             return;
         };
-        match commands.try_send(WindowCommand::Input(bytes)) {
-            Ok(()) | Err(TrySendError::Full(_)) => {}
-            Err(TrySendError::Closed(_)) => {
-                self.scheduling
-                    .fail(anyhow::anyhow!("Wayland command receiver disconnected"));
-            }
-        }
+        // Dropped when the queue is full, as coalescible input may be, and
+        // when the pane's controller ended: that is the pane's loss, never
+        // the Window's (see `PaneView::retire_closed_commands`).
+        let _ = commands.try_send(WindowCommand::Input(bytes));
     }
 
     fn commit_text_input(&mut self) {
@@ -10297,13 +10325,7 @@ impl App {
             let top = snapshot.scrollback_rows.first().and_then(|row| row.row_id);
             let sent = match (command, self.panes.pane.commands.as_ref()) {
                 // Retried with the next update while the match is unrevealed.
-                (Some(command), Some(commands)) => match try_advisory_command(commands, command) {
-                    Ok(sent) => sent,
-                    Err(error) => {
-                        self.scheduling.fail(error);
-                        false
-                    }
-                },
+                (Some(command), Some(commands)) => try_advisory_command(commands, command),
                 _ => false,
             };
             if !sent {
@@ -10365,16 +10387,14 @@ impl App {
             },
         );
         let search = &mut self.panes.pane.search;
-        match sent {
+        if sent {
             // Counted only when sent: nothing else answers it.
-            Ok(true) => {
-                search.in_flight = search.in_flight.saturating_add(1);
-                search.submitted_query = query;
-                search.searching = continuing && search.matches.is_empty();
-            }
+            search.in_flight = search.in_flight.saturating_add(1);
+            search.submitted_query = query;
+            search.searching = continuing && search.matches.is_empty();
+        } else {
             // Busy: Enter or Ctrl+N asks again.
-            Ok(false) => search.searching = false,
-            Err(error) => self.scheduling.fail(error),
+            search.searching = false;
         }
     }
 
@@ -11033,7 +11053,8 @@ impl App {
             size: resize,
             command: resize_command,
         });
-        Self::retry_pending_pane_resize(pane)
+        Self::retry_pending_pane_resize(pane);
+        Ok(())
     }
 
     /// Plan 0072 M2b: the Window lost keyboard focus, so no visible pane
@@ -11086,12 +11107,12 @@ impl App {
         }
     }
 
-    fn retry_pending_pane_resize(pane: &mut PaneView) -> Result<()> {
+    fn retry_pending_pane_resize(pane: &mut PaneView) {
         let Some(pending) = pane.pending_resize.take() else {
-            return Ok(());
+            return;
         };
         let Some(commands) = &pane.commands else {
-            return Ok(());
+            return;
         };
         let reclaim = matches!(pending.command, WindowCommand::ReclaimResize { .. });
         match commands.try_send(pending.command) {
@@ -11113,11 +11134,10 @@ impl App {
                     command,
                 });
             }
-            Err(TrySendError::Closed(_)) => {
-                anyhow::bail!("Wayland command receiver disconnected");
-            }
+            // The pane's controller ended: its resize is dropped with it,
+            // and the Window and its other panes go on.
+            Err(TrySendError::Closed(_)) => {}
         }
-        Ok(())
     }
 
     fn begin_pending_remote_split(
@@ -12950,17 +12970,46 @@ impl App {
             })
     }
 
-    fn retry_pending_pane_resizes(&mut self) -> Result<()> {
+    fn retry_pending_pane_resizes(&mut self) {
         for pane in
             std::iter::once(&mut self.panes.pane).chain(self.panes.inactive_panes.iter_mut())
         {
-            Self::retry_pending_pane_resize(pane)?;
+            Self::retry_pending_pane_resize(pane);
         }
         for tab in self.tab_state.tabs.iter_mut() {
             if let Some(view) = tab.value.as_mut() {
                 for pane in std::iter::once(&mut view.pane).chain(view.inactive_panes.iter_mut()) {
-                    Self::retry_pending_pane_resize(pane)?;
+                    Self::retry_pending_pane_resize(pane);
                 }
+            }
+        }
+    }
+
+    /// Stops every pane whose controller ended from sending to it, in every
+    /// tab, and redraws for the notices of those shown; see
+    /// [`PaneView::retire_closed_commands`]. The handoff banner speaks for
+    /// the Window while a daemon handoff holds it: controllers end with the
+    /// old daemon's connections, and the handoff's coordinator replaces
+    /// their panes.
+    fn retire_closed_pane_commands(&mut self, queue_handle: &QueueHandle<Self>) -> Result<()> {
+        let say = !self.handoff.holds_window_on_disconnect();
+        let mut shown = false;
+        for pane in
+            std::iter::once(&mut self.panes.pane).chain(self.panes.inactive_panes.iter_mut())
+        {
+            shown |= pane.retire_closed_commands(say);
+        }
+        for tab in self.tab_state.tabs.iter_mut() {
+            if let Some(view) = tab.value.as_mut() {
+                for pane in std::iter::once(&mut view.pane).chain(view.inactive_panes.iter_mut()) {
+                    pane.retire_closed_commands(say);
+                }
+            }
+        }
+        if shown && say {
+            self.presentation.full_redraw = true;
+            if self.surface.configured {
+                self.schedule_draw(queue_handle)?;
             }
         }
         Ok(())
@@ -14342,7 +14391,7 @@ impl App {
             .is_some_and(|probe| probe.observe_commit(committed_identity));
         if inject_graphical_input {
             self.scheduling.graphical_input_probe = None;
-            self.send_input(vec![b'q'])?;
+            self.send_input(vec![b'q']);
             if perf_trace_enabled() {
                 emit_perf_trace(
                     "splinterm",
@@ -18843,7 +18892,7 @@ mod tests {
             WindowCommand::Input(vec![1])
         );
 
-        App::retry_pending_pane_resize(&mut pane).expect("deferred resize retries");
+        App::retry_pending_pane_resize(&mut pane);
         let retried = command_receiver.try_recv().unwrap();
         assert!(matches!(retried, WindowCommand::PrepareResize { .. }));
         assert_ne!(pane.last_resize, previous);
@@ -18860,11 +18909,127 @@ mod tests {
             command_receiver.try_recv().unwrap(),
             WindowCommand::Input(vec![2])
         );
+        // The pane's controller ended: its deferred resize goes with it.
         drop(command_receiver);
-        let error = App::retry_pending_pane_resize(&mut pane)
-            .expect_err("disconnected deferred resize receiver");
-        assert!(error.to_string().contains("disconnected"));
+        App::retry_pending_pane_resize(&mut pane);
         assert!(pane.pending_resize.is_none());
+    }
+
+    /// A pane's controller can end while its display stream goes on, as when
+    /// the daemon refuses a request on the control connection, and its
+    /// command queue closes with it. That is that pane's loss alone: every
+    /// way the Window sends to it drops the command, where a closed queue
+    /// once ended the whole Window with its other panes and tabs.
+    #[test]
+    fn a_pane_whose_controller_ended_drops_commands_without_failing_the_window() {
+        let splint_id = SplintId::new();
+        let (_updates, update_receiver) = tokio::sync::mpsc::channel(1);
+        let (commands, command_receiver) = tokio::sync::mpsc::channel(4);
+        let mut pane = PaneView::from_options(
+            WindowPaneOptions {
+                snapshot: valid_snapshot(splint_id),
+                terminal_grid_limits: TerminalGridLimits::default(),
+                updates: update_receiver,
+                commands: commands.clone(),
+                authority: AuthorityStatus::default(),
+                controlled: true,
+                image_sources: ImageContentLeaseSet::default(),
+            },
+            SCALE_DENOMINATOR,
+        )
+        .unwrap();
+        drop(command_receiver);
+
+        let mut pending = VecDeque::new();
+        assert_eq!(
+            queue_terminal_input(Some(&commands), &mut pending, vec![b'x']),
+            TerminalInputQueueOutcome::Queued
+        );
+        assert!(pending.is_empty(), "input for a lost controller is dropped");
+        assert!(!try_advisory_command(
+            &commands,
+            WindowCommand::Resynchronize
+        ));
+        let mut resync_pending = false;
+        assert!(!request_return_live_resync(
+            Some(&commands),
+            &mut resync_pending,
+            2,
+            0
+        ));
+        assert!(!resync_pending);
+        App::emit_pane_resize(&mut pane, 640, 480, SCALE_DENOMINATOR, true)
+            .expect("a resize for a lost controller is dropped");
+        assert!(pane.pending_resize.is_none());
+
+        // During a daemon handoff the pane stops sending without a word:
+        // the handoff banner speaks for the Window.
+        assert!(pane.retire_closed_commands(false));
+        assert!(pane.commands.is_none());
+        assert_eq!(pane.status_notice(Instant::now()), None);
+    }
+
+    /// The pane stops sending to an ended controller, forgets what it had
+    /// deferred or was waiting on, and says so until its stream ends.
+    #[test]
+    fn a_pane_whose_controller_ended_stops_sending_and_says_so() {
+        let splint_id = SplintId::new();
+        let (_updates, update_receiver) = tokio::sync::mpsc::channel(1);
+        let (commands, command_receiver) = tokio::sync::mpsc::channel(1);
+        let mut pane = PaneView::from_options(
+            WindowPaneOptions {
+                snapshot: valid_snapshot(splint_id),
+                terminal_grid_limits: TerminalGridLimits::default(),
+                updates: update_receiver,
+                commands: commands.clone(),
+                authority: AuthorityStatus::default(),
+                controlled: true,
+                image_sources: ImageContentLeaseSet::default(),
+            },
+            SCALE_DENOMINATOR,
+        )
+        .unwrap();
+        let now = Instant::now();
+        assert!(
+            !pane.retire_closed_commands(true),
+            "its controller still runs"
+        );
+        assert!(pane.commands.is_some());
+        assert_eq!(pane.status_notice(now), None);
+
+        // Deferred behind a full queue when the controller ends.
+        commands.try_send(WindowCommand::Input(vec![1])).unwrap();
+        App::emit_pane_resize(&mut pane, 640, 480, SCALE_DENOMINATOR, true).unwrap();
+        App::request_pane_focus_report(&mut pane, true, false);
+        pane.pending_control_transfer = Some(7);
+        pane.resync_pending = true;
+        pane.history_page_pending = true;
+        pane.search.in_flight = 2;
+        pane.search.searching = true;
+        assert!(pane_command_retry_pending(&pane));
+        drop(command_receiver);
+
+        assert!(pane.retire_closed_commands(true));
+        assert!(pane.commands.is_none());
+        assert!(!pane.controller_active);
+        assert!(!pane_command_retry_pending(&pane));
+        assert_eq!(pane.pending_control_transfer, None);
+        assert!(!pane.resync_pending);
+        assert!(!pane.history_page_pending);
+        assert_eq!(pane.search.in_flight, 0);
+        assert!(!pane.search.searching);
+        assert!(pane.updates.is_some(), "its display stream goes on");
+        assert_eq!(pane.status_notice(now), Some(CONTROL_LOST_NOTICE));
+        assert!(!pane.retire_closed_commands(true), "said once");
+
+        // A lost display says why nothing changes, ahead of it.
+        pane.display_lost = Some(display_lost_notice(true));
+        assert_eq!(pane.status_notice(now), Some(display_lost_notice(true)));
+        pane.display_lost = None;
+
+        // Its process exited: the pane has nothing left to say.
+        pane.end_stream();
+        assert_eq!(pane.status_notice(now), None);
     }
 
     #[test]
@@ -19187,7 +19352,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(commands.try_recv().unwrap(), WindowCommand::Resynchronize);
-        App::retry_pending_pane_resize(&mut pane).unwrap();
+        App::retry_pending_pane_resize(&mut pane);
         assert!(matches!(
             commands.try_recv().unwrap(),
             WindowCommand::ReclaimResize { .. }
@@ -19257,7 +19422,7 @@ mod tests {
         .unwrap();
         App::cancel_pane_reclaim(&mut pane);
         assert_eq!(commands.try_recv().unwrap(), WindowCommand::Resynchronize);
-        App::retry_pending_pane_resize(&mut pane).unwrap();
+        App::retry_pending_pane_resize(&mut pane);
         assert!(matches!(
             commands.try_recv().unwrap(),
             WindowCommand::Resize { .. }
@@ -21513,12 +21678,32 @@ mod tests {
         let (commands, mut receiver) = tokio::sync::mpsc::channel(1);
 
         let mut pending = false;
-        assert!(!request_return_live_resync(Some(&commands), &mut pending, 0, 0).unwrap());
-        assert!(!request_return_live_resync(Some(&commands), &mut pending, 4, 2).unwrap());
-        assert!(request_return_live_resync(Some(&commands), &mut pending, 2, 0).unwrap());
+        assert!(!request_return_live_resync(
+            Some(&commands),
+            &mut pending,
+            0,
+            0
+        ));
+        assert!(!request_return_live_resync(
+            Some(&commands),
+            &mut pending,
+            4,
+            2
+        ));
+        assert!(request_return_live_resync(
+            Some(&commands),
+            &mut pending,
+            2,
+            0
+        ));
         assert!(pending);
         // One on its way: another return to live does not queue a second.
-        assert!(!request_return_live_resync(Some(&commands), &mut pending, 2, 0).unwrap());
+        assert!(!request_return_live_resync(
+            Some(&commands),
+            &mut pending,
+            2,
+            0
+        ));
         assert_eq!(receiver.try_recv().unwrap(), WindowCommand::Resynchronize);
         assert!(receiver.try_recv().is_err());
     }
@@ -21528,12 +21713,24 @@ mod tests {
         let (commands, mut receiver) = tokio::sync::mpsc::channel(1);
         commands.try_send(WindowCommand::ReleaseControl).unwrap();
         let mut pending = false;
-        assert!(!request_return_live_resync(Some(&commands), &mut pending, 2, 0).unwrap());
+        assert!(!request_return_live_resync(
+            Some(&commands),
+            &mut pending,
+            2,
+            0
+        ));
         assert!(!pending, "a dropped request is asked for again");
-        assert!(!try_advisory_command(&commands, WindowCommand::Resynchronize).unwrap());
+        assert!(!try_advisory_command(
+            &commands,
+            WindowCommand::Resynchronize
+        ));
         assert_eq!(receiver.try_recv().unwrap(), WindowCommand::ReleaseControl);
+        // Nor does a closed one: its pane's controller ended.
         drop(receiver);
-        assert!(try_advisory_command(&commands, WindowCommand::Resynchronize).is_err());
+        assert!(!try_advisory_command(
+            &commands,
+            WindowCommand::Resynchronize
+        ));
     }
 
     #[test]
@@ -21545,7 +21742,7 @@ mod tests {
         let mut pending = VecDeque::new();
 
         assert_eq!(
-            queue_terminal_input(Some(&commands), &mut pending, vec![2]).unwrap(),
+            queue_terminal_input(Some(&commands), &mut pending, vec![2]),
             TerminalInputQueueOutcome::Pending
         );
         assert_eq!(pending.front().unwrap().bytes, [2]);
@@ -21555,7 +21752,7 @@ mod tests {
             "pending input must not block the Wayland update consumer"
         );
         assert_eq!(
-            queue_terminal_input(Some(&commands), &mut pending, vec![3]).unwrap(),
+            queue_terminal_input(Some(&commands), &mut pending, vec![3]),
             TerminalInputQueueOutcome::Pending
         );
         assert_eq!(pending.front().unwrap().bytes, [2, 3]);
@@ -21579,11 +21776,11 @@ mod tests {
         let mut pending = VecDeque::new();
 
         assert_eq!(
-            queue_terminal_input(Some(&first), &mut pending, vec![2]).unwrap(),
+            queue_terminal_input(Some(&first), &mut pending, vec![2]),
             TerminalInputQueueOutcome::Pending
         );
         assert_eq!(
-            queue_terminal_input(Some(&second), &mut pending, vec![3]).unwrap(),
+            queue_terminal_input(Some(&second), &mut pending, vec![3]),
             TerminalInputQueueOutcome::Queued
         );
         assert_eq!(
@@ -21610,11 +21807,11 @@ mod tests {
         let mut pending = VecDeque::new();
 
         assert_eq!(
-            queue_terminal_input(Some(&first), &mut pending, vec![3]).unwrap(),
+            queue_terminal_input(Some(&first), &mut pending, vec![3]),
             TerminalInputQueueOutcome::Pending
         );
         assert_eq!(
-            queue_terminal_input(Some(&second), &mut pending, vec![4]).unwrap(),
+            queue_terminal_input(Some(&second), &mut pending, vec![4]),
             TerminalInputQueueOutcome::Pending
         );
         assert_eq!(pending_terminal_input_bytes(&pending), 2);
@@ -21646,11 +21843,11 @@ mod tests {
         let mut pending = VecDeque::new();
 
         assert_eq!(
-            queue_terminal_input(Some(&closed), &mut pending, vec![3]).unwrap(),
+            queue_terminal_input(Some(&closed), &mut pending, vec![3]),
             TerminalInputQueueOutcome::Pending
         );
         assert_eq!(
-            queue_terminal_input(Some(&surviving), &mut pending, vec![4]).unwrap(),
+            queue_terminal_input(Some(&surviving), &mut pending, vec![4]),
             TerminalInputQueueOutcome::Pending
         );
         drop(closed_receiver);
@@ -21675,13 +21872,13 @@ mod tests {
         let retained = vec![2; MAX_PENDING_TERMINAL_INPUT_BYTES - 2];
 
         assert_eq!(
-            queue_terminal_input(Some(&commands), &mut pending, retained).unwrap(),
+            queue_terminal_input(Some(&commands), &mut pending, retained),
             TerminalInputQueueOutcome::Pending
         );
         let before = pending.front().unwrap().bytes.clone();
         let bracketed_paste_end = b"\x1b[201~".to_vec();
         assert_eq!(
-            queue_terminal_input(Some(&commands), &mut pending, bracketed_paste_end).unwrap(),
+            queue_terminal_input(Some(&commands), &mut pending, bracketed_paste_end),
             TerminalInputQueueOutcome::Saturated
         );
         assert_eq!(pending.front().unwrap().bytes, before);
