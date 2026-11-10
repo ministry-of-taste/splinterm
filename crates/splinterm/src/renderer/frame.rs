@@ -727,6 +727,12 @@ impl SnapshotFrame {
         }
     }
 
+    /// Whether the frame was prepared for a grid of `snapshot`'s size, which
+    /// refreshing some of its rows from `snapshot` requires.
+    pub(crate) fn shows_grid_of(&self, snapshot: &TerminalSnapshot) -> bool {
+        self.columns as usize == snapshot.columns && self.rows as usize == snapshot.rows
+    }
+
     pub(crate) fn can_refresh_cursor_rows(&self, snapshot: &TerminalSnapshot) -> bool {
         self.font_ligatures == FontLigatures::Cursor
             && self.columns as usize == snapshot.columns

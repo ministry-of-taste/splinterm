@@ -17,6 +17,7 @@ use std::{
 use rustix::fs::{FlockOperation, Mode, OFlags, flock, open};
 use serde::{Deserialize, Serialize};
 use splinterm_core::{DojoId, SplintId, TopologyRevision};
+use splinterm_protocol::ErrorCode;
 use uuid::Uuid;
 
 const SCHEMA_VERSION: u16 = 1;
@@ -108,6 +109,9 @@ pub enum DiagnosticEventCode {
     WaylandFailure,
     TopologyFailure,
     PaneStreamFailure,
+    /// A pane's controller ended while the pane lives; the error code and
+    /// daemon error name why, and the event's Splint is that pane's.
+    PaneControllerFailure,
     GridCapped,
     Panic,
     TerminationSignal,
@@ -224,6 +228,10 @@ pub struct DiagnosticEvent {
     /// a compile-time constant naming the failing path, never runtime text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_location: Option<String>,
+    /// The daemon's refusal code when a refusal caused the event: one of a
+    /// closed set, never the refusal's message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_error: Option<ErrorCode>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -439,6 +447,26 @@ impl ClientDiagnostics {
         self.write_record(&record, level);
     }
 
+    /// Emits `event` for the pane showing `splint_id`, which need not be the
+    /// focused pane the Window's context names. `daemon_error` is the
+    /// daemon's refusal code when a refusal caused the event.
+    pub fn emit_for_pane(
+        &self,
+        level: DiagnosticLevel,
+        event: DiagnosticEventCode,
+        error_code: Option<DiagnosticErrorCode>,
+        splint_id: SplintId,
+        daemon_error: Option<ErrorCode>,
+    ) {
+        if !self.filter.enabled(module_for_event(event), level) {
+            return;
+        }
+        let mut record = self.event(level, event, None, error_code);
+        record.splint_id = Some(splint_id);
+        record.daemon_error = daemon_error;
+        self.write_record(&record, level);
+    }
+
     /// Emits a failure event that names where in Splinterm's source it was
     /// reported, and keeps that location for the exit record.
     pub fn emit_failure(
@@ -599,6 +627,7 @@ impl ClientDiagnostics {
             exit_class,
             error_code,
             failure_location: None,
+            daemon_error: None,
         }
     }
 
@@ -948,9 +977,9 @@ const fn module_for_event(event: DiagnosticEventCode) -> DiagnosticModule {
     match event {
         DiagnosticEventCode::WaylandFailure => DiagnosticModule::Wayland,
         DiagnosticEventCode::TopologyFailure => DiagnosticModule::Topology,
-        DiagnosticEventCode::PaneStreamFailure | DiagnosticEventCode::GridCapped => {
-            DiagnosticModule::Pane
-        }
+        DiagnosticEventCode::PaneStreamFailure
+        | DiagnosticEventCode::PaneControllerFailure
+        | DiagnosticEventCode::GridCapped => DiagnosticModule::Pane,
         DiagnosticEventCode::ClientStarted
         | DiagnosticEventCode::ConfigWarning
         | DiagnosticEventCode::ClientExit
@@ -1208,6 +1237,44 @@ mod tests {
             .collect();
         assert_eq!(records.len(), 2);
         assert_eq!(records[1].exit_class, Some(ExitClass::CleanUserClose));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A pane's controller failure is kept with its pane's Splint and the
+    /// daemon's refusal code, and is not the Window's failure: the exit
+    /// record after it stays clean and names no failure location.
+    #[test]
+    fn pane_controller_failure_names_its_pane_and_the_daemon_refusal() {
+        let root = test_directory("pane-controller");
+        let diagnostics = ClientDiagnostics::new(root.clone()).unwrap();
+        let splint_id = SplintId::new();
+        diagnostics.emit_for_pane(
+            DiagnosticLevel::Warn,
+            DiagnosticEventCode::PaneControllerFailure,
+            Some(DiagnosticErrorCode::Protocol),
+            splint_id,
+            Some(ErrorCode::StaleIncarnation),
+        );
+        diagnostics.finish(ExitClass::CleanUserClose, None);
+
+        let logs = retained_logs(&root);
+        assert_eq!(logs.len(), 1);
+        let text = fs::read_to_string(&logs[0]).unwrap();
+        let first = text.lines().next().unwrap();
+        assert!(first.contains(r#""event":"pane_controller_failure""#));
+        assert!(first.contains(r#""daemon_error":"stale_incarnation""#));
+        let records: Vec<DiagnosticEvent> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].module, DiagnosticModule::Pane);
+        assert_eq!(records[0].splint_id, Some(splint_id));
+        assert_eq!(records[0].error_code, Some(DiagnosticErrorCode::Protocol));
+        assert_eq!(records[0].daemon_error, Some(ErrorCode::StaleIncarnation));
+        assert_eq!(records[1].exit_class, Some(ExitClass::CleanUserClose));
+        assert_eq!(records[1].failure_location, None);
+        assert_eq!(records[1].daemon_error, None);
         fs::remove_dir_all(root).unwrap();
     }
 

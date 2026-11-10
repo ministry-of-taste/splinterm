@@ -95,9 +95,8 @@ impl KeyboardHandler for App {
             self.modal
                 .session_picker_consumed_keys
                 .insert(event.raw_code);
-            if let Err(error) = self.handle_copy_mode_key(&event, queue_handle, serial) {
-                self.scheduling.fail(error);
-            } else if self.presentation.full_redraw
+            self.handle_copy_mode_key(&event, queue_handle, serial);
+            if self.presentation.full_redraw
                 && let Err(error) = self.schedule_draw(queue_handle)
             {
                 self.scheduling.fail(error);
@@ -612,9 +611,7 @@ impl KeyboardHandler for App {
             return;
         }
         if self.modal.copy_mode.is_some() {
-            if let Err(error) = self.handle_copy_mode_key(&event, queue_handle, serial) {
-                self.scheduling.fail(error);
-            }
+            self.handle_copy_mode_key(&event, queue_handle, serial);
             return;
         }
         if self.modal_repeat_consumed(event.keysym) {
