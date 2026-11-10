@@ -1136,6 +1136,18 @@ struct TerminalPublicationReservation {
     _semantic: TerminalPublicationMemoryLease,
 }
 
+#[cfg(test)]
+impl TerminalPublicationReservation {
+    /// The process-wide publication bytes this reservation holds.
+    #[allow(
+        clippy::used_underscore_binding,
+        reason = "the lease is held only for its drop outside tests"
+    )]
+    fn semantic_bytes(&self) -> u64 {
+        self._semantic.bytes()
+    }
+}
+
 struct QueuedServerFrame {
     frame: ServerFrame,
     terminal_publication: Option<TerminalPublicationReservation>,
@@ -16604,8 +16616,13 @@ async fn try_reserve_terminal_publication(
         return None;
     }
     let permits = u32::try_from(publication_bytes).ok()?;
+    // The wake-time admission is sized for the largest update; once the
+    // frame's size is known, only that much stays held until it is written.
     let semantic = match publication_admission {
-        Some(admission) => admission,
+        Some(mut admission) => {
+            admission.shrink_to(publication_bytes);
+            admission
+        }
         None => TerminalPublicationMemoryLease::try_new(publication_bytes)?,
     };
     let subscriber = match subscriber {
@@ -26851,6 +26868,57 @@ mod tests {
         assert_eq!(
             state.terminal_publication_memory.available_permits(),
             TERMINAL_PUBLICATION_DAEMON_BYTES
+        );
+    }
+
+    /// The wake-time admission is sized for the largest update; a queued
+    /// update keeps only its own frame's bytes of it until it is written.
+    #[tokio::test]
+    async fn a_queued_update_holds_only_its_own_bytes_of_the_wake_admission() {
+        const ISOLATED_ENV: &str = "SPLINTERM_TEST_ISOLATED_PUBLICATION_RESERVATION";
+        if std::env::var_os(ISOLATED_ENV).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::a_queued_update_holds_only_its_own_bytes_of_the_wake_admission",
+                    "--test-threads=1",
+                ])
+                .env(ISOLATED_ENV, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "isolated publication-reservation test failed:\nstdout:\n{stdout}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+
+        // This child process runs only this test, so its whole-update
+        // admission cannot crowd the parallel tests that fill the
+        // process-wide ceiling, and that ceiling is entirely its own.
+        let state = test_state(true);
+        let subscriber = Arc::new(Semaphore::new(1));
+        let admission =
+            TerminalPublicationMemoryLease::try_new(TERMINAL_PUBLICATION_BYTES).unwrap();
+        let reservation = try_reserve_terminal_publication(
+            &state,
+            SplintId::new(),
+            Some(&subscriber),
+            4096,
+            Some(admission),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reservation.semantic_bytes(), 4096);
+        let rest =
+            TerminalPublicationMemoryLease::try_new(TERMINAL_PUBLICATION_DAEMON_BYTES - 4096)
+                .unwrap();
+        assert!(TerminalPublicationMemoryLease::try_new(1).is_none());
+        drop((rest, reservation));
+        assert!(
+            TerminalPublicationMemoryLease::try_new(TERMINAL_PUBLICATION_DAEMON_BYTES).is_some()
         );
     }
 
