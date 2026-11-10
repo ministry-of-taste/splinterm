@@ -16637,7 +16637,20 @@ fn frame_uses_terminal_transaction_memory(frame: &ServerFrame) -> bool {
 /// The writer holds it until the client has read the frame. Were every frame
 /// charged for the largest, two clients that stopped reading would stop
 /// every other connection's terminal output until their writes timed out.
+/// Large frames can still do that: the semaphore serves its waiters in
+/// order, so a frame that waits for more than is free holds back the small
+/// frames behind it.
 fn terminal_transaction_permits(frame: &ServerFrame) -> u32 {
+    /// A body and its encoded frames together are at most this many times
+    /// the body.
+    const BYTES_PER_BODY_BYTE: usize =
+        TERMINAL_TRANSACTION_MEMORY_BYTES / splinterm_protocol::MAX_TERMINAL_TRANSACTION_BYTES;
+    const _: () = assert!(
+        BYTES_PER_BODY_BYTE >= 3
+            && TERMINAL_TRANSACTION_MEMORY_BYTES
+                % splinterm_protocol::MAX_TERMINAL_TRANSACTION_BYTES
+                == 0
+    );
     struct ByteCount(usize);
     impl std::io::Write for ByteCount {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -16650,16 +16663,14 @@ fn terminal_transaction_permits(frame: &ServerFrame) -> u32 {
         }
     }
     let mut body = ByteCount(0);
-    // A frame that cannot be encoded holds nothing; the writer reports it
-    // when it encodes the frame.
+    // A frame that cannot be encoded holds one permit; the writer reports
+    // it when it encodes the frame.
     if serde_json::to_writer(&mut body, frame).is_err() {
         return 1;
     }
     let bytes = body
         .0
-        .saturating_mul(
-            TERMINAL_TRANSACTION_MEMORY_BYTES / splinterm_protocol::MAX_TERMINAL_TRANSACTION_BYTES,
-        )
+        .saturating_mul(BYTES_PER_BODY_BYTE)
         .clamp(1, TERMINAL_TRANSACTION_MEMORY_BYTES);
     u32::try_from(bytes).unwrap_or(u32::MAX)
 }
