@@ -15832,7 +15832,7 @@ fn spawn_control_subscription(
                                     .await;
                                 break;
                             }
-                            RevocationDecision::Terminate => break,
+                            RevocationDecision::Lagged | RevocationDecision::Closed => break,
                         }
                     }
                 };
@@ -16145,7 +16145,11 @@ enum FramePacingOutcome {
 enum RevocationDecision {
     Continue,
     Revoke(u64),
-    Terminate,
+    /// Revocations were missed, so this subscription's own grant may have
+    /// been revoked; it must end.
+    Lagged,
+    /// The daemon dropped its revocation stream; it is going away.
+    Closed,
 }
 
 fn classify_revocation(
@@ -16157,8 +16161,48 @@ fn classify_revocation(
             RevocationDecision::Revoke(revocation.grant_id)
         }
         Ok(_) => RevocationDecision::Continue,
-        Err(broadcast::error::RecvError::Lagged(_) | broadcast::error::RecvError::Closed) => {
-            RevocationDecision::Terminate
+        Err(broadcast::error::RecvError::Lagged(_)) => RevocationDecision::Lagged,
+        Err(broadcast::error::RecvError::Closed) => RevocationDecision::Closed,
+    }
+}
+
+/// What ended a terminal subscription's wait for its next event.
+#[derive(Debug, Eq, PartialEq)]
+enum SubscriptionWait<T> {
+    Received(T),
+    Revoked(u64),
+    RevocationsLagged,
+    RevocationsClosed,
+    Expired,
+}
+
+/// Polls `receive` to completion while hearing the subscription's
+/// revocations and its grant's expiry. A revocation of another grant keeps
+/// polling the same `receive`, never a new one, so an event it has already
+/// taken from the subscription is never lost. Revocations are heard only for
+/// a subscription with a grant, and the expiry only when `expires`.
+async fn wait_subscription_event<F: Future>(
+    receive: F,
+    revocations: &mut broadcast::Receiver<Revocation>,
+    grant_id: Option<u64>,
+    expires: bool,
+    mut expiry: Pin<&mut time::Sleep>,
+) -> SubscriptionWait<F::Output> {
+    tokio::pin!(receive);
+    loop {
+        tokio::select! {
+            value = &mut receive => return SubscriptionWait::Received(value),
+            revoked = revocations.recv(), if grant_id.is_some() => {
+                match classify_revocation(&revoked, grant_id) {
+                    RevocationDecision::Continue => {}
+                    RevocationDecision::Revoke(grant_id) => {
+                        return SubscriptionWait::Revoked(grant_id);
+                    }
+                    RevocationDecision::Lagged => return SubscriptionWait::RevocationsLagged,
+                    RevocationDecision::Closed => return SubscriptionWait::RevocationsClosed,
+                }
+            }
+            () = expiry.as_mut(), if expires => return SubscriptionWait::Expired,
         }
     }
 }
@@ -16180,7 +16224,9 @@ async fn wait_terminal_subscription_frame(
                     RevocationDecision::Revoke(grant_id) => {
                         return FramePacingOutcome::Revoke(grant_id);
                     }
-                    RevocationDecision::Terminate => return FramePacingOutcome::Terminate,
+                    RevocationDecision::Lagged | RevocationDecision::Closed => {
+                        return FramePacingOutcome::Terminate;
+                    }
                 }
             }
             () = expiry.as_mut(), if expires => {
@@ -16277,21 +16323,22 @@ fn spawn_subscription(
         tokio::pin!(expiry);
         let subscriber_publication_memory = Arc::new(Semaphore::new(1));
         'subscription: loop {
-            let (received, trailing_exit, publication_admission) = tokio::select! {
-                value = subscription.recv_coalesced_with_publication_admission(
-                    TERMINAL_PUBLICATION_BYTES,
-                ) => value,
-                revoked = revocations.recv(), if access.grant_id.is_some() => {
-                    match classify_revocation(&revoked, access.grant_id) {
-                        RevocationDecision::Revoke(grant_id) => {
-                            send_access_revoked(&outputs.control, id, sequence, grant_id).await;
-                            break;
-                        }
-                        RevocationDecision::Continue => continue,
-                        RevocationDecision::Terminate => break,
-                    }
+            let (received, trailing_exit, publication_admission) = match wait_subscription_event(
+                subscription.recv_coalesced_with_publication_admission(TERMINAL_PUBLICATION_BYTES),
+                &mut revocations,
+                access.grant_id,
+                access.expires_in.is_some(),
+                expiry.as_mut(),
+            )
+            .await
+            {
+                SubscriptionWait::Received(value) => value,
+                SubscriptionWait::Revoked(grant_id) => {
+                    send_access_revoked(&outputs.control, id, sequence, grant_id).await;
+                    break;
                 }
-                () = &mut expiry, if access.expires_in.is_some() => {
+                SubscriptionWait::RevocationsLagged | SubscriptionWait::RevocationsClosed => break,
+                SubscriptionWait::Expired => {
                     if let Some(grant_id) = access.grant_id {
                         send_access_revoked(&outputs.control, id, sequence, grant_id).await;
                         record_subscription_expiry(&audit, &handle).await;
@@ -18229,11 +18276,137 @@ mod tests {
         );
         assert_eq!(
             classify_revocation(&Err(broadcast::error::RecvError::Lagged(1)), Some(7)),
-            RevocationDecision::Terminate
+            RevocationDecision::Lagged
         );
         assert_eq!(
             classify_revocation(&Err(broadcast::error::RecvError::Closed), Some(7)),
-            RevocationDecision::Terminate
+            RevocationDecision::Closed
+        );
+    }
+
+    /// Sets its flag when dropped while still armed.
+    struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// A revocation of another grant arrives while the receive is under way;
+    /// the same receive is polled on and its event is delivered, never
+    /// dropped half-done.
+    #[tokio::test(start_paused = true)]
+    async fn a_foreign_revocation_keeps_polling_the_same_subscription_receive() {
+        let (revocations, mut receiver) = broadcast::channel(4);
+        let (release, released) = tokio::sync::oneshot::channel::<u8>();
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dropped_early = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let receive = {
+            let started = Arc::clone(&started);
+            let guard = DropFlag(Arc::clone(&dropped_early));
+            async move {
+                started.store(true, Ordering::SeqCst);
+                let value = released.await.unwrap();
+                std::mem::forget(guard);
+                value
+            }
+        };
+        let expiry = time::sleep(Duration::from_secs(1));
+        tokio::pin!(expiry);
+        let driver = async {
+            tokio::task::yield_now().await;
+            assert!(started.load(Ordering::SeqCst));
+            revocations.send(Revocation { grant_id: 8 }).unwrap();
+            // Two turns let the wait hear the revocation before the receive
+            // can finish, whichever of the two is polled first.
+            tokio::task::yield_now().await;
+            tokio::task::yield_now().await;
+            // Fails only when the receive was dropped; asserted below.
+            let _ = release.send(42);
+        };
+        let (outcome, ()) = tokio::join!(
+            wait_subscription_event(receive, &mut receiver, Some(7), true, expiry.as_mut()),
+            driver,
+        );
+        assert!(
+            !dropped_early.load(Ordering::SeqCst),
+            "the receive was dropped before it finished"
+        );
+        assert_eq!(outcome, SubscriptionWait::Received(42));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_subscription_wait_ends_on_its_revoke_lag_close_and_expiry() {
+        let expiry = time::sleep(Duration::from_secs(1));
+        tokio::pin!(expiry);
+        let (revocations, mut receiver) = broadcast::channel(4);
+        revocations.send(Revocation { grant_id: 7 }).unwrap();
+        // A Window's subscription has no grant and hears no revocations.
+        assert_eq!(
+            wait_subscription_event(
+                std::future::ready(5),
+                &mut receiver,
+                None,
+                false,
+                expiry.as_mut()
+            )
+            .await,
+            SubscriptionWait::Received(5)
+        );
+        assert_eq!(
+            wait_subscription_event(
+                std::future::pending::<()>(),
+                &mut receiver,
+                Some(7),
+                true,
+                expiry.as_mut(),
+            )
+            .await,
+            SubscriptionWait::Revoked(7)
+        );
+        assert_eq!(
+            wait_subscription_event(
+                std::future::pending::<()>(),
+                &mut receiver,
+                Some(7),
+                true,
+                expiry.as_mut(),
+            )
+            .await,
+            SubscriptionWait::Expired
+        );
+
+        drop(revocations);
+        assert_eq!(
+            wait_subscription_event(
+                std::future::pending::<()>(),
+                &mut receiver,
+                Some(7),
+                false,
+                expiry.as_mut(),
+            )
+            .await,
+            SubscriptionWait::RevocationsClosed
+        );
+
+        let (revocations, mut receiver) = broadcast::channel(1);
+        revocations.send(Revocation { grant_id: 1 }).unwrap();
+        revocations.send(Revocation { grant_id: 2 }).unwrap();
+        assert_eq!(
+            wait_subscription_event(
+                std::future::pending::<()>(),
+                &mut receiver,
+                Some(7),
+                false,
+                expiry.as_mut(),
+            )
+            .await,
+            SubscriptionWait::RevocationsLagged
         );
     }
 

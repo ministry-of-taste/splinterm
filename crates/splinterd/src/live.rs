@@ -2329,6 +2329,11 @@ impl CompactSubscription {
     /// caller can publish final state before exit. If exact revision continuity
     /// cannot be proven, resnapshot is required instead of pairing mismatched
     /// state.
+    ///
+    /// Once polled, the returned future must be polled to completion, not
+    /// dropped: it may already have taken the subscription's wake, and the
+    /// producer queues a new wake only into an empty mailbox, so later updates
+    /// would then arrive without one.
     pub async fn recv_coalesced(&mut self) -> (SubscriptionReceive, Option<ProcessExit>) {
         let (received, trailing_exit, _admission) =
             self.recv_coalesced_with_publication_admission(0).await;
@@ -2338,6 +2343,11 @@ impl CompactSubscription {
     /// Receives and materializes one coalesced event while holding a conservative
     /// process-wide publication reservation acquired only after an update wake.
     /// The returned lease must remain alive through wire encoding and delivery.
+    ///
+    /// Once polled, the returned future must be polled to completion, not
+    /// dropped: it may already have taken the subscription's wake while it
+    /// waits for the producer's batch, and the producer queues a new wake only
+    /// into an empty mailbox, so later updates would then arrive without one.
     pub async fn recv_coalesced_with_publication_admission(
         &mut self,
         publication_bytes: usize,
