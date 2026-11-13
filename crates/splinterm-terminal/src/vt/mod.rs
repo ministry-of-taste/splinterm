@@ -435,7 +435,7 @@ impl Parser {
                 (None, false)
             }
             b'X' | b'^' if self.state == State::Escape => {
-                self.state = State::SosPmApcString;
+                self.start_ignored_string();
                 (None, false)
             }
             b'_' if self.state == State::Escape => {
@@ -543,13 +543,8 @@ impl Parser {
                 }
                 0x00..=0x1f | 0x7f => (None, false),
                 _ => {
-                    self.string_utf8_remaining = match byte {
-                        0x80..=0xbf => self.string_utf8_remaining.saturating_sub(1),
-                        0xc2..=0xdf => 1,
-                        0xe0..=0xef => 2,
-                        0xf0..=0xf4 => 3,
-                        _ => 0,
-                    };
+                    self.string_utf8_remaining =
+                        utf8_remaining_after(self.string_utf8_remaining, byte);
                     // An OSC 52 string grows past the OSC limit when it reaches
                     // it, also one a checkpoint restored.
                     if self.string.len() == self.string_limit
@@ -713,14 +708,10 @@ impl Parser {
             State::ApcPrefix => {
                 if byte == b'G' {
                     self.start_string(State::KittyControl, 1024);
-                } else if byte == 0x1b {
-                    self.state = State::SosPmApcEscape;
-                } else if byte == 0x9c {
-                    self.state = State::Ground;
-                } else {
-                    self.state = State::SosPmApcString;
+                    return (None, false);
                 }
-                (None, false)
+                self.start_ignored_string();
+                self.feed_ignored_string(byte)
             }
             State::KittyControl => match byte {
                 b';' => {
@@ -779,17 +770,32 @@ impl Parser {
         (Some(Action::KittyCommand(control, truncated)), false)
     }
 
+    fn start_ignored_string(&mut self) {
+        self.state = State::SosPmApcString;
+        self.string_utf8_remaining = 0;
+    }
+
+    /// SOS, PM, and non-Kitty APC strings are discarded. Like every other
+    /// string, one ends at any ESC: an ESC that does not begin ST begins the
+    /// next sequence, so a stray introducer cannot swallow later output.
     fn feed_ignored_string(&mut self, byte: u8) -> (Option<Action>, bool) {
-        if byte == 0x9c {
-            self.state = State::Ground;
-        } else if self.state == State::SosPmApcEscape {
+        if self.state == State::SosPmApcEscape {
             if byte == b'\\' {
                 self.state = State::Ground;
                 return (None, false);
             }
-            self.state = State::SosPmApcString;
-        } else if byte == 0x1b {
-            self.state = State::SosPmApcEscape;
+            self.state = State::Escape;
+            self.clear_sequence();
+            return (None, true);
+        }
+        match byte {
+            0x1b => self.state = State::SosPmApcEscape,
+            // 0x9c is also a UTF-8 continuation byte; it is C1 ST only
+            // outside a multibyte sequence.
+            0x9c if self.string_utf8_remaining == 0 => self.state = State::Ground,
+            _ => {
+                self.string_utf8_remaining = utf8_remaining_after(self.string_utf8_remaining, byte);
+            }
         }
         (None, false)
     }
@@ -1003,6 +1009,17 @@ where
     deserializer.deserialize_seq(BytesVisitor(PhantomData))
 }
 
+/// The UTF-8 continuation bytes a string still expects after `byte`.
+const fn utf8_remaining_after(remaining: u8, byte: u8) -> u8 {
+    match byte {
+        0x80..=0xbf => remaining.saturating_sub(1),
+        0xc2..=0xdf => 1,
+        0xe0..=0xef => 2,
+        0xf0..=0xf4 => 3,
+        _ => 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1112,6 +1129,69 @@ mod tests {
                 Action::Print('Q'),
             ]
         );
+    }
+
+    fn feed_all(parser: &mut Parser, bytes: &[u8]) -> Vec<Action> {
+        let mut actions = Vec::new();
+        for byte in bytes {
+            let mut again = true;
+            while again {
+                let (action, next) = parser.feed(*byte);
+                actions.extend(action);
+                again = next;
+            }
+        }
+        actions
+    }
+
+    #[test]
+    fn ignored_strings_end_at_any_escape_and_keep_the_next_sequence() {
+        // SOS, PM, non-Kitty APC, the C1 APC byte, and an APC that ends
+        // before its prefix byte each stop at the program's next sequence.
+        for introducer in [
+            &b"\x1bXsos"[..],
+            b"\x1b^pm",
+            b"\x1b_apc",
+            b"\x9fapc",
+            b"\x1b_",
+        ] {
+            let mut parser = Parser::new(16, 16);
+            let mut input = introducer.to_vec();
+            input.extend_from_slice(b"\x1b[1mZ");
+            let actions = feed_all(&mut parser, &input);
+            assert!(
+                matches!(
+                    actions.as_slice(),
+                    [
+                        Action::Csi {
+                            final_byte: b'm',
+                            ..
+                        },
+                        Action::Print('Z')
+                    ]
+                ),
+                "{introducer:?}: {actions:?}"
+            );
+            assert_eq!(parser.state, State::Ground);
+        }
+
+        // ST still ends one without leaving an escape behind.
+        let mut parser = Parser::new(16, 16);
+        assert_eq!(
+            feed_all(&mut parser, b"\x1b_apc\x1b\\Z"),
+            vec![Action::Print('Z')]
+        );
+    }
+
+    #[test]
+    fn ignored_string_c1_terminator_is_not_taken_from_inside_utf8_text() {
+        // U+271C is e2 9c 9c; only the C1 ST after it ends the string.
+        let mut parser = Parser::new(16, 16);
+        let mut input = b"\x1b^".to_vec();
+        input.extend_from_slice("\u{271c}".as_bytes());
+        assert!(feed_all(&mut parser, &input).is_empty());
+        assert_eq!(parser.state, State::SosPmApcString);
+        assert_eq!(feed_all(&mut parser, b"\x9cZ"), vec![Action::Print('Z')]);
     }
 
     #[test]

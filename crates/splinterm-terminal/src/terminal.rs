@@ -4587,6 +4587,19 @@ mod tests {
     }
 
     #[test]
+    fn a_stray_string_introducer_does_not_swallow_later_frames() {
+        // An unterminated APC once hid every later synchronized frame a
+        // TUI drew, while the program kept running behind a stale screen.
+        let mut terminal = terminal(8, 2);
+        terminal.advance(b"\x1b_x");
+        let revision = terminal.revision();
+        terminal.advance(b"\x1b[?2026h\x1b[2J\x1b[Hframe\x1b[?2026l");
+        assert!(!terminal.synchronized_updates());
+        assert!(terminal.revision() > revision);
+        assert_eq!(row_text(&terminal, 0), "frame   ");
+    }
+
+    #[test]
     fn large_synchronized_redraw_commits_one_ordered_update() {
         const LINES: usize = 2_000;
         let mut terminal = Terminal::new(16, 4, TerminalConfig::default());
