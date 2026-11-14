@@ -345,33 +345,46 @@ mod tests {
         }
     }
 
-    fn system_sleep() -> &'static Path {
-        ["/usr/bin/sleep", "/bin/sleep"]
+    /// The program the tests copy and run under other names. Not `sleep`:
+    /// coreutils may be one multicall binary that picks its tool by name,
+    /// so a copy installed as `client` exits at once. A shell runs as any
+    /// name.
+    fn system_shell() -> &'static Path {
+        ["/bin/sh", "/usr/bin/sh"]
             .into_iter()
             .map(Path::new)
             .find(|path| path.is_file())
-            .expect("a sleep executable")
+            .expect("a shell")
     }
 
-    fn spawn_sleep(program: &Path) -> OwnedChild {
+    /// Runs `program`, a copy of the system shell, until the test drops it.
+    /// Without `BASH_ENV`, a bash run under another name reads no startup
+    /// file.
+    fn spawn_waiting(program: &Path) -> OwnedChild {
         // A sibling test thread's fork can briefly inherit the descriptor
         // that wrote a fresh copy, so its exec may see ETXTBSY.
         for _ in 0..100 {
-            match std::process::Command::new(program).arg("30").spawn() {
+            match std::process::Command::new(program)
+                .arg("-c")
+                .arg("read line")
+                .env_remove("BASH_ENV")
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+            {
                 Ok(child) => return OwnedChild(child),
                 Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
-                Err(error) => panic!("spawn sleeping child: {error}"),
+                Err(error) => panic!("spawn waiting child: {error}"),
             }
         }
-        panic!("spawn sleeping child: executable stayed busy");
+        panic!("spawn waiting child: executable stayed busy");
     }
 
     fn install_executable_copy(destination: &Path) {
         use std::os::unix::fs::PermissionsExt;
         let staged = destination.with_extension("staged");
-        fs::copy(system_sleep(), &staged).expect("copy executable");
+        fs::copy(system_shell(), &staged).expect("copy executable");
         fs::set_permissions(&staged, fs::Permissions::from_mode(0o755))
             .expect("make copy executable");
         fs::rename(&staged, destination).expect("install copy");
@@ -382,7 +395,7 @@ mod tests {
         let directory = TestDirectory::new();
         let executable = directory.0.join("client");
         install_executable_copy(&executable);
-        let child = spawn_sleep(&executable);
+        let child = spawn_waiting(&executable);
 
         let identity = ExecutableIdentity::from_pid(child.0.id()).expect("snapshot child");
         let metadata = fs::metadata(&executable).expect("installed metadata");
@@ -398,7 +411,7 @@ mod tests {
         let directory = TestDirectory::new();
         let executable = directory.0.join("client");
         install_executable_copy(&executable);
-        let child = spawn_sleep(&executable);
+        let child = spawn_waiting(&executable);
 
         // Replaced by rename: the path now names a different inode.
         install_executable_copy(&executable);
@@ -415,9 +428,9 @@ mod tests {
             .expect("create memfd");
         let mut image = File::from(memfd);
         image
-            .write_all(&fs::read(system_sleep()).expect("read executable"))
+            .write_all(&fs::read(system_shell()).expect("read executable"))
             .expect("write memfd image");
-        let child = spawn_sleep(Path::new(&format!(
+        let child = spawn_waiting(Path::new(&format!(
             "/proc/self/fd/{}",
             std::os::fd::AsRawFd::as_raw_fd(&image)
         )));
