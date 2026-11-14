@@ -323,10 +323,11 @@ empty. Report anything that could not be restored.
 
 ### 3.4 Host Exception
 
-When the user explicitly approves host graphical testing as an exception, retain
-the existing workspace 8 / DP-2 no-focus isolation requirements unless the user
-names an existing active Window. Apply the same exact-target, abort, and cleanup
-rules, and never treat VM authorization as host authorization.
+When the user explicitly approves host graphical testing as an exception, run it
+only on inactive, empty workspace 8 on DP-2 and launch the test Window without
+taking focus, unless the user names an existing active Window. Apply the same
+exact-target, abort, and cleanup rules, and never treat VM authorization as host
+authorization.
 
 ## 4. Repository Safety
 
