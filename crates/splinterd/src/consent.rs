@@ -2026,8 +2026,17 @@ mod tests {
         }
     }
 
-    fn spawn_sleep(program: &Path) -> OwnedChild {
-        spawn_owned(Command::new(program).arg("30"))
+    /// Runs `program`, the system shell or a copy of it, until the test
+    /// drops it. Without `BASH_ENV`, a bash run under another name reads no
+    /// startup file.
+    fn spawn_waiting(program: &Path) -> OwnedChild {
+        spawn_owned(
+            Command::new(program)
+                .arg("-c")
+                .arg("read line")
+                .env_remove("BASH_ENV")
+                .stdin(Stdio::piped()),
+        )
     }
 
     /// Spawns `command` and returns once the child executes its program.
@@ -2092,8 +2101,8 @@ mod tests {
     /// file with the same bytes or a stale installed inode.
     #[test]
     fn only_the_exact_pinned_snapshot_inode_is_trusted() {
-        let snapshot = sealed_copy(system_sleep());
-        let child = spawn_sleep(Path::new(&format!(
+        let snapshot = sealed_copy(system_shell());
+        let child = spawn_waiting(Path::new(&format!(
             "/proc/self/fd/{}",
             snapshot.as_raw_fd()
         )));
@@ -2115,7 +2124,7 @@ mod tests {
         // The pin never widens the graphical relay's rule.
         assert!(!adopted.is_matching_graphical_relay());
         // Same bytes, another file: never matched by content.
-        let twin = Arc::new(PinnedClientSnapshot::pin(sealed_copy(system_sleep())).unwrap());
+        let twin = Arc::new(PinnedClientSnapshot::pin(sealed_copy(system_shell())).unwrap());
         assert_ne!(twin.identity(), pinned.identity());
         let other = PeerIdentity {
             pinned_client: Some(twin),
@@ -2127,9 +2136,9 @@ mod tests {
         // rule, even in a daemon that pinned a snapshot.
         let scratch = scratch_prefix();
         let client = scratch.client();
-        install_copy(system_sleep(), &client);
-        let stale_child = spawn_sleep(&client);
-        install_copy(system_sleep(), &client);
+        install_copy(system_shell(), &client);
+        let stale_child = spawn_waiting(&client);
+        install_copy(system_shell(), &client);
         let stale = PeerIdentity {
             pinned_client: Some(Arc::clone(&pinned)),
             ..peer_for(stale_child.pid(), &scratch)
@@ -2158,11 +2167,24 @@ mod tests {
         rustix::fs::fcntl_add_seals(&partial, rustix::fs::SealFlags::WRITE).unwrap();
         assert!(PinnedClientSnapshot::pin(partial).is_err());
         // An ordinary file cannot carry seals at all.
-        let file = fs::File::open(system_sleep()).unwrap();
+        let file = fs::File::open(system_shell()).unwrap();
         assert!(PinnedClientSnapshot::pin(OwnedFd::from(file)).is_err());
         drop(child);
     }
 
+    /// The program the tests copy and run under other names. Not `sleep`:
+    /// coreutils may be one multicall binary that picks its tool by name,
+    /// so a copy installed as `splinterm` exits at once. A shell runs as
+    /// any name.
+    fn system_shell() -> &'static Path {
+        ["/bin/sh", "/usr/bin/sh"]
+            .into_iter()
+            .map(Path::new)
+            .find(|path| path.is_file())
+            .expect("a shell")
+    }
+
+    /// Run only under its own name; see `system_shell`.
     fn system_sleep() -> &'static Path {
         ["/usr/bin/sleep", "/bin/sleep"]
             .into_iter()
@@ -2218,15 +2240,15 @@ mod tests {
     fn durable_evidence_marks_the_installed_relay_by_either_snapshot() {
         let prefix = scratch_prefix();
         let relay = prefix.graphical_relay();
-        install_copy(system_sleep(), &relay);
-        let relay_child = spawn_sleep(&relay);
+        install_copy(system_shell(), &relay);
+        let relay_child = spawn_waiting(&relay);
         let mut running_relay = peer_for(relay_child.pid(), &prefix);
         running_relay.install_durable_evidence(DurableEvidence::default());
         assert!(running_relay.durable_evidence().unwrap().installed_relay);
 
         // The stream's peer ran another file, but the pinned snapshot hashed
         // the relay: still the relay.
-        let other_child = spawn_sleep(system_sleep());
+        let other_child = spawn_waiting(system_shell());
         let mut snapshot_relay = peer_for(other_child.pid(), &prefix);
         let relay_file = fs::metadata(&relay).unwrap();
         snapshot_relay.install_persistent_executable(ExecutableIdentity {
@@ -2254,9 +2276,9 @@ mod tests {
     fn trusted_client_identity_is_the_executing_inode_not_its_path() {
         let prefix = scratch_prefix();
         let client = prefix.client();
-        install_copy(system_sleep(), &client);
+        install_copy(system_shell(), &client);
         let original = fs::metadata(&client).unwrap();
-        let child = spawn_sleep(&client);
+        let child = spawn_waiting(&client);
 
         let peer = peer_for(child.pid(), &prefix);
         assert_eq!(
@@ -2269,7 +2291,7 @@ mod tests {
 
         // An upgrade replaces the installed client: the running client keeps
         // its old inode, is still identified by it, and no longer matches.
-        install_copy(system_sleep(), &client);
+        install_copy(system_shell(), &client);
         let replaced = fs::metadata(&client).unwrap();
         assert_ne!(replaced.ino(), original.ino());
         let stale = peer_for(child.pid(), &prefix);
@@ -2332,8 +2354,8 @@ mod tests {
     fn a_connection_trusted_at_hello_survives_replacement_of_the_installed_client() {
         let prefix = scratch_prefix();
         let client = prefix.client();
-        install_copy(system_sleep(), &client);
-        let child = spawn_sleep(&client);
+        install_copy(system_shell(), &client);
+        let child = spawn_waiting(&client);
         let mut connection = peer_for(child.pid(), &prefix);
         // Before its Hello a connection holds no client trust.
         assert!(!connection.connection_matches_splinterm());
@@ -2343,7 +2365,7 @@ mod tests {
         // A byte-identical copy renamed over the installed client: a new
         // inode, as a package upgrade installs.
         let original = fs::metadata(&client).unwrap().ino();
-        install_copy(system_sleep(), &client);
+        install_copy(system_shell(), &client);
         assert_ne!(fs::metadata(&client).unwrap().ino(), original);
         assert!(!connection.is_matching_splinterm());
         assert!(connection.connection_matches_splinterm());
@@ -2370,14 +2392,9 @@ mod tests {
     /// installed client is unchanged.
     #[test]
     fn a_peer_that_executes_another_program_loses_its_connection_trust() {
-        let shell = ["/bin/sh", "/usr/bin/sh"]
-            .into_iter()
-            .map(Path::new)
-            .find(|path| path.is_file())
-            .expect("a shell");
         let prefix = scratch_prefix();
         let client = prefix.client();
-        install_copy(shell, &client);
+        install_copy(system_shell(), &client);
         let mut child = spawn_owned(
             Command::new(&client)
                 .arg("-c")
@@ -2422,8 +2439,8 @@ mod tests {
         let trusted = TrustedClientProcesses::default();
         let prefix = scratch_prefix();
         let client = prefix.client();
-        install_copy(system_sleep(), &client);
-        let window = spawn_sleep(&client);
+        install_copy(system_shell(), &client);
+        let window = spawn_waiting(&client);
         let stale = prefix.directory().join("stale-splinterm");
         fs::hard_link(&client, &stale).unwrap();
         let mut first = peer_for_process(window.pid(), &prefix);
@@ -2432,7 +2449,7 @@ mod tests {
         let first_registration = first.register_trusted_client(&trusted).unwrap();
         assert_eq!(trusted.len(), 1);
 
-        install_copy(system_sleep(), &client);
+        install_copy(system_shell(), &client);
         let mut second = peer_for_process(window.pid(), &prefix);
         assert!(!second.is_matching_splinterm());
         say_hello_among(&mut second, window.pid(), &trusted);
@@ -2442,7 +2459,7 @@ mod tests {
         assert_eq!(trusted.len(), 1);
 
         // Another process executing the old inode.
-        let other = spawn_sleep(&stale);
+        let other = spawn_waiting(&stale);
         let mut intruder = peer_for_process(other.pid(), &prefix);
         say_hello_among(&mut intruder, other.pid(), &trusted);
         assert!(!intruder.connection_matches_splinterm());
@@ -2476,8 +2493,8 @@ mod tests {
     /// executing it.
     #[test]
     fn connection_trust_keeps_the_pinned_snapshot_rule() {
-        let snapshot = sealed_copy(system_sleep());
-        let child = spawn_sleep(Path::new(&format!(
+        let snapshot = sealed_copy(system_shell());
+        let child = spawn_waiting(Path::new(&format!(
             "/proc/self/fd/{}",
             snapshot.as_raw_fd()
         )));
@@ -2502,8 +2519,8 @@ mod tests {
     fn connection_trust_fails_closed_without_proof_of_the_same_process() {
         let prefix = scratch_prefix();
         let client = prefix.client();
-        install_copy(system_sleep(), &client);
-        let child = spawn_sleep(&client);
+        install_copy(system_shell(), &client);
+        let child = spawn_waiting(&client);
         let pid = child.pid();
 
         let mut unduplicated = peer_for(pid, &prefix);
@@ -2525,7 +2542,7 @@ mod tests {
         assert!(unpinned.connection_matches_splinterm());
 
         // A peer that never matched at Hello records nothing.
-        let other_child = spawn_sleep(system_sleep());
+        let other_child = spawn_waiting(system_shell());
         let mut other = peer_for(other_child.pid(), &prefix);
         say_hello(&mut other, other_child.pid());
         assert!(!other.connection_matches_splinterm());
@@ -2538,10 +2555,10 @@ mod tests {
     fn a_memfd_executable_is_identified_through_its_descriptor() {
         let memfd = rustix::fs::memfd_create("splinterm", rustix::fs::MemfdFlags::CLOEXEC).unwrap();
         let mut image = fs::File::from(memfd);
-        image.write_all(&fs::read(system_sleep()).unwrap()).unwrap();
+        image.write_all(&fs::read(system_shell()).unwrap()).unwrap();
         let expected = image.metadata().unwrap();
         // exec opens the image before close-on-exec descriptors are closed.
-        let child = spawn_sleep(Path::new(&format!("/proc/self/fd/{}", image.as_raw_fd())));
+        let child = spawn_waiting(Path::new(&format!("/proc/self/fd/{}", image.as_raw_fd())));
 
         let label = fs::read_link(format!("/proc/{}/exe", child.pid())).unwrap();
         assert!(label.to_string_lossy().starts_with("/memfd:splinterm"));
