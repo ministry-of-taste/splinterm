@@ -9,9 +9,10 @@ The validated installation target is **x86_64 Omarchy/Arch Linux with native Way
 
 **AUR is prerelease-capable, not stable-only.** The same package names can advance
 to release candidates and offer them as upgrades over stable 0.2.0. Both AUR
-bases still offer `0.1.1-1`; 0.2.0 distribution is pending. Check the offered
-version before confirming installation or upgrades. For stable 0.2.0 specifically,
-use its verified release assets or the packaging guide's exact-tag build:
+bases publish `0.2.0-1`, including matching optional MCP packages (verified
+2026-11-08). Check the offered version before confirming installation or
+upgrades. If the channel has advanced, use the verified release assets or the
+packaging guide's exact-tag build for stable 0.2.0 specifically:
 
 https://github.com/ministry-of-taste/splinterm/blob/main/docs/packaging.md
 
