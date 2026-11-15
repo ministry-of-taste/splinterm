@@ -3,7 +3,7 @@ title: Current status
 description: What is implemented, validated, limited, planned, and unreleased in Splinterm.
 ---
 
-Splinterm **0.2.0 is the current stable release**, published on 2026-11-03 at 04:43 UTC (2026-11-02 in the maintainer's local time) for x86_64 Omarchy/Arch Linux with native Wayland under Hyprland. It is GitHub Latest, not a prerelease. Earlier stable releases remain historical. Source, documentation, and GitHub releases are public; AUR distribution of 0.2.0 is pending. Broader platform compatibility and a support lifetime are not promised; future 0.x releases may change interfaces with documented migration.
+Splinterm **0.2.0 is the current stable release**, published on 2026-11-03 at 04:43 UTC (2026-11-02 in the maintainer's local time) for x86_64 Omarchy/Arch Linux with native Wayland under Hyprland. It is GitHub Latest, not a prerelease. Earlier stable releases remain historical. Source, documentation, and GitHub releases are public; both AUR package bases publish 0.2.0-1, including matching optional MCP packages. Broader platform compatibility and a support lifetime are not promised; future 0.x releases may change interfaces with documented migration.
 
 Stable release notes and assets:
 
@@ -21,8 +21,10 @@ passed. Candidate run `41523853666` built the packages once; protected promotion
 run `41578629716` published those exact artifacts without rebuilding and verified
 all five assets. Manifest SHA-256:
 `42a7012051ba5422b33c1ac0f9fbcb35d786ab99634a45b58c8daa4ab953e917`.
-Both AUR package bases still offer `0.1.1-1`, including matching optional MCP
-packages; 0.2.0 distribution has not happened yet. No new graphical sequence
+Both AUR package bases publish `0.2.0-1`, including matching optional MCP
+packages (verified 2026-11-08). Source base commit:
+`5474f70f19c43e26dc709838a17e02e32c3a4400`; prebuilt base commit:
+`de99d4f3e88f2bb5f0123bcc1b6f0ba5f7f7f66c`. No new graphical sequence
 was run for finalization; feature acceptance was recorded in the Omarchy VM on
 earlier builds of the same features, not a fresh final installed-package matrix.
 The current development tip may differ from the immutable release.
@@ -32,7 +34,7 @@ The current development tip may differ from the immutable release.
 - The product runs and has a normal graphical daily-use path.
 - Core terminal, persistence, multiplexing, packaging, and automation milestones have recorded validation.
 - The current target is narrow: x86_64 Omarchy/Arch Linux with native Wayland.
-- Install 0.2.0 from its GitHub release or exact-tag source checkout; AUR still offers 0.1.1-1 until distribution lands.
+- Install 0.2.0 from AUR (currently 0.2.0-1), its GitHub release, or an exact-tag source checkout; check the offered AUR version before confirming.
 - Broader distribution and long-term compatibility promises have not been released.
 
 ## Capability summary
@@ -58,7 +60,7 @@ The current development tip may differ from the immutable release.
 | Sixel, practical Kitty static images, inline iTerm2 PNG | Documented supported subsets |
 | Arch/Omarchy package | Versioned GitHub release and AUR packages validated |
 | Public source and versioned builds | Available |
-| [AUR packages](https://aur.archlinux.org/packages/splinterm-bin) | 0.1.1-1 available; 0.2.0 distribution pending. Prebuilt `splinterm-bin`, source-built `splinterm`, and optional MCP split packages; this channel can include release candidates, not only stable releases |
+| [AUR packages](https://aur.archlinux.org/packages/splinterm-bin) | 0.2.0-1 available. Prebuilt `splinterm-bin`, source-built `splinterm`, and optional MCP split packages; this channel can include release candidates, not only stable releases |
 | Stable release | 0.2.0 for the documented platform |
 | Broader compatibility and support lifetime | Not promised |
 | Nix and broader distributions | 0.2.0 release flake/module and headless checks; wider deployment acceptance and broader Linux support remain separate |

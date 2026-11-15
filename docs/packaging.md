@@ -42,10 +42,10 @@ for unpublished assets; use the reviewed candidate's generated drafts.
 
 **AUR is prerelease-capable, not stable-only.** The same `splinterm` and
 `splinterm-bin` package bases distribute stable releases and release candidates;
-a candidate can be offered as an upgrade over stable 0.2.0. AUR distribution
-of 0.2.0 is pending: both bases still offer `0.1.1-1`. Check the offered version
-before confirming. For stable 0.2.0 specifically, use the exact-tag build below
-or its verified release assets instead.
+a candidate can be offered as an upgrade over stable 0.2.0. Both bases publish
+`0.2.0-1`, including matching optional MCP packages (verified 2026-11-08). Check
+the offered version before confirming. If the channel has advanced, use the
+exact-tag build below or the verified release assets for stable 0.2.0 specifically.
 
 Install the prebuilt main package and optional exact-version MCP adapter with
 an AUR helper:

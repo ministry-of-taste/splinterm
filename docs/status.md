@@ -14,8 +14,8 @@ sequence, and this page owns what the product is today.
 0.1.1 and 0.1.0 remain historical stable releases; 0.1.0 was the first.
 
 Source, documentation, and immutable versioned GitHub packages are publicly
-available. AUR distribution of 0.2.0 is pending; both AUR bases still offer
-0.1.1-1. Core terminal emulation, daemon-owned persistence, multiplexing,
+available. Both AUR package bases publish 0.2.0-1, including matching optional
+MCP packages. Core terminal emulation, daemon-owned persistence, multiplexing,
 native Wayland presentation, Arch packaging, and bounded automation workflows
 are implemented and validated in the scopes named below. Public availability is
 not a promise of broader platform compatibility or a support lifetime. The
@@ -104,8 +104,10 @@ adapter together. See [Packaging](packaging.md) for the upgrade procedure.
   `61936ffb9df2917e25e69e65360c4813103da265dae4697d4043e78ff73c48ee`.
 - MCP package SHA-256:
   `9841678a36fb518db2bd9d6dd683bb7f2ec46f2541bb614d6c52f7b748fb9dda`.
-- AUR distribution of 0.2.0 has not happened. Both source and prebuilt package
-  bases still publish `0.1.1-1`, including their matching optional MCP packages.
+- Both AUR package bases publish `0.2.0-1`, including matching optional MCP
+  packages (verified 2026-11-08 against AUR RPC and anonymous Git remote HEADs).
+  Source base commit: `5474f70f19c43e26dc709838a17e02e32c3a4400`.
+  Prebuilt base commit: `de99d4f3e88f2bb5f0123bcc1b6f0ba5f7f7f66c`.
 
 No new graphical sequence was run for finalization. Feature acceptance was
 recorded in the Omarchy VM on earlier builds of the same features; this is not
@@ -397,7 +399,7 @@ post-alpha3, pre-1.0 roadmap milestone.
 | Easy agent access | Released in 0.2.0; accepted in the Omarchy VM | Per [ADR 0014](adr/0014-easy-agent-access.md): three access levels (Look, Look and type, Manage), three durations (just this once, while this workspace is open, always for this workspace), remembered grants for protected and Nix profile installs, a default-deny trusted prompt, and bounded, cancellable pending requests; a request a grant already covers is answered without a prompt. The access list with per-entry revoke and Revoke all access work through `splinterm access` (human and JSON), and `splinterm mcp setup` adds the MCP adapter to Claude Code, Codex, or VS Code in one step without granting anything (human and JSON). The **Agent access** list in the command palette revokes per entry, **Revoke all access** in the palette first shows exact counts, the Explorer marks which workspaces, Dojos, and Splints an agent can reach or is connected to, and a waiting indicator (an Explorer mark, the Window title, and the palette count) shows requests awaiting an answer. A click in the **Agent access** list only selects a row; Enter revokes. See [Automation](automation.md#easy-agent-access) and [MCP](mcp.md#easy-agent-access). |
 | Terminal images | Supported documented subset | Sixel, practical static Kitty, and inline iTerm2 PNG subsets are bounded; full Kitty graphics is not claimed. See [Images](images.md). |
 | Arch/Omarchy packaging | Stable release available | Immutable versioned GitHub and AUR split packages, service, desktop metadata, upgrade checks, trusted-client identity, and rollback guidance. See [Packaging](packaging.md). |
-| AUR packages | 0.1.1-1 available; 0.2.0 distribution pending | Prerelease-capable channel, not stable-only. Prebuilt [`splinterm-bin`](https://aur.archlinux.org/packages/splinterm-bin) publishes `splinterm-bin` and optional `splinterm-mcp-bin` from checksummed immutable versioned-release assets without local compilation. Source-built [`splinterm`](https://aur.archlinux.org/packages/splinterm) and `splinterm-mcp` remain available. |
+| AUR packages | 0.2.0-1 available | Prerelease-capable channel, not stable-only. Prebuilt [`splinterm-bin`](https://aur.archlinux.org/packages/splinterm-bin) publishes `splinterm-bin` and optional `splinterm-mcp-bin` from checksummed immutable versioned-release assets without local compilation. Source-built [`splinterm`](https://aur.archlinux.org/packages/splinterm) and `splinterm-mcp` remain available. |
 | Public source and versioned releases | Available | The repository, documentation, versioned GitHub releases and prereleases, and AUR packages are public. The retired rolling edge channel is no longer produced or consumed. |
 | Live daemon upgrade | Implemented and validated | From 0.2.0 on a newly installed build takes over running terminals; 0.1.x to 0.2.0 restarts once. See [Packaging](packaging.md). |
 | Stable release scope | 0.2.0 released | The documented Omarchy/Arch Linux target only; broader compatibility and a support lifetime are not promised. |

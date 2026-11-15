@@ -14,7 +14,7 @@ Splinterm combines a native Wayland terminal with a headless daemon that keeps s
 Humans use that persistent topology through native windows, tabs, and panes. Authorized tools can reach the same sessions through bounded JSON/NDJSON, SSH relay, and MCP interfaces. Splinterm is built in Rust from [Foot](https://codeberg.org/dnkl/foot)'s terminal behavior and designed first for Omarchy and Arch Linux.
 
 > [!IMPORTANT]
-> **Status: stable 0.2.0.** Splinterm's current stable release is available for x86_64 Omarchy/Arch Linux with native Wayland under Hyprland. Source, versioned GitHub release assets, and documentation are public; AUR packages still offer 0.1.1-1 while 0.2.0 distribution is pending. Live daemon upgrade is supported from 0.2.0 on; the one-time 0.1.x to 0.2.0 upgrade restarts the daemon and ends its shells. Broader platform compatibility and a support lifetime are not promised. Future 0.x releases may change interfaces with documented migration.
+> **Status: stable 0.2.0.** Splinterm's current stable release is available for x86_64 Omarchy/Arch Linux with native Wayland under Hyprland. Source, versioned GitHub release assets, and documentation are public; both AUR package bases publish 0.2.0-1. Live daemon upgrade is supported from 0.2.0 on; the one-time 0.1.x to 0.2.0 upgrade restarts the daemon and ends its shells. Broader platform compatibility and a support lifetime are not promised. Future 0.x releases may change interfaces with documented migration.
 >
 > See the repository-authoritative [current status](docs/status.md) for the exact capability and availability boundaries.
 
@@ -67,7 +67,7 @@ desktop launcher, headless daemon, and optional MCP variant. See
 [the NixOS installation guide](docs/nixos.md) for declarative desktop and server
 setup. This does not extend the Arch graphical validation claim to NixOS.
 
-The validated installation target is **x86_64 Omarchy/Arch Linux with native Wayland**. The prebuilt AUR packages download verified binaries and do not compile locally. **AUR is prerelease-capable, not stable-only:** these same package names can advance to release candidates. AUR 0.2.0 distribution is pending; both bases still offer 0.1.1-1. Check the offered version before installing or upgrading. For stable 0.2.0 specifically, use the exact-tag instructions in [Packaging](docs/packaging.md).
+The validated installation target is **x86_64 Omarchy/Arch Linux with native Wayland**. The prebuilt AUR packages download verified binaries and do not compile locally. **AUR is prerelease-capable, not stable-only:** these same package names can advance to release candidates. Both bases publish 0.2.0-1 (verified 2026-11-08). Check the offered version before installing or upgrading. If the channel has advanced, use the exact-tag instructions in [Packaging](docs/packaging.md) for stable 0.2.0 specifically.
 
 ```bash
 yay -S splinterm-bin
