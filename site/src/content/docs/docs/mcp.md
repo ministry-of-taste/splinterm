@@ -150,6 +150,53 @@ Requests, responses, pages, subscriptions, controllers, cursors, and deadlines a
 Terminal content is `untrusted_terminal_data`. An MCP host may display or index it as data, but it must never treat it as consent, authority, confirmation, executable source, or an instruction to call another tool.
 :::
 
+## Sending terminal input
+
+`splinterm.input` sends `text` as UTF-8 bytes unchanged, then any `keys` in
+order. It does not trim whitespace, remove control characters, translate LF to
+CR, or wrap text in bracketed-paste markers. Input requires the same scoped
+grant and exclusive controller authority either way.
+
+Press Enter with `keys: ["enter"]`. Agent hosts cannot reliably put a carriage
+return (CR, U+000D) in a tool argument: a model's line break arrives as LF, and
+a raw CR can be dropped before the call reaches the adapter (#278). TUIs such
+as Pi, Claude Code and Codex treat LF as "insert a newline" and only CR as
+"submit", so text that ends in a line break does not submit.
+
+```json
+{
+  "name": "splinterm.input",
+  "arguments": {
+    "splint_id": "018f4d8c-2a18-4b31-8c2f-9e7c5de77103",
+    "incarnation": 2,
+    "text": "hello",
+    "keys": ["enter"]
+  }
+}
+```
+
+The keys send the same bytes as the graphical client for the same key press:
+
+| Key | Bytes |
+|---|---|
+| `enter` | CR (`0d`) |
+| `tab` | `09` |
+| `shift-tab` | `ESC [ Z` |
+| `escape` | `1b` |
+| `backspace` | DEL (`7f`) |
+| `ctrl-a` … `ctrl-z` | `01` … `1a` (`ctrl-c` is `03`) |
+
+A call needs `text`, `keys`, or both. `text` must not be empty, `keys` holds 1
+to 64 names, and text plus keys together are capped at 64 KiB. Arrow and other
+cursor keys are not offered yet, because their bytes depend on the
+terminal's cursor-key mode. A `\r` inside `text` stays a backslash followed by
+`r`; only a JSON-escaped CR that survives the host reaches the terminal as CR.
+
+`accepted_bytes` counts the bytes written, text and keys together. It does not
+mean the foreground program interpreted them as a key or accepted the command:
+`hello` plus `enter` counts as six bytes. Keep diagnostics to lengths and
+synthetic control-byte probes; do not log real terminal input or prompts.
+
 ## Report agent status
 
 `splinterm.report_agent_status` takes `{ state, detail?, ttl_seconds?, splint_id?, incarnation? }`. `state` is `working`, `needs_input`, `done`, `error`, `idle`, or `null` to clear. Without `splint_id` and `incarnation`, the adapter uses `SPLINTERM_SPLINT_ID` and `SPLINTERM_SPLINT_INCARNATION` from its own environment, and fails with `invalid_argument` (`not inside a Splint`) when there are none. A host that starts stdio servers with a filtered environment must forward both variables. For Codex, add them to the server entry in `~/.codex/config.toml`:

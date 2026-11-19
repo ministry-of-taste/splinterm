@@ -723,16 +723,10 @@ impl ControlRegistry {
         arguments: &Value,
         cancellation: &CancellationToken,
     ) -> Result<Value, dispatch::DispatchFailure> {
-        let text = arguments["text"]
-            .as_str()
-            .ok_or_else(dispatch::DispatchFailure::internal)?;
-        self.action(
-            arguments,
-            Some(text.as_bytes().to_vec()),
-            None,
-            cancellation,
-        )
-        .await
+        let bytes =
+            crate::tools::input_bytes(arguments).ok_or_else(dispatch::DispatchFailure::internal)?;
+        self.action(arguments, Some(bytes), None, cancellation)
+            .await
     }
 
     async fn resize(

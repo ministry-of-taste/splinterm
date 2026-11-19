@@ -104,7 +104,7 @@ const REVIEWED_SCHEMA_FNV64: &[(&str, u64)] = &[
         "tools/decide_control_transfer.output.schema.json",
         0xaff5_14f4_0f32_0867,
     ),
-    ("tools/input.input.schema.json", 0xe79c_c053_2e93_6d2a),
+    ("tools/input.input.schema.json", 0x08b5_19c2_c637_7338),
     ("tools/input.output.schema.json", 0x6f42_6194_56e8_137c),
     (
         "tools/inspect_audit.input.schema.json",
