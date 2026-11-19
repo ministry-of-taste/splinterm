@@ -250,7 +250,7 @@ const DEFINITIONS: &[ToolDefinition] = &[
     ),
     tool_definition!(
         "input",
-        "Sends bounded UTF-8 input unchanged to one exact controlled Splint incarnation. Use \\r for Enter; \\n is LF, not Enter. Control characters require JSON escaping.",
+        "Sends bounded UTF-8 text unchanged, then any named keys, to one exact controlled Splint incarnation. Press Enter with keys [\"enter\"]; a line break in text is LF, which TUIs such as Pi treat as a new line, not submit.",
         false,
         false,
         false
@@ -436,6 +436,42 @@ pub(crate) fn validate_resource(kind: &str, resource: &Value) -> Result<(), Vali
     validate_schema(&parse_schema(schema), resource, &catalog.common_schema, 0)
 }
 
+/// The bytes one named key sends (#278). An agent host cannot carry a raw
+/// CR in a tool argument, so Enter and other control keys are named instead.
+/// The bytes match what the graphical client sends for the same key press.
+fn key_bytes(name: &str) -> Option<Vec<u8>> {
+    let bytes = match name {
+        "enter" => b"\r".to_vec(),
+        "tab" => b"\t".to_vec(),
+        "shift-tab" => b"\x1b[Z".to_vec(),
+        "escape" => b"\x1b".to_vec(),
+        "backspace" => vec![0x7f],
+        _ => {
+            let letter = name.strip_prefix("ctrl-")?.as_bytes();
+            let [letter @ b'a'..=b'z'] = letter else {
+                return None;
+            };
+            vec![letter - b'a' + 1]
+        }
+    };
+    Some(bytes)
+}
+
+/// The bytes `splinterm.input` writes: its text unchanged, then each key in
+/// order. `None` when neither is given or a key is unknown.
+pub(crate) fn input_bytes(arguments: &Value) -> Option<Vec<u8>> {
+    let text = arguments.get("text").and_then(Value::as_str);
+    let keys = arguments.get("keys").and_then(Value::as_array);
+    if text.is_none() && keys.is_none() {
+        return None;
+    }
+    let mut bytes = text.unwrap_or_default().as_bytes().to_vec();
+    for key in keys.into_iter().flatten() {
+        bytes.extend(key_bytes(key.as_str()?)?);
+    }
+    Some(bytes)
+}
+
 pub(crate) fn validate_arguments(name: &str, arguments: &Value) -> Result<(), ValidationError> {
     let Some(index) = definition_index(name) else {
         return Err(ValidationError::UnknownTool);
@@ -448,12 +484,10 @@ pub(crate) fn validate_arguments(name: &str, arguments: &Value) -> Result<(), Va
         0,
     )?;
     // JSON Schema maxLength counts Unicode scalar values. The frozen input
-    // contract separately caps the UTF-8 encoded body at 64 KiB.
+    // contract separately caps the UTF-8 encoded body, text and keys
+    // together, at 64 KiB, and needs at least one of them.
     if name == "splinterm.input"
-        && arguments
-            .get("text")
-            .and_then(Value::as_str)
-            .is_some_and(|text| text.len() > MAXIMUM_INPUT_TEXT_BYTES)
+        && input_bytes(arguments).is_none_or(|bytes| bytes.len() > MAXIMUM_INPUT_TEXT_BYTES)
     {
         return Err(ValidationError::InvalidArgument);
     }
@@ -938,6 +972,78 @@ mod tests {
             validate_arguments("splinterm.input", &input("é".repeat(40_000))),
             Err(ValidationError::InvalidArgument)
         );
+    }
+
+    #[test]
+    fn input_keys_send_the_client_bytes_after_text() {
+        let input = |extra: Value| {
+            let mut arguments = json!({
+                "splint_id": "11111111-2222-4333-8444-555555555555",
+                "incarnation": 1,
+            });
+            for (name, value) in extra.as_object().unwrap() {
+                arguments[name] = value.clone();
+            }
+            arguments
+        };
+        for (keys, bytes) in [
+            (json!(["enter"]), b"\r".to_vec()),
+            (json!(["tab", "shift-tab"]), b"\t\x1b[Z".to_vec()),
+            (json!(["escape", "backspace"]), b"\x1b\x7f".to_vec()),
+            (
+                json!(["ctrl-a", "ctrl-c", "ctrl-m", "ctrl-z"]),
+                vec![1, 3, 13, 26],
+            ),
+            (json!(["enter", "enter"]), b"\r\r".to_vec()),
+        ] {
+            let arguments = input(json!({"keys": keys}));
+            assert_eq!(validate_arguments("splinterm.input", &arguments), Ok(()));
+            assert_eq!(input_bytes(&arguments), Some(bytes));
+        }
+        let submitted = input(json!({"text": "hello", "keys": ["enter"]}));
+        assert_eq!(validate_arguments("splinterm.input", &submitted), Ok(()));
+        assert_eq!(input_bytes(&submitted), Some(b"hello\r".to_vec()));
+
+        for rejected in [
+            input(json!({})),
+            input(json!({"keys": []})),
+            input(json!({"keys": ["return"]})),
+            input(json!({"keys": ["ctrl-1"]})),
+            input(json!({"keys": ["\r"]})),
+            input(json!({"keys": "enter"})),
+            input(json!({"keys": vec!["enter"; 65]})),
+            input(json!({"text": "a".repeat(65_536), "keys": ["enter"]})),
+        ] {
+            assert_eq!(
+                validate_arguments("splinterm.input", &rejected),
+                Err(ValidationError::InvalidArgument),
+                "{rejected}"
+            );
+        }
+        assert_eq!(
+            validate_arguments(
+                "splinterm.input",
+                &input(json!({"text": "a".repeat(65_535), "keys": ["enter"]}))
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn every_advertised_input_key_has_bytes() {
+        let index = definition_index("splinterm.input").unwrap();
+        let names = catalog_cache().input_schemas[index]
+            .pointer("/allOf/0/properties/keys/items/enum")
+            .and_then(Value::as_array)
+            .expect("the input schema lists its key names");
+        assert_eq!(names.len(), 31);
+        for name in names {
+            let name = name.as_str().unwrap();
+            assert!(
+                key_bytes(name).is_some_and(|bytes| !bytes.is_empty()),
+                "{name}"
+            );
+        }
     }
 
     #[test]

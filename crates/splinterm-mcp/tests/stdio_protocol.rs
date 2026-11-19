@@ -4597,7 +4597,7 @@ fn controller_modes_overlay_control_resources_and_clear_on_release() {
     clippy::too_many_lines,
     reason = "one isolated fake-daemon exchange checks exact bytes under atomic and retained control"
 )]
-fn input_control_characters_reach_the_daemon_unchanged() {
+fn input_text_and_keys_reach_the_daemon_as_exact_bytes() {
     let texts = [
         "\r",
         " \r",
@@ -4610,15 +4610,32 @@ fn input_control_characters_reach_the_daemon_unchanged() {
         "\0",
         "é\r",
     ];
+    // An agent host cannot carry a raw CR (#278), so named keys follow text.
+    let cases: Vec<(Value, Vec<u8>)> = texts
+        .iter()
+        .map(|text| (json!({"text": text}), text.as_bytes().to_vec()))
+        .chain([
+            (json!({"keys": ["enter"]}), b"\r".to_vec()),
+            (
+                json!({"text": "MCP_CONTROL_BYTES", "keys": ["enter"]}),
+                b"MCP_CONTROL_BYTES\r".to_vec(),
+            ),
+            (
+                json!({"keys": ["ctrl-c", "escape", "tab", "shift-tab", "backspace", "ctrl-z"]}),
+                b"\x03\x1b\t\x1b[Z\x7f\x1a".to_vec(),
+            ),
+        ])
+        .collect();
     for retained in [false, true] {
         let (directory, socket) = isolated_socket("input-bytes");
         let listener = UnixListener::bind(&socket).unwrap();
         let splint_id: SplintId = "018f4d8c-2a18-4b31-8c2f-9e7c5de77103".parse().unwrap();
         let lair_id: LairId = "018f4d8c-2a18-4b31-8c2f-9e7c5de77101".parse().unwrap();
         let dojo_id: DojoId = "018f4d8c-2a18-4b31-8c2f-9e7c5de77102".parse().unwrap();
+        let all_expected: Vec<Vec<u8>> = cases.iter().map(|(_, bytes)| bytes.clone()).collect();
         let daemon = thread::spawn(move || {
             let mut connection = None;
-            for (index, text) in texts.iter().enumerate() {
+            for (index, expected) in all_expected.iter().enumerate() {
                 if connection.is_none() {
                     let mut stream = accept_automation(&listener);
                     stream.set_read_timeout(Some(TIMEOUT)).unwrap();
@@ -4667,7 +4684,7 @@ fn input_control_characters_reach_the_daemon_unchanged() {
                     panic!("expected unchanged input bytes");
                 };
                 assert_eq!(requested, splint_id);
-                assert_eq!(bytes, text.as_bytes(), "retained={retained}, text={text:?}");
+                assert_eq!(&bytes, expected, "retained={retained}, case={index}");
                 write_private_frame(
                     stream,
                     &ServerFrame::Response {
@@ -4682,7 +4699,7 @@ fn input_control_characters_reach_the_daemon_unchanged() {
                         },
                     },
                 );
-                if !retained || index == texts.len() - 1 {
+                if !retained || index == all_expected.len() - 1 {
                     let ClientFrame::Request {
                         request_id,
                         request: Request::ReleaseControl { controller_id: 101 },
@@ -4716,10 +4733,11 @@ fn input_control_characters_reach_the_daemon_unchanged() {
         } else {
             None
         };
-        for (index, text) in texts.iter().enumerate() {
+        for (index, (input, expected)) in cases.iter().enumerate() {
             let id = i64::try_from(index).unwrap() + 10;
-            let mut arguments =
-                json!({"splint_id":splint_id.to_string(),"incarnation":2,"text":text});
+            let mut arguments = input.clone();
+            arguments["splint_id"] = json!(splint_id.to_string());
+            arguments["incarnation"] = json!(2);
             if let Some(handle) = &controller {
                 arguments["controller_handle"] = handle.clone();
             }
@@ -4732,7 +4750,7 @@ fn input_control_characters_reach_the_daemon_unchanged() {
             assert_eq!(response["result"]["isError"], false, "{response}");
             assert_eq!(
                 response["result"]["structuredContent"]["data"]["accepted_bytes"],
-                text.len()
+                expected.len()
             );
             assert!(
                 response["result"]["structuredContent"]["data"]

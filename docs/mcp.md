@@ -331,14 +331,16 @@ cursors expire with the adapter process and are not portable.
 
 ### Sending terminal input
 
-`splinterm.input` sends `text` as UTF-8 bytes unchanged. It does not trim
-whitespace, remove control characters, translate LF to CR, or wrap text in
-bracketed-paste markers. Use `\r` (CR, U+000D) for Enter in a TUI; `\n` is LF
-and may insert a newline instead of submitting. Tab (`\t`), Escape (`\u001b`),
-Ctrl-C (`\u0003`), and other control characters also pass through. Input still
-requires the same scoped grant and exclusive controller authority.
+`splinterm.input` sends `text` as UTF-8 bytes unchanged, then any `keys` in
+order. It does not trim whitespace, remove control characters, translate LF to
+CR, or wrap text in bracketed-paste markers. Input requires the same scoped
+grant and exclusive controller authority either way.
 
-For example, the decoded `text` below ends with one carriage-return byte:
+Press Enter with `keys: ["enter"]`. Agent hosts cannot reliably put a carriage
+return (CR, U+000D) in a tool argument: a model's line break arrives as LF, and
+a raw CR can be dropped before the call reaches the adapter (#278). TUIs such
+as Pi, Claude Code and Codex treat LF as "insert a newline" and only CR as
+"submit", so text that ends in a line break does not submit.
 
 ```json
 {
@@ -346,23 +348,33 @@ For example, the decoded `text` below ends with one carriage-return byte:
   "arguments": {
     "splint_id": "018f4d8c-2a18-4b31-8c2f-9e7c5de77103",
     "incarnation": 2,
-    "text": "hello\r"
+    "text": "hello",
+    "keys": ["enter"]
   }
 }
 ```
 
-A CR-only string is valid; an empty string is not. JSON must escape control
-characters: send the serialized `"\r"`, not a literal CR inside a JSON string,
-and do not double-escape it into a literal backslash followed by `r`.
-`accepted_bytes` counts the UTF-8 bytes supplied to the adapter, including
-controls; it does not mean the foreground program interpreted them as a key
-or accepted the command. For example, space plus CR counts as two bytes.
+The keys send the same bytes as the graphical client for the same key press:
 
-If a host reports CR-only input as empty, or space plus CR as one byte, compare
-its outgoing JSON-RPC arguments with a direct stdio call to the same adapter
-build using an isolated test target. That is not the adapter's expected
-behavior. Keep diagnostics to lengths and synthetic control-byte probes; do
-not log real terminal input or prompts.
+| Key | Bytes |
+|---|---|
+| `enter` | CR (`0d`) |
+| `tab` | `09` |
+| `shift-tab` | `ESC [ Z` |
+| `escape` | `1b` |
+| `backspace` | DEL (`7f`) |
+| `ctrl-a` … `ctrl-z` | `01` … `1a` (`ctrl-c` is `03`) |
+
+A call needs `text`, `keys`, or both. `text` must not be empty, `keys` holds 1
+to 64 names, and text plus keys together are capped at 64 KiB. Arrow and other
+cursor keys are not offered yet, because their bytes depend on the
+terminal's cursor-key mode. A `\r` inside `text` stays a backslash followed by
+`r`; only a JSON-escaped CR that survives the host reaches the terminal as CR.
+
+`accepted_bytes` counts the bytes written, text and keys together. It does not
+mean the foreground program interpreted them as a key or accepted the command:
+`hello` plus `enter` counts as six bytes. Keep diagnostics to lengths and
+synthetic control-byte probes; do not log real terminal input or prompts.
 
 ### Reading terminal text
 

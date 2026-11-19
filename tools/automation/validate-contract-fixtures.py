@@ -228,7 +228,7 @@ EXPECTED_MCP_SCHEMA_SHA256 = {
     'tools/create_lair.output.schema.json': '557707f92f7bfd92e8210d92c3fda0a957d48611748d2b78dde348b13376f81f',
     'tools/decide_control_transfer.input.schema.json': '5a7850fa934828ce9ef9cbbf06ae45f36b988526419ec680de463776a1a66b0f',
     'tools/decide_control_transfer.output.schema.json': 'da0732232dcdfb0db30de9a288a1afd8603ce46a40d493f33c8061b90616e6d1',
-    'tools/input.input.schema.json': 'd6efb17cb06b9203dc438a93583af8540ed228879171ce839e6b9477802d0b94',
+    'tools/input.input.schema.json': '0cd75c68072f934ab9db2a9de04e652fc8d10ab72eba9ef3c2fdff43ec4944c1',
     'tools/input.output.schema.json': 'a05fb11845b1608909b103b94fb623300361edc4847fff5c8bea5a05a3ca21d1',
     'tools/inspect_audit.input.schema.json': 'c8d137b259cd0518e521326d3e56433883635de94743d6b9f2c428ff4b5e66bd',
     'tools/inspect_audit.output.schema.json': '61a80e47dd290aa22c3d4d29ee09c17db00191f4242c87630cc52fe6e61d2e8f',
@@ -311,6 +311,8 @@ EXPECTED_MCP_VALID_FIXTURES = {
     # per-tool fixtures keep the per-cell form.
     "read_terminal-text.output.json",
     "read_scrollback-text.output.json",
+    # #278: named keys follow text, so an agent can press Enter.
+    "input-keys.input.json",
 }
 EXPECTED_MCP_INVALID_FIXTURES = {
     "argv-echo.json",
