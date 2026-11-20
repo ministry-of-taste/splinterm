@@ -20,7 +20,7 @@ ROLE_ALIASES = {
     "darker_bg": ("darker_background", "darker_bg", "color0"),
     "lighter_bg": ("lighter_background", "lighter_bg", "color8"),
     "selection": (
-        "selection", "selection_background", "color8", "color0", "background", "bg",
+        "selection_background", "selection", "color8", "color0", "background", "bg",
     ),
     "muted": ("muted", "color8", "dark_foreground", "dark_fg"),
     "fg": ("foreground", "fg", "color7"),
