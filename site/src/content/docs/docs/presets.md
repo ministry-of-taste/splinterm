@@ -1,23 +1,25 @@
 ---
 title: Dojo presets
-description: Inspect, customize, and run complete Dojo layouts without shell injection or partial topology changes.
+description: Launch repeatable multi-pane workspaces with one command—no shell script glue or half-built layouts.
 ---
 
-Dojo presets turn a named layout into one atomic Splinterm topology transaction. The client validates and compiles the complete pane tree before the daemon persists it or launches a process. Presets use direct argument vectors; they are not shell scripts.
+Dojo presets let you open a complete multi-pane workspace in a single command. Before `splinterd` creates anything or starts a single shell, the client validates the entire layout and commits it as one atomic transaction—so a broken config never leaves half a workspace behind.
+
+Pane commands use structured argument vectors rather than passing strings through `sh -c`.
 
 ## Bundled Omarchy workflows
 
-Splinterm ships five workflows:
+Splinterm ships with five ready-to-use layouts modeled on Omarchy's tmux workflows:
 
 | Preset | Layout |
 | --- | --- |
-| `omarchy.t` | Reopen the first running Dojo, or create a one-shell `Work` Lair. |
-| `omarchy.tdl` | Editor and one or two AI panes over a shell. |
-| `omarchy.tds` | 2×2 editor, watched diff, shell, and `opencode` layout. |
-| `omarchy.tdlm` | One `tdl` Dojo per immediate non-hidden real child directory. |
-| `omarchy.tsl` | A deterministic 1–16 pane command swarm. |
+| `omarchy.t` | Reopen the first running Dojo, or create a fresh one-shell `Work` Lair. |
+| `omarchy.tdl` | Editor plus one or two AI panes above a shell. |
+| `omarchy.tds` | 2×2 grid: editor, watched diff, shell, and `opencode`. |
+| `omarchy.tdlm` | One `tdl` Dojo per immediate non-hidden child directory. |
+| `omarchy.tsl` | A 1–16 pane command swarm. |
 
-Inspect and preview them without contacting the daemon:
+Inspect and dry-run presets locally without touching `splinterd`:
 
 ```bash
 splinterm preset list
@@ -26,7 +28,7 @@ splinterm preset check
 splinterm preset run omarchy.tdl --cwd "$PWD" --param ai=opencode --dry-run
 ```
 
-Run a preset with:
+Launch a preset for real:
 
 ```bash
 splinterm preset run omarchy.tdl --cwd "$PWD" --param ai=opencode
@@ -34,23 +36,23 @@ splinterm preset run omarchy.tdl --param ai=c --param ai2=cx
 splinterm preset run omarchy.tsl --param count=4 --param command='codex -a never'
 ```
 
-Successful layout runs open their first Dojo in a native Window. Add `--no-open` to keep a layout headless after full reconciliation; `omarchy.t` always opens.
+Layout presets open their first Dojo in a native window automatically. Pass `--no-open` if you want to create the layout headlessly (`omarchy.t` always opens a window).
 
-:::caution[Unrestricted aliases are opt-in]
-The packaged `c`, `cx`, and `cy` aliases carry deliberately unrestricted agent flags. They fail before mutation unless `[presets] allow-unrestricted-commands=yes` is explicit in `config.ini`. Splinterm never silently weakens those flags.
+:::caution[Unrestricted agent aliases are opt-in]
+The bundled `c`, `cx`, and `cy` command aliases include unrestricted agent flags. Splinterm refuses to run them unless you explicitly enable `allow-unrestricted-commands=yes` under `[presets]` in `config.ini`.
 :::
 
-## Optional Bash helpers
+## Optional Bash shortcuts
 
-Generate the integration for review, or install it to a dedicated file:
+If you like short shell commands, Splinterm can generate collision-safe Bash helpers using a separate `s*` prefix so they never shadow your existing `t*` tmux aliases:
 
 ```bash
-splinterm preset shell-init omarchy --shell bash
-splinterm preset shell-install omarchy --shell bash
+splinterm preset shell-init omarchy --shell bash     # preview first
+splinterm preset shell-install omarchy --shell bash  # install to ~/.config/splinterm/shell/omarchy.bash
 source "${XDG_CONFIG_HOME:-$HOME/.config}/splinterm/shell/omarchy.bash"
 ```
 
-The helpers use a separate collision-safe namespace:
+The installed helpers map cleanly to the bundled presets:
 
 ```text
 s                 omarchy.t
@@ -60,11 +62,11 @@ sdlm AI [AI2]     omarchy.tdlm
 ssl COUNT COMMAND omarchy.tsl
 ```
 
-Installation refuses to replace an existing file and never edits `.bashrc`. When sourced, the file defines nothing if any proposed name is already an alias, function, builtin, or executable.
+`shell-install` never modifies `.bashrc` and refuses to overwrite an existing file. When sourced, the script checks every helper name first and defines nothing if any of them would collide with an existing alias, function, builtin, or binary in `PATH`.
 
-## Add a user catalog
+## Writing your own presets
 
-Select an optional strict TOML catalog in `config.ini`:
+Point `[presets]` in `config.ini` at a TOML catalog file:
 
 ```ini
 [presets]
@@ -72,7 +74,7 @@ file=presets.toml
 allow-unrestricted-commands=no
 ```
 
-A catalog defines direct command aliases and bounded pane/split trees. User preset names may shadow bundled names. The schema rejects unknown fields, cycles, reused nodes, missing children, unsafe command strings, trees deeper than 32, and layouts over 32 panes.
+Your presets can sit alongside—or override—the bundled ones. Splinterm checks the catalog strictly (rejecting unknown fields, node cycles, missing children, trees deeper than 32, and layouts with more than 32 panes):
 
 ```toml
 version = 1
@@ -109,6 +111,6 @@ cwd = "{cwd}"
 title = "shell"
 ```
 
-`{cwd}` and `{cwd.basename}` are the only placeholders. Pane commands are direct argv, or values parsed by Splinterm's closed compatibility lexer; they are never passed to `sh -c`.
+Only `{cwd}` and `{cwd.basename}` are expanded as placeholders. Commands are executed directly as argv (or parsed by Splinterm's closed lexer), never evaluated by a shell.
 
-Non-dry runs are trusted-local human operations. Remote, automation, and MCP clients cannot invoke private preset materialization. For the complete schema and failure semantics, read repository [`docs/presets.md`](https://github.com/ministry-of-taste/splinterm/blob/main/docs/presets.md).
+Preset runs are trusted local human actions—remote, automation, and MCP clients cannot materialize presets. For the full schema and error behavior, see [`docs/presets.md`](https://github.com/ministry-of-taste/splinterm/blob/main/docs/presets.md).

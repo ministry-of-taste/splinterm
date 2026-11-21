@@ -1,18 +1,18 @@
 ---
 title: Remote access
-description: Open native remote Splinterm windows or relay bounded automation through authenticated SSH.
+description: Attach native Wayland windows to remote Splinterm daemons over SSH, or relay scoped automation without opening a network port.
 ---
 
-Splinterm supports two distinct SSH workflows without exposing a daemon network listener:
+Splinterm runs over your existing OpenSSH setup—`splinterd` never opens a network listener of its own. There are two separate SSH workflows:
 
-- a **native graphical client** for a person using a remote account; and
-- a **policy-scoped stdio relay** for machine automation.
+- **Native remote windows** for humans working on another Linux machine running `splinterd`.
+- **The stdio automation relay** for scripts and tools that need policy-scoped remote access.
 
-Transport is not interchangeable authority. OpenSSH authenticates the human graphical workflow. Machine operations remain governed by exact executable policy.
+Human SSH windows and machine automation don't share the same trust path: OpenSSH authenticates your interactive session, while machine relay clients still require an explicit policy on the remote host.
 
-## Configure a remote profile
+## 1. Define a remote profile
 
-Profiles live at `${XDG_CONFIG_HOME:-~/.config}/splinterm/remotes.toml`:
+Create `${XDG_CONFIG_HOME:-~/.config}/splinterm/remotes.toml`:
 
 ```toml
 version = 1
@@ -26,57 +26,64 @@ known_hosts_file = "~/.ssh/known_hosts"
 connect_timeout_seconds = 15
 ```
 
-The schema is strict. It does not accept arbitrary SSH options, commands, forwarding, environment, or shell fragments. Ordinary safe aliases, identities, certificates, agents, and proxy routing may still come from OpenSSH configuration; Splinterm supplies fixed safety overrides.
+`remotes.toml` uses a strict schema—it doesn't accept raw SSH flags, port forwarding, or shell fragments. Standard host aliases, certificates, ssh-agent keys, and `ProxyJump` routing in your `~/.ssh/config` still work normally, with Splinterm applying safe defaults (such as strict host-key checking).
 
-Inspect and probe without opening a Window:
+Check your profile before opening a window:
 
 ```bash
 splinterm remote list
-splinterm remote inspect wintermute
-splinterm remote check wintermute
+splinterm remote inspect wintermute  # shows resolved settings and exact SSH argv
+splinterm remote check wintermute    # read-only SSH, relay, and daemon health probe
 ```
 
-`remote inspect` prints resolved non-secret settings and structured SSH argv. `remote check` performs bounded SSH, relay, daemon, `Ping`, and `ListLairs` probes without mutating topology.
+## 2. Open a remote window
 
-## Open a native remote Window
+From a terminal:
 
 ```bash
-splinterm --remote wintermute
+splinterm --remote wintermute          # opens the remote Recent Dojos picker
 splinterm --remote wintermute dojos
 splinterm --remote wintermute reopen
 splinterm --remote wintermute launch --working-directory /srv/project
 splinterm --remote wintermute window --lair-id LAIR_ID --dojo-id DOJO_ID
 ```
 
-Omitting the command opens the remote Recent Dojos picker. A Window stays bound to one endpoint and can discover, attach, split, control, search, and restore remote Dojos through one OpenSSH child. New remote panes briefly show a client-local `Opening remote pane…` placeholder while bounded protocol round trips complete.
+One window stays bound to one remote host and runs over a single OpenSSH child process. You can list, attach, split, search, and restore remote Dojos just like local ones. While a new remote pane initializes, Splinterm briefly displays an `Opening remote pane…` placeholder.
 
-OpenSSH may use the controlling terminal for passwords, key passphrases, PINs, or hardware tokens. Without a terminal it uses an ssh-agent key first, then your own `SSH_ASKPASS`, and only then Splinterm's own prompt in the connection status Window. Unknown or changed host keys fail closed. Splinterm does not run `ssh-keyscan`, accept unknown keys, or store credentials.
+### Launching without a terminal
 
-## Open a remote without a terminal
+You don't need a shell open first to connect to a remote host. Any of these launch the graphical remote flow directly:
 
-Open a remote from the **Splinterm Remotes** app-menu entry, the **Remote Dojos** desktop action, `splinterm remotes`, or the **Remote Dojos…** row of the local Recent Dojos picker. One Window lists the profiles in `remotes.toml`, shows the chosen profile's connection status and any SSH prompt, lists that host's Dojos (with **New terminal**), and then becomes the remote terminal. Escape steps back one stage: from the status screen or the Dojo list (which also ends that SSH connection) to the profiles, and from the profiles it closes the Window. `splinterm remotes` typed in a terminal returns at once and prints nothing; the launcher runs with no inherited stdio and no controlling terminal, so OpenSSH cannot prompt on a terminal. An agent key or your own `SSH_ASKPASS` is preferred; when neither can answer, Splinterm asks on the status screen.
+- The **Splinterm Remotes** app-menu entry or **Remote Dojos** desktop action
+- Running `splinterm remotes` (returns immediately and opens the launcher window)
+- Choosing **Remote Dojos…** inside local Recent Dojos
+- Running **Open Remote…** from the command palette (opens a profile chooser and launches the chosen host in one new window)
 
-**Open Remote…** in the command palette shows the profiles as a pop-up over the current Window and opens the chosen one in exactly one new Window, which connects, lists that host's Dojos, and becomes the remote terminal. The status screen and its password field never appear inside a local terminal Window.
+The launcher window walks through three stages—**profile list → connecting status → remote Dojo picker**—and then turns into your remote terminal. Press `Escape` to step back one stage (which cleanly closes the SSH connection if you back out of a host).
 
-Every graphical remote launch first shows a status screen ("Connecting to …") while OpenSSH authenticates and the remote daemon answers. On success the same Window goes on to the remote's Dojo picker; on failure it shows the categorized cause, a one-line remedy, the newest sanitized OpenSSH lines, and the agent or `SSH_ASKPASS` setup, with R or Enter to retry and C, Q, or Escape to close (in the launcher, to go back to the profiles). OpenSSH's error output stays in that Window. Started from a terminal, OpenSSH may still prompt on that terminal, because Splinterm forces `SSH_ASKPASS` only when stdin is not a terminal. If a direct `splinterm --remote PROFILE` closes before connecting, `splinterm` exits with status 1. The client diagnostics log under `~/.local/state/splinterm/logs/` records only the failure category.
+### Authentication and SSH prompts
 
-When OpenSSH needs a password, passphrase, or PIN and nothing else can answer, the status Window shows OpenSSH's prompt text and a masked password field: Enter submits, and Escape cancels the attempt. The field never echoes; the screen and accessibility text say only whether it is empty. Yes/no questions take Y or N. Splinterm's own executable answers OpenSSH as `SSH_ASKPASS` through a private per-attempt socket and token, accepts prompts only from that attempt's OpenSSH, wipes answers after use, and never logs them. Pasting into the field is allowed for password managers, and the status Window does not use an input method. Escape, closing the Window, or two unanswered minutes end the attempt by stopping OpenSSH first, so it never sends an empty password. Non-graphical commands such as `remote check` never show this prompt.
+Splinterm never stores passwords, never runs `ssh-keyscan`, and always fails closed on unknown or changed host keys.
+
+- **Started from a terminal:** OpenSSH can prompt on that terminal as usual (passwords, passphrases, hardware token PINs).
+- **Started graphically (no controlling terminal):** OpenSSH tries `ssh-agent` first, then your own `SSH_ASKPASS` if configured, and finally Splinterm's built-in prompt inside the connection status window.
+- **Built-in prompt:** Shows OpenSSH's prompt with a masked input field (pasting from a password manager works; `Y`/`N` for yes/no prompts; `Enter` submits; `Escape` cancels). Answers pass over a private per-attempt socket to that exact OpenSSH child, are wiped immediately after use, and are never logged. Closing the window or letting two minutes pass cancels OpenSSH cleanly without sending an empty password.
+- **Connection errors:** If a connection fails, the status window stays open with the failure category, a one-line fix hint, and recent sanitized OpenSSH output. Press `R` or `Enter` to retry, or `C`/`Q`/`Escape` to close.
 
 ## Authority and boundaries
 
-A native remote Window receives ordinary human multiplexer authority after SSH authenticates the remote account. It can request normal controller ownership but cannot use trusted-local forced takeover. It also does not publish local compositor focus or receive remote terminal image bodies.
+- **Human session behavior:** Once SSH authenticates your remote account, your remote window gets normal multiplexer authority (attach, split, type, resize, restore). Forced controller takeover (`Ctrl+Shift+U`) confirms in that remote window itself (never on the daemon host, and requires `integration.remote-agent-prompts=yes`). Remote windows do not publish local compositor focus or transfer terminal images.
+- **If SSH drops:** Your local window closes and releases any input controller leases, but sends no kill requests—all remote shells stay alive in the remote `splinterd`.
+- **Agent prompts across SSH:** By default (`integration.remote-agent-prompts=yes`), a remote window surfaces agent access prompts from the remote machine so you can approve or deny them where you're working.
+- **Not a local sandbox:** Any process already running as your remote Unix account can invoke the installed graphical relay (`--graphical-stdio`) with your account's normal authority. Policy and consent bound cooperating tools; they don't contain hostile processes already running as your user.
 
-SSH or relay loss closes the affected local views and releases connection-owned controllers. It sends no kill or close request, so daemon-owned remote Splints continue running.
-
-The human role is not a boundary against software already running as the account. `splinterd` recognizes the graphical relay by its installed executable and `--graphical-stdio` mode, and the relay forwards whatever its caller sends, so any process running as the account can start it and receive the same authority without a prompt. Policy and consent keep cooperating tools within what was granted and make their access visible; they do not contain a hostile process, which can already read the account's files and run its commands.
-
-:::note[Remote images]
-Remote graphical sessions intentionally omit terminal image transfer. Unexpected remote image metadata fails the affected pane closed rather than opening a content channel.
+:::note[No remote image transfer]
+Remote graphical sessions intentionally omit Sixel/Kitty/iTerm2 image bodies. Unexpected image metadata fails the affected pane closed rather than opening an unvetted content channel.
 :::
 
-## Automation over SSH
+## Machine automation over SSH
 
-The machine relay is a different entry point:
+Automated tools use a separate stdio relay entry point:
 
 ```bash
 ssh -T \
@@ -85,8 +92,6 @@ ssh -T \
   /usr/bin/splinterm relay --stdio
 ```
 
-It copies bounded private-protocol bytes over stdio. The remote daemon authorizes the exact installed `splinterm-relay` executable under an owner-controlled policy. SSH login, socket access, and Unix account identity do not grant machine operations.
+On the remote host, `splinterd` authorizes the exact installed `splinterm-relay` executable against your owner-controlled policy—an SSH login alone grants no machine operations. Use a dedicated account or restricted SSH key when relay callers shouldn't inherit full shell access. Diagnostics stay on stderr so stdout remains pure protocol bytes.
 
-Use a dedicated account or restricted key when relay callers must not inherit the account's other SSH capabilities. Relay stdout is protocol data only; diagnostics stay on stderr.
-
-For the complete relay identity, profile schema, authentication, reconnect, and policy contract, read repository [`docs/remote.md`](https://github.com/ministry-of-taste/splinterm/blob/main/docs/remote.md).
+For the complete profile schema, reconnect semantics, and relay contract, see [`docs/remote.md`](https://github.com/ministry-of-taste/splinterm/blob/main/docs/remote.md).

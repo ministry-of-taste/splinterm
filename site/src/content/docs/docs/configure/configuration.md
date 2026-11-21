@@ -1,22 +1,25 @@
 ---
 title: Configuration
-description: Configure Splinterm fonts, geometry, shell behavior, scrollback, pane chrome, cursor, and theme overrides.
+description: Configure Splinterm fonts, Omarchy theme integration, session lifetime, Explorer, keymaps, and clipboard behavior.
 ---
 
-The default configuration path is:
+Splinterm reads its configuration from:
 
 ```text
 ${XDG_CONFIG_HOME:-~/.config}/splinterm/config.ini
 ```
 
-Start from the repository example at `config/splinterm/config.ini`. Set `SPLINTERM_CONFIG` to test another file without replacing your normal configuration.
+Start from the commented example in `config/splinterm/config.ini`. To test an alternate file without replacing your main config, run with `SPLINTERM_CONFIG=/path/to/config.ini`.
 
-## Minimal example
+Splinterm parses strictly: unknown sections, unknown keys, and malformed values fail with a line-numbered message rather than silently falling back. Run `splinterm config check` anytime to validate your file.
+
+## Starter example
 
 ```ini
 [main]
-font=monospace:style=Regular
-font-pixelsize=14
+# Leave font and size unset to follow Omarchy's monospace font and text size live.
+# font=JetBrains Mono Nerd Font:style=Regular
+# font-pixelsize=14
 font-sizing-policy=output-scale
 padding-left=12
 padding-right=12
@@ -42,6 +45,11 @@ frame-title=splint
 style=block
 blink=yes
 
+[explorer]
+agent-status=yes
+status-colors=yes
+status-glyphs=icons
+
 [key-bindings]
 profile=splinterm
 # file=keybindings.toml
@@ -52,93 +60,106 @@ profile=splinterm
 allow-unrestricted-commands=no
 ```
 
-Malformed supported values fail startup. Unknown sections and keys produce line-numbered diagnostics.
+## Settings reference
 
-## Common settings
+### `[main]`, `[scrollback]`, and `[cursor]`
 
-| Key | Meaning | Default or range |
+| Key | Purpose | Default / range |
 | --- | --- | --- |
-| `main.font` | fontconfig pattern; styles remain in its resolved family | Fontconfig `monospace` Regular |
-| `main.font-pixelsize` | terminal pixel font size; any size key stops the terminal following Omarchy's text size | 6–96; Omarchy's text size, otherwise 14 |
-| `main.font-point-size` | alternative point size | 6–96; unset |
+| `main.font` | Fontconfig pattern; unset follows fontconfig `monospace` live | Fontconfig `monospace` Regular |
+| `main.font-pixelsize` | Terminal font size in pixels (opts out of Omarchy text size) | `6`–`96`; Omarchy text size, else `14` |
+| `main.font-point-size` | Terminal font size in points (mutually exclusive with pixelsize) | `6`–`96`; unset |
 | `main.font-sizing-policy` | `output-scale` or `physical-dpi` | `output-scale` |
-| `main.ui-font-pixelsize` | text size of tabs, Explorer, menus, the command palette and pickers, independent of the terminal font size and zoom; configuration reload applies it | 6–96; Omarchy's text size, otherwise 14 |
-| `main.startup` | `new-dojo` or `dojo-picker`: what a commandless desktop launch opens | `new-dojo` |
-| `main.omarchy-integration-hint` | under Omarchy without the `terminal` tag, show one desktop notification recommending `splinterm integration omarchy enable` | `yes` |
-| `main.padding-*` | four independent logical edges | 0–10000; 12 |
-| `main.initial-columns` | initial grid columns | 2–480; 80 |
-| `main.initial-rows` | initial grid rows | 2–128; 24 |
-| `main.shell` | executable for an empty launch | account login shell |
-| `scrollback.lines` | daemon terminal history budget | 0–1,000,000; 1000 |
-| `cursor.style` | `block`, `beam`, or `underline` | `block` |
-| `multiplexer.persistent-by-default` | ordinary unnamed local graphical Lairs are persistent (`yes`) or Window-owned (`no`) | `yes` |
-| `multiplexer.persist-on-tab-organization` | create/name/rename a tab atomically promotes its transient Lair | `yes` |
-| `multiplexer.tab-strip-border` | a full-width line along the bottom of the tab strip, as thin as a `line` divider and under the active tab's thicker accent underline; configuration reload applies it | `yes` |
-| `multiplexer.new-dojo-directory` | where a new Dojo or Lair opened inside a Window starts: `inherit`, `home`, an absolute path, or `~/path` (resolved on the owning daemon) | `home` |
-| `multiplexer.new-splint-directory` | where a split inside a Dojo starts; same values | `inherit` |
-| `multiplexer.close-unused` | Close Tab and Window close terminate a Dojo that was never used | `no` |
-| `multiplexer.divider-style` | `line`, `frame`, or `none`; configuration reload applies it | `line` |
-| `multiplexer.pane-gap` | empty logical px between neighbouring Splints: outside each frame with `frame`, around the centred line with `line`, plain spacing with `none`; also kept around the panes at the Window's edges; shrinks, down to none, where the Splints cannot fit it; configuration reload applies it | 0–64; `0` |
-| `multiplexer.frame-title` | `splint` or `none`; configuration reload applies it | `splint` |
-| `explorer.agent-status` | show reported agent status in the Explorer and on Dojo tabs (`no` hides it) | `yes` |
-| `key-bindings.profile` | `splinterm` or `omarchy-tmux` | `splinterm` |
-| `key-bindings.file` | optional strict TOML overlay | unset |
-| `key-bindings.prefix-timeout-ms` | prefix timeout in milliseconds | 250–5000; 1000 |
-| `presets.file` | optional strict preset catalog | unset |
-| `presets.allow-unrestricted-commands` | enable packaged `c`, `cx`, `cy` aliases | `no` |
+| `main.ui-font-pixelsize` | Text size for tabs, Explorer, menus, palette, and pickers | `6`–`96`; Omarchy text size, else `14` |
+| `main.startup` | `new-dojo` or `dojo-picker` for commandless desktop launches | `new-dojo` |
+| `main.omarchy-integration-hint` | Show a one-time reminder under Omarchy 4 if the `terminal` tag is missing | `yes` |
+| `main.padding-*` | Independent logical padding on `left`, `right`, `top`, `bottom` | `0`–`10000`; `12` |
+| `main.initial-columns` / `initial-rows` | Initial grid dimensions | `2`–`480` (`80`) / `2`–`128` (`24`) |
+| `main.shell` | Shell executable for an empty launch | Account login shell |
+| `main.theme` | Explicit Splinterm JSON theme path (opts out of Omarchy auto-discovery) | unset |
+| `scrollback.lines` | Daemon scrollback budget per Splint | `0`–`1,000,000`; `1000` |
+| `cursor.style` / `cursor.blink` | `block`, `beam`, or `underline`; blink `yes`/`no` | `block` / `yes` |
+
+### `[multiplexer]`
+
+| Key | Purpose | Default / range |
+| --- | --- | --- |
+| `persistent-by-default` | Whether unnamed local graphical launches persist (`yes`) or close with their window (`no`) | `yes` |
+| `persist-on-tab-organization` | Adding or explicitly naming a Dojo promotes a transient Lair to persistent | `yes` |
+| `close-unused` | Close Tab and window close terminate Dojos that were never used | `no` |
+| `new-dojo-directory` | Starting directory for new Dojos/Lairs: `inherit`, `home`, absolute path, or `~/path` | `home` |
+| `new-splint-directory` | Starting directory for new splits (same choices) | `inherit` |
+| `tab-strip-border` | Draw a thin full-width bottom rule under the tab strip | `yes` |
+| `divider-style` | `line`, `frame`, or `none` | `line` |
+| `pane-gap` | Logical px gap between panes and around window edges; shrinks if space is tight | `0`–`64`; `0` |
+| `frame-title` | Show `splint` titles on framed panes or `none` | `splint` |
+
+### `[explorer]`, `[integration]`, `[clipboard]`, `[key-bindings]`, `[presets]`
+
+| Key | Purpose | Default |
+| --- | --- | --- |
+| `explorer.agent-status` | Show reported agent status in the Explorer and on Dojo tabs | `yes` |
+| `explorer.status-colors` | Color status glyphs and the `Asking` marker from the theme (`no` uses plain text color) | `yes` |
+| `explorer.status-glyphs` | `icons` (two-cell icons) or `dots` (one-cell geometric shapes) | `icons` |
+| `explorer.current-marker` | Marker icon before the active Lair, Dojo, and Splint (e.g. `eye`, `crosshair`, `focus-2`) | `eye` |
+| `explorer.full-height` | Dock the Explorer full window height beside the tab strip (`no` places it below) | `yes` |
+| `explorer.collapsed` | Start the Explorer collapsed to its compact icon rail | `no` |
+| `explorer.row-lines` | `1` (single line) or `2` (adds agent detail or working directory under each Splint) | `1` |
+| `integration.dialog-shortcut` | Shortcut to engage a waiting trusted dialog's keyboard without answering (`ctrl+alt+<letter-or-digit>` or `none`; also bound globally under Hyprland while a dialog waits) | `ctrl+alt+g` |
+| `integration.remote-agent-prompts` | Show remote host agent-access prompts in your `splinterm --remote` window | `yes` |
+| `clipboard.image-directory` | Private `0700` directory (no symlinks) for saving pasted clipboard PNGs via the palette | unset |
+| `clipboard.middle-click-paste` | Paste primary selection on middle click (`no` passes middle click to mouse-aware apps) | `yes` |
+| `clipboard.osc52` | Terminal OSC 52 clipboard access: `copy-paste` (programs in a controlled pane, including SSH sessions and agents, can read your clipboard without asking), `copy` (write-only), or `off` | `copy-paste` |
+| `key-bindings.profile` | Built-in keymap profile: `splinterm` or `omarchy-tmux` | `splinterm` |
+| `key-bindings.file` | Optional strict TOML overlay relative to `config.ini` | unset |
+| `key-bindings.prefix-timeout-ms` | Prefix timeout for `omarchy-tmux` | `250`–`5000`; `1000` |
+| `presets.file` | Optional strict TOML preset catalog | unset |
+| `presets.allow-unrestricted-commands` | Opt into the bundled `c`, `cx`, and `cy` unrestricted agent aliases | `no` |
+
+Optional `[colors]`, `[colors-dark]`, and `[colors-light]` sections also let you override `alpha`, `blur`, tab/Explorer backgrounds, and individual chrome roles (`accent`, `focus-ring`, `text-muted`, `warning`, etc.) while keeping the rest of your Omarchy theme live. See `config/splinterm/config.ini` for the full commented list.
+
+**Live reload:** **Reload configuration** applies `main.ui-font-pixelsize`, `[colors*]` overrides, every `[multiplexer]` key except `persistent-by-default`, all `[explorer]` keys, `integration.remote-agent-prompts`, all `[clipboard]` keys, and `[key-bindings]` without restarting the window or its shells.
 
 ## Terminal lifetime
 
-`persistent-by-default=no` applies to commandless desktop/SUPER+ENTER launches, bare `splinterm launch`, picker **New**, and in-Window **New Terminal**. Closing the owning Window terminates an unpromoted transient Lair. Explicitly named, command-bearing, preset, restore/relaunch, remote, automation, and MCP creation remains persistent.
+- **`persistent-by-default=no`:** Unnamed desktop launches (`Super+Enter`), bare `splinterm launch`, picker **New**, and in-window **New Terminal** belong to their window and end when it closes. Named launches, command launches, presets, restores, remotes, automation, and MCP stay persistent.
+- **`persist-on-tab-organization=yes` (default):** Opening a second Dojo or explicitly naming/renaming a Dojo promotes a transient Lair to persistent permanently. Generated default names (`Dojo 1`, etc.) don't trigger promotion.
+- **`close-unused=yes`:** **Close Tab** and compositor window close will terminate a Dojo instead of detaching *only* if all of the following are true at close time:
+  - it still has only its original, unsplit default shell pane;
+  - the pane has never received keyboard, paste, or mouse input (focus events don't count);
+  - neither the Dojo nor its pane was ever explicitly named or renamed;
+  - no other window is attached to it; and
+  - the shell itself is still in the foreground (a program started by your shell rc counts as use).
 
-With `persist-on-tab-organization=yes`, creating another Dojo or explicitly naming/renaming a Dojo atomically promotes the complete Lair. Promotion is permanent, so a later Window close detaches normally. Set it to `no` to keep organized and multi-tab Lairs Window-owned. Generated Lair and `Dojo 1` names do not promote, and unpromoted transient Dojos never enter Recent Dojos.
-
-With `close-unused=yes`, **Close Tab** and closing the Window from the compositor terminate a Dojo that was never used instead of detaching from it. The daemon decides at the moment of the close: the Dojo must still hold only its original pane, never split; that pane must never have received keys, paste, or mouse input (focus reports do not count); it must have started as a plain default-shell terminal in the running daemon, in any Lair, named or not; the Dojo must never have been named, at creation (even a chosen name equal to the default label) or by a rename of it or its pane; no other Window may be attached, and a Window attaching during the close either keeps the Dojo or is refused; and the shell itself must hold the terminal foreground, so a program started from a shell startup file counts as use. Anything else detaches as before, as does **Detach Window**. When the closed Dojo was the last in a Lair the user never named (one created under a name Splinterm generated for a graphical launch, such as `terminal-1787899189123456789-4132`, and never renamed), that Lair goes too; a Lair the user named stays, empty, even when its name looks generated. Remote Windows get the same decision from the remote daemon.
+  Anything else detaches normally, and **Detach Window** always detaches. If that closed Dojo was the last one in a Lair with an auto-generated name, the empty Lair is removed too; user-named Lairs remain.
 
 ## Font sizing and Wayland scale
 
-The default `main.font-sizing-policy=output-scale` follows Wayland compositor output geometry, including fractional output scale. Choose `physical-dpi` when point-sized fonts should instead follow the output's reported mode and physical-size DPI.
+The default `main.font-sizing-policy=output-scale` follows Wayland compositor output geometry, including fractional scaling. Switch to `physical-dpi` if you want point-sized fonts derived from the display's reported physical DPI instead.
 
-`main.font-pixelsize` and `main.font-point-size` are mutually exclusive. Pixel-sized fonts remain fixed according to the selected sizing policy; point-sized fonts are converted from the effective DPI. See [Why native Wayland?](/docs/wayland/) for how scaling fits into the native client.
-
-When neither size key is set, Splinterm follows Omarchy's text size, as described under Omarchy theme integration below. The minimal example above sets `font-pixelsize=14`, which opts out.
+`main.font-pixelsize` and `main.font-point-size` are mutually exclusive. Leave both unset to follow Omarchy's live text size automatically. See [Why native Wayland?](/docs/wayland/) for how scaling fits into the native client.
 
 ## Omarchy theme integration
 
-With `main.theme` unset, Splinterm reads the active Omarchy theme from the first of these directories that exists, or whose theme Omarchy is staging as `current/next-theme`:
+When `main.theme` is unset, Splinterm tracks your active Omarchy theme automatically—no manual export script needed—and reloads valid theme edits live without restarting your daemon, shells, or windows.
 
-1. `${XDG_STATE_HOME:-~/.local/state}/omarchy/current/theme/`.
-2. `~/.local/state/omarchy/current/theme/`, where Omarchy 4 always writes, when `XDG_STATE_HOME` points elsewhere.
-3. Omarchy 3.x's `~/.config/omarchy/current/theme/`, read-only.
+- **Theme discovery order:** Checks `${XDG_STATE_HOME:-~/.local/state}/omarchy/current/theme/`, then `~/.local/state/omarchy/current/theme/`, then Omarchy 3.x's `~/.config/omarchy/current/theme/` (falling back cleanly during theme switches without jumping to stale copies).
+- **Colors (`foot.ini` + `colors.toml`):** Terminal ANSI colors, selection, alpha, and blur come from the theme's `foot.ini` (`[colors]` and `[colors-dark]` merge key-by-key just like Foot). Chrome roles come from `colors.toml` (canonical Omarchy 4 names first, then legacy aliases). Active-tab text automatically chooses whichever of background or foreground has higher WCAG contrast, and inactive tab labels mix toward foreground if needed to clear 4.5:1 contrast.
+- **Glassy Windows & `shell.toml`:** Toggling Omarchy's Glassy Windows updates `foot.ini` (`alpha=0.65`, `blur=yes`), which Splinterm picks up within half a second—making only the default background, padding, tab strip, and docked Explorer translucent while text, explicit cell backgrounds, and the cursor stay crisp and opaque. Popups, menus, and pickers follow Omarchy 4's `shell.toml` (`[menu]` and `[popups]` `background-alpha`), automatically raising alpha if needed to keep text readable over bright wallpapers.
+- **Live text size:** With no font size set in `config.ini`, Splinterm follows Omarchy's `shell.toml` `[font] base-size` live (converted to points using the same `px × 9/12` rule Omarchy uses for Foot and other terminals). Window chrome has its own size (`main.ui-font-pixelsize`, otherwise Omarchy's `base-size` in px, otherwise `14` px) and is unaffected by terminal zoom.
+- **Opting out:** Point `main.theme` at a JSON file to disable Omarchy auto-discovery:
+  ```ini
+  [main]
+  theme=~/.config/splinterm/theme.json
+  ```
 
-Splinterm re-checks the choice on every poll, so it follows the Omarchy 4 migration live. During a theme switch it keeps the directory it was reading rather than falling back to an old Omarchy 3.x copy, and an empty `omarchy/current` left in a higher-priority root never hides the live theme.
-
-The effective `foot.ini` supplies terminal colors, selection, alpha, and blur. As in Foot, `[colors]` and `[colors-dark]` merge key by key into the dark palette. `colors.toml` supplies standard Omarchy roles, with the canonical Omarchy 4 name read before the legacy alias. The active-tab body uses `lighter_background`, then `lighter_bg`, then Foot `bright0`, rather than the terminal selection color. Inactive tab labels start from `muted`, then `color8`, `dark_foreground`, `dark_fg`, or Foot `bright0`. They keep that colour when it reaches 4.5:1 contrast against the tab strip without being louder than the foreground. Otherwise they use the first qualifying 25/50/75 % mix with the foreground, or the plain foreground. The accent comes from `accent`, `cursor`, `blue`, or `color4`. JSON themes may set `inactive_tab_foreground` explicitly.
-
-Active tab text is independent from terminal selection text. Splinterm chooses whichever effective terminal background or foreground has higher WCAG contrast against the resolved active-tab body, preferring foreground on a tie. Native Omarchy themes need no Splinterm-specific roles. Explicit JSON themes may override the active-tab roles and use the same fallback rule against their own background and foreground roles.
-
-Valid theme changes reload without restarting the daemon, shell, or window. A malformed or incomplete replacement retains the last valid palette.
-
-Omarchy's Glassy Windows works through the theme's `foot.ini`, as it does for Foot. Turning it on adds `alpha=0.65` and `blur=yes` under `[colors-dark]` unless the theme already sets them, and turning it off removes them again. Splinterm applies each change within half a second. Only the default terminal background, padding, and tab strip become translucent; text, explicit cell backgrounds, and the cursor stay opaque and crisp. An explicit `[colors] alpha` or `blur` in Splinterm's own configuration overrides the theme and Glassy Windows.
-
-Splinterm also follows the Omarchy 4 shell's `shell.toml`. It layers the user's `~/.config/omarchy/shell.toml` over the active theme's `shell.toml` key by key, as the shell does. Terminal windows pick up edits within half a second; standalone session-picker and remote-status windows read them when they open. The action palette and the Dojo and session picker follow `[menu] background-alpha`. The tab context menu, Dojo prompt, search, history, and the upgrade banner follow `[popups] background-alpha`. A panel is drawn as the window's own glass with that alpha layered over it, so panels stay opaque while Glassy Windows is off and with Omarchy's default of 1.0. Borders, selected rows, and text stay opaque, and Splinterm raises a panel's alpha as far as needed to keep its text at 4.5:1 contrast over any wallpaper. The docked Lair Explorer is part of the window, like the tab strip: its background, selected row and active filter use the terminal's own background alpha (foot.ini `alpha`, which Glassy Windows sets), so the backdrop shows through it as through the terminal, while its text, icons, divider and rules stay opaque.
-
-While `config.ini` sets no font size, Splinterm also follows Omarchy's text size, which `omarchy-display-text-size` writes as `[font] base-size`: the user `shell.toml` value, then the theme's, then Splinterm's 14 px default. Like Omarchy does for Foot, kitty, ghostty and alacritty, it uses `px × 9/12` points rounded to a whole point, so 12 px gives 9 pt and 16 px gives 12 pt, and the default `output-scale` policy sizes those points exactly as Foot does. Open terminal windows rescale live. Like the shell, Splinterm reads `base-size` with `parseInt` and a 1 px floor and clamps the resulting points to the 6–96 pt it renders; a value without digits keeps the current size, or 12 px at startup. Set `main.font-pixelsize` or `main.font-point-size` to opt out.
-
-Window chrome (tabs, Explorer, menus, the command palette and its lists, pickers and Dojo prompts) has its own text size: `main.ui-font-pixelsize` when set, otherwise Omarchy's `base-size` in px (12 px on a stock desktop) even when `config.ini` sets the terminal's size, otherwise 14 px. Runtime zoom resizes only the terminal. Chrome text stops growing where it would overflow its fixed row, and frame titles also stay within the terminal cell height of the pane border. A `base-size` change redraws chrome live, and **Reload configuration** applies a changed `main.ui-font-pixelsize`.
-
-Set an explicit JSON palette only to opt out of native discovery:
-
-```ini
-[main]
-theme=~/.config/splinterm/theme.json
-```
+Malformed or incomplete theme edits are ignored safely while keeping the last valid palette.
 
 ## Keymaps and the command palette
 
-Splinterm binds only a closed registry of application actions. Keyboard dispatch, command-palette labels, tab menus, and generated help therefore describe the same resolved keymap. Configuration cannot register shell commands or callbacks.
+Splinterm binds only a fixed registry of built-in application actions—configuration cannot bind arbitrary shell commands. Because dispatch, the command palette, tab menus, and in-app help all read the same resolved keymap, displayed shortcuts never drift out of sync.
 
-Inspect the active configuration without contacting the daemon:
+Inspect keymaps locally without contacting `splinterd`:
 
 ```bash
 splinterm config check
@@ -148,19 +169,18 @@ splinterm keymap show omarchy-tmux
 splinterm keymap conflicts
 ```
 
-The default `splinterm` profile provides the controls in the [quickstart](/docs/quickstart/). The `omarchy-tmux` profile adds familiar `Ctrl+Space` and `Ctrl+B` prefixes, pane and tab workflows, local pane zoom, stable-ID choosers, `Prefix+B` tab-strip toggling, trusted searchable `Prefix+?` key help, transactional configuration reload, `Prefix+[` vi copy mode, and `Prefix Shift+S/F/V/O` for Save, pin toggle, Preview, and Restore of the current Lair. The closed `lair.save`, `lair.pin-toggle`, `lair.preview`, and `lair.restore` actions remain available to strict overlays when another chord layout is preferred. `dojo.close-other-tabs` is likewise available even though neither profile claims a default chord.
+### Profiles and copy mode
 
-`Ctrl+Shift+1` through `Ctrl+Shift+9` activate the first nine Dojo tabs in both profiles; `omarchy-tmux` also keeps `Alt+1`–`9` and lists them first. Keys match the symbol the layout produces, but with Shift held a number-row 1–9 key that matches nothing as a symbol is retried as its digit, so these chords work where Shift+1 produces `!` while symbol bindings such as `Prefix &` keep priority. A symbol binding also wins where a layout's Shift+digit produces it: zoom-in (`Ctrl++`, which also matches `=`) takes Swiss `Ctrl+Shift+1`, Turkish Q `Ctrl+Shift+4`, and Hungarian `Ctrl+Shift+3`/`7` instead of selecting a tab. With managed tabs, `Ctrl+Shift+2` and `Ctrl+Shift+6` no longer send `Ctrl+@` (NUL) and `Ctrl+^` to the terminal on US layouts; `Ctrl+2` or `Ctrl+Space` and `Ctrl+6` still do. Legacy direct single-Splint attachments still forward them.
+- **`splinterm` (default):** Direct `Ctrl+Shift+…` shortcuts covered in the [quickstart](/docs/quickstart/).
+- **`omarchy-tmux`:** Adds `Ctrl+Space` and `Ctrl+B` prefixes, tmux-like pane/tab controls, pane zoom, searchable key help (`Prefix+?`), config reload, vi copy mode (`Prefix+[`), and current-Lair save/pin/preview/restore (`Prefix Shift+S/F/V/O`).
+- **Tab jump chords:** `Ctrl+Shift+1`–`9` jump to tabs 1–9 in both profiles (`omarchy-tmux` also provides `Alt+1`–`9`). On non-US keyboard layouts where a Shift+digit produces a bound symbol (such as zoom-in), the symbol binding keeps priority.
+- **Copy mode (`Prefix+[`):** Navigate with `h/j/k/l`, arrows, Home/End, or PageUp/PageDown; press `v` to select, `y` or `Super+C` to copy to the Wayland clipboard and exit, or `Escape` to cancel.
+- **Omarchy copy/paste:** Both profiles accept `Ctrl+Shift+C`/`V`, `Super+C`/`V`, and `Ctrl+Insert`/`Shift+Insert` while leaving `Ctrl+C` as terminal interrupt. Run `splinterm integration omarchy enable` once on Omarchy so universal `Super+C`/`V` routes to terminal copy/paste.
+- **Snap to live:** Pressing `Enter` while scrolled back in history returns to live output without sending a newline to the shell.
 
-Inside keybinding help, type to search the effective action labels, configuration names, shortcuts, sources, and closed keywords. Use Up/Down or PageUp/PageDown to navigate, `Ctrl+U` to clear, and Escape once to clear a non-empty query or again to close. Query input and paste remain client-owned and never reach the terminal.
+### Custom keybinding overlay
 
-The command palette is a curated trusted subset of this closed registry. It projects shortcut labels from the effective resolved keymap and exposes binding help, reload, copy mode, pane zoom, Dojo/Lair workflows, and Window detach without allowing configuration, plugins, or terminal output to register commands.
-
-Both profiles provide terminal `Ctrl+Shift+C/V` and `Super+C/V`. They accept what Omarchy's universal `Super+C/V` sends terminal-tagged windows: `Ctrl+Shift+C/V` on current Omarchy (`quattro` since `129c67e2`, after 4.0.4), `Ctrl+Insert`/`Shift+Insert` on Omarchy 3.x and 4.0.x. The `omarchy-tmux` profile advertises `Ctrl+Shift+C/V` first so generated help remains usable when the compositor reserves Super chords; `splinterm` keeps `Super+C/V` primary. Omarchy must classify `com.oldjobobo.splinterm` as a terminal. Its terminal rule does not list Splinterm, so run `splinterm integration omarchy enable` once to add the tag; without it, Omarchy's universal copy sends ordinary `Ctrl+C`, which remains terminal interrupt, and the terminal transparency and `Ctrl+Space` input-method rules do not apply. Until the tag is present, the first Splinterm Window under Omarchy 4 shows one desktop notification saying so; set `main.omarchy-integration-hint=no` to silence it. Splinterm-owned command-palette, keybinding-help, search, and rename fields accept effective `clipboard.copy` / `clipboard.paste` bindings such as `Ctrl+Shift+C/V` and retain local `Super+C/V/X/Z`; terminal-pane `Super+X/Z` remain application-owned. These Super shortcuts work only when the compositor delivers the chord to the Splinterm Window. In copy mode, move with `h/j/k/l`, arrows, Home/End, or PageUp/PageDown. Press `v` to begin selecting, `y` or `Super+C` to publish to the Wayland clipboard and exit, or Escape to cancel. `Super+V/X/Z`, pointer input, paste, and IME text are consumed locally and never forwarded to the terminal application.
-
-While a focused pane is viewing historical output, plain Enter or keypad Enter returns it to live output without sending terminal input. A later Enter pressed while already live submits normally.
-
-A strict overlay can unbind and replace closed actions:
+Create a strict TOML overlay and point `key-bindings.file` at it:
 
 ```toml
 version = 1
@@ -174,36 +194,21 @@ sequence = ["Ctrl+Alt+P"]
 action = "app.command-palette"
 ```
 
-Unknown actions, malformed chords, duplicate bindings, and semantic conflicts fail startup with source context rather than partially applying. A conflict with a built-in binding also names the `[[unbind]]` sequence that frees the chord.
+Duplicate bindings, unknown actions, and conflicts fail at startup with exact file/line context (and name the `[[unbind]]` needed to free a built-in chord).
 
-## Dojo presets
+## Presets and remote profiles
 
-The optional `[presets]` file describes complete named pane trees. Splinterm always ships the bounded `omarchy.t`, `omarchy.tdl`, `omarchy.tds`, `omarchy.tdlm`, and `omarchy.tsl` workflows. Inspection and dry-run are local; real runs commit the complete layout atomically.
-
-Read [Dojo presets](/docs/presets/) for catalog syntax, commands, parameters, and the optional collision-safe `s`, `sdl`, `sds`, `sdlm`, and `ssl` Bash helpers.
-
-## Remote profiles
-
-SSH endpoints use a separate strict TOML file at `${XDG_CONFIG_HOME:-~/.config}/splinterm/remotes.toml`. Profile configuration cannot inject arbitrary SSH options or remote commands.
-
-```bash
-splinterm remote list
-splinterm remote inspect PROFILE
-splinterm remote check PROFILE
-```
-
-Read [Remote access](/docs/remote/) for the profile schema and graphical versus automation authority.
+- **Dojo presets** live in an optional strict TOML file selected by `[presets] file=presets.toml`. See [Dojo presets](/docs/presets/) for bundled Omarchy layouts and custom pane trees.
+- **Remote SSH profiles** live in `${XDG_CONFIG_HOME:-~/.config}/splinterm/remotes.toml`. See [Remote access](/docs/remote/) for the schema and `splinterm remote check`.
 
 ## Moving from Foot
 
-Copy supported values rather than copying a complete `foot.ini`:
+Rather than copying an entire `foot.ini`, bring over the supported settings you care about:
 
-- Foot `font` maps to `main.font`.
-- Foot `pixelsize=N` maps to `main.font-pixelsize=N`.
-- Foot `size=N` maps to `main.font-point-size=N`.
-- Foot `initial-window-size-chars` maps to columns and rows.
-- Foot `shell`, scrollback lines, cursor style, alpha, and blur have bounded mappings.
+- `font` → `main.font`
+- `pixelsize=N` → `main.font-pixelsize=N`
+- `size=N` → `main.font-point-size=N`
+- `initial-window-size-chars` → `main.initial-columns` and `main.initial-rows`
+- `shell`, scrollback `lines`, `cursor.style`, and `[colors]` `alpha`/`blur` map directly.
 
-Arbitrary bindings, notifications, server mode, URL modes, and advanced rendering controls are not currently supported through Splinterm configuration.
-
-Theme alpha and blur are native Wayland presentation features. Blur is requested only when translucency is active, the theme enables it, and the compositor advertises compatible protocol support. Unsupported compositors continue without blur.
+Foot-specific features such as arbitrary custom bindings, server mode, notifications, and URL modes aren't configured through Splinterm's `config.ini`.
