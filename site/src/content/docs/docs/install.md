@@ -1,38 +1,54 @@
 ---
 title: Installation
-description: Install or update Splinterm on Arch Linux and Omarchy.
+description: Install or upgrade Splinterm on Arch Linux and Omarchy.
 ---
 
-The validated installation target is **x86_64 Omarchy/Arch Linux with native Wayland under Hyprland**. **0.2.0 is the current stable release**; future release candidates remain prereleases. Stable 0.2.0 does not promise broader platform compatibility or a support lifetime. Future 0.x releases may change interfaces with documented migration. Live daemon upgrade is supported from 0.2.0 on, but the one-time 0.1.x to 0.2.0 upgrade restarts the daemon and ends its shells. Save your work and perform that upgrade from a terminal not owned by `splinterd`.
+Splinterm **0.2.0** is built and validated for **x86_64 Omarchy and Arch Linux** running native Wayland under Hyprland. See [Current status](/docs/status/) for exact platform limits and NixOS notes.
 
-## Install the prebuilt AUR package
+## Install from AUR (recommended)
 
-**AUR is prerelease-capable, not stable-only.** The same package names can advance
-to release candidates and offer them as upgrades over stable 0.2.0. Both AUR
-bases publish `0.2.0-1`, including matching optional MCP packages (verified
-2026-11-08). Check the offered version before confirming installation or
-upgrades. If the channel has advanced, use the verified release assets or the
-packaging guide's exact-tag build for stable 0.2.0 specifically:
-
-https://github.com/ministry-of-taste/splinterm/blob/main/docs/packaging.md
-
-Install the recommended [splinterm-bin AUR package](https://aur.archlinux.org/packages/splinterm-bin). It downloads verified prebuilt x86_64 binaries and resolves the `xdg-terminal-exec` AUR dependency without compiling Splinterm locally:
+The `splinterm-bin` package downloads verified prebuilt binaries and pulls in `xdg-terminal-exec` without compiling Rust locally. Use `yay` or `paru`:
 
 ```bash
 yay -S splinterm-bin
 ```
 
-The optional policy-scoped MCP adapter is a separate exact-version prebuilt package:
+If you also want the optional MCP server for coding agents, install its matching split package:
 
 ```bash
 yay -S splinterm-mcp-bin
 ```
 
-Source-built `splinterm` and `splinterm-mcp` packages remain available. Migrating from them prompts once to approve replacement by the conflicting `-bin` packages. `paru` may be used instead of `yay`. AUR availability does not expand the supported target or promise a support lifetime. Check the package version offered by your helper before confirming an upgrade.
+Prefer compiling locally? Source-built `splinterm` and `splinterm-mcp` packages are on AUR as well (switching between source and `-bin` packages prompts once to replace the conflicting package).
 
-## Install the current versioned release directly
+:::note[Checking the AUR version]
+The AUR packages track both stable releases and release candidates—they aren't pinned to stable-only. Check the version your helper offers before confirming an install or upgrade. To pin strictly to stable `v0.2.0` if AUR has moved ahead, follow the exact-tag instructions in the [packaging guide](https://github.com/ministry-of-taste/splinterm/blob/main/docs/packaging.md).
+:::
 
-For the newest published versioned package, clone the public repository and run the release installer:
+## Recommended on Omarchy
+
+Omarchy's default Hyprland rules don't tag Splinterm as a terminal yet. Until they do, Omarchy's universal `Super+C` sends a regular `Ctrl+C` (interrupt) instead of copying, `Super+V` sends `Ctrl+V`, and Omarchy's terminal transparency and `Ctrl+Space` input-method rules skip the window.
+
+Run this once after installing:
+
+```bash
+splinterm integration omarchy enable
+splinterm integration omarchy status
+```
+
+That adds a small user-owned Hyprland rule for the `terminal` tag, sets Splinterm as your default terminal, and runs the Omarchy screensaver inside Splinterm. Everything it touches is reversible with `splinterm integration omarchy disable`.
+
+Until the tag is in place, the first Splinterm window on Omarchy 4 shows one desktop notification as a reminder. To silence it without enabling the integration, add `omarchy-integration-hint=no` under `[main]` in `config.ini`.
+
+## Upgrading from 0.1.x
+
+From **0.2.0 onward**, Splinterm supports live daemon upgrades so your running shells survive package updates.
+
+Upgrading from **0.1.x to 0.2.0** is a one-time exception: the internal protocol changed, so the upgrade restarts `splinterd` and ends any running shells. Save your work and run that upgrade from another terminal (such as Foot) rather than inside Splinterm.
+
+## Install with `./install.sh`
+
+If you'd rather skip an AUR helper, clone the repository from a terminal not owned by `splinterd` and run the release installer:
 
 ```bash
 git clone https://github.com/ministry-of-taste/splinterm.git
@@ -40,50 +56,27 @@ cd splinterm
 ./install.sh
 ```
 
-The installer selects the newest published qualifying SemVer `v…` release, **including prereleases**; it is not a stable-only selector. For stable 0.2.0 specifically, use its release assets or the exact-tag build instructions in the packaging guide:
+The script fetches the newest published SemVer release (including prereleases), verifies the release manifest digest and package checksums, saves an emergency snapshot of the previous binaries for manual recovery, installs through Pacman, and verifies the installed client identity. GitHub CLI login is optional; anonymous downloads work out of the box.
 
-https://github.com/ministry-of-taste/splinterm/blob/main/docs/packaging.md
-
-The installer verifies the GitHub-recorded candidate-manifest digest and exact package checksums, preserves an emergency binary snapshot, warns before stopping a running daemon, installs through Pacman, and verifies the packaged client identity. The snapshot supports diagnosis and manual recovery; it is not a package-consistent rollback.
-
-The repository and versioned release assets are public. GitHub CLI authentication is optional; the installer falls back to anonymous verified downloads.
-
-:::caution
-The default installer downloads only a published versioned release; it never selects historical `edge-*` releases or an arbitrary `main` commit. Source mode operates on a clean committed `HEAD` and does not package uncommitted worktree changes. A development checkout is not the published stable release; use the exact `v0.2.0` tag when building stable 0.2.0. Review the current worktree before using source mode.
-:::
-
-## Build from committed source
-
-To compile and package the current committed checkout locally:
+To build and package your current committed `HEAD` locally instead:
 
 ```bash
 ./install.sh --source
-```
-
-Include the complete package test suite with:
-
-```bash
+# Or include the full package test suite:
 ./install.sh --source --check
 ```
 
-## What installation does not change
+:::caution[Source mode uses committed HEAD only]
+`./install.sh --source` intentionally ignores uncommitted changes in your working tree. Check out the exact `v0.2.0` tag if you want to compile the published stable release from source rather than the tip of `main`.
+:::
 
-The installer does not:
+## What installation leaves untouched
 
-- make Splinterm your default terminal;
-- edit Omarchy or Hyprland configuration;
-- enable persistent systemd user lingering; or
-- opt a fresh installation into the optional MCP package.
+Installing the package will never:
 
-## Recommended on Omarchy
+- change your default terminal;
+- edit your Omarchy or Hyprland configuration;
+- enable systemd user lingering; or
+- install or authorize the optional MCP adapter.
 
-Omarchy's Hyprland rule that marks windows as terminals does not list Splinterm. Until it does, Omarchy's universal `Super+C` sends `Ctrl+C` (interrupt) and `Super+V` sends `Ctrl+V` to Splinterm instead of copying and pasting, and Omarchy's terminal transparency and `Ctrl+Space` input-method rules skip it. Run this once to fix that:
-
-```bash
-splinterm integration omarchy enable
-splinterm integration omarchy status
-```
-
-It adds the `terminal` tag through a small user-owned Hyprland module, makes Splinterm your default terminal, and runs the Omarchy screensaver in Splinterm. `splinterm integration omarchy disable` reverses all of it exactly. The package install message recommends it, and the first Splinterm Window under Omarchy 4 shows one desktop notification until the tag is present; set `omarchy-integration-hint=no` under `[main]` in `config.ini` to silence it.
-
-Continue to the [quickstart](/docs/quickstart/) after installation. If an MCP host needs bounded access, follow the separate [MCP adapter setup](/docs/mcp/); installing the adapter alone grants no authority.
+Ready to try it? Head to the [quickstart](/docs/quickstart/). If you installed the MCP adapter, continue to [MCP adapter setup](/docs/mcp/)—installing the binary alone grants no access.

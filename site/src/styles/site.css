@@ -151,9 +151,10 @@ a:focus-visible { outline: 2px solid var(--signal); outline-offset: 4px; }
 .hero-note { margin: 1.6rem 0 0; color: var(--dim); font: 300 .72rem/1.6 var(--mono); }
 
 .topology-scene { width: min(100%, 680px); margin: 0 auto; border: 1px solid var(--line-hot); background: #171719; box-shadow: 24px 24px 0 #191719, 24px 24px 0 1px var(--line); }
-.topology-toolbar { height: 42px; display: flex; align-items: center; gap: 7px; padding: 0 14px; border-bottom: 1px solid var(--line); }
-.topology-toolbar span { width: 7px; height: 7px; border: 1px solid var(--dim); border-radius: 50%; }
-.topology-toolbar code { margin-left: auto; color: var(--dim); font-size: .58rem; }
+.topology-toolbar { height: 36px; display: flex; align-items: stretch; justify-content: space-between; padding: 0 14px 0 0; border-bottom: 1px solid var(--line); background: #141416; }
+.topology-tab { display: inline-flex; align-items: center; gap: .5rem; padding: 0 14px; border-right: 1px solid var(--line); background: #171719; box-shadow: inset 0 -2px 0 var(--signal); color: var(--ink); font: 500 .62rem var(--mono); letter-spacing: .03em; }
+.topology-tab i { display: inline-block; flex: none; width: .78rem; height: .62rem; background-color: var(--signal); -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 14 11' fill='none' stroke='%23000' stroke-width='1.7' stroke-linecap='square' stroke-linejoin='miter'%3E%3Cpath d='M1.5 2L5.5 5.5L1.5 9'/%3E%3Cpath d='M7.5 9H12.5'/%3E%3C/svg%3E") center / contain no-repeat; mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 14 11' fill='none' stroke='%23000' stroke-width='1.7' stroke-linecap='square' stroke-linejoin='miter'%3E%3Cpath d='M1.5 2L5.5 5.5L1.5 9'/%3E%3Cpath d='M7.5 9H12.5'/%3E%3C/svg%3E") center / contain no-repeat; }
+.topology-toolbar code { align-self: center; color: var(--dim); font-size: .58rem; }
 .topology-canvas { position: relative; min-height: 440px; overflow: hidden; background-image: linear-gradient(rgb(218 147 54 / .045) 1px, transparent 1px), linear-gradient(90deg, rgb(218 147 54 / .045) 1px, transparent 1px); background-size: 34px 34px; }
 .daemon-node, .lair-node, .dojo-node { position: absolute; z-index: 2; background: #252123; border: 1px solid var(--line-hot); font-family: var(--mono); }
 .daemon-node { top: 33px; left: 50%; width: 180px; padding: 13px 16px; transform: translateX(-50%); border-top: 2px solid var(--signal); }

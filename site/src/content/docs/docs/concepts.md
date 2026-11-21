@@ -1,54 +1,54 @@
 ---
 title: Core concepts
-description: Understand Splinterm's persistent topology and its disposable graphical views.
+description: How Splinterm separates persistent sessions (Lairs, Dojos, Splints) from disposable Wayland windows.
 ---
 
-Splinterm separates terminal process lifetime from graphical client lifetime. Its vocabulary makes that ownership explicit.
+Most terminals tie your shell to the window on screen: close the window and the shell dies. Splinterm splits those two jobs apart. A background daemon (`splinterd`) owns your sessions and processes; Wayland windows are just lightweight views into that state.
 
-## Persistent topology
+Splinterm uses three core layers for what persists—collectively your **Topology**—and two names for the temporary views on your desktop.
+
+## What persists in `splinterd`
 
 ```text
 Topology
 └── Lair: project atlas
     ├── Dojo: editor
-    │   ├── Splint: shell
+    │   ├── Splint: nvim
     │   └── Splint: tests
     └── Dojo: services
-        └── Splint: server
+        └── Splint: api server
 ```
 
-### Topology
-
-The complete daemon-owned catalog of Lairs, Dojos, Splints, layout trees, names, stable IDs, focus hints, and lifecycle metadata.
-
 ### Lair
-
-A named persistent session or project. One Lair contains zero or more Dojos.
+A named workspace or project—typically one per repo or area of work. A Lair groups related Dojos (and can remain empty).
 
 ### Dojo
-
-One persistent terminal layout within a Lair. A Dojo owns a binary pane-layout tree whose leaves are Splints.
+A single persistent layout inside a Lair. A Dojo is a split-pane tree (horizontal and vertical splits) whose leaves are Splints. Think of it like a saved workspace tab that keeps living even when no window is showing it.
 
 ### Splint
+One individual terminal pane. Every Splint has a stable ID, its own scrollback and terminal state, saved launch metadata, and a running (or exited) process.
 
-An individual terminal pane. It has a stable ID, terminal state, launch metadata, and a process lifecycle.
+### Topology
+The full catalog of Lairs, Dojos, Splints, layouts, and metadata managed by `splinterd`.
 
-## Disposable presentation
+## What stays disposable on screen
 
 ### Window
-
-A native Wayland toplevel managed by the compositor. It receives compositor scaling, input, clipboard, IME, and frame lifecycle events directly. A window displays one or more Dojos but does not own their process lifetime. See [Why native Wayland?](/docs/wayland/) for the practical benefits and current limits.
+A native Wayland window managed by your compositor (see [Why native Wayland?](/docs/wayland/)). A window can display one or more Dojos, and closing it only disconnects your view—it doesn't kill the shells underneath.
 
 ### Tab
+A window-local pointer to a daemon-owned Dojo. Tabs live only inside that window: you can show Dojos from different Lairs side by side as tabs, reorder them, or close a tab to detach it without affecting the running Dojo.
 
-A window-local reference to one daemon-owned Dojo. Tabs and their order disappear with the window. Closing a tab detaches the view; it does not close the Dojo.
+:::tip[Want throwaway terminals too?]
+Ordinary unnamed terminals persist by default, but you can switch them to close-with-window behavior (`persistent-by-default=no`) or auto-clean untouched shells (`close-unused=yes`). See [Sessions and persistence](/docs/sessions/) and [Configuration](/docs/configure/configuration/).
+:::
 
-## Lifecycle words
+## Lifecycle terms you'll see in the CLI and UI
 
-- **Attach:** observe an existing running Dojo or Splint through a client.
-- **Detach:** remove a graphical view without terminating the underlying process.
-- **Incarnation:** one process lifetime inside a stable Splint identity.
-- **Restore:** explicitly start an exited Splint using saved launch metadata.
-- **Controller:** the one client currently allowed to send input or resize a Splint.
+- **Attach** — connect a window or client to a running Dojo or Splint.
+- **Detach** — close a view or tab without stopping the underlying process.
+- **Restore** — explicitly start a fresh process in an exited Splint using its saved working directory and command metadata.
+- **Incarnation** — a single process run inside a Splint. Each time a Splint is restored or relaunched, its incarnation number increments while its Splint ID stays the same (useful for scripts and agents so they never send input to the wrong process).
+- **Controller** — the one client currently allowed to send keyboard input or resize a Splint. Many clients can watch at once, but only one controls it at a time.
 
-The distinction between persistent topology and disposable presentation is important for both people and automation. Structured clients can mutate topology, but those operations do not imply compositor-native window control.
+Keeping persistent sessions separate from graphical windows is what makes everything else in Splinterm click: you can switch machines over SSH, close windows freely, or let an authorized script watch a build pane—without mixing session state with window management.

@@ -77,6 +77,60 @@ header.header {
   --ec-frm-edTabBarBrdCol: var(--sl-color-gray-5);
 }
 
+/* Replace Expressive Code's macOS-style three-dot terminal bar with a Splinterm tab-strip header */
+.expressive-code figure.frame.is-terminal {
+  --button-spacing: calc(2rem + var(--ec-brdWd) + 0.45rem);
+}
+
+.expressive-code figure.frame.is-terminal figcaption.header {
+  justify-content: flex-start;
+  align-items: stretch;
+  min-height: 2rem;
+  padding: 0;
+}
+
+.expressive-code figure.frame.is-terminal figcaption.header::before {
+  display: none;
+  content: none;
+  -webkit-mask-image: none;
+  mask-image: none;
+}
+
+.expressive-code figure.frame.is-terminal figcaption.header .title {
+  position: relative;
+  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-height: 2rem;
+  padding: 0 0.85rem;
+  border-inline-end: 1px solid var(--ec-frm-trmTtbBrdBtmCol);
+  border-top-left-radius: calc(var(--ec-brdRad, 2px) - 1px);
+  background: var(--ec-frm-trmBg);
+  box-shadow: inset 0 -2px 0 var(--sl-color-accent);
+  color: var(--sl-color-gray-1);
+  font-family: var(--sl-font-mono);
+  font-size: 0.7rem;
+  font-weight: 500;
+  letter-spacing: 0.03em;
+}
+
+.expressive-code figure.frame.is-terminal figcaption.header .title::before {
+  content: '';
+  flex: none;
+  width: 0.82rem;
+  height: 0.65rem;
+  background-color: var(--sl-color-accent);
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 14 11' fill='none' stroke='%23000' stroke-width='1.7' stroke-linecap='square' stroke-linejoin='miter'%3E%3Cpath d='M1.5 2L5.5 5.5L1.5 9'/%3E%3Cpath d='M7.5 9H12.5'/%3E%3C/svg%3E") center / contain no-repeat;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 14 11' fill='none' stroke='%23000' stroke-width='1.7' stroke-linecap='square' stroke-linejoin='miter'%3E%3Cpath d='M1.5 2L5.5 5.5L1.5 9'/%3E%3Cpath d='M7.5 9H12.5'/%3E%3C/svg%3E") center / contain no-repeat;
+}
+
+.expressive-code figure.frame.is-terminal figcaption.header .title:empty::after {
+  content: 'shell';
+  color: var(--sl-color-gray-2);
+  text-transform: lowercase;
+}
+
 .hero {
   position: relative;
   max-width: none;
