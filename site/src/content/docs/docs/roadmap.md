@@ -1,75 +1,65 @@
 ---
 title: Roadmap
-description: Product direction from stable 0.2.0 toward a broader 1.0 support contract.
+description: Where Splinterm is headed from stable 0.2.0 toward a supported 1.0 release.
 ---
 
-Splinterm's roadmap uses **Now / Next / Later / Explore** horizons instead of release dates. These horizons describe intended product outcomes. They are not delivery dates, implementation order, compatibility guarantees, or promises that every listed idea will ship.
+Splinterm's roadmap uses **Now / Next / Later / Explore** horizons instead of calendar dates. These describe the outcomes we're working toward—not delivery deadlines or compatibility guarantees.
 
-[Current status](/docs/status/) remains the authority for what works today. The repository [product roadmap](https://github.com/ministry-of-taste/splinterm/blob/main/docs/product-roadmap.md) contains the full strategic rationale. Maintainer dependency order, implementation plans, and delivery gates are tracked separately from the public product repository; accepted decisions needed to understand shipped behavior are promoted into public ADRs and documentation.
+For what works today, check [Current status](/docs/status/). For the full strategic write-up, see [`docs/product-roadmap.md`](https://github.com/ministry-of-taste/splinterm/blob/main/docs/product-roadmap.md). Maintainer task tracking lives outside the public repo; accepted architectural decisions land in `docs/adr/` and these docs.
 
-Stable 0.2.0 is available on the documented Omarchy/Arch target. The future 1.0
-support contract below is a roadmap goal, not a guarantee added by that release.
+## Now: daily-driver confidence
 
-## Now: strengthen daily-driver confidence
+*Current focus (0.2.x on x86_64 Omarchy / Arch Linux)*
 
-The current priority is to make persistence understandable, desktop behavior coherent, and installation trustworthy on the validated x86_64 Omarchy/Arch environment.
+Make session persistence intuitive, desktop integration seamless, and upgrades boring on the platform Splinterm validates today:
 
-Planned outcomes include:
+- Clear, recognizable Lair states (named, pinned, transient, restorable, expired) and predictable save/pin/restore/delete controls—still without saving terminal bodies or secrets.
+- Rock-solid Omarchy theme fidelity and desktop integration.
+- Continued validation of local file-drop path insertion and clipboard PNG saving (remote image transfer stays excluded).
+- Smoother install, upgrade, recovery, diagnostics, and agent-consent flows.
+- Ongoing startup and memory-footprint tracking with explicit triage for regressions.
 
-- recognizable named, pinned, disposable, restorable, and expired Lair states;
-- clear save, restore, pin, delete, and bounded-retention controls without persisting terminal contents or secrets;
-- exact theme fidelity and supported Omarchy desktop integration;
-- continued validation of bounded local-file drop path insertion and local clipboard-image saving available in 0.2.0, excluding remote image transfer;
-- stronger installation, upgrade, recovery, diagnostics, and automation-consent journeys; and
-- continued performance and memory validation, with explicit dispositions for regressions.
+**How we know we're there:** A new user can install Splinterm, organize real work, close windows freely, return to their sessions, and predict every destructive action without asking the maintainer.
 
-This horizon succeeds when a new user can install Splinterm, organize work, close its Window, return safely, and predict destructive actions without maintainer assistance.
+## Next: a real 1.0 support contract
 
-## Next: define a supported 1.0 contract
+Calling a release `1.0` means committing to an explicit, testable relationship with users—not just hitting a feature count:
 
-A supported release requires more than implemented features. It requires an explicit and testable relationship with users.
+- Clear platform support matrix, release channels, compatibility windows, and breaking-change rules.
+- Tested upgrade, rollback, reset, and recovery runbooks.
+- Stable human workflows, `config.ini` surface, JSON/NDJSON schemas, and Arch packaging contracts.
+- Straightforward issue-reporting and security-reporting processes with realistic expectations.
+- Clear resource limits, diagnostics, and failure messages treated as ordinary product UX.
 
-Before a 1.0 claim, the project intends to:
+## Later: one connected workspace
 
-- declare supported platforms, compatibility windows, release channels, and breaking-change policy;
-- publish tested upgrade, rollback, reset, and recovery procedures;
-- stabilize human workflows, configuration, machine schemas, and package contracts;
-- establish issue reporting, security reporting, and realistic support expectations; and
-- make resource limits, diagnostics, and failure behavior ordinary product knowledge.
+Once the local daily driver is rock-solid, make local, remote, headless, and agent-assisted work feel like one cohesive environment:
 
-Version 1.0 is a support contract, not a reward for accumulating features.
+- Polished remote SSH profiles, connection diagnostics, and smooth recovery after drops.
+- Stable integration kits and reference recipes for scripts and MCP hosts.
+- Clear visual distinction between human and automated activity inside shared sessions.
+- Portable, declarative workspace definitions that never execute arbitrary shell scripts.
 
-## Later: connect the persistent workspace
-
-After the primary product is dependable, local, remote, headless, and authorized tool access should become intentional ways into the same work rather than separate terminal worlds.
-
-Candidate outcomes include:
-
-- productized native remote profiles, connection diagnostics, and SSH recovery;
-- stable integration kits and reference journeys for tools and MCP hosts;
-- visibly distinct human and automated activity inside shared topology; and
-- portable workspace definitions that do not execute untrusted shell source.
-
-This horizon does not imply a public daemon listener, cloud account, hosted control plane, synchronized secrets, or collaborative simultaneous typing.
+Even here, Splinterm won't add a public daemon network listener, a cloud account or hosted control plane, synced secrets, or simultaneous multi-user typing.
 
 ## Explore: broader Linux support
 
-The following are research directions rather than commitments:
+Directions we're open to investigating—not commitments:
 
-- broader Nix and Home Manager deployment acceptance beyond the 0.2.0 release's source flake and module;
-- additional Wayland compositors backed by compatibility matrices;
-- additional distribution artifacts with coherent service and upgrade behavior;
-- a carefully bounded extension model; and
-- selective compatibility work driven by real applications.
+- Broader NixOS and Home Manager deployment acceptance beyond the 0.2.0 source flake/module.
+- Additional Wayland compositors backed by real compatibility testing.
+- Additional distro packages with proper service and upgrade handling.
+- A carefully scoped extension model.
+- Selective compatibility work driven by real terminal applications.
 
-An expansion should proceed only when it serves a real blocked user, can be continuously validated, has an honest support boundary, and justifies the primary-product work it delays.
+We only expand to a new platform when real users are blocked, we can test it continuously, we can state an honest support boundary, and it's worth the core work it delays.
 
-## Deliberate boundaries
+## Deliberate non-goals
 
-Splinterm does not currently promise reboot-transparent process survival, arbitrary `foot.ini` compatibility, unrestricted automation, collaborative typing, a hosted control plane, or broad Linux support without continuous validation.
+Splinterm does **not** aim for reboot-transparent process survival, arbitrary `foot.ini` compatibility, unrestricted agent access, collaborative simultaneous typing, a hosted control plane, or claiming support for distros we don't continuously test.
 
-The primary human workflow remains the product anchor. Automation expands Splinterm; it does not redefine it as an "AI terminal."
+Splinterm is a terminal for people first. Good automation makes it more useful, without turning it into an "AI terminal."
 
-## Evidence and feedback
+## How decisions get made
 
-Roadmap decisions use release validation, issue patterns, documentation feedback, explicit user research, and privacy-preserving aggregate website analytics. The terminal application itself does not embed product telemetry, and website analytics cannot prove that a terminal workflow succeeded.
+Priorities come from release validation, real user issues, documentation feedback, and aggregate website analytics. The terminal application itself collects **no** telemetry.

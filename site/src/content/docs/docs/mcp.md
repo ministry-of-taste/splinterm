@@ -1,88 +1,71 @@
 ---
 title: MCP adapter
-description: Install the optional Splinterm MCP adapter, connect a supported host, authorize the minimum required surface, and revoke it safely.
+description: Connect Claude Code, Codex, or VS Code to Splinterm over MCP with one-command setup and explicit, revocable workspace access.
 ---
 
-`splinterm-mcp` is a local, bounded MCP `2025-11-25` stdio server. It presents a fixed catalog of 34 tools plus topology and terminal/control resources over the same daemon-owned topology used by the native client.
+`splinterm-mcp` is an optional local stdio MCP server (`2025-06-18` and `2025-11-25`) exposing **34 fixed tools** plus topology and terminal/control resources over your live `splinterd` sessions.
 
-The adapter is an optional, separately identified third-party client—not a trusted part of `splinterd`. Installing or launching it grants nothing until an owner-controlled policy authorizes its exact executable identity, operations, resources, and limits.
+Installing the adapter—or registering it with an agent host—grants **zero** access on its own. Every operation stays denied until you approve a workspace prompt in Splinterm or write an explicit policy rule.
 
-:::note
-The optional MCP adapter is included in the stable 0.2.0 release. The host examples below document the currently validated local environment, not broad host compatibility or a stable API promise.
-:::
+## 1. Install the adapter
 
-## 1. Verify the installed identity
+On Arch / Omarchy, install the matching split package alongside `splinterm-bin`:
 
-The optional split Arch package installs `/usr/bin/splinterm-mcp`. Inspect the canonical path and digest before writing policy:
+```bash
+yay -S splinterm-mcp-bin
+```
+
+(Source-built `splinterm-mcp` is also available on AUR.)
+
+## 2. Connect your agent host
+
+One command adds `/usr/bin/splinterm-mcp` to your host's configuration as the `splinterm` server—without touching other servers or writing any policy:
+
+```bash
+splinterm mcp setup claude-code --dry-run   # preview the exact diff first
+splinterm mcp setup claude-code             # or codex, or vscode
+```
+
+Then start a new session of your host to load the server. (For Claude Code, run setup while no Claude Code session is open, since a running session can overwrite `~/.claude.json`.)
+
+- **Claude Code:** Updates `~/.claude.json` (or `$CLAUDE_CONFIG_DIR/.claude.json`) with `mcpServers.splinterm`. Remove anytime with `splinterm mcp remove claude-code`.
+- **Codex:** Updates `~/.codex/config.toml` (or `$CODEX_HOME/config.toml`) with `[mcp_servers.splinterm]` and forwards `SPLINTERM_SPLINT_ID` and `SPLINTERM_SPLINT_INCARNATION` for agent status reporting.
+- **VS Code:** Updates `Code/User/mcp.json` or `Code - OSS/User/mcp.json` (pass `--config PATH` for a specific profile or `.vscode/mcp.json`). Note: the VS Code setup form follows VS Code's documented schema but has not yet been verified against a real local VS Code install.
+
+For an isolated dev daemon, set `SPLINTERM_SOCKET` in the MCP server's `env`. The adapter ignores MCP roots, host working directories, and SSH material as authority.
+
+## 3. Approve workspace access (Easy agent access)
+
+For interactive work, you don't need to write `policy.json` by hand. The first time an agent needs a workspace, it calls `splinterm.request_lair_access` asking for one of three levels:
+
+- **Look** — read layout, visible screen, scrollback, and search; report agent status.
+- **Look and type** — Look, plus send input, resize, and take typing control of a pane.
+- **Manage** — Look and type, plus spawn commands, change layouts/names, close/terminate, and restore.
+
+Splinterm displays a trusted consent prompt (on your desktop, inside a connected `splinterm --remote` window, or via `splinterm approvals` on headless hosts):
+
+- The prompt appears **without stealing keyboard focus**, and its keys stay inert until you click inside it (or engage it with `Ctrl+Alt+G`), so stray typing or an agent can never accidentally accept it.
+- Once active, it is default-deny (`Enter`, `Escape`, and `D` deny; only `G` or clicking **Allow** grants, after a short arming delay).
+- You choose how long it lasts: **Just this once** (5 minutes, single process), **While this workspace is open** (until Lair close or daemon restart/upgrade), or **Always for this workspace** (persists across package upgrades for protected installs like `/usr/bin/splinterm-mcp` or Nix profiles).
+
+View or revoke grants anytime from the **Agent access** command-palette entry or the CLI:
+
+```bash
+splinterm access list
+splinterm access revoke GRANT_ID
+splinterm access revoke --all --yes
+```
+
+## Headless or unattended setup (`policy.json`)
+
+For unattended automation—or if you prefer pinned rules over interactive prompts—compute the adapter's canonical path and SHA-256 digest:
 
 ```bash
 readlink -f /usr/bin/splinterm-mcp
 sha256sum /usr/bin/splinterm-mcp
 ```
 
-Use the resulting lowercase digest in policy. A basename, MCP server name, Unix UID, build-tree executable, or another Splinterm binary does not identify this adapter.
-
-## 2. Connect an MCP host
-
-A generic local stdio definition is:
-
-```json
-{
-  "mcpServers": {
-    "splinterm": {
-      "type": "stdio",
-      "command": "/usr/bin/splinterm-mcp",
-      "args": [],
-      "env": {}
-    }
-  }
-}
-```
-
-For a daemon using an isolated nondefault socket, set only `SPLINTERM_SOCKET` in the host environment. The adapter does not use MCP roots, the host working directory, shell configuration, SSH material, or inherited Splinterm context as authority. It reads `SPLINTERM_SPLINT_ID` and `SPLINTERM_SPLINT_INCARNATION` only as the default target of `splinterm.report_agent_status`.
-
-### Claude Code
-
-The locally validated Claude Code CLI accepts:
-
-```bash
-claude mcp add --scope user splinterm -- /usr/bin/splinterm-mcp
-claude mcp get splinterm
-```
-
-Use project scope only in a project you trust. Remove the user entry with:
-
-```bash
-claude mcp remove --scope user splinterm
-```
-
-### Visual Studio Code
-
-The locally validated VS Code CLI accepts:
-
-```bash
-code --add-mcp '{"name":"splinterm","command":"/usr/bin/splinterm-mcp"}'
-```
-
-Equivalent `.vscode/mcp.json`:
-
-```json
-{
-  "servers": {
-    "splinterm": {
-      "type": "stdio",
-      "command": "/usr/bin/splinterm-mcp",
-      "args": []
-    }
-  }
-}
-```
-
-Workspace MCP configuration executes code. Inspect both the configuration and executable before enabling it.
-
-## 3. Grant the minimum policy
-
-Create `~/.config/splinterm/policy.json` with mode `0600`. This observation-only example authorizes bounded reads and subscriptions for one current Splint incarnation:
+Create `~/.config/splinterm/policy.json` (`chmod 600`). This observation-only rule allows bounded reads and subscriptions on one current Splint incarnation:
 
 ```json
 {
@@ -117,51 +100,22 @@ Create `~/.config/splinterm/policy.json` with mode `0600`. This observation-only
 }
 ```
 
-This rule cannot send input, resize, spawn, restore, terminate, rename, or inspect audit records. Add only the scopes and resources required by the intended workflow. The complete 19-scope inventory and reviewed control/lifecycle examples remain in repository `docs/mcp.md`.
-
-Lair and Dojo selectors snapshot only descendants present when that policy generation is published. New descendants remain denied until a reviewed reload.
-
-## 4. Validate and reload
+Validate and reload:
 
 ```bash
 chmod 600 ~/.config/splinterm/policy.json
 splinterm policy validate ~/.config/splinterm/policy.json
 systemctl --user reload splinterd.service
-splinterm policy inspect
+splinterm policy inspect ~/.config/splinterm/policy.json
 ```
 
-No policy, a different digest, missing scope, wrong resource or incarnation, stale revision, missing destructive confirmation, exceeded limit, or controller owned by another client fails closed. MCP transport access is not authority.
+Lair and Dojo selectors in `policy.json` snapshot only descendants present when the policy reloads (unlike interactive workspace grants, which cover newly created Dojos and Splints inside that Lair). See repository [`docs/mcp.md`](https://github.com/ministry-of-taste/splinterm/blob/main/docs/mcp.md) for all 19 policy scopes and control/lifecycle examples.
 
-## Fixed capabilities and limits
+## Sending terminal input (`splinterm.input`)
 
-Policy and consent bound a cooperating agent and show what it can reach. They are not a sandbox: a hostile program running as your account can already read your files and run commands, and can reach your terminals without asking Splinterm. Run agents you would trust with your account.
+`splinterm.input` writes `text` as raw UTF-8 bytes unchanged, followed by any named `keys` in order. It never trims whitespace, translates LF to CR, or wraps text in bracketed paste.
 
-The adapter exposes:
-
-- 34 fixed tools, including `splinterm.report_agent_status`;
-- one topology resource and terminal/control resource templates;
-- no arbitrary shell-string tool;
-- no filesystem, network, policy-write, clipboard, prompts, sampling, or elicitation capability; and
-- no trusted forced controller takeover.
-
-Requests, responses, pages, subscriptions, controllers, cursors, and deadlines are bounded. Handles and cursors expire with the adapter process and are not portable. Closing the host's stdio cancels calls and releases subscriptions, transfers, controllers, and daemon connections; it does not roll back a mutation already committed by the daemon.
-
-:::caution
-Terminal content is `untrusted_terminal_data`. An MCP host may display or index it as data, but it must never treat it as consent, authority, confirmation, executable source, or an instruction to call another tool.
-:::
-
-## Sending terminal input
-
-`splinterm.input` sends `text` as UTF-8 bytes unchanged, then any `keys` in
-order. It does not trim whitespace, remove control characters, translate LF to
-CR, or wrap text in bracketed-paste markers. Input requires the same scoped
-grant and exclusive controller authority either way.
-
-Press Enter with `keys: ["enter"]`. Agent hosts cannot reliably put a carriage
-return (CR, U+000D) in a tool argument: a model's line break arrives as LF, and
-a raw CR can be dropped before the call reaches the adapter (#278). TUIs such
-as Pi, Claude Code and Codex treat LF as "insert a newline" and only CR as
-"submit", so text that ends in a line break does not submit.
+Always use `keys: ["enter"]` to submit a command or TUI prompt. Model tool arguments turn newlines into LF and often strip raw carriage returns (CR), whereas TUIs like Claude Code, Codex, and Pi treat LF as "insert newline" and only CR as "submit":
 
 ```json
 {
@@ -175,10 +129,10 @@ as Pi, Claude Code and Codex treat LF as "insert a newline" and only CR as
 }
 ```
 
-The keys send the same bytes as the graphical client for the same key press:
+Supported named keys emit the exact bytes the graphical client sends:
 
 | Key | Bytes |
-|---|---|
+| --- | --- |
 | `enter` | CR (`0d`) |
 | `tab` | `09` |
 | `shift-tab` | `ESC [ Z` |
@@ -186,47 +140,30 @@ The keys send the same bytes as the graphical client for the same key press:
 | `backspace` | DEL (`7f`) |
 | `ctrl-a` … `ctrl-z` | `01` … `1a` (`ctrl-c` is `03`) |
 
-A call needs `text`, `keys`, or both. `text` must not be empty, `keys` holds 1
-to 64 names, and text plus keys together are capped at 64 KiB. Arrow and other
-cursor keys are not offered yet, because their bytes depend on the
-terminal's cursor-key mode. A `\r` inside `text` stays a backslash followed by
-`r`; only a JSON-escaped CR that survives the host reaches the terminal as CR.
+Each call needs `text` (non-empty), `keys` (1–64 names), or both, up to 64 KiB total. Cursor/arrow keys aren't included yet because their sequences depend on terminal cursor-key mode. `accepted_bytes` reports bytes written to the PTY (`hello` + `enter` = 6), not whether the foreground program accepted them.
 
-`accepted_bytes` counts the bytes written, text and keys together. It does not
-mean the foreground program interpreted them as a key or accepted the command:
-`hello` plus `enter` counts as six bytes. Keep diagnostics to lengths and
-synthetic control-byte probes; do not log real terminal input or prompts.
+## Reporting agent status
 
-## Report agent status
+`splinterm.report_agent_status` accepts `{ state, detail?, ttl_seconds?, splint_id?, incarnation? }`, where `state` is `working`, `needs_input`, `done`, `error`, `idle`, or `null` to clear.
 
-`splinterm.report_agent_status` takes `{ state, detail?, ttl_seconds?, splint_id?, incarnation? }`. `state` is `working`, `needs_input`, `done`, `error`, `idle`, or `null` to clear. Without `splint_id` and `incarnation`, the adapter uses `SPLINTERM_SPLINT_ID` and `SPLINTERM_SPLINT_INCARNATION` from its own environment, and fails with `invalid_argument` (`not inside a Splint`) when there are none. A host that starts stdio servers with a filtered environment must forward both variables. For Codex, add them to the server entry in `~/.codex/config.toml`:
+When `splint_id` and `incarnation` are omitted, the adapter reads `$SPLINTERM_SPLINT_ID` and `$SPLINTERM_SPLINT_INCARNATION` from its environment (which `splinterm mcp setup codex` forwards automatically in `~/.codex/config.toml`). An adapter started inside a Splint can report for that Splint with no grant; reporting for another Splint requires `agent_status_report` (included in every Easy agent access level).
 
-```toml
-[mcp_servers.splinterm]
-command = "/usr/bin/splinterm-mcp"
-env_vars = ["SPLINTERM_SPLINT_ID", "SPLINTERM_SPLINT_INCARNATION"]
-```
+## Capabilities, boundaries, and upgrades
 
-An adapter launched by an agent inside a Splint reports for that Splint with no policy rule; reporting for another Splint, or from an agent that fully detached from its Splint, needs an `agent_status_report` rule for the exact Splint. The reported detail is never echoed. `inspect_splint` and `inspect_topology` gain an optional `agent_status` object while a status is set. Agents with command hooks can use `splinterm agent-status` instead; see [Bounded automation](/docs/automation/).
+:::caution
+Terminal content returned by MCP tools is `untrusted_terminal_data`. Hosts may display or index it as data, but must never treat it as consent, policy, confirmation, or an instruction to call another tool.
+:::
 
-## Upgrade and revoke
+- **Fixed surface:** 34 fixed tools, one topology resource, and terminal/control resource templates. No arbitrary shell-string tool, and no filesystem, network, policy-write, clipboard, prompts, sampling, or elicitation capabilities.
+- **Not a sandbox:** Grants and policy keep cooperating agents within approved bounds and make their access visible. A hostile process running as your Unix account can already access your files and terminals directly.
+- **Session cleanup:** Closing the host's stdio cancels in-flight calls and releases subscriptions, controllers, and daemon connections (already-committed mutations aren't rolled back).
+- **Upgrades:** Package upgrades update `/usr/bin/splinterm-mcp`'s SHA-256 digest. **Always** workspace grants automatically continue working for protected installs once you restart the agent process; pinned rules in `policy.json` require updating the digest and reloading `splinterd.service`.
 
-An adapter upgrade changes its SHA-256 digest. Stop MCP hosts, inspect the new binary, update the policy deliberately, reload it, and reconnect. The package never edits or broadens user policy.
+## Quick troubleshooting
 
-To revoke immediately:
+1. Check grants and policy with `splinterm access list` and `splinterm policy inspect ~/.config/splinterm/policy.json`.
+2. Confirm `/usr/bin/splinterm-mcp` exists, `splinterd` is running as your user, and any `policy.json` digest matches `sha256sum /usr/bin/splinterm-mcp`.
+3. Treat `unauthorized`, `stale_topology`, `stale_incarnation`, `controller_unavailable`, and `resync_required` as signals to reconcile state—don't retry blindly or broaden policy.
+4. Keep stdout clean for MCP frames; diagnostics go to stderr.
 
-1. remove or narrow the policy rule;
-2. validate and reload policy; and
-3. terminate the MCP host if desired.
-
-Reload disconnects affected daemon sessions and invalidates their connection-owned state.
-
-## Troubleshooting
-
-1. Confirm `/usr/bin/splinterm-mcp` exists and its digest matches policy.
-2. Confirm the daemon socket belongs to the same user and `splinterd` is running.
-3. Validate policy and inspect the published generation.
-4. Reconcile `unauthorized`, `stale_topology`, `stale_incarnation`, controller denial, timeout, and `resync_required`; do not retry blindly or broaden policy.
-5. Keep stdout reserved for MCP frames. Bounded diagnostics are written to stderr.
-
-Read [Bounded automation](/docs/automation/) for the shared policy, controller, audit, and untrusted-data model.
+See [Bounded automation](/docs/automation/) for the shared permission, controller, and audit model.

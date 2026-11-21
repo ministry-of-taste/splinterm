@@ -7,78 +7,78 @@ const horizons = [
     label: 'Now',
     stage: 'Stable 0.2.0',
     title: 'Earn daily-driver confidence.',
-    summary: 'Make persistence understandable, desktop behavior coherent, and installation trustworthy on the environment Splinterm can validate today.',
+    summary: 'Make persistence intuitive, Omarchy desktop integration seamless, and upgrades boring on the platform Splinterm validates today.',
     outcomes: [
-      'Intentional Lair states and lifecycle controls',
-      'Exact theme fidelity and Omarchy integration',
-      'Bounded local-file drop path insertion',
-      'Trustworthy install, recovery, and diagnostics',
-      'Continued performance and memory validation',
+      'Clear Lair states and predictable save/pin/restore controls',
+      'Exact Omarchy theme fidelity and desktop integration',
+      'Validated local file-drop and clipboard image workflows',
+      'Smooth install, live-upgrade, recovery, and diagnostics',
+      'Tracked startup latency and memory footprint',
     ],
-    signal: 'A new user can leave a Window, return to the same work, and predict every destructive action without maintainer help.',
+    signal: 'A new user can close windows freely, return to running work, and predict every destructive action without maintainer help.',
   },
   {
     number: '02',
     label: 'Next',
     stage: 'Supported 1.0',
-    title: 'Turn behavior into a contract.',
-    summary: 'Support the complete primary journey rather than merely implementing it.',
+    title: 'Define a real 1.0 support contract.',
+    summary: 'Commit to explicit, tested guarantees around upgrades, schemas, and recovery—not just a feature checklist.',
     outcomes: [
-      'Declared platform and compatibility boundaries',
-      'Tested upgrade, rollback, and recovery paths',
-      'Stable configuration and machine contracts',
-      'Security and issue-reporting processes',
-      'Visible resource limits and failure behavior',
+      'Declared platform matrix and compatibility windows',
+      'Tested upgrade, rollback, reset, and recovery runbooks',
+      'Stable configuration, CLI, and JSON/NDJSON contracts',
+      'Clear bug-report and security-disclosure processes',
+      'Understandable resource limits and failure diagnostics',
     ],
-    signal: 'Version 1.0 is a support contract—not a reward for accumulating features.',
+    signal: '1.0 is a support contract you can rely on, not an arbitrary milestone for accumulating features.',
   },
   {
     number: '03',
     label: 'Later',
     stage: 'Connected workspace',
-    title: 'Keep one workspace across entry points.',
-    summary: 'Make local, remote, headless, and authorized tool access feel like ways into the same work instead of separate terminal worlds.',
+    title: 'Keep one workspace across local, remote, and tools.',
+    summary: 'Make local windows, SSH hosts, headless daemons, and authorized agents feel like one coherent workflow.',
     outcomes: [
-      'Productized remote profiles and recovery',
-      'Stable integration kits and reference journeys',
-      'Distinct human and automation activity',
-      'Portable, non-executable workspace definitions',
+      'Polished remote SSH profiles and drop recovery',
+      'Reference integration kits for scripts and MCP hosts',
+      'Clear visual cues for human vs. automated activity',
+      'Portable, declarative workspace definitions',
     ],
-    signal: 'No public daemon listener, hosted control plane, synchronized secrets, or collaborative typing is implied.',
+    signal: 'Still no daemon network listener, cloud account, hosted control plane, synced secrets, or simultaneous typing.',
   },
   {
     number: '04',
     label: 'Explore',
     stage: 'Broader Linux',
-    title: 'Expand only where support stays honest.',
-    summary: 'Research additional environments without turning interest into an unsupported promise.',
+    title: 'Expand only where we can test continuously.',
+    summary: 'Investigate new environments without turning curiosity into an unsupported promise.',
     outcomes: [
-      'Broader Nix and Home Manager deployment acceptance',
-      'Additional validated Wayland compositors',
-      'Coherent tertiary distribution artifacts',
-      'A carefully bounded extension model',
-      'Compatibility driven by real applications',
+      'Broader NixOS and Home Manager deployment acceptance',
+      'Additional Wayland compositors with test coverage',
+      'Additional distro packages with clean service upgrades',
+      'A carefully scoped extension model',
+      'Selective compatibility driven by real terminal apps',
     ],
-    signal: 'Every expansion needs a blocked user, continuous validation, a support boundary, and an honest opportunity cost.',
+    signal: 'Every new platform needs real blocked users, automated testing, a clear boundary, and an honest trade-off.',
   },
 ];
 ---
 
 <SiteLayout
   title="Roadmap — Splinterm"
-  description="Splinterm's public product roadmap from daily-driver confidence to a supported persistent workspace."
+  description="Where Splinterm is headed from stable 0.2.0 toward a supported 1.0 release."
 >
   <section class="roadmap-hero shell-section" aria-labelledby="roadmap-title">
     <div class="roadmap-hero-copy">
-      <p class="eyebrow"><span>Direction, not a deadline</span> · Product roadmap</p>
-      <h1 id="roadmap-title">The work persists.<br /><em>The promise grows carefully.</em></h1>
+      <p class="eyebrow"><span>Horizons, not deadlines</span> · Product roadmap</p>
+      <h1 id="roadmap-title">From daily driver<br />to a <em>supported 1.0.</em></h1>
       <p>
-        Splinterm has a stable 0.2.0 release on its documented platform. The roadmap works toward
-        a broader 1.0 support contract; stable 0.2.0 does not imply those future guarantees.
-        The horizons below describe outcomes—not dates, feature quotas, or compatibility guarantees.
+        Splinterm 0.2.0 is stable on x86_64 Omarchy and Arch Linux. These horizons lay out what
+        we're building toward next—outcomes and graduation bars rather than calendar dates or
+        premature compatibility promises.
       </p>
       <div class="hero-actions">
-        <a class="button primary" href="#horizons">Follow the horizons <span aria-hidden="true">↓</span></a>
+        <a class="button primary" href="#horizons">Explore the horizons <span aria-hidden="true">↓</span></a>
         <a class="button secondary" href="/docs/roadmap/">Read the detailed roadmap</a>
       </div>
     </div>
@@ -97,11 +97,11 @@ const horizons = [
   </section>
 
   <section class="roadmap-north shell-section" aria-labelledby="north-star-title">
-    <div class="section-index" aria-hidden="true">North star / Persistent work</div>
-    <blockquote id="north-star-title">Splinterm should become the place terminal work lives while windows, machines, and tools come and go.</blockquote>
+    <div class="section-index" aria-hidden="true">North star</div>
+    <blockquote id="north-star-title">One place where your terminal work stays alive while windows, machines, and tools come and go.</blockquote>
     <p>
-      The primary human workflow remains the anchor. Automation expands the product; it does not
-      redefine Splinterm as an “AI terminal.” Every support claim stays narrower than the evidence.
+      Splinterm is built for humans first. Scoped automation makes it more capable, without turning
+      it into an “AI terminal.” We only claim support for environments we actually test.
     </p>
   </section>
 
@@ -118,11 +118,11 @@ const horizons = [
           <p class="horizon-summary">{horizon.summary}</p>
         </header>
         <div class="public-horizon-outcomes">
-          <p>Product outcomes</p>
+          <p>Target outcomes</p>
           <ul>
             {horizon.outcomes.map((outcome) => <li>{outcome}</li>)}
           </ul>
-          <div class="public-horizon-signal"><span>{index === 3 ? 'Decision test' : 'Graduation signal'}</span>{horizon.signal}</div>
+          <div class="public-horizon-signal"><span>{index === 3 ? 'Decision bar' : 'Graduation bar'}</span>{horizon.signal}</div>
         </div>
       </article>
     ))}
@@ -130,29 +130,29 @@ const horizons = [
 
   <section class="roadmap-boundaries shell-section" aria-labelledby="boundaries-title">
     <div>
-      <p class="eyebrow">Deliberate restraint</p>
-      <h2 id="boundaries-title">Not every direction becomes a promise.</h2>
+      <p class="eyebrow">Deliberate non-goals</p>
+      <h2 id="boundaries-title">What we’re intentionally not building.</h2>
     </div>
     <ul>
-      <li>Reboot-transparent process survival</li>
+      <li>Reboot-transparent process checkpointing</li>
       <li>Arbitrary <code>foot.ini</code> compatibility</li>
-      <li>Unrestricted automation</li>
+      <li>Unrestricted agent or script access</li>
       <li>Collaborative simultaneous typing</li>
       <li>A hosted cloud control plane</li>
-      <li>Broad Linux support without validation</li>
+      <li>Distro claims without continuous testing</li>
     </ul>
   </section>
 
   <section class="roadmap-exit shell-section" aria-labelledby="roadmap-exit-title">
     <div>
-      <p class="eyebrow">Public product truth</p>
-      <h2 id="roadmap-exit-title">Direction here.<br />Boundaries in the docs.</h2>
+      <p class="eyebrow">Dig deeper</p>
+      <h2 id="roadmap-exit-title">Want the full rationale?</h2>
     </div>
     <div>
-      <p>This page communicates the product path. Public documentation records strategy, current status, accepted architecture, and supported boundaries; maintainer delivery sequencing is tracked separately.</p>
+      <p>The roadmap docs cover the full reasoning behind each horizon, and Current status tracks exactly what works today.</p>
       <div class="hero-actions">
         <a class="button primary" href="/docs/roadmap/">Roadmap documentation</a>
-        <a class="text-link" href="https://github.com/ministry-of-taste/splinterm/blob/main/docs/product-roadmap.md">Product roadmap <span aria-hidden="true">↗</span></a>
+        <a class="text-link" href="https://github.com/ministry-of-taste/splinterm/blob/main/docs/product-roadmap.md">Repository roadmap <span aria-hidden="true">↗</span></a>
       </div>
     </div>
   </section>
