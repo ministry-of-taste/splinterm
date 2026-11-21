@@ -1,18 +1,18 @@
 ---
 title: Troubleshooting
-description: Diagnose common local Splinterm installation, daemon, session, and configuration problems.
+description: Quick checks for installation paths, splinterd health, authorization errors, config failures, and missing Dojos.
 ---
 
-This page covers the first local checks. Splinterm 0.2.0 is stable within a narrow validated Omarchy/Arch environment, so failures outside that target may not have a supported resolution.
+Start here when something local isn't behaving as expected. Keep in mind that Splinterm 0.2.0 is validated on x86_64 Omarchy and Arch Linux under Hyprland—issues outside that environment may not have a supported fix yet.
 
-## Check the installed command
+## Check which binaries are on `PATH`
 
 ```bash
 command -v splinterm
 command -v splinterd
 ```
 
-On the packaged system, the trusted graphical client and daemon are adjacent under `/usr/bin`. A user-local `splinterm` earlier in `PATH` does not match the running system daemon's trusted-UI identity.
+On a packaged install, both should resolve under `/usr/bin/`. A development binary earlier in `PATH` (such as `~/.local/bin/splinterm` or `~/.cargo/bin/splinterm`) won't match `/usr/bin/splinterd`'s trusted graphical client check and will be rejected.
 
 ## Check the daemon
 
@@ -21,17 +21,25 @@ systemctl --user status splinterd.service
 splinterm ping
 ```
 
-Start the user service on demand if needed:
+If the user service isn't running yet, start it:
 
 ```bash
 systemctl --user start splinterd.service
 ```
 
-The default socket is `$XDG_RUNTIME_DIR/splinterm/splinterd.sock`. A development instance may use another path through `SPLINTERM_SOCKET`.
+The default Unix socket lives at `$XDG_RUNTIME_DIR/splinterm/splinterd.sock` (development runs via `./splinterm-test` override this with `SPLINTERM_SOCKET`).
 
-## The daemon restarted after a heavy workload
+## A window exits as unauthorized
 
-Check whether systemd recorded an out-of-memory result and inspect the daemon's independent control-plane limits:
+For a fresh graphical launch, `splinterd` grants trusted-UI access only when the client executable matches the `splinterm` binary sitting right beside the running `splinterd` executable (by device and inode). Check:
+
+1. `command -v splinterm` points to `/usr/bin/splinterm`, not a shadowing user-local copy.
+2. The running daemon is `/usr/bin/splinterd` from the same package build.
+3. After a package upgrade replaces `/usr/bin/splinterm`, existing windows opened before the upgrade keep working while their connections stay open, and any fresh connection must come from the installed `/usr/bin/splinterm` (or the snapshot pinned by a live-upgraded daemon). If a pre-upgrade client process loses its connections and tries to reconnect—or if `splinterd` is running from a different directory than `command -v splinterm`—it will be rejected; reopen from the launcher or align the daemon (`splinterm upgrade --now` or restart `splinterd.service`).
+
+## The daemon restarted under heavy load
+
+Check whether systemd hit a resource limit and inspect the daemon's journal:
 
 ```bash
 systemctl --user show splinterd.service \
@@ -40,13 +48,13 @@ systemctl --user show splinterd.service \
 journalctl --user-unit splinterd.service -n 50 --no-pager
 ```
 
-The packaged task ceiling protects the daemon from unbounded process creation, while `MemoryHigh` causes reclaim and throttling rather than imposing a hard memory ceiling. Terminal workloads run in a separate aggregate slice with nested per-Dojo and per-Splint boundaries, so they do not share the daemon's task or memory-pressure budget. `MemoryCurrent` includes charged page cache, some of which may be reclaimable under pressure.
+Terminal workloads run inside a separate `app-splinterm.slice` hierarchy (with nested per-Dojo and per-Splint scopes), keeping them isolated from `splinterd`'s own task and memory budget. Note that `MemoryHigh` applies memory pressure/reclaim rather than a hard OOM kill, and `MemoryCurrent` includes reclaimable page cache.
 
-After a daemon restart, inspect exited topology with `splinterm list --all`. Restoration is explicit because Splinterm never reruns saved commands automatically.
+After a restart, inspect exited sessions with `splinterm list --all`. Splinterm never re-runs saved commands automatically—use `restore` explicitly on what you want back.
 
-## A new Splint reports an internal launch failure
+## A new Splint fails to launch
 
-The packaged daemon fails closed when it cannot place a terminal helper in its exact systemd scope before executing the shell. Inspect the daemon and workload hierarchy:
+The packaged daemon fails closed if it can't place a new shell inside its systemd scope. Inspect the daemon logs and workload slice:
 
 ```bash
 journalctl --user-unit splinterd.service -n 40 --no-pager
@@ -54,42 +62,35 @@ systemctl --user status app-splinterm.slice
 systemd-cgls --user-unit app-splinterm.slice
 ```
 
-The aggregate slice can be inactive when no Splints are running. Do not work around placement failure by launching the packaged daemon manually: that removes the package's required-containment contract. A direct development daemon may fall back with a bounded warning, but it does not claim workload isolation.
+It's normal for `app-splinterm.slice` to show as inactive when no Splints are running. Avoid working around placement errors by starting `/usr/bin/splinterd` manually outside systemd—that bypasses the packaged workload containment.
 
-## A window exits as unauthorized
+## Config fails at startup
 
-Check all of the following:
-
-1. `command -v splinterm` resolves to the packaged client.
-2. The running daemon executable is the packaged adjacent `splinterd`.
-3. The client and daemon come from the same package build.
-4. Old windows were reopened after replacing either executable.
-
-Do not install a development client to an earlier user-local `PATH` entry and treat it as the packaged desktop client.
-
-## Configuration fails at startup
-
-Run with the intended file and read the line-numbered diagnostic:
+Test the exact config file and read the line-numbered error:
 
 ```bash
-SPLINTERM_CONFIG=/path/to/config.ini splinterm launch
+splinterm config check
+# Or test an alternate file:
+SPLINTERM_CONFIG=/path/to/config.ini splinterm config check
 ```
 
-Unknown keys and malformed values fail rather than being guessed. Compare the file with the [supported configuration](/docs/configure/configuration/).
+Unknown sections, unknown keys, and invalid values fail explicitly instead of being guessed. Compare against [Configuration](/docs/configure/configuration/).
 
 ## A Dojo is missing from Recent Dojos
 
-The native picker opens only Dojos whose complete pane layout is still running. Exited Splints remain in persistent metadata, but starting them again requires explicit restore.
-
-Inspect active and exited topology through the human CLI:
+Recent Dojos lists only Dojos whose panes are still running. Exited Dojos stay in saved metadata until you restore or close them. Check both active and exited sessions:
 
 ```bash
 splinterm list
 splinterm list --all
 ```
 
-## Automation is denied
+Unpromoted transient Lairs (when `persistent-by-default=no` or launched via an XDG command) are also intentionally omitted from Recent Dojos.
 
-Socket access, the same Unix account, SSH login, or running inside a Splint does not grant automation authority. Persistent automation requires a valid owner-controlled policy for the exact executable identity, operation scopes, resources, and limits.
+## Automation or MCP calls are denied
 
-A controller denial can also be normal: one client may hold a Splint's exclusive input/resize lease while others continue observing.
+Reaching the Unix socket, running as the same Linux user, connecting over SSH, or running inside a Splint does not grant automation access.
+
+- Check active workspace grants and matching policy rules with `splinterm access list` and `splinterm policy inspect ~/.config/splinterm/policy.json`.
+- If you upgraded `/usr/bin/splinterm-mcp`, its SHA-256 digest changed—policy rules pinning the old digest will fail closed until updated and reloaded.
+- A **controller denied** error is often normal: another client (such as your open window) currently holds exclusive input/resize control of that Splint while other clients can still observe it.

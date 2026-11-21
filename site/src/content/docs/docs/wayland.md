@@ -1,73 +1,60 @@
 ---
 title: Why native Wayland?
-description: What Splinterm gains from speaking Wayland directly, how persistence changes the model, and where the current limits are.
+description: What Splinterm gets from speaking Wayland directly, why daemon persistence matters more, and where the limits are.
 ---
 
-Splinterm is a native Wayland client. It speaks directly to the compositor instead of presenting an X11 window through the XWayland compatibility layer.
+Splinterm is a native Wayland client—it talks directly to your compositor instead of going through XWayland.
 
-That choice improves how the terminal participates in a modern Wayland desktop. It is not, by itself, what makes Splinterm unique. The larger difference is that the native window is only a disposable view into terminal state owned by the headless `splinterd` daemon.
+Speaking Wayland natively makes the terminal behave like a first-class citizen on a modern Linux desktop, though plenty of terminals do that today. What actually sets Splinterm apart is pairing that lightweight Wayland client with `splinterd`, a headless daemon that owns your shells and layouts underneath.
 
 ```text
 Hyprland / Wayland compositor
              ↓
   disposable splinterm window
              ↓
-   persistent splinterd topology
+     persistent splinterd
              ↓
-     shells · layouts · scrollback
+   shells · layouts · scrollback
 ```
 
-## What users gain
+## What direct Wayland gives you
 
 ### Compositor-aware scaling
+Splinterm reads output geometry and scale straight from Wayland. With the default `output-scale` font policy, text stays sharp across mixed-DPI monitors and fractional scaling—no blurry XWayland upscaling. See [Font sizing and Wayland scale](/docs/configure/configuration/#font-sizing-and-wayland-scale).
 
-Splinterm receives output geometry and scale information directly from Wayland. Its default `output-scale` font policy follows compositor output scaling, including fractional output scale. This avoids routing display behavior through an X11 compatibility window.
+### Native input, clipboard, and IME
+Keyboard events, pointer actions, Wayland clipboard exchange, compose sequences, and IME preedit all run natively. Splinterm reports the active terminal cell rectangle back to the compositor so IME candidate popups appear right where you're typing.
 
-See [Configuration](/docs/configure/configuration/#font-sizing-and-wayland-scale) for the available sizing policies.
+### Damage-driven rendering
+Splinterm tracks which terminal regions changed and schedules redraws with compositor frame callbacks instead of repainting the whole window on every tick. (This is CPU composition over Wayland shared memory, not GPU rendering.)
 
-### Native input and clipboard
+### Optional compositor blur
+When your active theme enables translucency and blur—and your compositor advertises the matching protocol—Splinterm requests native background blur. On compositors without that protocol, it simply runs without blur.
 
-The graphical client handles Wayland keyboard and pointer events, clipboard exchange, compose input, and IME preedit. The IME cursor rectangle follows the active terminal cell so candidate and composition interfaces can be positioned by the compositor.
+### Tighter client isolation than X11
+Wayland doesn't give ordinary clients the global window snooping and input injection X11 historically allowed. That's a healthier baseline, though it isn't a complete security boundary on its own—Splinterm still enforces separate rules for automation policy, controller ownership, and untrusted terminal output.
 
-### Damage-driven presentation
+## Why persistence is the bigger shift
 
-Splinterm tracks changed terminal regions and schedules frames with the compositor. It can update damaged areas without treating every terminal change as a reason to blindly redraw the complete window.
+Plenty of modern terminals already have a Wayland backend. Where they differ from Splinterm is who owns your shell:
 
-Damage-driven does not mean GPU-rendered. The current renderer uses CPU composition with Wayland shared-memory buffers.
-
-### Optional compositor effects
-
-When the active theme requests translucency and blur, and the compositor advertises the compatible protocol, Splinterm can request native background blur for its window region. Missing protocol support remains a normal no-blur case rather than a startup failure.
-
-### Stronger client isolation than traditional X11
-
-Wayland does not give ordinary clients the broad global window inspection and input-injection model traditionally available to X11 clients. This is a useful platform boundary, but it does not make Splinterm absolutely secure. Automation authority, terminal output, controller ownership, and graphical focus remain separately constrained.
-
-## The persistence difference
-
-Many current terminal emulators can use a native Wayland backend. Native Wayland support alone therefore is not the main product distinction.
-
-In Splinterm, `splinterd` owns shell processes, terminal state, scrollback, layouts, and persistent session metadata. A `splinterm` Wayland window displays that state but does not own its lifetime. Closing the window detaches the view; it does not end the work beneath it.
-
-The daemon itself requires neither Wayland nor X11. It can continue serving persistent sessions while no graphical client is connected.
-
-| Model | Presentation | Process owner | Closing the window |
+| Setup | Display surface | Process owner | Closing the window |
 | --- | --- | --- | --- |
-| X11 terminal under XWayland | X11 compatibility surface | Usually the terminal process | Usually ends the shell |
-| Terminal with a Wayland backend | Native or selectable Wayland surface | Usually the terminal process | Usually ends the shell |
-| Terminal with tmux or Zellij | Terminal plus nested multiplexer | The nested multiplexer | Multiplexer session persists |
-| Splinterm | Disposable native Wayland surface | Headless `splinterd` | Daemon-owned shells and layouts persist |
+| X11 terminal via XWayland | X11 compatibility layer | Usually the terminal process | Usually kills the shell |
+| Wayland terminal | Native Wayland surface | Usually the terminal process | Usually kills the shell |
+| Terminal + tmux or Zellij | Terminal plus nested multiplexer | Nested multiplexer | Multiplexer session persists |
+| **Splinterm** | Disposable native Wayland surface | Headless `splinterd` | Shells and layouts keep running |
 
-These rows describe common ownership models, not universal behavior for every terminal or configuration.
+Because `splinterd` itself needs neither Wayland nor X11, your sessions keep running when every window is closed—and headless servers can run `splinterd` with no graphical stack at all.
 
-Splinterm derives terminal behavior from [Foot](https://codeberg.org/dnkl/foot), a Wayland-native terminal. The architectural departure is Splinterm's persistent daemon topology, native panes and tabs, and bounded access to that same topology for graphical, CLI, SSH relay, and automation clients.
+Splinterm's terminal emulation comes from [Foot](https://codeberg.org/dnkl/foot), a fast Wayland-native terminal. Splinterm builds persistent daemon topology, built-in panes and tabs, SSH remote windows, and scoped automation on top of that foundation.
 
-## What native does not promise
+## What native Wayland does *not* promise
 
-- **Not automatic speed.** Removing XWayland is not a universal performance guarantee.
-- **Not GPU rendering.** Splinterm currently uses CPU/Wayland-SHM composition.
-- **Not universal compositor support.** The validated target is x86_64 Omarchy/Arch Linux under the documented Hyprland environment.
-- **Not an absolute security claim.** Wayland isolation is one boundary inside a larger authority model.
-- **Not compositor control.** Creating or mutating a persistent Dojo does not map, focus, move, resize, or assign a native window to a workspace.
+- **Not automatic speed.** Skipping XWayland doesn't guarantee faster rendering by itself.
+- **Not GPU rendering.** Splinterm currently renders on the CPU into Wayland shared-memory buffers.
+- **Not every compositor.** The validated target is x86_64 Omarchy and Arch Linux under Hyprland.
+- **Not a security sandbox.** Wayland isolation helps at the windowing layer, not against arbitrary processes running as your own user.
+- **Not compositor window control.** Creating or arranging a Dojo via CLI or MCP never focuses, moves, resizes, or assigns workspaces to your Hyprland windows.
 
-See [Current status](/docs/status/) for the supported target and [Core concepts](/docs/concepts/) for the distinction between persistent topology and disposable presentation.
+See [Current status](/docs/status/) for exact platform boundaries and [Core concepts](/docs/concepts/) for how persistent topology and disposable windows fit together.
