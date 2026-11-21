@@ -78,21 +78,35 @@ class GenerateOmarchyThemeTests(unittest.TestCase):
     def test_canonical_names_win_and_empty_values_fall_through(self) -> None:
         colors = self.colors("tokyo-night")
         both = self.exporter.generate(
-            {**colors, "lighter_bg": "#111111", "bg": "#222222", "bright_fg": "#333333"}
+            {
+                **colors,
+                "lighter_bg": "#111111",
+                "bg": "#222222",
+                "bright_fg": "#333333",
+                "selection_background": "#556677",
+            }
         )
         self.assertEqual(both["active_tab_background"], "#24283b")
         self.assertEqual(both["background"], "#1a1b26")
         self.assertEqual(both["ansi"][15], "#c0caf5")
+        self.assertEqual(both["selection"], "#556677")
 
         legacy = self.colors("legacy-gruvbox")
         self.assertNotIn("lighter_background", legacy)
         self.assertEqual(self.exporter.generate(legacy)["ansi"][15], "#d4be98")
 
         fallthrough = self.exporter.generate(
-            {**colors, "lighter_background": "", "lighter_bg": "#444444", "muted": ""}
+            {
+                **colors,
+                "lighter_background": "",
+                "lighter_bg": "#444444",
+                "muted": "",
+                "selection_background": "",
+            }
         )
         self.assertEqual(fallthrough["active_tab_background"], "#444444")
         self.assertEqual(fallthrough["pane_border"], "#565f89")
+        self.assertEqual(fallthrough["selection"], "#292e42")
 
     def test_missing_bright_accents_are_derived_like_omarchy(self) -> None:
         colors = dict(self.colors("tokyo-night"))
