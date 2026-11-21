@@ -1,29 +1,31 @@
 ---
 title: Quickstart
-description: Open a new Splinterm terminal, detach from work, and return to the running session.
+description: Open a Splinterm terminal, close the window, and jump back into your running session.
 ---
 
-This first workflow demonstrates Splinterm's central behavior: the graphical window can close while the daemon-owned terminal session continues running.
+The quickest way to understand Splinterm is to close a window while something is still running inside it.
 
 ## 1. Install Splinterm
 
-Follow [Installation](/docs/install/) from an x86_64 Omarchy/Arch system.
+Follow [Installation](/docs/install/) on x86_64 Omarchy or Arch Linux. If you're on Omarchy, run `splinterm integration omarchy enable` once so `Super+C`/`Super+V` and terminal transparency work properly.
 
-## 2. Open a new terminal
+## 2. Open a terminal
 
-Use the installed desktop entry or run:
+Launch Splinterm from your app menu, or run:
 
 ```bash
 splinterm-xdg-terminal-exec
 ```
 
-A commandless launch creates a fresh persistent **Lair**, one **Dojo**, and one **Splint**. A working directory is preserved exactly. If another application supplies a command through the XDG terminal contract, Splinterm preserves its structured argv without rebuilding shell text and creates a transient client-bound Lair instead. That Lair and all its processes disappear when the command exits or the owning Window disconnects. Native `splinterm launch -- COMMAND...` remains persistent.
+That opens a fresh persistent **Lair** with one **Dojo** and one terminal pane (**Splint**), starting in your current directory.
 
-## 3. Leave the work running
+## 3. Close the window while work is running
 
-Start a recognizable process in the terminal, then close the graphical window. Closing the final tab detaches the client; it does not terminate the daemon-owned Dojo or its running Splints.
+Start something easy to recognize—`htop`, a tailing log, or a dev server—then close the window.
 
-## 4. Return through Recent Dojos
+Closing the window (or its last tab) only detaches the graphical client. The daemon (`splinterd`) keeps your shell and layout running in the background.
+
+## 4. Pick up where you left off
 
 Open the native Dojo picker:
 
@@ -31,37 +33,43 @@ Open the native Dojo picker:
 splinterm dojos
 ```
 
-Choose the running Dojo. `splinterm sessions` remains a compatibility alias. In a focused managed Splinterm window, **Ctrl+Shift+S** opens the same Recent Dojos workflow as trusted application chrome.
+Select your running Dojo to reattach (`splinterm sessions` is an alias for the same command). Inside any Splinterm window, press **Ctrl+Shift+S** to open the same picker.
 
-To reopen the last locally remembered running Dojo directly:
+To jump straight back into whichever running Dojo you used last:
 
 ```bash
 splinterm reopen
 ```
 
-## Essential controls
-
-| Action | Control |
-| --- | --- |
-| Command palette | Ctrl+Shift+P |
-| Recent Dojos | Ctrl+Shift+S |
-| New horizontal split | Ctrl+Shift+Enter |
-| New vertical split | Ctrl+Shift+\\ |
-| Move between panes | Ctrl+Shift+Arrow |
-| Cycle tabs | Ctrl+Tab / Ctrl+Shift+Tab |
-| Jump to tab 1–9 | Ctrl+Shift+1 … Ctrl+Shift+9 |
-| New Dojo tab | Ctrl+Shift+D |
-| Detach active tab | Ctrl+Shift+Q |
-| Toggle tab strip | Ctrl+Shift+B |
-| Search scrollback | Ctrl+Shift+F |
-| Copy / paste | Ctrl+Shift+C / Ctrl+Shift+V (Super+C/V and Ctrl+Insert/Shift+Insert aliases) |
-
-The `omarchy-tmux` profile advertises Ctrl+Shift+C/V first because compositors may reserve Super chords. Super shortcuts work only when the compositor delivers the chord to the Splinterm Window. When Omarchy classifies `com.oldjobobo.splinterm` as a terminal, it delivers universal copy/paste as `Ctrl+Shift+C/V` on current Omarchy (`quattro` since `129c67e2`, after 4.0.4) or `Ctrl+Insert`/`Shift+Insert` on Omarchy 3.x and 4.0.x, which Splinterm accepts while preserving ordinary `Ctrl+C` terminal interrupt. Omarchy does not classify Splinterm by default; run `splinterm integration omarchy enable` once, as described in [installation](/docs/install/#recommended-on-omarchy). While viewing historical output, plain Enter returns the focused pane to live output without submitting terminal input.
-
-:::note[Detach is not restore]
-Reopening attaches to processes that are still running. If a Splint has exited, starting it again from saved launch metadata is an explicit restore operation.
+:::note[Reopening vs. restoring]
+Reopening attaches to processes that are still running. If a shell or command has already exited, starting it again from saved launch metadata is an explicit **restore**—Splinterm never re-runs exited commands on its own.
 :::
 
-The optional `omarchy-tmux` profile adds `Ctrl+Space` / `Ctrl+B` prefixes, trusted searchable `Prefix+?` key help, `Prefix+[` vi copy mode, and `Prefix Shift+S/F/V/O` for Save, pin toggle, Preview, and Restore of the current Lair. See [Configuration and keymaps](/docs/configure/configuration/).
+## Everyday shortcuts
 
-Next, learn the [core concepts](/docs/concepts/), read about [sessions and persistence](/docs/sessions/), or create complete layouts with [Dojo presets](/docs/presets/).
+| Action | Shortcut |
+| --- | --- |
+| Command palette | `Ctrl+Shift+P` |
+| Recent Dojos | `Ctrl+Shift+S` |
+| Split horizontally | `Ctrl+Shift+Enter` |
+| Split vertically | `Ctrl+Shift+\` |
+| Move between panes | `Ctrl+Shift+Arrow` |
+| Cycle tabs | `Ctrl+Tab` / `Ctrl+Shift+Tab` |
+| Jump to tab 1–9 | `Ctrl+Shift+1` … `Ctrl+Shift+9` |
+| New Dojo tab | `Ctrl+Shift+D` |
+| Detach active tab | `Ctrl+Shift+Q` |
+| Toggle tab strip | `Ctrl+Shift+B` |
+| Search scrollback | `Ctrl+Shift+F` |
+| Copy / paste | `Ctrl+Shift+C` / `Ctrl+Shift+V` |
+
+A few handy details as you settle in:
+
+- **Copy & paste on Omarchy:** `Super+C`/`Super+V` and `Ctrl+Insert`/`Shift+Insert` also work as copy/paste aliases alongside `Ctrl+Shift+C`/`V` while leaving `Ctrl+C` as normal terminal interrupt—just make sure you've run `splinterm integration omarchy enable` (see [Recommended on Omarchy](/docs/install/#recommended-on-omarchy)).
+- **Jumping back to live output:** When scrolled back through history, press `Enter` once to snap back to live output without sending a newline to your shell.
+- **Prefer tmux chords?** Set `profile=omarchy-tmux` under `[key-bindings]` in `config.ini` for `Ctrl+Space` and `Ctrl+B` prefixes, searchable key help (`Prefix+?`), vi copy mode (`Prefix+[`), and quick Lair save/pin/preview/restore bindings (`Prefix Shift+S/F/V/O`).
+
+## Where to go next
+
+- Learn how Lairs, Dojos, Splints, and windows relate in [Core concepts](/docs/concepts/).
+- Configure window-owned transient terminals, restore, and reset in [Sessions and persistence](/docs/sessions/).
+- Customize fonts, Omarchy themes, and keymaps in [Configuration](/docs/configure/configuration/), or spin up full multi-pane workspaces with [Dojo presets](/docs/presets/).

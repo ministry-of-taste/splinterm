@@ -3,127 +3,83 @@
 
 # Splinterm
 
-**A persistent, security-conscious terminal substrate for humans and bounded automation.**
+**A native Wayland terminal where closing the window never kills your shells.**
 
-[Website](https://splinterm.com/) · [Documentation](https://splinterm.com/docs/) · [Release notes](RELEASE_NOTES.md) · [Quickstart](https://splinterm.com/docs/quickstart/) · [Product roadmap](docs/product-roadmap.md) · [Current status](docs/status.md)
+[Website](https://splinterm.com/) · [Documentation](https://splinterm.com/docs/) · [Quickstart](https://splinterm.com/docs/quickstart/) · [Release notes](RELEASE_NOTES.md) · [Roadmap](docs/product-roadmap.md) · [Status](docs/status.md)
 
 </div>
 
-Splinterm combines a native Wayland terminal with a headless daemon that keeps shells, layouts, and terminal state alive when graphical clients disconnect. Close a window, come back later, and the work is still running.
+Splinterm pairs a lightweight Wayland terminal with a background daemon (`splinterd`) that owns your shells, pane layouts, and scrollback. Close a window whenever you want, come back later, and your work is still running.
 
-Humans use that persistent topology through native windows, tabs, and panes. Authorized tools can reach the same sessions through bounded JSON/NDJSON, SSH relay, and MCP interfaces. Splinterm is built in Rust from [Foot](https://codeberg.org/dnkl/foot)'s terminal behavior and designed first for Omarchy and Arch Linux.
+You get built-in tabs, split panes, presets, and SSH-backed remote windows without wrapping `tmux` around every terminal. When you want scripts or coding agents to work alongside you, they connect to the same live sessions through a scoped JSON/NDJSON CLI, SSH relay, or optional MCP server—with explicit permissions you can inspect and revoke at any time.
 
-> [!IMPORTANT]
-> **Status: stable 0.2.0.** Splinterm's current stable release is available for x86_64 Omarchy/Arch Linux with native Wayland under Hyprland. Source, versioned GitHub release assets, and documentation are public; both AUR package bases publish 0.2.0-1. Live daemon upgrade is supported from 0.2.0 on; the one-time 0.1.x to 0.2.0 upgrade restarts the daemon and ends its shells. Broader platform compatibility and a support lifetime are not promised. Future 0.x releases may change interfaces with documented migration.
->
-> See the repository-authoritative [current status](docs/status.md) for the exact capability and availability boundaries.
+Splinterm is written in Rust, grounded in [Foot](https://codeberg.org/dnkl/foot)'s terminal emulation, and built first for **Omarchy and Arch Linux** (`x86_64`, native Wayland under Hyprland).
+
+> [!NOTE]
+> **Current release: 0.2.0** for x86_64 Omarchy and Arch Linux. Live daemon upgrades work from 0.2.0 onward (upgrading from 0.1.x to 0.2.0 is a one-time restart that ends existing shells). For exact platform limits, validation status, and NixOS notes, see [Current status](docs/status.md).
 
 ## Why Splinterm
 
-### Your shell outlives its window
-
-`splinterd` owns the terminal processes, layouts, and session metadata. A Wayland window is a disposable view into that state—not the owner of it. Detaching a client does not end the work beneath it.
-
-### One topology for people and tools
-
-Native windows, the human CLI, structured clients, the SSH relay, and the MCP adapter all operate on the same persistent sessions. Automation does not live in a separate, less capable terminal world.
-
-### Authority is explicit
-
-Automation is constrained by exact executable identity, explicit scopes, bounded resources and messages, controller ownership, consent, revocation, and body-free audit metadata. Terminal output remains untrusted data; it cannot grant authority or become an automatic instruction.
-
-### Terminal behavior has an oracle
-
-Foot is Splinterm's behavioral foundation, not just visual inspiration. The terminal kernel is a Rust translation grounded in a pinned Foot implementation, with provenance retained in [`THIRD_PARTY.md`](THIRD_PARTY.md).
-
-## What works today
-
-| Area | Current state |
-| --- | --- |
-| Native Wayland terminal | Implemented and validated |
-| Persistent sessions and explicit restore | Implemented and validated |
-| Pane layouts and multiple Dojos | Implemented and validated |
-| Omarchy keymap, presets, and optional Bash helpers | Implemented and validated |
-| Vi copy mode and context-local desktop editing | Implemented and validated |
-| Window-local Dojo tabs | Implemented and validated |
-| Multi-client controller transfer | Implemented and validated |
-| JSON/NDJSON automation | Implemented and validated |
-| SSH stdio relay | Implemented and validated |
-| MCP adapter | Implemented and validated |
-| Sixel, practical Kitty static images, and inline iTerm2 PNG | Documented supported subsets |
-| Arch/Omarchy package | Versioned GitHub release and AUR packages validated |
-| Public source and versioned builds | Available |
-| AUR packages | Prebuilt `splinterm-bin` and source-built `splinterm`; optional MCP split packages |
-| Stable release | 0.2.0 for the documented Omarchy/Arch Linux target |
-| Broader compatibility and support lifetime | Not promised |
-| Nix and broader distributions | 0.2.0 release flake/module and headless checks; wider acceptance remains separate |
-
-For limitations and release gates, read [Current status](docs/status.md). Exact image support is documented in [`docs/images.md`](docs/images.md).
+- **Your shells outlive their window.** `splinterd` owns your terminal processes, layouts, and scrollback. A Wayland window is just a disposable view—closing it detaches, it doesn't kill your work.
+- **Native Wayland, Foot-class footprint.** Direct Wayland input, scaling, clipboard, IME, and damage-driven rendering built from Foot's battle-tested terminal kernel ([`THIRD_PARTY.md`](THIRD_PARTY.md)), without stacking a nested multiplexer on top.
+- **One workspace for people and tools.** Native windows, the CLI, remote SSH windows, and the optional MCP adapter all share the same persistent sessions.
+- **Explicit permissions, never silent trust.** Scripts and agents don't inherit graphical access. You choose what they can read or control—via workspace consent or explicit policy—and terminal output is always treated as untrusted data.
 
 ## Install
 
-**NixOS:** the repository includes a source-built flake with the full Wayland GUI,
-desktop launcher, headless daemon, and optional MCP variant. See
-[the NixOS installation guide](docs/nixos.md) for declarative desktop and server
-setup. This does not extend the Arch graphical validation claim to NixOS.
-
-The validated installation target is **x86_64 Omarchy/Arch Linux with native Wayland**. The prebuilt AUR packages download verified binaries and do not compile locally. **AUR is prerelease-capable, not stable-only:** these same package names can advance to release candidates. Both bases publish 0.2.0-1 (verified 2026-11-08). Check the offered version before installing or upgrading. If the channel has advanced, use the exact-tag instructions in [Packaging](docs/packaging.md) for stable 0.2.0 specifically.
+On **x86_64 Omarchy / Arch Linux**, install the prebuilt AUR package with `yay` or `paru`:
 
 ```bash
 yay -S splinterm-bin
-# Optional policy-scoped MCP adapter:
+# Optional MCP adapter:
 yay -S splinterm-mcp-bin
 ```
 
-The source-built alternatives are `splinterm` and `splinterm-mcp`. `paru` may be used instead of `yay`. The stable release is scoped to the documented platform; it does not promise a support lifetime. Release candidates remain prereleases even when AUR offers them as upgrades.
+Source-built `splinterm` and `splinterm-mcp` packages are also on AUR. Because the AUR channel can also carry release candidates between stable releases, check the version your helper offers before confirming—or install an exact release tag with [docs/packaging.md](docs/packaging.md).
 
-For the newest published versioned release package, use Foot or another terminal
-not owned by `splinterd`, then clone the public repository and run:
+### Recommended on Omarchy
 
-```bash
-git clone https://github.com/ministry-of-taste/splinterm.git
-cd splinterm
-./install.sh
-```
-
-The release installer selects the newest published qualifying SemVer `v…` release, **including prereleases**; it is not a stable-only selector. For stable 0.2.0 specifically, follow the exact-tag instructions in [Packaging](docs/packaging.md). The installer verifies its GitHub-recorded manifest digest and package checksums, preserves an emergency binary snapshot, installs through Pacman, and verifies the packaged client identity. The snapshot supports diagnosis and manual recovery; it is not a package-consistent rollback. GitHub CLI authentication is optional, and anonymous public downloads are supported.
-
-To build and package the current committed checkout locally, run:
+Run this once so Hyprland tags Splinterm as a terminal (fixing `Super+C`/`Super+V` copy/paste and terminal transparency rules) and wires up default-terminal and screensaver integration:
 
 ```bash
-./install.sh --source
+splinterm integration omarchy enable
 ```
 
-Add `--check` to run the complete package test suite. The installer deliberately packages a clean committed `HEAD`; it does not include uncommitted worktree changes.
+Installation itself never edits your Omarchy or Hyprland config, changes your default terminal, or installs the MCP adapter behind your back. `splinterm integration omarchy disable` reverses everything cleanly.
 
-Installation does **not** change your default terminal, edit Omarchy or Hyprland configuration, enable systemd user lingering, or install the optional MCP package on a fresh system. After installation, `splinterm integration omarchy enable` explicitly configures the complete reversible user-level default-terminal, terminal-tag, and screensaver integration. Trusted graphical authority requires the client to be the exact device/inode sibling adjacent to the running `/usr/bin/splinterd`. A window opened before an upgrade replaces `/usr/bin/splinterm` keeps working, including new tabs and panes, while it runs, until it is live-upgraded or reopened. New launches use the new install.
+### Other install methods
 
-Read the complete [installation guide](https://splinterm.com/docs/install/).
+- **Release installer (from a terminal not owned by `splinterd`):**
+  ```bash
+  git clone https://github.com/ministry-of-taste/splinterm.git
+  cd splinterm
+  ./install.sh          # newest published release (may include prereleases)
+  ./install.sh --source # build and package the current committed HEAD
+  ```
+- **NixOS:** Includes a source-built flake and module for desktop and headless setups; see [docs/nixos.md](docs/nixos.md) (Arch graphical validation does not automatically extend to NixOS).
 
-## Start using it
+For upgrade details, recovery snapshots, and exact-tag installs, see the [installation guide](https://splinterm.com/docs/install/) and [`docs/packaging.md`](docs/packaging.md).
 
-Open a fresh terminal from the installed desktop entry or the XDG terminal launcher:
+## Quickstart
+
+Open a terminal from your app launcher or run:
 
 ```bash
 splinterm-xdg-terminal-exec
 ```
 
-Ordinary unnamed graphical terminals are persistent by default. Set `multiplexer.persistent-by-default=no` to make commandless desktop/SUPER+ENTER, bare `splinterm launch`, picker **New**, and in-Window **New Terminal** belong to their Window instead; closing it then terminates and removes the unpromoted Lair. Explicit names, command-bearing native launches, presets, remote creation, restore/relaunch, automation, and MCP remain persistent.
-
-`multiplexer.persist-on-tab-organization=yes` is also the default. Creating another Dojo or explicitly naming/renaming a Dojo atomically promotes the complete transient Lair, after which Window close detaches normally. Command-bearing XDG launches retain their existing client-bound behavior regardless of configuration.
-
-Return through the native Dojo picker:
+Start something recognizable (like `htop` or a dev server), then close the window. Your shell keeps running in `splinterd`. Bring it back anytime with the native picker:
 
 ```bash
-splinterm dojos   # choose a running Dojo or start a new terminal
-splinterm reopen  # reopen the last locally remembered running Dojo
+splinterm dojos   # pick a running Dojo or start a new terminal
+splinterm reopen  # jump straight back to the last running Dojo
 ```
 
-`splinterm sessions` remains a compatibility alias for `splinterm dojos`.
+(`splinterm sessions` works as an alias for `splinterm dojos`.)
 
-Inside a managed Splinterm window, these controls cover the essential workflow:
+### Essential shortcuts
 
-| Action | Control |
+| Action | Shortcut |
 | --- | --- |
 | Command palette | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd> |
 | Recent Dojos | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>S</kbd> |
@@ -136,23 +92,12 @@ Inside a managed Splinterm window, these controls cover the essential workflow:
 | Search scrollback | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>F</kbd> |
 | Copy / paste | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>C</kbd> / <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>V</kbd> |
 
-The optional `omarchy-tmux` profile adds familiar `Ctrl+Space` / `Ctrl+B`
-prefixes, searchable `Prefix+?` resolved-key help, `Prefix+[` vi copy mode, and
-`Prefix Shift+S/F/V/O` for Save, pin toggle, Preview, and Restore of the current
-Lair. In copy mode, navigate with vi keys or arrows, press `v` to select, `y` to
-publish to the Wayland clipboard, or Escape to cancel. Outside copy mode,
-`Ctrl+Shift+C/V` provide compositor-safe terminal copy/paste; `Super+C/V` and
-`Ctrl+Insert`/`Shift+Insert` remain aliases. On Omarchy, run
-`splinterm integration omarchy enable` once so Omarchy tags Splinterm as a
-terminal; until then its universal `Super+C` sends `Ctrl+C` (interrupt). Splinterm-owned fields additionally provide bounded local
-selection, cut, and undo without claiming universal terminal `Super+X/Z`.
-Packaged atomic Dojo presets and optional collision-safe Bash helpers cover the
-standard Omarchy `t`, `tdl`, `tds`, `tdlm`, and `tsl` workflows under
-Splinterm's separate `s*` shell namespace.
+If you prefer tmux-style chords, set `profile=omarchy-tmux` under `[key-bindings]` in `config.ini` for `Ctrl+Space` / `Ctrl+B` prefixes, searchable key help (`Prefix+?`), vi copy mode (`Prefix+[`), and current-Lair save/restore bindings. Bundled **Dojo presets** and optional `s*` Bash helpers also mirror Omarchy's `t`, `tdl`, `tds`, `tdlm`, and `tsl` workflows without colliding with your existing aliases.
 
-Reopening attaches to processes that are still running. Starting an exited process again from saved launch metadata is an explicit **restore** operation.
+> [!TIP]
+> **Reopening vs. restoring:** Reopening attaches to a shell that is still running. If a process has exited, starting it again from saved launch metadata is always an explicit **restore**—Splinterm never re-runs saved commands automatically.
 
-Continue with the [quickstart](https://splinterm.com/docs/quickstart/), repository [human usage guide](docs/usage.md), or website [Dojos and persistence](https://splinterm.com/docs/sessions/).
+For window-owned transient terminals (`persistent-by-default=no`), tab controls, and full workflows, see the [quickstart](https://splinterm.com/docs/quickstart/), [sessions guide](https://splinterm.com/docs/sessions/), or [docs/usage.md](docs/usage.md).
 
 ## How it works
 
@@ -167,71 +112,46 @@ Continue with the [quickstart](https://splinterm.com/docs/quickstart/), reposito
                          └─────┬─────┘
                                │ owns
 Topology
-└── Lair: project or persistent session
-    ├── Dojo: terminal layout
-    │   ├── Splint: shell or process
-    │   └── Splint: shell or process
+└── Lair: project or workspace
+    ├── Dojo: split pane layout
+    │   ├── Splint: running shell or command
+    │   └── Splint: running shell or command
     └── Dojo: another layout
-        └── Splint: shell or process
+        └── Splint: running shell or command
 ```
 
-- **Topology** — the daemon's complete persistent session catalog.
-- **Lair** — a named project or persistent session.
-- **Dojo** — one persistent terminal layout inside a Lair.
-- **Splint** — an individual terminal pane and process lifecycle.
-- **Window** — a native Wayland view that may display multiple Dojos as local tabs.
+- **Lair** — a named project or workspace grouping related Dojos.
+- **Dojo** — a persistent split-pane layout inside a Lair.
+- **Splint** — an individual terminal pane and its process lifecycle.
+- **Topology** — the full catalog of Lairs, Dojos, and Splints owned by `splinterd`.
+- **Window** — a native Wayland view that displays one or more Dojos as local tabs.
 
-Window and tab lifetimes are separate from Dojo and Splint lifetimes. Closing a view detaches it; terminating a process is an explicit, guarded action.
+Closing a window or tab detaches your view; terminating a running Splint or Dojo is always a separate, confirmed action. Read [Core concepts](https://splinterm.com/docs/concepts/) or [`docs/architecture.md`](docs/architecture.md) for the deeper design.
 
-Read [Core concepts](https://splinterm.com/docs/concepts/) for the user model or [`docs/architecture.md`](docs/architecture.md) for system ownership and boundaries.
+## Automation, remote access, and configuration
 
-## Automation and remote access
-
-Splinterm exposes a deliberately bounded automation surface rather than making its private daemon protocol public:
-
-- **JSON/NDJSON CLI** for versioned one-shot operations and subscriptions.
-- **SSH stdio relay** for remote automation without a network listener in `splinterd`.
-- **Native remote client** for a profile-bound graphical workflow over an authenticated relay.
-- **MCP adapter** as an optional, separately packaged and policy-identified integration.
-
-Machine access does not inherit human graphical authority and remains governed by automation policy. Native remote Windows are different: OpenSSH authenticates the human account, and the installed graphical relay receives normal terminal-multiplexer authority without automation policy.
-
-Authoritative references:
-
-- [`docs/automation.md`](docs/automation.md) — public JSON/NDJSON contracts, policy, and exit behavior
-- [`docs/remote.md`](docs/remote.md) — SSH relay, remote profiles, and authority boundaries
-- [`docs/mcp.md`](docs/mcp.md) — MCP installation, policy, and host setup
-- [`docs/integrations.md`](docs/integrations.md) — integration-author checklist and safe client workflows
-- [`dist/schemas/v2/`](dist/schemas/v2/) — checked-in public machine schemas
-
-## Configuration
-
-Splinterm uses `${XDG_CONFIG_HOME:-~/.config}/splinterm/config.ini` for its focused configuration surface. It supports fonts and sizing, shell behavior, scrollback, cursor settings, pane chrome, keymap overlays, and explicit theme overrides.
-
-On Omarchy, Splinterm reads the active theme's effective `foot.ini` and `colors.toml` and safely reloads valid palette changes without restarting the daemon or shell. When `main.font` is unset, graphical clients also follow fontconfig's effective `monospace` family live; explicit font patterns remain user-owned, and invalid live generations retain the last valid font without restarting the Window or its processes.
-
-See the [configuration guide](https://splinterm.com/docs/configure/configuration/) for supported keys, keymap inspection, Omarchy integration, and Foot migration.
+- **Automation & MCP:** Scripts and agents can inspect sessions, stream events, report live agent status, or send input via the versioned JSON/NDJSON CLI, SSH stdio relay, or optional MCP adapter. Machine clients never inherit human graphical trust; access is controlled through explicit workspace consent or policy rules. See [`docs/automation.md`](docs/automation.md), [`docs/mcp.md`](docs/mcp.md), [`docs/integrations.md`](docs/integrations.md), and [`dist/schemas/v2/`](dist/schemas/v2/).
+- **Remote sessions:** Open native remote Wayland windows over your own OpenSSH setup without running a daemon network listener—no automation policy required for human SSH sessions. See [`docs/remote.md`](docs/remote.md).
+- **Configuration & Omarchy themes:** Configured in `${XDG_CONFIG_HOME:-~/.config}/splinterm/config.ini`. On Omarchy, Splinterm automatically tracks your active theme (`foot.ini`, `colors.toml`, `shell.toml`) and live monospace font changes without restarting windows or shells. See the [configuration guide](https://splinterm.com/docs/configure/configuration/).
 
 ## Documentation
 
-| If you want to… | Start here |
+| Looking for… | Start here |
 | --- | --- |
-| Install and evaluate Splinterm | [Installation](https://splinterm.com/docs/install/) |
-| Open, detach, and return to work | [Quickstart](https://splinterm.com/docs/quickstart/) |
-| Understand Lairs, Dojos, Splints, and windows | [Core concepts](https://splinterm.com/docs/concepts/) |
-| Manage persistence, restore, and reset | [Dojos and persistence](https://splinterm.com/docs/sessions/) |
-| Configure the terminal | [Configuration](https://splinterm.com/docs/configure/configuration/) |
-| Check maturity and availability | [Current status](docs/status.md) |
-| Use windows, tabs, panes, and restore safely | [Human usage](docs/usage.md) |
-| Find CLI commands and machine-output boundaries | [CLI reference](docs/cli.md) |
-| Troubleshoot an installation | [Troubleshooting](https://splinterm.com/docs/troubleshooting/) |
-| Contribute to the project | [Contributing](CONTRIBUTING.md) |
-
-Specialist contracts and design records remain in [`docs/`](docs/). Plans, spikes, benchmarks, and retained artifacts are development history and evidence—not the primary user guide.
+| Installing or upgrading | [Installation](https://splinterm.com/docs/install/) |
+| First two minutes with Splinterm | [Quickstart](https://splinterm.com/docs/quickstart/) |
+| Lairs, Dojos, Splints, and windows | [Core concepts](https://splinterm.com/docs/concepts/) |
+| Persistence, restore, and reset | [Sessions and persistence](https://splinterm.com/docs/sessions/) |
+| Fonts, themes, keymaps, and Foot migration | [Configuration](https://splinterm.com/docs/configure/configuration/) |
+| What works today and platform limits | [Current status](docs/status.md) |
+| Full daily-use reference | [Human usage guide](docs/usage.md) |
+| CLI subcommands and JSON output | [CLI reference](docs/cli.md) |
+| Fixing local issues | [Troubleshooting](https://splinterm.com/docs/troubleshooting/) |
+| Contributing to the codebase | [Contributing](CONTRIBUTING.md) |
 
 ## Development
 
-Splinterm is a Rust workspace. The normal non-graphical validation is:
+Splinterm is a Rust workspace. Standard checks:
 
 ```bash
 cargo fmt --all --check
@@ -239,25 +159,19 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-For an isolated development daemon and client:
+To hack on Splinterm without touching your live desktop daemon, use the isolated test wrapper:
 
 ```bash
-./splinterm-test          # build, start or reuse the test daemon, and open Splinterm
+./splinterm-test          # build, start or reuse the isolated daemon, and open a window
 ./splinterm-test restart  # rebuild and restart after daemon or protocol changes
-./splinterm-test ping     # build and verify the isolated daemon
-./splinterm-test stop     # stop the isolated daemon
+./splinterm-test ping     # verify the isolated daemon
+./splinterm-test stop     # stop it
 ```
 
-Read [`CONTRIBUTING.md`](CONTRIBUTING.md) and the [development guide](https://splinterm.com/docs/development/) before changing domain, protocol, renderer, or Foot-derived behavior.
+Read [`CONTRIBUTING.md`](CONTRIBUTING.md) and the [development guide](https://splinterm.com/docs/development/) before modifying domain, protocol, renderer, or Foot-derived code.
 
-## Design authority and lineage
+## Lineage & license
 
-Splinterm's emulator half is derived from Foot's architecture and behavior. Translated or adapted code records its source provenance and retains the relevant MIT attribution. See [`docs/adr/0001-foot-rust-port.md`](docs/adr/0001-foot-rust-port.md) and [`THIRD_PARTY.md`](THIRD_PARTY.md).
+Splinterm's terminal emulator kernel is ported from [Foot](https://codeberg.org/dnkl/foot), preserving source provenance and MIT attribution in [`docs/adr/0001-foot-rust-port.md`](docs/adr/0001-foot-rust-port.md) and [`THIRD_PARTY.md`](THIRD_PARTY.md).
 
-## Support Splinterm
-
-If Splinterm is useful to you, you can [support its continued development on Ko-fi](https://ko-fi.com/oldjobobo).
-
-## License
-
-Splinterm is available under the [MIT License](LICENSE).
+If Splinterm is useful to you, you can [support development on Ko-fi](https://ko-fi.com/oldjobobo). Released under the [MIT License](LICENSE).
