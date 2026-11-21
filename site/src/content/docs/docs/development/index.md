@@ -1,15 +1,13 @@
 ---
 title: Development
-description: Build, test, and understand the Splinterm workspace without mixing contributor internals into user guidance.
+description: Build, test, and contribute to the Splinterm Rust workspace using isolated dev daemons and branch-first worktrees.
 ---
 
-Splinterm is a Rust workspace with separate crates for the graphical client, daemon, domain model, protocol, relay, MCP adapter, PTY boundary, and Foot-derived terminal kernel.
+Splinterm is a Cargo workspace split cleanly across the graphical client, daemon, domain model, private protocol, SSH relay, MCP adapter, PTY layer, and Foot-derived terminal kernel.
 
-## Branch-first development
+## Branch-first workflow
 
-Keep the root `main` checkout for coordination and releases. Make each coherent
-plan, feature, fix, or documentation milestone on a short-lived branch in a
-dedicated sibling worktree:
+Keep your root `main` checkout clean for fetches, review, and releases. Do every feature, fix, or documentation milestone on a short-lived branch in its own worktree:
 
 ```bash
 git fetch origin
@@ -17,17 +15,11 @@ git worktree add --no-track -b feat/my-change \
   ../splinterm-worktrees/my-change origin/main
 ```
 
-One writer owns each worktree. Dependent or overlapping changes remain serial;
-read-only review may inspect the task worktree. Validate and review the actual
-diff, then publish the task branch with `git push --set-upstream origin HEAD`
-before opening a pull request. Prefer squash merge, then remove the merged
-worktree and branch. Release candidates and publication originate only from
-reviewed `main` commits. See the repository's `CONTRIBUTING.md` and `AGENTS.md`
-for the complete workflow and agent-specific stop-loss rules.
+Keep one writer per worktree, run focused checks and `git diff --check`, push with `git push --set-upstream origin HEAD`, and open a PR for squash merge. Clean up the merged branch and worktree afterward. See `CONTRIBUTING.md` and `AGENTS.md` in the repository for the full workflow and agent guardrails.
 
-## Standard validation
+## Standard Rust validation
 
-Run from the repository root:
+Run from the worktree root:
 
 ```bash
 cargo fmt --all --check
@@ -35,42 +27,41 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-Changes to domain or protocol behavior should include focused tests and preserve crate boundaries.
+Changes to domain or protocol behavior should include focused tests and respect crate boundaries.
 
-## Isolated development instance
+## Testing against an isolated daemon
 
-The `splinterm-test` helper builds and runs against an isolated owner-only socket:
+Use `./splinterm-test` to build and run against a private owner-only socket without touching your live desktop sessions:
 
 ```bash
-./splinterm-test          # build, start/reuse the test daemon, open a client
-./splinterm-test restart  # rebuild and restart after daemon/protocol changes
-./splinterm-test ping     # build and verify the isolated daemon
-./splinterm-test stop     # stop the isolated daemon
+./splinterm-test          # build, start or reuse the isolated daemon, open a window
+./splinterm-test restart  # rebuild and restart after daemon or protocol changes
+./splinterm-test ping     # check the isolated daemon
+./splinterm-test stop     # stop it
 ```
 
-The helper intentionally labels and isolates its development authorization bypass. Do not use that bypass with the packaged daemon or normal user state.
+The wrapper uses an intentionally isolated development auth bypass—never point it at your packaged `splinterd` or normal user state.
 
-## Workspace map
+## Workspace layout
 
 | Crate | Responsibility |
 | --- | --- |
-| `splinterm` | CLI, native Wayland frontend, input, and rendering |
-| `splinterd` | authoritative topology, PTYs, persistence, and policy |
-| `splinterm-core` | transport- and UI-independent domain model |
-| `splinterm-protocol` | versioned private client-daemon transport |
-| `splinterm-relay` | policy-identified SSH stdio transport |
-| `splinterm-mcp` | optional policy-identified MCP adapter |
-| `splinterm-pty` | Linux PTY and child-process boundary |
-| `splinterm-terminal` | Foot-derived grid and streaming terminal kernel |
+| `splinterm` | CLI, native Wayland frontend, input, and CPU/SHM renderer |
+| `splinterd` | Authoritative topology, PTYs, persistence, consent, and policy |
+| `splinterm-core` | Transport- and UI-independent domain model |
+| `splinterm-protocol` | Versioned private client–daemon wire protocol |
+| `splinterm-relay` | Policy-identified SSH stdio relay |
+| `splinterm-mcp` | Optional policy-identified MCP stdio adapter |
+| `splinterm-pty` | Linux PTY and child-process management |
+| `splinterm-terminal` | Foot-derived terminal grid and parser kernel |
 
-## Documentation boundaries
+## Where docs live
 
-- User workflows belong in this site's main documentation.
-- Machine contracts remain authoritative in `docs/automation.md` and checked-in schemas.
-- Architectural decisions remain in `docs/adr/`.
-- Plans and spikes record decisions and validation history; they are not user instructions.
-- Retained benchmark and graphical evidence should not enter ordinary documentation search.
+- **User guides:** This site (`site/src/content/docs/`).
+- **Public machine contracts:** Repository `docs/automation.md`, `docs/mcp.md`, and checked-in schemas under `dist/schemas/v2/`.
+- **Architecture decisions:** `docs/adr/`.
+- **Internal plans, spikes, and benchmarks:** Development history and evidence—not user documentation.
 
-## Optional Foot differential
+## Foot lineage and differential checks
 
-Splinterm-owned tests and adopted fixtures are release authority. Foot's pinned implementation remains an optional historical differential; do not modify the canonical checkout or silently regenerate comparison references. Ported code must retain compatible licensing, exact provenance, and required notices in `THIRD_PARTY.md`. See [ADR 0013](https://github.com/ministry-of-taste/splinterm/blob/main/docs/adr/0013-splinterm-owned-renderer-acceptance.md).
+Splinterm's own test suite and fixtures are release authority. The pinned Foot 1.27.0 checkout remains an optional historical differential reference—never edit the canonical Foot checkout or silently regenerate reference images. Any ported code must preserve MIT license compatibility, exact provenance, and attribution in `THIRD_PARTY.md`. See [ADR 0013](https://github.com/ministry-of-taste/splinterm/blob/main/docs/adr/0013-splinterm-owned-renderer-acceptance.md).
